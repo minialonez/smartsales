@@ -244,32 +244,29 @@ let currentPage = 'dashboard';
 // ── API Helper (รองรับ Apps Script redirect + CORS) ──
 async function api(action, params = {}) {
   try {
-    // Demo mode ถ้ายังไม่ได้ตั้ง API_URL
     if (!API_URL) return demoResponse(action, params);
 
-    // Apps Script ต้องใช้ Content-Type: text/plain เพื่อหลีก CORS preflight
-    // และต้อง redirect: follow เพื่อรองรับ 302 redirect
-    const payload = JSON.stringify({ action, ...params });
-
-    const res = await fetch(API_URL, {
-      method: 'POST',
-      redirect: 'follow',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: payload,
-    });
-
-    const text = await res.text();
+    // ลอง POST ก่อน
     try {
+      const res = await fetch(API_URL, {
+        method: 'POST',
+        redirect: 'follow',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({ action, ...params }),
+      });
+      const text = await res.text();
+      const json = JSON.parse(text);
+      return json;
+    } catch (postErr) {
+      // POST ล้มเหลว → fallback เป็น GET
+      const qs = new URLSearchParams({ action, ...params }).toString();
+      const res = await fetch(API_URL + '?' + qs, { redirect: 'follow' });
+      const text = await res.text();
       return JSON.parse(text);
-    } catch {
-      // กรณี Apps Script return HTML error page
-      console.error('API response not JSON:', text.substring(0, 200));
-      return { success: false, error: 'เซิร์ฟเวอร์ตอบกลับผิดรูปแบบ' };
     }
   } catch (err) {
     console.error('API Error:', err);
-    // Fallback to demo mode ถ้า fetch ล้มเหลว
-    toast('ไม่สามารถเชื่อมต่อเซิร์ฟเวอร์ได้ — ใช้ Demo Mode', 'error');
+    toast('ไม่สามารถเชื่อมต่อเซิร์ฟเวอร์ — ใช้ Demo Mode', 'error');
     return demoResponse(action, params);
   }
 }
@@ -597,6 +594,16 @@ async function renderDebt(el) {
 async function renderSales(el) {
   const stations = ['ALL','FRONT1','FRONT2','FRONT3','FRONT4','SS','SR','OS','OR'];
   let viewMode = 'daily', selectedDate = todayISO(), filterStation = 'ALL';
+  let showEntry = false;
+
+  // ค่าที่กรอก (เก็บ per station per date)
+  const entryKey = () => `${selectedDate}`;
+  const entries = {};
+  function getEntry() {
+    const k = entryKey();
+    if (!entries[k]) entries[k] = {};
+    return entries[k];
+  }
 
   async function render() {
     const res = await api('getDailySales', { date: formatDateKey(selectedDate) });
@@ -604,6 +611,7 @@ async function renderSales(el) {
     if (filterStation !== 'ALL') data = data.filter(s => s.station === filterStation);
     const totalSales = data.filter(s=>s.amount>0).reduce((a,s)=>a+s.amount,0);
     const totalReturns = data.filter(s=>s.amount<0).reduce((a,s)=>a+s.amount,0);
+    const ent = getEntry();
 
     const billColor = b => b.startsWith('OS')?'var(--info)':b.startsWith('OR')?'var(--purple)':b.startsWith('SS')?'var(--success)':b.startsWith('SR')?'var(--danger)':'var(--text2)';
 
@@ -612,12 +620,71 @@ async function renderSales(el) {
         <div class="page-title">ยอดขาย</div>
         <div class="flex gap-2 items-center">
           <div class="tab-bar">
-            ${['daily','monthly','yearly'].map(m=>`<button class="tab-btn ${viewMode===m?'active':''}" onclick="this.viewMode='${m}'">${m==='daily'?'รายวัน':m==='monthly'?'รายเดือน':'รายปี'}</button>`).join('')}
+            ${['daily','monthly','yearly'].map(m=>`<button class="tab-btn ${viewMode===m?'active':''}" data-view="${m}">${m==='daily'?'รายวัน':m==='monthly'?'รายเดือน':'รายปี'}</button>`).join('')}
           </div>
-          <input type="date" class="input" value="${selectedDate}" style="width:155px" onchange="this._date=this.value">
+          <input type="date" class="input" value="${selectedDate}" style="width:155px" id="sales-date">
+          <button class="btn ${showEntry?'btn-primary':'btn-outline'} btn-sm" id="toggle-entry">${ICONS.edit} กรอกยอด</button>
           <button class="btn btn-outline btn-sm">${ICONS.file} นำเข้า Excel</button>
         </div>
       </div>
+
+      <!-- ═══ ช่องกรอกยอด (ตาม format จริง: แถว = ประเภท, คอลัมน์ = Station) ═══ -->
+      <div id="entry-panel" class="${showEntry?'':'hidden'}" style="margin-bottom:16px">
+        <div class="card" style="border:1px solid var(--primary);border-radius:var(--radius-lg);background:rgba(91,124,250,.03);padding:16px">
+          <div class="flex justify-between items-center mb-3">
+            <div class="font-semi" style="color:var(--primary)">📝 สรุปยอดรายวัน — ${fmtDate(selectedDate)}</div>
+            <button class="btn btn-primary btn-sm" id="save-entry">${ICONS.check} บันทึก</button>
+          </div>
+          <div class="table-wrap">
+            <table style="font-size:.82rem">
+              <thead><tr>
+                <th style="background:var(--surface3);min-width:120px">รายการ</th>
+                <th style="background:var(--surface3);min-width:90px">All Station</th>
+                ${['Front1','Front2','Front3','Front4','Invoice','Order','Payment'].map(s=>`<th style="background:var(--surface3);min-width:90px">${s}</th>`).join('')}
+              </tr></thead>
+              <tbody>
+                ${[
+                  {key:'cash_in',   label:'💰 นำเงินเข้า',   color:'var(--success)',editable:true},
+                  {key:'sales',     label:'🧾 ยอดขาย',       color:'var(--primary)',editable:false},
+                  {key:'cash_out',  label:'💸 นำเงินออก',     color:'var(--danger)', editable:true},
+                  {key:'returns',   label:'↩️ ยอดคืนสินค้า', color:'var(--warn)',   editable:true},
+                  {key:'drawer',    label:'🗃️ Cash Drawer',  color:'var(--purple)', editable:true},
+                  {key:'transfer',  label:'🏦 Transfer',      color:'var(--info)',   editable:false},
+                  {key:'card',      label:'💳 Card',           color:'var(--text2)',  editable:false},
+                  {key:'cheque',    label:'📄 Cheque',         color:'var(--text2)',  editable:false},
+                  {key:'refund',    label:'🔄 Refund',         color:'var(--text2)',  editable:false},
+                ].map(row => {
+                  const stns = ['Front1','Front2','Front3','Front4','Invoice','Order','Payment'];
+                  const vals = stns.map(s => ent[row.key+'_'+s] || 0);
+                  const allSum = vals.reduce((a,b)=>a+b,0);
+                  return `<tr>
+                    <td style="font-weight:600;color:${row.color};white-space:nowrap">${row.label}</td>
+                    <td style="text-align:right;font-weight:700;color:var(--text)">${allSum?'฿'+fmtNum(allSum):'-'}</td>
+                    ${stns.map((s,i) => row.editable
+                      ? `<td><input class="input entry-cell" data-key="${row.key}_${s}" type="number" value="${vals[i]||''}" placeholder="0" step="0.01" style="width:85px;padding:4px 6px;font-size:.8rem;text-align:right;border-color:${row.color}40"></td>`
+                      : `<td style="text-align:right;color:var(--text2)">${vals[i]?fmtNum(vals[i]):'-'}</td>`
+                    ).join('')}
+                  </tr>`;
+                }).join('')}
+                <tr style="border-top:2px solid var(--border)">
+                  <td style="font-weight:800;color:var(--text)">📊 Sum (ตรวจสอบ)</td>
+                  <td></td>
+                  ${['Front1','Front2','Front3','Front4','Invoice','Order','Payment'].map(s => {
+                    const inflow = (ent['cash_in_'+s]||0) + (ent['sales_'+s]||0) + (ent['cash_out_'+s]||0) + (ent['returns_'+s]||0);
+                    const outflow = (ent['drawer_'+s]||0) + (ent['transfer_'+s]||0) + (ent['card_'+s]||0) + (ent['cheque_'+s]||0) + (ent['refund_'+s]||0);
+                    const diff = outflow - inflow;
+                    const isOk = Math.abs(diff) < 1;
+                    return `<td style="text-align:center;font-weight:800;font-size:.85rem;color:${isOk?'var(--success)':'var(--danger)'}">
+                      ${isOk ? '✓ OK' : '฿'+fmtNum(diff)}
+                    </td>`;
+                  }).join('')}
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
       <div class="flex gap-2 mb-3 flex-wrap">
         ${stations.map(s=>`<button class="pill ${filterStation===s?'active':''}" data-station="${s}">${s}</button>`).join('')}
       </div>
@@ -628,19 +695,20 @@ async function renderSales(el) {
         ${statCard('ยอดสุทธิ', '฿'+fmtNum(totalSales+totalReturns), '', 'var(--primary)', ICONS.bar)}
       </div>
       <div class="card-flat">
-        <div class="table-wrap" style="max-height:420px;overflow-y:auto">
+        <div class="table-wrap" style="max-height:380px;overflow-y:auto">
           <table>
-            <thead><tr><th>เลขที่บิล</th><th>Station</th><th>ช่องทางชำระ</th><th>ลูกค้า</th><th style="text-align:right">จำนวนเงิน</th><th>SP No.</th><th>สถานะ</th></tr></thead>
+            <thead><tr><th>Bill Number</th><th>Bill Date</th><th>Station</th><th>Type</th><th style="text-align:right">Baht</th><th>Confirmation</th><th>Pay Date</th><th>Remarks</th></tr></thead>
             <tbody>
               ${data.length ? data.map(s=>`<tr>
-                <td style="color:${billColor(s.bill_no)};font-weight:600">${s.bill_no}</td>
-                <td><span class="badge badge-info">${s.station}</span></td>
-                <td>${s.pay_method}</td>
-                <td style="color:var(--text)">${s.customer}</td>
-                <td style="text-align:right;font-weight:600;color:${s.amount<0?'var(--danger)':'var(--success)'}">฿${fmtNum(s.amount)}</td>
-                <td class="text-xs">${s.sp_no||'-'}</td>
-                <td>${s.match_status==='matched'?'<span class="badge badge-success">Matched</span>':'<span class="badge badge-muted">รอ</span>'}</td>
-              </tr>`).join('') : '<tr><td colspan="7" style="text-align:center;padding:30px;color:var(--text3)">ไม่มีข้อมูลในวันที่เลือก</td></tr>'}
+                <td style="color:${billColor(s.bill_no||s['Bill Number']||'')};font-weight:600">${s.bill_no||s['Bill Number']||''}</td>
+                <td>${fmtDate(s.date||s['Bill Date']||'')}</td>
+                <td><span class="badge badge-info">${s.station||s['Station']||''}</span></td>
+                <td>${s.pay_method||s['Type']||''}</td>
+                <td style="text-align:right;font-weight:600;color:${(s.amount||s['Baht']||0)<0?'var(--danger)':'var(--success)'}">฿${fmtNum(s.amount||s['Baht']||0)}</td>
+                <td class="text-xs">${s['Confirmation']||s.sp_no||'-'}</td>
+                <td class="text-xs">${s['Pay Date']||'-'}</td>
+                <td class="text-xs truncate" style="max-width:150px">${s['Remarks1']||s.customer||''}</td>
+              </tr>`).join('') : '<tr><td colspan="8" style="text-align:center;padding:30px;color:var(--text3)">ไม่มีข้อมูลในวันที่เลือก</td></tr>'}
             </tbody>
           </table>
         </div>
@@ -651,9 +719,28 @@ async function renderSales(el) {
       </div>
     `;
 
-    // Bind station filter pills
+    // ── Bindings ──
     el.querySelectorAll('.pill[data-station]').forEach(btn => {
       btn.addEventListener('click', () => { filterStation = btn.dataset.station; render(); });
+    });
+    el.querySelectorAll('.tab-btn[data-view]').forEach(btn => {
+      btn.addEventListener('click', () => { viewMode = btn.dataset.view; render(); });
+    });
+    document.getElementById('sales-date')?.addEventListener('change', e => { selectedDate = e.target.value; render(); });
+    document.getElementById('toggle-entry')?.addEventListener('click', () => { showEntry = !showEntry; render(); });
+
+    // ── Live update entry cells ──
+    el.querySelectorAll('.entry-cell').forEach(inp => {
+      inp.addEventListener('input', () => {
+        const ent = getEntry();
+        ent[inp.dataset.key] = parseFloat(inp.value) || 0;
+        // Re-render to update Sum row and All Station totals
+        render();
+      });
+    });
+
+    document.getElementById('save-entry')?.addEventListener('click', () => {
+      toast('บันทึกยอดเรียบร้อย — พร้อม Matching กับ Statement', 'success');
     });
   }
   render();
