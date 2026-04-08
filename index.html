@@ -281,12 +281,47 @@ function todayISO() { return new Date().toISOString().split('T')[0]; }
 function todayKey() { return todayISO().replace(/-/g, ''); }
 function fmtDate(d) {
   if (!d) return '';
-  const dt = new Date(d);
-  if (isNaN(dt)) return d;
-  return `${String(dt.getDate()).padStart(2,'0')}/${String(dt.getMonth()+1).padStart(2,'0')}/${dt.getFullYear()}`;
+  var str = String(d);
+  
+  // แปลง พ.ศ. → ค.ศ. (25xx → 20xx)
+  str = str.replace(/(\d{4})-(\d{2})-(\d{2})/, function(m, y, mo, dd) {
+    var year = Number(y); if (year > 2400) year -= 543;
+    return String(dd).padStart(2,'0') + '/' + String(mo).padStart(2,'0') + '/' + year;
+  });
+  str = str.replace(/(\d{1,2})\/(\d{1,2})\/(\d{4})/, function(m, dd, mo, y) {
+    var year = Number(y); if (year > 2400) year -= 543;
+    return String(dd).padStart(2,'0') + '/' + String(mo).padStart(2,'0') + '/' + year;
+  });
+  
+  // ถ้าเป็น ISO date (2026-04-08)
+  if (/^\d{4}-\d{2}-\d{2}/.test(str)) {
+    var p = str.split('T')[0].split('-');
+    var y = Number(p[0]); if (y > 2400) y -= 543;
+    return p[2] + '/' + p[1] + '/' + y;
+  }
+  
+  // ถ้าเป็น Date object
+  if (d instanceof Date && !isNaN(d)) {
+    return `${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}/${d.getFullYear()}`;
+  }
+  
+  // ถ้าเป็น dd/mm/yyyy อยู่แล้ว
+  if (/^\d{2}\/\d{2}\/\d{4}/.test(str)) return str.split(' ')[0];
+  
+  // try parse as Date
+  var dt = new Date(d);
+  if (!isNaN(dt)) return `${String(dt.getDate()).padStart(2,'0')}/${String(dt.getMonth()+1).padStart(2,'0')}/${dt.getFullYear()}`;
+  
+  return str.split(' ')[0]; // ตัดเวลาออก
 }
 function fmtNum(n) { return new Intl.NumberFormat('th-TH',{minimumFractionDigits:2,maximumFractionDigits:2}).format(n); }
 function fmtInt(n) { return new Intl.NumberFormat('th-TH').format(n); }
+
+function extractTimeStr(val) {
+  if (!val) return '';
+  const match = String(val).match(/\d{2}:\d{2}(:\d{2})?/);
+  return match ? match[0] : '';
+}
 
 // ── Toast ──
 function toast(msg, type = 'info') {
@@ -364,32 +399,44 @@ function handleStmtUpload(result, fileName) {
 
   // Parse ตาม format ธนาคาร
   if (bank === 'KTB') {
-    // KTB: headers row 11 (index 10), data from row 12+
     const sheet = firstSheet;
-    for (let i = 11; i < sheet.length; i++) {
+    // หา header row (Date)
+    let hRow = 10;
+    for (let i = 0; i < Math.min(15, sheet.length); i++) {
+      if (sheet[i] && sheet[i].some(c => String(c).includes('Date'))) { hRow = i; break; }
+    }
+    for (let i = hRow + 1; i < sheet.length; i++) {
       const r = sheet[i];
       if (!r[0] || !r[5]) continue;
-      rows.push({ bank, date: String(r[0]).split(' ')[0], time: String(r[0]).split(' ')[1] || '', ref_no: String(r[3]||''), description: String(r[3]||''), amount: Number(r[5])||0, match_status: 'unmatched', match_station: '', match_bill: '' });
+      rows.push({ bank, date: fmtDate(r[0]), time: extractTimeStr(r[0]), ref_no: String(r[3]||''), description: String(r[3]||''), amount: Number(r[5])||0, match_status: 'unmatched', match_station: '', match_bill: '' });
     }
   } else if (bank === 'KBANK') {
     const sheet = firstSheet;
-    for (let i = 11; i < sheet.length; i++) {
+    let hRow = 10;
+    for (let i = 0; i < Math.min(15, sheet.length); i++) {
+      if (sheet[i] && sheet[i].some(c => String(c).includes('วันที่'))) { hRow = i; break; }
+    }
+    for (let i = hRow + 1; i < sheet.length; i++) {
       const r = sheet[i];
-      if (!r[1]) continue;
-      const amt = Number(r[6]) || -(Number(r[4])||0);
-      if (!amt) continue;
-      rows.push({ bank, date: String(r[1]).split(' ')[0], time: String(r[2]||''), ref_no: '', description: String(r[3]||''), amount: amt, match_status: 'unmatched', match_station: '', match_bill: '' });
+      const dateVal = r[0] || r[1];
+      const deposit = Number(r[6]) || Number(r[5]) || 0;
+      if (!dateVal || !deposit) continue;
+      rows.push({ bank, date: fmtDate(dateVal), time: String(r[1]||r[2]||''), ref_no: String(r[12]||r[11]||''), description: String(r[3]||r[2]||''), amount: deposit, match_status: 'unmatched', match_station: '', match_bill: '' });
     }
   } else if (bank === 'BBL') {
     const sheet = firstSheet;
-    for (let i = 4; i < sheet.length; i++) {
+    let hRow = 3;
+    for (let i = 0; i < Math.min(8, sheet.length); i++) {
+      if (sheet[i] && sheet[i].some(c => String(c).includes('วันที่') || String(c).includes('รายละเอียด'))) { hRow = i; break; }
+    }
+    for (let i = hRow + 1; i < sheet.length; i++) {
       const r = sheet[i];
-      if (!r[1]) continue;
+      const dateVal = r[1];
       const credit = Number(r[4]) || 0;
       const debit = Number(r[3]) || 0;
-      const amt = credit || -debit;
-      if (!amt) continue;
-      rows.push({ bank, date: String(r[1]).split(' ')[0], time: '', ref_no: String(r[7]||''), description: String(r[2]||''), amount: amt, match_status: 'unmatched', match_station: '', match_bill: '' });
+      if (!dateVal || (!credit && !debit)) continue;
+      if (String(r[2]||'').includes('ยอดรวม') || String(r[0]||'').includes('หมายเหตุ')) continue;
+      rows.push({ bank, date: fmtDate(dateVal), time: extractTimeStr(dateVal), ref_no: String(r[7]||''), description: String(r[2]||''), amount: credit || -debit, match_status: 'unmatched', match_station: '', match_bill: '' });
     }
   } else {
     // Unknown format — ลองอ่าน sheet แรกเป็น generic
@@ -991,13 +1038,67 @@ async function renderMatching(el) {
     });
     document.getElementById('btn-auto-match')?.addEventListener('click', async () => {
       toast('กำลัง Auto Match...', 'info');
+
+      // ── ลอง Backend ก่อน ──
       const res = await api('autoMatch', { date: formatDateKey(matchDate), action_by: currentUser?.display_name || 'Admin' });
-      if (res.success && res.data) {
-        toast(`Auto Match สำเร็จ — จับคู่ได้ ${res.data.matched||0} รายการ`, 'success');
-      } else {
-        toast(res.error || 'Auto Match ไม่สำเร็จ', 'error');
+
+      if (res.success && res.data && res.data.matched > 0) {
+        toast(`Auto Match (Server) สำเร็จ — จับคู่ได้ ${res.data.matched} รายการ`, 'success');
+        render();
+        return;
       }
-      render();
+
+      // ── Fallback: Client-side match จากข้อมูลที่โหลดมาแล้ว ──
+      if (data.length > 0 && uploadedSales.length > 0) {
+        let clientMatched = 0;
+        const transferSales = uploadedSales.filter(s => {
+          const type = (s.pay_method || s.Type || s['Type'] || '').toLowerCase();
+          return type === 'transfer';
+        });
+
+        data.forEach(stmt => {
+          if (stmt.match_status === 'matched') return;
+          const stmtAmt = Number(stmt.amount || 0);
+          if (!stmtAmt || stmtAmt <= 0) return;
+
+          const match = transferSales.find(sale => {
+            if (sale._clientMatched) return false;
+            const saleAmt = Number(sale.amount || sale.Baht || sale['Baht'] || 0);
+            return Math.abs(saleAmt - stmtAmt) < 0.01;
+          });
+
+          if (match) {
+            match._clientMatched = true;
+            stmt.match_status = 'matched';
+            stmt.match_station = match.station || match.Station || match['Station'] || '';
+            stmt.match_bill = match.bill_no || match['Bill Number'] || '';
+            clientMatched++;
+          }
+        });
+
+        if (clientMatched > 0) {
+          toast(`Auto Match (Client) — จับคู่ได้ ${clientMatched} รายการ จากยอดขายที่นำเข้า`, 'success');
+          render();
+          return;
+        }
+      }
+
+      // ── ไม่เจอเลย ──
+      const errMsg = res.error || 'ไม่พบรายการที่จับคู่ได้';
+      toast(errMsg, 'error');
+
+      // แนะนำสิ่งที่ต้องทำ
+      openModal('Auto Match ไม่พบคู่', `
+        <div class="flex-col gap-3">
+          <p class="text-sm">ตรวจสอบว่า:</p>
+          <div style="padding:12px;background:var(--surface2);border-radius:8px" class="text-sm">
+            <p>1. <strong>นำเข้าข้อมูลยอดขาย</strong> ก่อน (หน้ายอดขาย → "นำเข้า Excel")</p>
+            <p class="mt-2">2. <strong>วาง Statement</strong> ของธนาคาร (หน้า Matching → "วาง Statement")</p>
+            <p class="mt-2">3. ยอดขายที่ Type = <strong>Transfer</strong> จะถูกจับคู่กับ Statement ที่ยอดตรงกัน</p>
+          </div>
+          ${res.error ? '<p class="text-xs text-dim mt-2">Server: '+res.error+'</p>' : ''}
+        </div>
+      `);
     });
   }
   render();
