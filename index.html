@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Smart Finance</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <style>
 /* ── Reset & Variables ── */
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
@@ -175,6 +176,10 @@ tr.row-danger td{background:rgba(239,87,87,.06);border-left:3px solid var(--dang
 <!-- Toast Container -->
 <div class="toast-container" id="toasts"></div>
 
+<!-- Hidden file inputs -->
+<input type="file" id="file-sales" accept=".xlsx,.xlsm,.xls,.csv" style="display:none">
+<input type="file" id="file-stmt" accept=".xlsx,.xlsm,.xls,.csv" style="display:none">
+
 <!-- Login Page -->
 <div id="login-page">
   <div class="login-card fade-in">
@@ -290,6 +295,149 @@ function toast(msg, type = 'info') {
   el.textContent = msg;
   document.getElementById('toasts').appendChild(el);
   setTimeout(() => el.remove(), 4000);
+}
+
+// ── Debounce (ลด re-render) ──
+function debounce(fn, ms = 300) {
+  let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); };
+}
+
+// ── Excel File Parser ──
+function parseExcelFile(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const data = new Uint8Array(e.target.result);
+        const workbook = XLSX.read(data, { type: 'array', cellDates: true });
+        const result = {};
+        workbook.SheetNames.forEach(name => {
+          result[name] = XLSX.utils.sheet_to_json(workbook.Sheets[name], { header: 1, defval: '' });
+        });
+        resolve({ sheets: result, sheetNames: workbook.SheetNames });
+      } catch (err) {
+        reject(err);
+      }
+    };
+    reader.onerror = reject;
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+function triggerFileUpload(inputId, callback) {
+  const inp = document.getElementById(inputId);
+  inp.value = '';
+  inp.onchange = async () => {
+    if (!inp.files[0]) return;
+    try {
+      toast('กำลังอ่านไฟล์...', 'info');
+      const result = await parseExcelFile(inp.files[0]);
+      callback(result, inp.files[0].name);
+    } catch (err) {
+      toast('อ่านไฟล์ไม่สำเร็จ: ' + err.message, 'error');
+    }
+  };
+  inp.click();
+}
+
+// ── Statement Upload Handler ──
+let uploadedStatements = [];
+
+function handleStmtUpload(result, fileName) {
+  const rows = [];
+  const nameLC = fileName.toLowerCase();
+
+  // ตรวจว่าเป็น Statement ธนาคารไหน
+  let bank = 'UNKNOWN';
+  if (nameLC.includes('ktb') || nameLC.includes('กรุงไทย')) bank = 'KTB';
+  else if (nameLC.includes('kbank') || nameLC.includes('kasikorn') || nameLC.includes('กสิกร')) bank = 'KBANK';
+  else if (nameLC.includes('bbl') || nameLC.includes('กรุงเทพ')) bank = 'BBL';
+
+  // ลอง auto-detect จากเนื้อหา
+  const firstSheet = result.sheets[result.sheetNames[0]] || [];
+  for (const row of firstSheet.slice(0, 10)) {
+    const joined = row.join(' ').toLowerCase();
+    if (joined.includes('ktb') || joined.includes('กรุงไทย')) { bank = 'KTB'; break; }
+    if (joined.includes('kasikorn') || joined.includes('กสิกร') || joined.includes('k-deposit')) { bank = 'KBANK'; break; }
+    if (joined.includes('bbl') || joined.includes('กรุงเทพ') || joined.includes('bangkok bank')) { bank = 'BBL'; break; }
+  }
+
+  // Parse ตาม format ธนาคาร
+  if (bank === 'KTB') {
+    // KTB: headers row 11 (index 10), data from row 12+
+    const sheet = firstSheet;
+    for (let i = 11; i < sheet.length; i++) {
+      const r = sheet[i];
+      if (!r[0] || !r[5]) continue;
+      rows.push({ bank, date: String(r[0]).split(' ')[0], time: String(r[0]).split(' ')[1] || '', ref_no: String(r[3]||''), description: String(r[3]||''), amount: Number(r[5])||0, match_status: 'unmatched', match_station: '', match_bill: '' });
+    }
+  } else if (bank === 'KBANK') {
+    const sheet = firstSheet;
+    for (let i = 11; i < sheet.length; i++) {
+      const r = sheet[i];
+      if (!r[1]) continue;
+      const amt = Number(r[6]) || -(Number(r[4])||0);
+      if (!amt) continue;
+      rows.push({ bank, date: String(r[1]).split(' ')[0], time: String(r[2]||''), ref_no: '', description: String(r[3]||''), amount: amt, match_status: 'unmatched', match_station: '', match_bill: '' });
+    }
+  } else if (bank === 'BBL') {
+    const sheet = firstSheet;
+    for (let i = 4; i < sheet.length; i++) {
+      const r = sheet[i];
+      if (!r[1]) continue;
+      const credit = Number(r[4]) || 0;
+      const debit = Number(r[3]) || 0;
+      const amt = credit || -debit;
+      if (!amt) continue;
+      rows.push({ bank, date: String(r[1]).split(' ')[0], time: '', ref_no: String(r[7]||''), description: String(r[2]||''), amount: amt, match_status: 'unmatched', match_station: '', match_bill: '' });
+    }
+  } else {
+    // Unknown format — ลองอ่าน sheet แรกเป็น generic
+    const sheet = firstSheet;
+    for (let i = 1; i < sheet.length; i++) {
+      const r = sheet[i];
+      rows.push({ bank, date: String(r[0]||''), time: String(r[1]||''), ref_no: String(r[2]||''), description: String(r[3]||''), amount: Number(r[4])||0, match_status: 'unmatched', match_station: '', match_bill: '' });
+    }
+  }
+
+  uploadedStatements = rows;
+  toast(`อ่าน Statement ${bank} สำเร็จ — ${rows.length} รายการ`, 'success');
+
+  // Re-render matching page with uploaded data
+  if (currentPage === 'matching') navigateTo('matching');
+}
+
+// ── Sales Import Handler ──
+let uploadedSales = [];
+
+function handleSalesUpload(result, fileName) {
+  // ลองหา Main sheet หรือ sheet แรก
+  const sheetName = result.sheetNames.find(n => n.toLowerCase().includes('main')) || result.sheetNames[0];
+  const sheet = result.sheets[sheetName] || [];
+
+  const rows = [];
+  // หา header row (Bill Number)
+  let headerRow = -1;
+  for (let i = 0; i < Math.min(20, sheet.length); i++) {
+    if (sheet[i] && sheet[i].some(c => String(c).includes('Bill Number') || String(c).includes('Bill Date'))) {
+      headerRow = i; break;
+    }
+  }
+  if (headerRow === -1) headerRow = 13; // default Main R14 (index 13)
+
+  for (let i = headerRow + 1; i < sheet.length; i++) {
+    const r = sheet[i];
+    if (!r[1] && !r[4]) continue; // skip empty
+    rows.push({
+      bill_no: String(r[0]||''), date: String(r[1]||''), station: String(r[2]||''),
+      pay_method: String(r[3]||''), amount: Number(r[4])||0, confirmation: String(r[5]||''),
+      pay_date: String(r[6]||''), customer: String(r[7]||''),
+    });
+  }
+
+  uploadedSales = rows;
+  toast(`อ่านยอดขายสำเร็จ — ${rows.length} รายการ`, 'success');
+  if (currentPage === 'sales') navigateTo('sales');
 }
 
 // ── Modal ──
@@ -608,9 +756,16 @@ async function renderSales(el) {
   async function render() {
     const res = await api('getDailySales', { date: formatDateKey(selectedDate) });
     let data = (res.data?.data || []);
-    if (filterStation !== 'ALL') data = data.filter(s => s.station === filterStation);
-    const totalSales = data.filter(s=>s.amount>0).reduce((a,s)=>a+s.amount,0);
-    const totalReturns = data.filter(s=>s.amount<0).reduce((a,s)=>a+s.amount,0);
+
+    // รวม uploaded sales (ถ้ามี)
+    if (uploadedSales.length > 0) {
+      data = [...data, ...uploadedSales];
+    }
+
+    if (filterStation !== 'ALL') data = data.filter(s => (s.station||s['Station']) === filterStation);
+    const getAmt = s => Number(s.amount || s['Baht'] || 0);
+    const totalSales = data.filter(s=>getAmt(s)>0).reduce((a,s)=>a+getAmt(s),0);
+    const totalReturns = data.filter(s=>getAmt(s)<0).reduce((a,s)=>a+getAmt(s),0);
     const ent = getEntry();
 
     const billColor = b => b.startsWith('OS')?'var(--info)':b.startsWith('OR')?'var(--purple)':b.startsWith('SS')?'var(--success)':b.startsWith('SR')?'var(--danger)':'var(--text2)';
@@ -624,7 +779,7 @@ async function renderSales(el) {
           </div>
           <input type="date" class="input" value="${selectedDate}" style="width:155px" id="sales-date">
           <button class="btn ${showEntry?'btn-primary':'btn-outline'} btn-sm" id="toggle-entry">${ICONS.edit} กรอกยอด</button>
-          <button class="btn btn-outline btn-sm">${ICONS.file} นำเข้า Excel</button>
+          <button class="btn btn-outline btn-sm" id="btn-import-sales">${ICONS.file} นำเข้า Excel</button>
         </div>
       </div>
 
@@ -714,7 +869,7 @@ async function renderSales(el) {
         </div>
         <div class="flex justify-between items-center" style="padding:12px 16px;border-top:1px solid var(--border)">
           <span class="text-sm text-dim">${data.length} รายการ</span>
-          <span class="font-bold">รวม: ฿${fmtNum(data.reduce((a,s)=>a+s.amount,0))}</span>
+          <span class="font-bold">รวม: ฿${fmtNum(data.reduce((a,s)=>a+getAmt(s),0))}</span>
         </div>
       </div>
     `;
@@ -729,14 +884,32 @@ async function renderSales(el) {
     document.getElementById('sales-date')?.addEventListener('change', e => { selectedDate = e.target.value; render(); });
     document.getElementById('toggle-entry')?.addEventListener('click', () => { showEntry = !showEntry; render(); });
 
-    // ── Live update entry cells ──
+    // ── Live update entry cells (update DOM directly, no re-render) ──
     el.querySelectorAll('.entry-cell').forEach(inp => {
-      inp.addEventListener('input', () => {
+      inp.addEventListener('input', debounce(() => {
         const ent = getEntry();
         ent[inp.dataset.key] = parseFloat(inp.value) || 0;
-        // Re-render to update Sum row and All Station totals
-        render();
-      });
+        // Update All Station column + Sum row directly
+        const stns = ['Front1','Front2','Front3','Front4','Invoice','Order','Payment'];
+        const sumRow = el.querySelector('tr:last-child');
+        if (!sumRow) return;
+        const sumCells = sumRow.querySelectorAll('td');
+        stns.forEach((s, idx) => {
+          const inflow = (ent['cash_in_'+s]||0) + (ent['sales_'+s]||0) + (ent['cash_out_'+s]||0) + (ent['returns_'+s]||0);
+          const outflow = (ent['drawer_'+s]||0) + (ent['transfer_'+s]||0) + (ent['card_'+s]||0) + (ent['cheque_'+s]||0) + (ent['refund_'+s]||0);
+          const diff = outflow - inflow;
+          const isOk = Math.abs(diff) < 1;
+          if (sumCells[idx + 2]) {
+            sumCells[idx + 2].textContent = isOk ? '✓ OK' : '฿' + fmtNum(diff);
+            sumCells[idx + 2].style.color = isOk ? 'var(--success)' : 'var(--danger)';
+          }
+        });
+      }, 150));
+    });
+
+    // ── Button bindings ──
+    document.getElementById('btn-import-sales')?.addEventListener('click', () => {
+      triggerFileUpload('file-sales', handleSalesUpload);
     });
 
     document.getElementById('save-entry')?.addEventListener('click', () => {
@@ -753,7 +926,13 @@ async function renderMatching(el) {
 
   async function render() {
     const res = await api('getStatements', { date: formatDateKey(matchDate), bank: bankFilter });
-    const data = res.data?.data || [];
+    let data = res.data?.data || [];
+
+    // รวม uploaded statements (ถ้ามี)
+    if (uploadedStatements.length > 0) {
+      data = [...data, ...uploadedStatements.filter(s => bankFilter === 'ALL' || s.bank === bankFilter)];
+    }
+
     const matched = data.filter(s=>s.match_status==='matched').length;
     const unmatched = data.length - matched;
 
@@ -762,8 +941,8 @@ async function renderMatching(el) {
         <div class="page-title">Statement Matching</div>
         <div class="flex gap-2 items-center">
           <input type="date" class="input" value="${matchDate}" style="width:155px" id="match-date">
-          <button class="btn btn-outline btn-sm">${ICONS.file} วาง Statement</button>
-          <button class="btn btn-primary btn-sm">${ICONS.pulse} Auto Match</button>
+          <button class="btn btn-outline btn-sm" id="btn-stmt-upload">${ICONS.file} วาง Statement</button>
+          <button class="btn btn-primary btn-sm" id="btn-auto-match">${ICONS.pulse} Auto Match</button>
         </div>
       </div>
       <div class="flex justify-between items-center mb-3">
@@ -807,6 +986,19 @@ async function renderMatching(el) {
       btn.addEventListener('click', () => { bankFilter = btn.dataset.bank; render(); });
     });
     document.getElementById('match-date')?.addEventListener('change', e => { matchDate = e.target.value; render(); });
+    document.getElementById('btn-stmt-upload')?.addEventListener('click', () => {
+      triggerFileUpload('file-stmt', (result, name) => { handleStmtUpload(result, name); render(); });
+    });
+    document.getElementById('btn-auto-match')?.addEventListener('click', async () => {
+      toast('กำลัง Auto Match...', 'info');
+      const res = await api('autoMatch', { date: formatDateKey(matchDate), action_by: currentUser?.display_name || 'Admin' });
+      if (res.success && res.data) {
+        toast(`Auto Match สำเร็จ — จับคู่ได้ ${res.data.matched||0} รายการ`, 'success');
+      } else {
+        toast(res.error || 'Auto Match ไม่สำเร็จ', 'error');
+      }
+      render();
+    });
   }
   render();
 }
