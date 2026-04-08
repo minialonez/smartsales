@@ -236,26 +236,41 @@ tr.row-danger td{background:rgba(239,87,87,.06);border-left:3px solid var(--dang
 // ══════════════════════════════════════════════════════════════
 // CONFIG & API
 // ══════════════════════════════════════════════════════════════
-const API_URL = 'https://script.google.com/macros/s/AKfycbxKFt7Dcq1PPyYEy_zEwTuuNS2MkHywy7s3Wz3KTuSrIqBE9k5GUP3b8IOT8oGXkMWR/exec'; // ← ใส่ Web App URL ของ Apps Script
+const API_URL = 'https://script.google.com/macros/s/AKfycbxKFt7Dcq1PPyYEy_zEwTuuNS2MkHywy7s3Wz3KTuSrIqBE9k5GUP3b8IOT8oGXkMWR/exec';
 
 let currentUser = null;
 let currentPage = 'dashboard';
 
-// ── API Helper ──
+// ── API Helper (รองรับ Apps Script redirect + CORS) ──
 async function api(action, params = {}) {
   try {
-    // ถ้ายังไม่ได้ตั้ง API_URL ใช้ demo mode
+    // Demo mode ถ้ายังไม่ได้ตั้ง API_URL
     if (!API_URL) return demoResponse(action, params);
+
+    // Apps Script ต้องใช้ Content-Type: text/plain เพื่อหลีก CORS preflight
+    // และต้อง redirect: follow เพื่อรองรับ 302 redirect
+    const payload = JSON.stringify({ action, ...params });
 
     const res = await fetch(API_URL, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action, ...params }),
+      redirect: 'follow',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: payload,
     });
-    return await res.json();
+
+    const text = await res.text();
+    try {
+      return JSON.parse(text);
+    } catch {
+      // กรณี Apps Script return HTML error page
+      console.error('API response not JSON:', text.substring(0, 200));
+      return { success: false, error: 'เซิร์ฟเวอร์ตอบกลับผิดรูปแบบ' };
+    }
   } catch (err) {
-    toast('เกิดข้อผิดพลาด: ' + err.message, 'error');
-    return { success: false, error: err.message };
+    console.error('API Error:', err);
+    // Fallback to demo mode ถ้า fetch ล้มเหลว
+    toast('ไม่สามารถเชื่อมต่อเซิร์ฟเวอร์ได้ — ใช้ Demo Mode', 'error');
+    return demoResponse(action, params);
   }
 }
 
@@ -288,6 +303,14 @@ function openModal(title, html) {
 }
 function closeModal() { document.getElementById('modal-overlay').classList.remove('open'); }
 
+// ── Safe Storage (fallback เมื่อ localStorage ไม่พร้อมใช้) ──
+const _mem = {};
+const safeStorage = {
+  get(k) { try { return localStorage.getItem(k); } catch { return _mem[k] || null; } },
+  set(k,v) { try { localStorage.setItem(k,v); } catch { _mem[k] = v; } },
+  del(k) { try { localStorage.removeItem(k); } catch { delete _mem[k]; } },
+};
+
 // ══════════════════════════════════════════════════════════════
 // AUTH
 // ══════════════════════════════════════════════════════════════
@@ -307,7 +330,7 @@ async function doLogin() {
   const res = await api('login', { username, password });
   if (res.success) {
     currentUser = res.data;
-    if (remember) localStorage.setItem('sf_user', JSON.stringify(currentUser));
+    if (remember) safeStorage.set('sf_user', JSON.stringify(currentUser));
     showApp();
   } else {
     errEl.textContent = res.error || 'ไม่สามารถเข้าสู่ระบบได้';
@@ -317,7 +340,7 @@ async function doLogin() {
 
 function doLogout() {
   currentUser = null;
-  localStorage.removeItem('sf_user');
+  safeStorage.del('sf_user');
   document.getElementById('app').classList.add('hidden');
   document.getElementById('login-page').classList.remove('hidden');
   document.getElementById('login-pass').value = '';
@@ -325,13 +348,13 @@ function doLogout() {
 
 // ── Check saved login ──
 (function checkSavedLogin() {
-  const saved = localStorage.getItem('sf_user');
-  if (saved) {
-    try {
+  try {
+    const saved = safeStorage.get('sf_user');
+    if (saved) {
       currentUser = JSON.parse(saved);
       showApp();
-    } catch (e) { localStorage.removeItem('sf_user'); }
-  }
+    }
+  } catch (e) { safeStorage.del('sf_user'); }
 })();
 
 // Enter key on login
