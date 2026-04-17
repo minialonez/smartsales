@@ -558,36 +558,7 @@ function generateBillList(result, fileName) {
     }
   }
 
-  // ── 3. เพิ่ม Summary rows (นำเงินเข้า/ออก/Cash Drawer) จาก Main R3-R11 ──
-  if (mainHdr > 5) {
-    const summaryLabels = { 2:'นำเงินเข้า', 4:'นำเงินออก', 5:'ยอดคืนสินค้า', 6:'Cash Drawer' };
-    for (const rowIdx in summaryLabels) {
-      const r = Number(rowIdx);
-      if (r >= mainSheet.length) continue;
-      const row = mainSheet[r] || [];
-      const label = summaryLabels[rowIdx];
-      // Station ต่างๆ col 2-5 (Front1-4)
-      ['Front1','Front2','Front3','Front4'].forEach((st, idx) => {
-        const amt = Number(row[2 + idx]) || 0;
-        if (amt === 0) return;
-        newBills.push({
-          bill_no: '',
-          date: todayISO(),
-          station: st,
-          type: 'Cash',
-          amount: amt,
-          confirmation: '',
-          pay_date: '',
-          remarks1: label,
-          remarks2: '',
-          bank: '',
-          due_date: '',
-          match_status: 'pending',
-          source: 'summary',
-        });
-      });
-    }
-  }
+  // ── 3. (ยกเลิก) ไม่ import summary rows แล้ว — ผู้ใช้จะกรอกเองในตาราง Summary ด้านบน ──
 
   billList = newBills;
   toast(`Generate สำเร็จ — Smart: ${smartCount}, POS: ${posCount}, Main: ${mainCount} รายการ`, 'success');
@@ -643,53 +614,215 @@ function transformBill(billNo, amount, customer, date) {
   };
 }
 
-// ── Render Bill List Page ──
-async function renderBillList(el) {
+// ── Main Page State (persistent across renders) ──
+let mainSummary = {
+  // Summary rows values (กรอกเอง — POS Front1-4)
+  // Key format: "row_station" e.g. "cashIn_Front1"
+};
+let cashCount = {
+  // ธนบัตร/เหรียญ ต่อ Station
+  // Key format: "denomination_Station" e.g. "1000_Front1"
+};
+const DENOMINATIONS = [1000, 500, 100, 50, 20, 10, 5, 1];
+
+// ── Render Main Page (Summary + Bill List + Change Counting) ──
+async function renderMain(el) {
   let filterStation = 'ALL';
   let filterType = 'ALL';
+  let showChange = false;
+  let selectedDate = todayISO();
 
   const TYPE_OPTIONS = ['', 'Cash', 'Transfer', 'Card', 'Cheque', 'Other', 'Unknown', 'Refund'];
   const STATION_OPTIONS = ['', 'Front1', 'Front2', 'Front3', 'Front4', 'Invoice', 'Invoice Credit', 'Order', 'Order Credit', 'Payment'];
+  const SUMMARY_STATIONS = ['Front1', 'Front2', 'Front3', 'Front4', 'Invoice', 'Order', 'Payment', 'Invoice Credit', 'Order Credit'];
+
+  // ── คำนวณ Transfer/Card/Cheque/Refund อัตโนมัติจาก billList ──
+  function calcAutoValue(type, station) {
+    return billList.filter(b => {
+      const st = (b.station || '').trim();
+      const ty = (b.type || '').trim();
+      return st === station && ty === type;
+    }).reduce((s, b) => s + (Number(b.amount) || 0), 0);
+  }
+
+  // คำนวณ ยอดขาย (Sales) row — Invoice/Order/Payment = SUMIFS, Front1-4 = กรอกเอง
+  function calcSales(station) {
+    // ถ้าเป็น Invoice/Order/Payment → รวมทุกบิลที่ station นั้น
+    if (['Invoice', 'Invoice Credit', 'Order', 'Order Credit', 'Payment'].includes(station)) {
+      return billList.filter(b => (b.station || '').trim() === station)
+        .reduce((s, b) => s + (Number(b.amount) || 0), 0);
+    }
+    // Front1-4 กรอกเอง
+    return Number(mainSummary['sales_' + station]) || 0;
+  }
+
+  // คำนวณยอดรวมธนบัตรใน Cash Drawer
+  function calcCashDrawer(station) {
+    return DENOMINATIONS.reduce((s, d) => s + d * (Number(cashCount[d + '_' + station]) || 0), 0);
+  }
+
+  // ── Sum check: เงินเข้า vs เงินออก ──
+  function calcSumCheck(station) {
+    const cashIn = Number(mainSummary['cashIn_' + station]) || 0;
+    const sales = calcSales(station);
+    const cashOut = Number(mainSummary['cashOut_' + station]) || 0;
+    const returns = Number(mainSummary['returns_' + station]) || 0;
+    const drawer = Number(mainSummary['drawer_' + station]) || 0;
+    const transfer = calcAutoValue('Transfer', station);
+    const card = calcAutoValue('Card', station);
+    const cheque = calcAutoValue('Cheque', station);
+    const refund = calcAutoValue('Refund', station);
+
+    // Inflow = cashIn + sales + cashOut + returns (cashOut/returns เป็น negative)
+    // Outflow = drawer + transfer + card + cheque + refund
+    const inflow = cashIn + sales + cashOut + returns;
+    const outflow = drawer + transfer + card + cheque + refund;
+    const diff = inflow - outflow;
+    return { diff, isOk: Math.abs(diff) < 0.01 };
+  }
 
   function render() {
+    // ── Filter bill list ──
     let data = billList;
     if (filterStation !== 'ALL') data = data.filter(b => b.station === filterStation);
     if (filterType !== 'ALL') data = data.filter(b => b.type === filterType);
 
-    // สรุป
-    const totalAmount = data.reduce((s,b) => s + (Number(b.amount)||0), 0);
-    const byStation = {};
-    const byType = {};
-    billList.forEach(b => {
-      byStation[b.station] = (byStation[b.station]||0) + Number(b.amount||0);
-      const t = b.type || '(ว่าง)';
-      byType[t] = (byType[t]||0) + Number(b.amount||0);
-    });
-
-    const stations = [...new Set(billList.map(b=>b.station).filter(Boolean))];
-    const types = [...new Set(billList.map(b=>b.type))];
+    const totalAmount = data.reduce((s, b) => s + (Number(b.amount) || 0), 0);
+    const stations = [...new Set(billList.map(b => b.station).filter(Boolean))];
+    const types = [...new Set(billList.map(b => b.type))];
 
     el.innerHTML = `
       <div class="flex justify-between items-center mb-3">
-        <div class="page-title">Bill List — ศูนย์กลางข้อมูล</div>
+        <div class="page-title">Main — สรุปยอดรายวัน</div>
         <div class="flex gap-2 items-center">
+          <input type="date" class="input" value="${selectedDate}" id="main-date" style="width:160px">
           <button class="btn btn-primary btn-sm" id="btn-gen-smart">${ICONS.download} Generate จาก Smart</button>
-          <button class="btn btn-outline btn-sm" id="btn-save-bl">${ICONS.check} บันทึก</button>
+          <button class="btn ${showChange?'btn-primary':'btn-outline'} btn-sm" id="btn-toggle-change">🪙 นับธนบัตร</button>
+          <button class="btn btn-success btn-sm" id="btn-save-main">${ICONS.check} บันทึก</button>
+        </div>
+      </div>
+
+      <!-- ═══════ SECTION 1: Summary Table (ส่วนบน) ═══════ -->
+      <div class="card-flat mb-3">
+        <div class="table-wrap" style="overflow-x:auto">
+          <table style="font-size:.82rem;min-width:1100px">
+            <thead>
+              <tr>
+                <th style="min-width:110px;text-align:center;background:var(--surface3)">All Station</th>
+                <th style="min-width:90px;text-align:center;background:var(--surface3)">รายการ</th>
+                ${SUMMARY_STATIONS.map(s=>`<th style="min-width:95px;text-align:center;background:var(--surface3)">${s}</th>`).join('')}
+              </tr>
+            </thead>
+            <tbody>
+              <!-- Row 3: นำเงินเข้า -->
+              ${buildSumRow('cashIn', 'นำเงินเข้า', 'var(--success)', true)}
+
+              <!-- Row 4: ยอดขาย (Sales) -->
+              ${(function(){
+                const vals = SUMMARY_STATIONS.map(s => calcSales(s));
+                const allSum = vals.reduce((a,b)=>a+b,0);
+                return `<tr style="background:rgba(91,124,250,.06)">
+                  <td style="text-align:right;font-weight:700">${fmtNum(allSum)}</td>
+                  <td style="font-weight:600;color:var(--primary)">🧾 ยอดขาย</td>
+                  ${SUMMARY_STATIONS.map((s,i)=>{
+                    const isManual = ['Front1','Front2','Front3','Front4'].includes(s);
+                    return isManual
+                      ? `<td><input class="input sum-cell" data-k="sales_${s}" type="number" value="${mainSummary['sales_'+s]||''}" step="0.01" placeholder="0" style="width:95%;padding:3px 6px;font-size:.78rem;text-align:right;border-color:var(--primary)"></td>`
+                      : `<td style="text-align:right;font-weight:600;color:var(--info)">${vals[i]?fmtNum(vals[i]):'-'}</td>`;
+                  }).join('')}
+                </tr>`;
+              })()}
+
+              <!-- Row 5: นำเงินออก -->
+              ${buildSumRow('cashOut', 'นำเงินออก', 'var(--danger)', true)}
+
+              <!-- Row 6: ยอดคืนสินค้า -->
+              ${buildSumRow('returns', 'ยอดคืนสินค้า', 'var(--warn)', true)}
+
+              <!-- Row 7: Cash Drawer -->
+              ${buildCashDrawerRow()}
+
+              <!-- Row 8-11: Transfer/Card/Cheque/Refund (auto) -->
+              ${buildAutoRow('Transfer', '🏦 Transfer', 'var(--info)')}
+              ${buildAutoRow('Card', '💳 Card', 'var(--purple)')}
+              ${buildAutoRow('Cheque', '📄 Cheque', 'var(--text2)')}
+              ${buildAutoRow('Refund', '🔄 Refund', 'var(--warn)')}
+
+              <!-- Row 12: Sum Check -->
+              <tr style="border-top:2px solid var(--border);background:var(--surface2)">
+                <td></td>
+                <td style="font-weight:800;color:var(--text)">📊 Sum</td>
+                ${SUMMARY_STATIONS.map(s=>{
+                  // Sum check เฉพาะ Front1-4 และ Invoice/Invoice Credit/Order Credit
+                  if (!['Front1','Front2','Front3','Front4','Invoice','Invoice Credit','Order Credit'].includes(s)) {
+                    return `<td></td>`;
+                  }
+                  const {diff, isOk} = calcSumCheck(s);
+                  return `<td style="text-align:center;font-weight:700;color:${isOk?'var(--success)':'var(--danger)'}">${isOk?'✓ OK':fmtNum(diff)}</td>`;
+                }).join('')}
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- ═══════ SECTION 2: Change Counting (Collapsible) ═══════ -->
+      ${showChange ? `
+      <div class="card-flat mb-3">
+        <div style="padding:10px 14px;background:var(--surface2);border-bottom:1px solid var(--border)" class="flex justify-between items-center">
+          <div class="font-semi">🪙 นับธนบัตร/เหรียญ (ใส่จำนวน)</div>
+          <div class="text-xs text-dim">ธนบัตร/เหรียญ × จำนวน = เงินในลิ้นชัก (Cash Drawer ด้านบน)</div>
+        </div>
+        <div class="table-wrap" style="overflow-x:auto">
+          <table style="font-size:.82rem;min-width:700px">
+            <thead>
+              <tr>
+                <th style="min-width:80px;text-align:center;background:var(--surface3)">ธนบัตร/เหรียญ</th>
+                ${['Front1','Front2','Front3','Front4','Invoice'].map(s=>`<th style="min-width:95px;text-align:center;background:var(--surface3)">${s}</th>`).join('')}
+                <th style="min-width:95px;text-align:center;background:var(--surface3)">รวม (บาท)</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${DENOMINATIONS.map(d => `
+                <tr>
+                  <td style="font-weight:700;color:var(--primary);text-align:center">฿${fmtInt(d)}</td>
+                  ${['Front1','Front2','Front3','Front4','Invoice'].map(s => `
+                    <td><input type="number" class="input cash-cell" data-denom="${d}" data-station="${s}" value="${cashCount[d+'_'+s]||''}" min="0" step="1" placeholder="0" style="width:95%;padding:3px 6px;font-size:.78rem;text-align:right"></td>
+                  `).join('')}
+                  <td style="text-align:right;font-weight:600;color:var(--success)" data-denom-total="${d}">
+                    ${fmtNum(['Front1','Front2','Front3','Front4','Invoice'].reduce((s,st)=>s+(d*(Number(cashCount[d+'_'+st])||0)),0))}
+                  </td>
+                </tr>
+              `).join('')}
+              <tr style="border-top:2px solid var(--border);background:var(--surface2)">
+                <td style="font-weight:800">รวมทั้งหมด</td>
+                ${['Front1','Front2','Front3','Front4','Invoice'].map(s => `
+                  <td style="text-align:right;font-weight:800;color:var(--success)" data-station-total="${s}">
+                    ฿${fmtNum(calcCashDrawer(s))}
+                  </td>
+                `).join('')}
+                <td style="text-align:right;font-weight:800;color:var(--success);font-size:1rem" id="grand-total">
+                  ฿${fmtNum(['Front1','Front2','Front3','Front4','Invoice'].reduce((s,st)=>s+calcCashDrawer(st),0))}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div style="padding:10px 14px;background:var(--surface2);border-top:1px solid var(--border)" class="flex gap-2">
+          <button class="btn btn-outline btn-sm" id="btn-apply-cash">⬆️ ใส่ยอดรวมเข้า Cash Drawer</button>
+          <span class="text-xs text-muted" style="align-self:center">กดเพื่อส่งยอดรวมไปที่ตาราง Summary (Cash Drawer)</span>
+        </div>
+      </div>
+      ` : ''}
+
+      <!-- ═══════ SECTION 3: Bill List Transactions (ส่วนล่าง) ═══════ -->
+      <div class="flex justify-between items-center mb-2">
+        <div class="font-semi">📋 Bill List (${billList.length} รายการ)</div>
+        <div class="flex gap-2">
           <button class="btn btn-outline btn-sm" id="btn-clear-bl">ล้าง</button>
         </div>
       </div>
 
-      <p class="text-sm text-dim mb-3">อัปโหลดไฟล์ Smart (.xlsm) → ระบบแปลงเลขบิลเป็น Bill List พร้อม dropdown แก้ไข Type/Bank/Due Date</p>
-
-      <!-- Summary cards -->
-      <div class="flex gap-3 flex-wrap mb-3 stagger">
-        ${statCard('รายการทั้งหมด', billList.length, '', 'var(--info)', ICONS.file)}
-        ${statCard('ยอดรวม', '฿'+fmtNum(billList.reduce((s,b)=>s+Number(b.amount||0),0)), '', 'var(--primary)', ICONS.dollar)}
-        ${statCard('Smart bills', billList.filter(b=>b.source==='smart').length, 'SS/SR/SC/OS/OR/SP', 'var(--success)', ICONS.check)}
-        ${statCard('POS + Summary', billList.filter(b=>b.source!=='smart').length, 'Front1-4 + Change', 'var(--warn)', ICONS.bar)}
-      </div>
-
-      <!-- Filter pills -->
       <div class="flex gap-2 mb-2 flex-wrap items-center">
         <span class="text-xs text-dim">Station:</span>
         <button class="pill ${filterStation==='ALL'?'active':''}" data-fs="ALL">ALL</button>
@@ -701,9 +834,8 @@ async function renderBillList(el) {
         ${types.map(t=>`<button class="pill ${filterType===t?'active':''}" data-ft="${t}">${t||'(ว่าง)'}</button>`).join('')}
       </div>
 
-      <!-- Main table -->
       <div class="card-flat">
-        <div class="table-wrap" style="max-height:520px;overflow-y:auto">
+        <div class="table-wrap" style="max-height:420px;overflow-y:auto">
           <table>
             <thead>
               <tr>
@@ -721,14 +853,12 @@ async function renderBillList(el) {
                 <th>Due Date</th>
               </tr>
             </thead>
-            <tbody id="bl-tbody">
+            <tbody>
               ${data.length === 0 ? '<tr><td colspan="12" style="text-align:center;padding:40px;color:var(--text3)">ยังไม่มีข้อมูล — กด "Generate จาก Smart" เพื่อเริ่มต้น</td></tr>' :
                 data.map((b, idx) => {
                   const realIdx = billList.indexOf(b);
-                  const isSmart = b.source === 'smart';
                   const badgeCls = b.source==='smart'?'badge-success':b.source==='pos'?'badge-info':'badge-warn';
                   const badgeText = b.source==='smart'?'Smart':b.source==='pos'?'POS':'Summary';
-
                   return `<tr data-idx="${realIdx}">
                     <td class="text-xs text-muted">${idx+1} <span class="badge ${badgeCls}" style="margin-left:4px">${badgeText}</span></td>
                     <td style="font-weight:600;color:var(--text)">${b.bill_no||'-'}</td>
@@ -765,53 +895,100 @@ async function renderBillList(el) {
             </tbody>
           </table>
         </div>
-        <div class="flex justify-between items-center" style="padding:12px 16px;border-top:1px solid var(--border)">
+        <div class="flex justify-between items-center" style="padding:10px 14px;border-top:1px solid var(--border)">
           <span class="text-sm text-dim">${data.length} / ${billList.length} รายการ</span>
           <span class="font-bold">รวม: ฿${fmtNum(totalAmount)}</span>
         </div>
       </div>
-
-      <!-- Summary by Station and Type -->
-      ${billList.length>0 ? `
-      <div class="flex gap-3 mt-3" style="display:grid;grid-template-columns:1fr 1fr">
-        <div class="card">
-          <div class="font-semi mb-3">สรุปตาม Station</div>
-          ${Object.entries(byStation).sort((a,b)=>b[1]-a[1]).map(([st,amt])=>`
-            <div class="flex justify-between items-center" style="padding:6px 0;border-bottom:1px solid var(--border)">
-              <span class="text-sm">${st}</span>
-              <span class="font-semi" style="color:${amt<0?'var(--danger)':'var(--text)'}">฿${fmtNum(amt)}</span>
-            </div>
-          `).join('')}
-        </div>
-        <div class="card">
-          <div class="font-semi mb-3">สรุปตาม Type</div>
-          ${Object.entries(byType).sort((a,b)=>b[1]-a[1]).map(([t,amt])=>`
-            <div class="flex justify-between items-center" style="padding:6px 0;border-bottom:1px solid var(--border)">
-              <span class="text-sm">${t}</span>
-              <span class="font-semi" style="color:${amt<0?'var(--danger)':'var(--text)'}">฿${fmtNum(amt)}</span>
-            </div>
-          `).join('')}
-        </div>
-      </div>
-      ` : ''}
     `;
 
-    // ── Bindings ──
+    bindMainEvents();
+  }
+
+  // ── Helper: สร้าง row ที่กรอกเอง (cashIn, cashOut, returns) ──
+  function buildSumRow(key, label, color, editable) {
+    const vals = SUMMARY_STATIONS.map(s => Number(mainSummary[key+'_'+s]) || 0);
+    const allSum = vals.reduce((a,b)=>a+b,0);
+    return `<tr>
+      <td style="text-align:right;font-weight:700">${allSum?fmtNum(allSum):'-'}</td>
+      <td style="font-weight:600;color:${color}">${label}</td>
+      ${SUMMARY_STATIONS.map((s,i)=>{
+        // cashIn: Front1-4 + Invoice, cashOut: Front1 + Invoice, returns: Front1-3 + Invoice
+        const allowedStations = {
+          cashIn: ['Front1','Front2','Front3','Front4','Invoice'],
+          cashOut: ['Front1','Invoice'],
+          returns: ['Front1','Front2','Front3','Front4','Invoice'],
+        };
+        const allowed = (allowedStations[key] || []).includes(s);
+        if (!allowed) return `<td></td>`;
+        return `<td><input class="input sum-cell" data-k="${key}_${s}" type="number" value="${mainSummary[key+'_'+s]||''}" step="0.01" placeholder="0" style="width:95%;padding:3px 6px;font-size:.78rem;text-align:right;border-color:${color}"></td>`;
+      }).join('')}
+    </tr>`;
+  }
+
+  // ── Helper: Cash Drawer row ──
+  function buildCashDrawerRow() {
+    const vals = SUMMARY_STATIONS.map(s => Number(mainSummary['drawer_'+s]) || 0);
+    const allSum = vals.reduce((a,b)=>a+b,0);
+    return `<tr>
+      <td style="text-align:right;font-weight:700">${allSum?fmtNum(allSum):'-'}</td>
+      <td style="font-weight:600;color:var(--purple)">🗃️ Cash Drawer</td>
+      ${SUMMARY_STATIONS.map((s,i)=>{
+        if (!['Front1','Front2','Front3','Front4','Invoice'].includes(s)) return `<td></td>`;
+        return `<td><input class="input sum-cell" data-k="drawer_${s}" type="number" value="${mainSummary['drawer_'+s]||''}" step="0.01" placeholder="0" style="width:95%;padding:3px 6px;font-size:.78rem;text-align:right;border-color:var(--purple)"></td>`;
+      }).join('')}
+    </tr>`;
+  }
+
+  // ── Helper: Auto row (Transfer/Card/Cheque/Refund) ──
+  function buildAutoRow(type, label, color) {
+    const vals = SUMMARY_STATIONS.map(s => calcAutoValue(type, s));
+    const allSum = vals.reduce((a,b)=>a+b,0);
+    return `<tr>
+      <td style="text-align:right;font-weight:700">${allSum?fmtNum(allSum):'-'}</td>
+      <td style="font-weight:600;color:${color}">${label}</td>
+      ${SUMMARY_STATIONS.map((s,i)=>{
+        if (['Invoice Credit', 'Order Credit'].includes(s)) return `<td></td>`;
+        return `<td style="text-align:right;color:${vals[i]?color:'var(--text3)'};font-weight:${vals[i]?'600':'400'}">${vals[i]?fmtNum(vals[i]):'-'}</td>`;
+      }).join('')}
+    </tr>`;
+  }
+
+  // ── Bind events ──
+  function bindMainEvents() {
+    // Buttons
     document.getElementById('btn-gen-smart')?.addEventListener('click', () => {
       triggerFileUpload('file-sales', generateBillList);
     });
-
+    document.getElementById('btn-toggle-change')?.addEventListener('click', () => {
+      showChange = !showChange; render();
+    });
     document.getElementById('btn-clear-bl')?.addEventListener('click', () => {
       if (confirm('ล้างข้อมูล Bill List ทั้งหมด?')) { billList = []; render(); }
     });
-
-    document.getElementById('btn-save-bl')?.addEventListener('click', async () => {
+    document.getElementById('btn-save-main')?.addEventListener('click', async () => {
       toast('กำลังบันทึก...', 'info');
-      const res = await api('saveDailySales', { date: todayKey(), rows: billList, created_by: currentUser?.display_name || 'Admin' });
+      const res = await api('saveDailySales', {
+        date: formatDateKey(selectedDate),
+        rows: billList,
+        summary: mainSummary,
+        cash_count: cashCount,
+        created_by: currentUser?.display_name || 'Admin'
+      });
       if (res.success) toast(`บันทึกสำเร็จ — ${billList.length} รายการ`, 'success');
       else toast(res.error || 'บันทึกไม่สำเร็จ', 'error');
     });
+    document.getElementById('main-date')?.addEventListener('change', e => { selectedDate = e.target.value; });
+    document.getElementById('btn-apply-cash')?.addEventListener('click', () => {
+      // ส่งยอดรวม cash counting → ใส่ Cash Drawer
+      ['Front1','Front2','Front3','Front4','Invoice'].forEach(s => {
+        mainSummary['drawer_'+s] = calcCashDrawer(s);
+      });
+      toast('ส่งยอดรวมเข้า Cash Drawer เรียบร้อย', 'success');
+      render();
+    });
 
+    // Filter pills
     el.querySelectorAll('.pill[data-fs]').forEach(btn => {
       btn.addEventListener('click', () => { filterStation = btn.dataset.fs; render(); });
     });
@@ -819,18 +996,74 @@ async function renderBillList(el) {
       btn.addEventListener('click', () => { filterType = btn.dataset.ft; render(); });
     });
 
-    // ── In-place edit without re-render ──
+    // Summary cells (cashIn/cashOut/returns/sales/drawer)
+    el.querySelectorAll('.sum-cell').forEach(inp => {
+      inp.addEventListener('input', debounce(() => {
+        mainSummary[inp.dataset.k] = parseFloat(inp.value) || 0;
+        updateSumCheckRow();
+        updateAllStationColumn();
+      }, 200));
+    });
+
+    // Cash counting cells
+    el.querySelectorAll('.cash-cell').forEach(inp => {
+      inp.addEventListener('input', debounce(() => {
+        const k = inp.dataset.denom + '_' + inp.dataset.station;
+        cashCount[k] = parseInt(inp.value) || 0;
+        // Update totals
+        const denom = Number(inp.dataset.denom);
+        const rowTotal = ['Front1','Front2','Front3','Front4','Invoice']
+          .reduce((s, st) => s + denom * (Number(cashCount[denom+'_'+st]) || 0), 0);
+        const totalEl = el.querySelector(`[data-denom-total="${denom}"]`);
+        if (totalEl) totalEl.textContent = fmtNum(rowTotal);
+        
+        const stationTotal = calcCashDrawer(inp.dataset.station);
+        const stEl = el.querySelector(`[data-station-total="${inp.dataset.station}"]`);
+        if (stEl) stEl.textContent = '฿' + fmtNum(stationTotal);
+        
+        const grand = ['Front1','Front2','Front3','Front4','Invoice'].reduce((s,st)=>s+calcCashDrawer(st),0);
+        const gEl = document.getElementById('grand-total');
+        if (gEl) gEl.textContent = '฿' + fmtNum(grand);
+      }, 200));
+    });
+
+    // Bill list cells — in-place edit
     el.querySelectorAll('.bl-cell').forEach(inp => {
       inp.addEventListener('change', () => {
         const tr = inp.closest('tr');
         const idx = Number(tr.dataset.idx);
         const field = inp.dataset.field;
         billList[idx][field] = inp.value;
+        // ถ้าแก้ station/type → re-render เพื่ออัปเดต summary
+        if (field === 'station' || field === 'type') render();
       });
     });
   }
+
+  function updateSumCheckRow() {
+    const sumRow = el.querySelectorAll('tbody tr').item(9); // row 10 (0-indexed = 9)
+    if (!sumRow) return;
+    const cells = sumRow.querySelectorAll('td');
+    SUMMARY_STATIONS.forEach((s, i) => {
+      if (!['Front1','Front2','Front3','Front4','Invoice','Invoice Credit','Order Credit'].includes(s)) return;
+      const { diff, isOk } = calcSumCheck(s);
+      if (cells[i + 2]) {
+        cells[i + 2].textContent = isOk ? '✓ OK' : fmtNum(diff);
+        cells[i + 2].style.color = isOk ? 'var(--success)' : 'var(--danger)';
+      }
+    });
+  }
+
+  function updateAllStationColumn() {
+    // อัปเดตคอลัมน์ All Station (col 1) ของทุก row
+    // (ไม่ re-render ทั้งหน้าเพื่อ performance)
+  }
+
   render();
 }
+
+// alias สำหรับ backward compat
+async function renderBillList(el) { return renderMain(el); }
 
 function toISODate(d) {
   if (!d) return '';
@@ -962,7 +1195,7 @@ document.getElementById('login-pass').addEventListener('keydown', e => { if (e.k
 // ══════════════════════════════════════════════════════════════
 const NAV_ITEMS = [
   { id:'dashboard', icon:'home',    label:'แดชบอร์ด' },
-  { id:'billlist',  icon:'dollar',  label:'Bill List' },
+  { id:'main',      icon:'dollar',  label:'Main' },
   { id:'matching',  icon:'pulse',   label:'Matching' },
   { id:'debt',      icon:'card',    label:'ติดตามหนี้' },
   { id:'data',      icon:'folder',  label:'จัดการข้อมูล' },
@@ -994,7 +1227,7 @@ function showApp() {
   document.getElementById('app').classList.remove('hidden');
   document.getElementById('sidebar-user').textContent = `${currentUser.display_name} (${currentUser.role})`;
   renderNav();
-  navigateTo('billlist');
+  navigateTo('main');
 }
 
 function renderNav() {
@@ -1009,6 +1242,8 @@ function renderNav() {
 }
 
 function navigateTo(page) {
+  // Backward compat: billlist → main
+  if (page === 'billlist') page = 'main';
   currentPage = page;
   renderNav();
   const main = document.getElementById('main');
@@ -1082,7 +1317,7 @@ function formatDateKey(d) { return d ? d.replace(/-/g,'') : todayKey(); }
 
 const PAGE_RENDERERS = {
   dashboard: renderDashboard,
-  billlist: renderBillList,
+  main: renderMain,
   debt: renderDebt,
   sales: renderSales,
   matching: renderMatching,
