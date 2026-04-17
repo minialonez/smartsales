@@ -163,6 +163,10 @@ tr.row-danger td{background:rgba(239,87,87,.06);border-left:3px solid var(--dang
 .stagger > *:nth-child(4){animation-delay:.2s}
 .stagger > *:nth-child(5){animation-delay:.25s}
 
+/* ── Spinner ── */
+.spinner{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite;vertical-align:middle}
+@keyframes spin{to{transform:rotate(360deg)}}
+
 /* ── Responsive ── */
 @media(max-width:768px){
   #sidebar{position:fixed;z-index:100;left:-230px;transition:left .2s}
@@ -199,7 +203,7 @@ tr.row-danger td{background:rgba(239,87,87,.06);border-left:3px solid var(--dang
         <input type="checkbox" id="login-remember" style="accent-color:var(--primary)"> จดจำการเข้าสู่ระบบ
       </label>
       <div id="login-error" class="login-error hidden"></div>
-      <button class="btn btn-primary w-full" style="justify-content:center;padding:11px 0;font-size:.95rem;border-radius:var(--radius-lg);margin-top:4px" onclick="doLogin()">เข้าสู่ระบบ</button>
+      <button id="login-btn" class="btn btn-primary w-full" style="justify-content:center;padding:11px 0;font-size:.95rem;border-radius:var(--radius-lg);margin-top:4px" onclick="doLogin()">เข้าสู่ระบบ</button>
     </div>
   </div>
 </div>
@@ -895,6 +899,7 @@ async function doLogin() {
   const password = document.getElementById('login-pass').value;
   const remember = document.getElementById('login-remember').checked;
   const errEl = document.getElementById('login-error');
+  const btn = document.getElementById('login-btn');
   errEl.classList.add('hidden');
 
   if (!username || !password) {
@@ -903,14 +908,29 @@ async function doLogin() {
     return;
   }
 
-  const res = await api('login', { username, password });
-  if (res.success) {
-    currentUser = res.data;
-    if (remember) safeStorage.set('sf_user', JSON.stringify(currentUser));
-    showApp();
-  } else {
-    errEl.textContent = res.error || 'ไม่สามารถเข้าสู่ระบบได้';
+  // Set loading state
+  const originalText = btn.textContent;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> กำลังเข้าสู่ระบบ...';
+
+  try {
+    const res = await api('login', { username, password });
+    if (res.success) {
+      currentUser = res.data;
+      if (remember) safeStorage.set('sf_user', JSON.stringify(currentUser));
+      btn.innerHTML = '<span class="spinner"></span> กำลังโหลดระบบ...';
+      showApp();
+    } else {
+      errEl.textContent = res.error || 'ไม่สามารถเข้าสู่ระบบได้';
+      errEl.classList.remove('hidden');
+      btn.disabled = false;
+      btn.textContent = originalText;
+    }
+  } catch (err) {
+    errEl.textContent = 'เกิดข้อผิดพลาด: ' + err.message;
     errEl.classList.remove('hidden');
+    btn.disabled = false;
+    btn.textContent = originalText;
   }
 }
 
@@ -923,7 +943,8 @@ function doLogout() {
 }
 
 // ── Check saved login ──
-(function checkSavedLogin() {
+// defer saved-login check until all declarations are ready
+function checkSavedLogin() {
   try {
     const saved = safeStorage.get('sf_user');
     if (saved) {
@@ -931,7 +952,7 @@ function doLogout() {
       showApp();
     }
   } catch (e) { safeStorage.del('sf_user'); }
-})();
+}
 
 // Enter key on login
 document.getElementById('login-pass').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
@@ -1648,6 +1669,9 @@ async function renderUsers(el) {
     </div>
   `;
 }
+
+// ── Initialize after all declarations are ready ──
+checkSavedLogin();
 </script>
 </body>
 </html>
