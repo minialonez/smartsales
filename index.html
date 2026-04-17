@@ -645,8 +645,23 @@ function parseSPReport(result, fileName) {
   }
 
   paymentList = paymentList.concat(newPayments);
+  
+  // ── Link SP กับ Bill List — mark บิลที่ถูกตัดว่า 'paid' ──
+  let linkedCount = 0;
+  newPayments.forEach(sp => {
+    (sp.bills || []).forEach(childBill => {
+      const billIdx = billList.findIndex(b => b.bill_no === childBill.bill_no);
+      if (billIdx >= 0) {
+        billList[billIdx].match_status = 'paid';
+        billList[billIdx].paid_by_sp = sp.sp_no;
+        billList[billIdx].pay_date = sp.date;
+        linkedCount++;
+      }
+    });
+  });
+  
   persistMainState();
-  toast(`นำเข้า SP สำเร็จ — ${count} รายการ SP, ${childCount} บิลที่ตัด`, 'success');
+  toast(`นำเข้า SP สำเร็จ — ${count} SP, ${childCount} บิลที่ตัด${linkedCount?`, เชื่อมกับ Bill List ${linkedCount} บิล`:''}`, 'success');
   if (currentPage === 'payments') navigateTo('payments');
 }
 
@@ -841,6 +856,7 @@ async function renderMain(el) {
   let filterType = 'ALL';
   let filterDateFrom = '';
   let filterDateTo = '';
+  let hidePaid = false;
   let showChange = false;
   let selectedDate = todayISO();
 
@@ -908,6 +924,7 @@ async function renderMain(el) {
     let data = billList;
     if (filterStation !== 'ALL') data = data.filter(b => b.station === filterStation);
     if (filterType !== 'ALL') data = data.filter(b => b.type === filterType);
+    if (hidePaid) data = data.filter(b => b.match_status !== 'paid');
     
     // Filter by date range
     if (filterDateFrom || filterDateTo) {
@@ -921,6 +938,7 @@ async function renderMain(el) {
     }
 
     const totalAmount = data.reduce((s, b) => s + (Number(b.amount) || 0), 0);
+    const paidCount = billList.filter(b => b.match_status === 'paid').length;
     const stations = [...new Set(billList.map(b => b.station).filter(Boolean))];
     const types = [...new Set(billList.map(b => b.type))];
 
@@ -1071,11 +1089,12 @@ async function renderMain(el) {
 
       <!-- ═══════ SECTION 3: Bill List Transactions (ส่วนล่าง) ═══════ -->
       <div class="flex justify-between items-center mb-2">
-        <div class="font-semi">📋 Bill List (${billList.length} รายการ${filterDateFrom||filterDateTo?` · กรอง ${filterDateFrom||'…'} → ${filterDateTo||'…'}`:''})</div>
+        <div class="font-semi">📋 Bill List (${billList.length} รายการ${paidCount?` · <span style="color:var(--success)">จ่ายแล้ว ${paidCount}</span>`:''}${filterDateFrom||filterDateTo?` · กรอง ${filterDateFrom||'…'} → ${filterDateTo||'…'}`:''})</div>
         <div class="flex gap-2 flex-wrap">
           <input type="date" class="input" id="filter-date-from" value="${filterDateFrom}" placeholder="จาก" title="วันที่เริ่ม" style="width:140px;font-size:.8rem">
           <input type="date" class="input" id="filter-date-to" value="${filterDateTo}" placeholder="ถึง" title="วันที่สิ้นสุด" style="width:140px;font-size:.8rem">
           ${filterDateFrom||filterDateTo?'<button class="btn btn-ghost btn-sm" id="btn-clear-date">✕ ล้างวันที่</button>':''}
+          ${paidCount?`<button class="btn ${hidePaid?'btn-primary':'btn-outline'} btn-sm" id="btn-hide-paid">${hidePaid?'👁️ แสดงบิลที่จ่ายแล้ว':'🚫 ซ่อนบิลที่จ่ายแล้ว'}</button>`:''}
           <button class="btn btn-primary btn-sm" id="btn-add-bill">${ICONS.plus} เพิ่มบิล</button>
           <button class="btn btn-outline btn-sm" id="btn-bulk-date">📅 Bulk</button>
           <button class="btn btn-outline btn-sm" id="btn-auto-duedate">⚡ Auto Due</button>
@@ -1118,10 +1137,12 @@ async function renderMain(el) {
                 data.map((b, idx) => {
                   const realIdx = billList.indexOf(b);
                   const badgeCls = b.source==='smart'?'badge-success':b.source==='pos'?'badge-info':'badge-warn';
-                  const badgeText = b.source==='smart'?'Smart':b.source==='pos'?'POS':'Summary';
-                  return `<tr data-idx="${realIdx}">
-                    <td class="text-xs text-muted">${idx+1} <span class="badge ${badgeCls}" style="margin-left:4px">${badgeText}</span></td>
-                    <td style="font-weight:600;color:var(--text)">${b.bill_no||'-'}</td>
+                  const badgeText = b.source==='smart'?'Smart':b.source==='pos'?'POS':b.source==='manual'?'Manual':'Summary';
+                  const isPaid = b.match_status === 'paid';
+                  const rowStyle = isPaid ? 'background:rgba(45,212,160,.08);opacity:.85' : '';
+                  return `<tr data-idx="${realIdx}" style="${rowStyle}">
+                    <td class="text-xs text-muted">${idx+1} <span class="badge ${badgeCls}" style="margin-left:4px">${badgeText}</span>${isPaid?'<br><span class="badge badge-success" style="margin-top:2px" title="จ่ายแล้วโดย '+(b.paid_by_sp||'')+'">✓ จ่ายแล้ว</span>':''}</td>
+                    <td style="font-weight:600;color:var(--text)">${b.bill_no||'-'}${isPaid&&b.paid_by_sp?`<br><span class="text-xs" style="color:var(--success)">← ${b.paid_by_sp}</span>`:''}</td>
                     <td style="position:relative"><input type="date" class="input bl-cell" data-field="date" value="${toISODate(b.date)}" style="padding:3px 6px;font-size:.78rem;width:130px">
                       <button class="btn-copy-down" data-idx="${realIdx}" data-field="date" title="คัดลอกลงทุกแถวที่เหลือ (Ctrl+↓)" style="background:none;border:1px solid var(--border);color:var(--text2);padding:0 6px;margin-left:2px;border-radius:4px;cursor:pointer;font-size:.75rem">⬇️</button>
                     </td>
@@ -1243,6 +1264,7 @@ async function renderMain(el) {
     document.getElementById('filter-date-from')?.addEventListener('change', e => { filterDateFrom = e.target.value; render(); });
     document.getElementById('filter-date-to')?.addEventListener('change', e => { filterDateTo = e.target.value; render(); });
     document.getElementById('btn-clear-date')?.addEventListener('click', () => { filterDateFrom = ''; filterDateTo = ''; render(); });
+    document.getElementById('btn-hide-paid')?.addEventListener('click', () => { hidePaid = !hidePaid; render(); });
 
     // ── เพิ่มบิลเอง ──
     document.getElementById('btn-add-bill')?.addEventListener('click', () => {
