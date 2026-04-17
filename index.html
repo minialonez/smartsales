@@ -419,6 +419,24 @@ function handleStmtUpload(result, fileName) {
     if (joined.includes('bbl') || joined.includes('กรุงเทพ') || joined.includes('bangkok bank')) { bank = 'BBL'; break; }
   }
 
+  // helper: แปลง date โดยตรวจจับ พ.ศ. พิเศษ
+  let buddhistCount = 0;
+  function convertDate(val) {
+    if (!val) return '';
+    // ถ้าเป็น Date object แล้วปี > 2400 = พ.ศ.
+    if (val instanceof Date && val.getFullYear() > 2400) {
+      buddhistCount++;
+      const converted = new Date(val.getFullYear() - 543, val.getMonth(), val.getDate());
+      return fmtDate(converted);
+    }
+    const result = fmtDate(val);
+    // ตรวจซ้ำในผลลัพธ์
+    if (/\/25\d\d$/.test(result)) {
+      buddhistCount++;
+    }
+    return result;
+  }
+
   // Parse ตาม format ธนาคาร
   if (bank === 'KTB') {
     const sheet = firstSheet;
@@ -430,7 +448,7 @@ function handleStmtUpload(result, fileName) {
     for (let i = hRow + 1; i < sheet.length; i++) {
       const r = sheet[i];
       if (!r[0] || !r[5]) continue;
-      rows.push({ bank, date: fmtDate(r[0]), time: extractTimeStr(r[0]), ref_no: String(r[3]||''), description: String(r[3]||''), amount: Number(r[5])||0, match_status: 'unmatched', match_station: '', match_bill: '' });
+      rows.push({ bank, date: convertDate(r[0]), time: extractTimeStr(r[0]), ref_no: String(r[3]||''), description: String(r[3]||''), amount: Number(r[5])||0, match_status: 'unmatched', match_station: '', match_bill: '' });
     }
   } else if (bank === 'KBANK') {
     const sheet = firstSheet;
@@ -443,7 +461,7 @@ function handleStmtUpload(result, fileName) {
       const dateVal = r[0] || r[1];
       const deposit = Number(r[6]) || Number(r[5]) || 0;
       if (!dateVal || !deposit) continue;
-      rows.push({ bank, date: fmtDate(dateVal), time: String(r[1]||r[2]||''), ref_no: String(r[12]||r[11]||''), description: String(r[3]||r[2]||''), amount: deposit, match_status: 'unmatched', match_station: '', match_bill: '' });
+      rows.push({ bank, date: convertDate(dateVal), time: String(r[1]||r[2]||''), ref_no: String(r[12]||r[11]||''), description: String(r[3]||r[2]||''), amount: deposit, match_status: 'unmatched', match_station: '', match_bill: '' });
     }
   } else if (bank === 'BBL') {
     const sheet = firstSheet;
@@ -458,19 +476,20 @@ function handleStmtUpload(result, fileName) {
       const debit = Number(r[3]) || 0;
       if (!dateVal || (!credit && !debit)) continue;
       if (String(r[2]||'').includes('ยอดรวม') || String(r[0]||'').includes('หมายเหตุ')) continue;
-      rows.push({ bank, date: fmtDate(dateVal), time: extractTimeStr(dateVal), ref_no: String(r[7]||''), description: String(r[2]||''), amount: credit || -debit, match_status: 'unmatched', match_station: '', match_bill: '' });
+      rows.push({ bank, date: convertDate(dateVal), time: extractTimeStr(dateVal), ref_no: String(r[7]||''), description: String(r[2]||''), amount: credit || -debit, match_status: 'unmatched', match_station: '', match_bill: '' });
     }
   } else {
     // Unknown format — ลองอ่าน sheet แรกเป็น generic
     const sheet = firstSheet;
     for (let i = 1; i < sheet.length; i++) {
       const r = sheet[i];
-      rows.push({ bank, date: String(r[0]||''), time: String(r[1]||''), ref_no: String(r[2]||''), description: String(r[3]||''), amount: Number(r[4])||0, match_status: 'unmatched', match_station: '', match_bill: '' });
+      rows.push({ bank, date: convertDate(r[0]), time: String(r[1]||''), ref_no: String(r[2]||''), description: String(r[3]||''), amount: Number(r[4])||0, match_status: 'unmatched', match_station: '', match_bill: '' });
     }
   }
 
   uploadedStatements = rows;
-  toast(`อ่าน Statement ${bank} สำเร็จ — ${rows.length} รายการ`, 'success');
+  const bhMsg = buddhistCount > 0 ? ` (แปลง พ.ศ.→ค.ศ. ${buddhistCount} รายการ)` : '';
+  toast(`อ่าน Statement ${bank} สำเร็จ — ${rows.length} รายการ${bhMsg}`, 'success');
 
   // Re-render matching page with uploaded data
   if (currentPage === 'matching') navigateTo('matching');
