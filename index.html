@@ -463,6 +463,107 @@ function handleStmtUpload(result, fileName) {
 let uploadedSales = [];
 let billList = []; // ศูนย์กลางข้อมูล: Smart bills + POS + Change
 
+// ── Persist state to localStorage — function only, restore happens after mainSummary/cashCount declared ──
+function persistMainState() {
+  try {
+    safeStorage.set('sf_billList', JSON.stringify(billList));
+    safeStorage.set('sf_mainSummary', JSON.stringify(mainSummary));
+    safeStorage.set('sf_cashCount', JSON.stringify(cashCount));
+  } catch (e) { console.warn('Could not persist:', e); }
+}
+
+function restoreMainState() {
+  try {
+    const savedBills = safeStorage.get('sf_billList');
+    if (savedBills) billList = JSON.parse(savedBills);
+    const savedSummary = safeStorage.get('sf_mainSummary');
+    if (savedSummary) Object.assign(mainSummary, JSON.parse(savedSummary));
+    const savedCash = safeStorage.get('sf_cashCount');
+    if (savedCash) Object.assign(cashCount, JSON.parse(savedCash));
+  } catch (e) { console.warn('Could not restore state:', e); }
+}
+
+// ══════════════════════════════════════════════════════════════
+// Parse Front POS Report (rpt_sql_pssdailybycashierbybill.xls)
+// Format: Bill S2604001XXX-YYYYYYY โดย XXX = 001(F1), 002(F2), 003(F3), 004(F4)
+//         R = คืนเงิน, S = ขาย
+// Col: 1=Bill | 2=Cashier | 3=ยอดบิล | 6=ยอดขายสุทธิ | 7=เงินสด | 8=โอน/บัตร | 9=เช็ค
+// ══════════════════════════════════════════════════════════════
+function parseFrontPosReport(result, fileName) {
+  const newBills = [];
+  let count = 0;
+
+  // ใช้ sheet แรก
+  const sheetName = result.sheetNames[0];
+  const sheet = result.sheets[sheetName] || [];
+
+  // หา header row (แถวที่มีคอลัมน์ "ยอดบิล" หรือ "รับเงินสด")
+  let headerRow = -1;
+  for (let i = 0; i < Math.min(10, sheet.length); i++) {
+    const row = sheet[i] || [];
+    const joined = row.map(c => String(c)).join('|');
+    if (joined.includes('ยอดบิล') || joined.includes('รับเงินสด') || joined.includes('ยอดขายสุทธิ')) {
+      headerRow = i; break;
+    }
+  }
+  if (headerRow === -1) headerRow = 1;
+
+  for (let i = headerRow + 1; i < sheet.length; i++) {
+    const r = sheet[i] || [];
+    const billNo = String(r[0] || '').trim();
+    if (!billNo) continue;
+
+    // หยุดที่บรรทัดสรุปท้ายไฟล์
+    if (billNo.includes('ยอดขายสุทธิ') || billNo.includes('คูปอง') || billNo.startsWith('**') || billNo.includes('Page') || billNo.includes('.rpt')) break;
+
+    // ต้องเป็น format S/R ตามด้วยตัวเลข และมี -
+    if (!/^[SR]\d{8,}-\d+$/.test(billNo)) continue;
+
+    const prefix = billNo.split('-')[0];
+    const stationCode = prefix.slice(-3);
+    const stationMap = { '001': 'Front1', '002': 'Front2', '003': 'Front3', '004': 'Front4' };
+    const station = stationMap[stationCode] || 'Front1';
+
+    const cashier = String(r[1] || '').trim();
+    const netSales = Number(r[5]) || 0;
+    const cash = Number(r[6]) || 0;
+    const transfer = Number(r[7]) || 0;
+    const cheque = Number(r[8]) || 0;
+
+    let type = '';
+    if (cash > 0) type = 'Cash';
+    else if (transfer > 0) type = 'Transfer';
+    else if (cheque > 0) type = 'Cheque';
+    else type = 'Cash';
+
+    const isReturn = billNo.startsWith('R');
+    const finalAmount = isReturn ? -Math.abs(netSales) : netSales;
+    if (isReturn) type = 'Refund';
+
+    newBills.push({
+      bill_no: billNo,
+      date: todayISO(),
+      station: station,
+      type: type,
+      amount: finalAmount,
+      confirmation: '',
+      pay_date: '',
+      remarks1: cashier,
+      remarks2: '',
+      bank: '',
+      due_date: '',
+      match_status: 'pending',
+      source: 'pos',
+    });
+    count++;
+  }
+
+  billList = billList.concat(newBills);
+  persistMainState();
+  toast(`นำเข้า Front POS สำเร็จ — ${count} รายการ`, 'success');
+  if (currentPage === 'main') navigateTo('main');
+}
+
 // ── Generate Bill List จาก Smart Excel ──
 function generateBillList(result, fileName) {
   const newBills = [];
@@ -561,9 +662,10 @@ function generateBillList(result, fileName) {
   // ── 3. (ยกเลิก) ไม่ import summary rows แล้ว — ผู้ใช้จะกรอกเองในตาราง Summary ด้านบน ──
 
   billList = newBills;
+  persistMainState();
   toast(`Generate สำเร็จ — Smart: ${smartCount}, POS: ${posCount}, Main: ${mainCount} รายการ`, 'success');
 
-  if (currentPage === 'billlist') navigateTo('billlist');
+  if (currentPage === 'main' || currentPage === 'billlist') navigateTo('main');
 }
 
 // ── Transform เลขบิล → Station + Type ──
@@ -704,9 +806,10 @@ async function renderMain(el) {
     el.innerHTML = `
       <div class="flex justify-between items-center mb-3">
         <div class="page-title">Main — สรุปยอดรายวัน</div>
-        <div class="flex gap-2 items-center">
+        <div class="flex gap-2 items-center flex-wrap">
           <input type="date" class="input" value="${selectedDate}" id="main-date" style="width:160px">
-          <button class="btn btn-primary btn-sm" id="btn-gen-smart">${ICONS.download} Generate จาก Smart</button>
+          <button class="btn btn-primary btn-sm" id="btn-gen-smart">${ICONS.download} Smart (SS/OS/OR/SR)</button>
+          <button class="btn btn-info btn-sm" id="btn-import-pos" style="background:var(--info);color:#fff">${ICONS.download} Front POS</button>
           <button class="btn ${showChange?'btn-primary':'btn-outline'} btn-sm" id="btn-toggle-change">🪙 นับธนบัตร</button>
           <button class="btn btn-success btn-sm" id="btn-save-main">${ICONS.check} บันทึก</button>
         </div>
@@ -990,11 +1093,14 @@ async function renderMain(el) {
     document.getElementById('btn-gen-smart')?.addEventListener('click', () => {
       triggerFileUpload('file-sales', generateBillList);
     });
+    document.getElementById('btn-import-pos')?.addEventListener('click', () => {
+      triggerFileUpload('file-sales', parseFrontPosReport);
+    });
     document.getElementById('btn-toggle-change')?.addEventListener('click', () => {
       showChange = !showChange; render();
     });
     document.getElementById('btn-clear-bl')?.addEventListener('click', () => {
-      if (confirm('ล้างข้อมูล Bill List ทั้งหมด?')) { billList = []; render(); }
+      if (confirm('ล้างข้อมูล Bill List ทั้งหมด?')) { billList = []; persistMainState(); render(); }
     });
     document.getElementById('btn-save-main')?.addEventListener('click', async () => {
       toast('กำลังบันทึก...', 'info');
@@ -1022,6 +1128,7 @@ async function renderMain(el) {
     el.querySelectorAll('.sum-cell').forEach(inp => {
       inp.addEventListener('input', debounce(() => {
         mainSummary[inp.dataset.k] = parseFloat(inp.value) || 0;
+        persistMainState();
         updateSumCheckRow();
         updateAllStationColumn();
       }, 200));
@@ -1032,6 +1139,7 @@ async function renderMain(el) {
       inp.addEventListener('input', debounce(() => {
         const k = inp.dataset.denom + '_' + inp.dataset.station;
         cashCount[k] = parseInt(inp.value) || 0;
+        persistMainState();
         // Update totals
         const denom = Number(inp.dataset.denom);
         const rowTotal = ['Front1','Front2','Front3','Front4','Invoice']
@@ -1056,6 +1164,7 @@ async function renderMain(el) {
         const idx = Number(tr.dataset.idx);
         const field = inp.dataset.field;
         billList[idx][field] = inp.value;
+        persistMainState();
         // ถ้าแก้ station/type → re-render เพื่ออัปเดต summary
         if (field === 'station' || field === 'type') render();
       });
@@ -2114,6 +2223,7 @@ async function renderUsers(el) {
 }
 
 // ── Initialize after all declarations are ready ──
+restoreMainState();
 checkSavedLogin();
 </script>
 </body>
