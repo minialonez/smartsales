@@ -569,7 +569,7 @@ function generateBillList(result, fileName) {
       // Station ต่างๆ col 2-5 (Front1-4)
       ['Front1','Front2','Front3','Front4'].forEach((st, idx) => {
         const amt = Number(row[2 + idx]) || 0;
-        if (amt === 0) continue;
+        if (amt === 0) return;
         newBills.push({
           bill_no: '',
           date: todayISO(),
