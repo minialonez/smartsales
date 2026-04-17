@@ -246,28 +246,29 @@ const API_URL = 'https://script.google.com/macros/s/AKfycbxKFt7Dcq1PPyYEy_zEwTuu
 let currentUser = null;
 let currentPage = 'dashboard';
 
-// ── API Helper (รองรับ Apps Script redirect + CORS) ──
+// ── API Helper (ใช้ GET เสมอ เพราะ Apps Script redirect ทำให้ POST body หาย) ──
 async function api(action, params = {}) {
   try {
     if (!API_URL) return demoResponse(action, params);
 
-    // ลอง POST ก่อน
+    // ใช้ GET — ส่ง parameters ผ่าน URL query string
+    const qs = new URLSearchParams({ action });
+    Object.keys(params).forEach(k => {
+      const v = params[k];
+      if (v !== undefined && v !== null && v !== '') {
+        qs.set(k, typeof v === 'object' ? JSON.stringify(v) : String(v));
+      }
+    });
+
+    const res = await fetch(API_URL + '?' + qs.toString(), { redirect: 'follow' });
+    const text = await res.text();
+
     try {
-      const res = await fetch(API_URL, {
-        method: 'POST',
-        redirect: 'follow',
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify({ action, ...params }),
-      });
-      const text = await res.text();
-      const json = JSON.parse(text);
-      return json;
-    } catch (postErr) {
-      // POST ล้มเหลว → fallback เป็น GET
-      const qs = new URLSearchParams({ action, ...params }).toString();
-      const res = await fetch(API_URL + '?' + qs, { redirect: 'follow' });
-      const text = await res.text();
       return JSON.parse(text);
+    } catch {
+      // Apps Script อาจ return HTML (error page)
+      console.error('API response not JSON:', text.substring(0, 300));
+      return demoResponse(action, params);
     }
   } catch (err) {
     console.error('API Error:', err);
