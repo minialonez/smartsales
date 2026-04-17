@@ -282,42 +282,58 @@ async function api(action, params = {}) {
 }
 
 // ── Date Helpers (dd/mm/yyyy เสมอ) ──
-function todayISO() { return new Date().toISOString().split('T')[0]; }
+function todayISO() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
 function todayKey() { return todayISO().replace(/-/g, ''); }
+
+// แปลงทุก input → dd/mm/yyyy (ค.ศ.) ไม่มี timezone shift
 function fmtDate(d) {
-  if (!d) return '';
-  var str = String(d);
-  
-  // แปลง พ.ศ. → ค.ศ. (25xx → 20xx)
-  str = str.replace(/(\d{4})-(\d{2})-(\d{2})/, function(m, y, mo, dd) {
-    var year = Number(y); if (year > 2400) year -= 543;
-    return String(dd).padStart(2,'0') + '/' + String(mo).padStart(2,'0') + '/' + year;
-  });
-  str = str.replace(/(\d{1,2})\/(\d{1,2})\/(\d{4})/, function(m, dd, mo, y) {
-    var year = Number(y); if (year > 2400) year -= 543;
-    return String(dd).padStart(2,'0') + '/' + String(mo).padStart(2,'0') + '/' + year;
-  });
-  
-  // ถ้าเป็น ISO date (2026-04-08)
-  if (/^\d{4}-\d{2}-\d{2}/.test(str)) {
-    var p = str.split('T')[0].split('-');
-    var y = Number(p[0]); if (y > 2400) y -= 543;
-    return p[2] + '/' + p[1] + '/' + y;
-  }
-  
-  // ถ้าเป็น Date object
+  if (!d && d !== 0) return '';
+
+  // 1) Date object → ใช้ local getters ตรงๆ (ไม่ผ่าน ISO)
   if (d instanceof Date && !isNaN(d)) {
-    return `${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}/${d.getFullYear()}`;
+    let y = d.getFullYear();
+    if (y > 2400) y -= 543; // พ.ศ.→ค.ศ.
+    return `${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}/${y}`;
   }
-  
-  // ถ้าเป็น dd/mm/yyyy อยู่แล้ว
-  if (/^\d{2}\/\d{2}\/\d{4}/.test(str)) return str.split(' ')[0];
-  
-  // try parse as Date
+
+  // 2) Excel serial number (เช่น 45748) → แปลงเป็น Date
+  if (typeof d === 'number' && d > 10000 && d < 80000) {
+    // Excel epoch: 1899-12-30 (มี leap year bug)
+    const excelEpoch = new Date(1899, 11, 30);
+    const ms = d * 86400000;
+    const dt = new Date(excelEpoch.getTime() + ms);
+    return `${String(dt.getDate()).padStart(2,'0')}/${String(dt.getMonth()+1).padStart(2,'0')}/${dt.getFullYear()}`;
+  }
+
+  var str = String(d).trim();
+  if (!str || str === 'null' || str === 'undefined') return '';
+
+  // 3) dd/mm/yyyy อยู่แล้ว
+  var m1 = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+  if (m1) {
+    let y = Number(m1[3]); if (y > 2400) y -= 543;
+    return `${String(m1[1]).padStart(2,'0')}/${String(m1[2]).padStart(2,'0')}/${y}`;
+  }
+
+  // 4) ISO date yyyy-mm-dd (ไม่ใช้ Date constructor เพื่อเลี่ยง timezone shift)
+  var m2 = str.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (m2) {
+    let y = Number(m2[1]); if (y > 2400) y -= 543;
+    return `${m2[3]}/${m2[2]}/${y}`;
+  }
+
+  // 5) Fallback: ลอง parse เป็น Date แล้วใช้ local
   var dt = new Date(d);
-  if (!isNaN(dt)) return `${String(dt.getDate()).padStart(2,'0')}/${String(dt.getMonth()+1).padStart(2,'0')}/${dt.getFullYear()}`;
-  
-  return str.split(' ')[0]; // ตัดเวลาออก
+  if (!isNaN(dt)) {
+    let y = dt.getFullYear();
+    if (y > 2400) y -= 543;
+    return `${String(dt.getDate()).padStart(2,'0')}/${String(dt.getMonth()+1).padStart(2,'0')}/${y}`;
+  }
+
+  return str.split(' ')[0];
 }
 function fmtNum(n) { return new Intl.NumberFormat('th-TH',{minimumFractionDigits:2,maximumFractionDigits:2}).format(n); }
 function fmtInt(n) { return new Intl.NumberFormat('th-TH').format(n); }
@@ -349,10 +365,11 @@ function parseExcelFile(file) {
     reader.onload = (e) => {
       try {
         const data = new Uint8Array(e.target.result);
-        const workbook = XLSX.read(data, { type: 'array', cellDates: true });
+        const workbook = XLSX.read(data, { type: 'array', cellDates: true, cellNF: false, cellText: false });
         const result = {};
         workbook.SheetNames.forEach(name => {
-          result[name] = XLSX.utils.sheet_to_json(workbook.Sheets[name], { header: 1, defval: '' });
+          // raw: true → ได้ Date object สำหรับ date cells (ไม่แปลงเป็น string)
+          result[name] = XLSX.utils.sheet_to_json(workbook.Sheets[name], { header: 1, defval: '', raw: true });
         });
         resolve({ sheets: result, sheetNames: workbook.SheetNames });
       } catch (err) {
@@ -833,10 +850,15 @@ function calcNextMonth20(dateStr) {
   if (!dateStr) return '';
   const iso = toISODate(dateStr);
   if (!iso) return '';
-  const d = new Date(iso);
-  if (isNaN(d)) return '';
-  const next = new Date(d.getFullYear(), d.getMonth() + 1, 20);
-  return next.toISOString().split('T')[0];
+  // Parse yyyy-mm-dd เป็น local date ตรงๆ (ไม่ผ่าน new Date(isoString) เพราะจะโดน UTC shift)
+  const parts = iso.split('-');
+  if (parts.length !== 3) return '';
+  const y = Number(parts[0]);
+  const m = Number(parts[1]) - 1;
+  // วันที่ 20 เดือนถัดไป
+  const next = new Date(y, m + 1, 20);
+  if (isNaN(next)) return '';
+  return `${next.getFullYear()}-${String(next.getMonth()+1).padStart(2,'0')}-${String(next.getDate()).padStart(2,'0')}`;
 }
 
 // ── Main Page State (persistent across renders) ──
@@ -1396,10 +1418,9 @@ async function renderMain(el) {
       billList.forEach(b => {
         // เฉพาะบิลเครดิต (Invoice Credit / Order Credit) ที่ยังไม่มี Due Date
         if ((b.station === 'Invoice Credit' || b.station === 'Order Credit') && !b.due_date && b.date) {
-          const d = new Date(b.date.includes('/') ? toISODate(b.date) : b.date);
-          if (!isNaN(d)) {
-            const next = new Date(d.getFullYear(), d.getMonth() + 1, 20);
-            b.due_date = next.toISOString().split('T')[0];
+          const next = calcNextMonth20(b.date);
+          if (next) {
+            b.due_date = next;
             count++;
           }
         }
@@ -1693,10 +1714,33 @@ async function renderPayments(el) {
 }
 
 function toISODate(d) {
-  if (!d) return '';
-  const s = String(d);
-  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.split('T')[0].split(' ')[0];
-  // dd/mm/yyyy → yyyy-mm-dd
+  if (!d && d !== 0) return '';
+
+  // Date object
+  if (d instanceof Date && !isNaN(d)) {
+    let y = d.getFullYear();
+    if (y > 2400) y -= 543;
+    return `${y}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+  }
+
+  // Excel serial number
+  if (typeof d === 'number' && d > 10000 && d < 80000) {
+    const excelEpoch = new Date(1899, 11, 30);
+    const dt = new Date(excelEpoch.getTime() + d * 86400000);
+    return `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`;
+  }
+
+  const s = String(d).trim();
+  if (!s || s === 'null' || s === 'undefined') return '';
+
+  // yyyy-mm-dd already
+  const iso = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (iso) {
+    let y = Number(iso[1]); if (y > 2400) y -= 543;
+    return `${y}-${iso[2]}-${iso[3]}`;
+  }
+
+  // dd/mm/yyyy
   const m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
   if (m) {
     let y = Number(m[3]); if (y > 2400) y -= 543;
