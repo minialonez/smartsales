@@ -2403,6 +2403,20 @@ async function renderMain(el) {
             }
           }
           
+          // ── Change Data (นับธนบัตรทอน) — import ไปเก็บใน cashCount.__byDate ──
+          if (data.changeData && typeof data.changeData === 'object') {
+            if (!cashCount.__byDate) cashCount.__byDate = {};
+            Object.entries(data.changeData).forEach(([dateISO, stationData]) => {
+              if (!cashCount.__byDate[dateISO]) cashCount.__byDate[dateISO] = {};
+              Object.entries(stationData || {}).forEach(([station, denoms]) => {
+                Object.entries(denoms || {}).forEach(([denom, count]) => {
+                  const key = denom + '_' + station;
+                  cashCount.__byDate[dateISO][key] = Number(count) || 0;
+                });
+              });
+            });
+          }
+          
           // ── Statements ──
           if (mode === 'replace') {
             statementsByBank = { KTB: [], KBANK: [], 'BBL NW': [], BBL: [], UNKNOWN: [] };
