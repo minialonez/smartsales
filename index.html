@@ -2736,9 +2736,6 @@ async function renderMain(el) {
             var res = await api('saveDailySales', {
               date: pivotDate,
               rows: chunk,
-              // ส่ง summary + cash_count เฉพาะ chunk แรกของปีที่มี selectedDate
-              summary: (year === yearFromDate(selectedDate) && ci === 0) ? mainSummary : undefined,
-              cash_count: (year === yearFromDate(selectedDate) && ci === 0) ? cashCount : undefined,
               created_by: currentUser?.display_name || 'Admin',
             });
             if (!res || !res.success) {
@@ -2749,6 +2746,67 @@ async function renderMain(el) {
             if (totalBills > CHUNK_SIZE) {
               toast('กำลังบันทึก... ' + savedBills + '/' + totalBills + ' บิล', 'info');
             }
+          }
+        }
+        
+        // ── 1b. บันทึก Meta (summary + cash_count + change) แยกต่อปี ──
+        // รวม dates ทั้งหมดที่ต้องเก็บ meta แล้ว group ตามปี
+        var metaYears = new Set();
+        if (mainSummary && mainSummary.__byDate) {
+          Object.keys(mainSummary.__byDate).forEach(function(d) {
+            var y = yearFromDate(d);
+            if (y) metaYears.add(y);
+          });
+        }
+        // flat keys (จาก render วันปัจจุบัน) → ผูกกับ selectedDate's year
+        var hasFlatSummary = Object.keys(mainSummary).some(function(k) { return k !== '__byDate' && k.includes('_'); });
+        if (hasFlatSummary) {
+          var y = yearFromDate(selectedDate);
+          if (y) metaYears.add(y);
+        }
+        if (cashCount && cashCount.__byDate) {
+          Object.keys(cashCount.__byDate).forEach(function(d) {
+            var y = yearFromDate(d);
+            if (y) metaYears.add(y);
+          });
+        }
+        
+        for (var my of metaYears) {
+          // filter __byDate ให้เหลือแค่ปีนี้
+          var subSummary = { __byDate: {} };
+          if (mainSummary.__byDate) {
+            Object.keys(mainSummary.__byDate).forEach(function(d) {
+              if (yearFromDate(d) === my) subSummary.__byDate[d] = mainSummary.__byDate[d];
+            });
+          }
+          // flat keys (แนบให้ปีของ selectedDate)
+          if (my === yearFromDate(selectedDate) && hasFlatSummary) {
+            Object.keys(mainSummary).forEach(function(k) {
+              if (k !== '__byDate' && k.includes('_')) subSummary[k] = mainSummary[k];
+            });
+          }
+          
+          var subCash = { __byDate: {} };
+          if (cashCount.__byDate) {
+            Object.keys(cashCount.__byDate).forEach(function(d) {
+              if (yearFromDate(d) === my) subCash.__byDate[d] = cashCount.__byDate[d];
+            });
+          }
+          
+          // Skip ถ้าไม่มีข้อมูล meta ในปีนี้
+          var hasMeta = Object.keys(subSummary.__byDate).length > 0 
+                     || Object.keys(subSummary).filter(k => k !== '__byDate').length > 0 
+                     || Object.keys(subCash.__byDate).length > 0;
+          if (!hasMeta) continue;
+          
+          var metaRes = await api('saveDailyMeta', {
+            date: my + '0101',
+            summary: subSummary,
+            cash_count: subCash,
+            updated_by: currentUser?.display_name || 'Admin',
+          });
+          if (!metaRes || !metaRes.success) {
+            toast('บันทึก Meta ปี ' + my + ' ล้มเหลว (ไม่ critical)', 'warn');
           }
         }
         
