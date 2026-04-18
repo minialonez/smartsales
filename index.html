@@ -656,7 +656,7 @@ function parseFrontPosReport(result, fileName) {
         station: station,
         type: isReturn ? 'Refund' : type,
         amount: finalAmount,
-        confirmation: transferRef,
+        confirmation: '',
         pay_date: '',
         remarks1: currentCashierName ? `${currentCashier} ${currentCashierName}` : currentCashier,
         remarks2: transferRef,
