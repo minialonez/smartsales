@@ -561,6 +561,7 @@ function clearStatementsByBank(bank) {
 let uploadedSales = [];
 let billList = []; // ศูนย์กลางข้อมูล: Smart bills + POS + Change
 let paymentList = []; // SP List พร้อม Parent-Child
+let cashflowList = []; // เงินเข้า-ออก: Deposit, Withdrawal, Transfer, Misc
 
 // ── Persist state to localStorage — function only, restore happens after mainSummary/cashCount declared ──
 function persistMainState() {
@@ -569,6 +570,7 @@ function persistMainState() {
     safeStorage.set('sf_mainSummary', JSON.stringify(mainSummary));
     safeStorage.set('sf_cashCount', JSON.stringify(cashCount));
     safeStorage.set('sf_paymentList', JSON.stringify(paymentList));
+    safeStorage.set('sf_cashflowList', JSON.stringify(cashflowList));
   } catch (e) { console.warn('Could not persist:', e); }
 }
 
@@ -730,6 +732,28 @@ function validateAll() {
     });
   }
   
+  // ── Cashflow ที่ยังไม่ match (Transfer/Supplier) ──
+  const unmatchedCashflow = cashflowList.filter(c => 
+    c.match_status !== 'matched' && (c.type === 'deposit' || c.type === 'supplier' || c.type === 'transfer')
+  );
+  if (unmatchedCashflow.length > 3) {
+    warnings.push({
+      level: 'warn',
+      category: 'cashflow_unmatched',
+      msg: `มีรายการเงินเข้า-ออก ${unmatchedCashflow.length} รายการยังไม่ match กับ Statement`,
+    });
+  }
+  
+  // ── Supplier ที่ไม่มีชื่อคู่ค้า ──
+  const supplierNoName = cashflowList.filter(c => c.type === 'supplier' && !c.counterparty);
+  if (supplierNoName.length > 0) {
+    warnings.push({
+      level: 'warn',
+      category: 'supplier_no_name',
+      msg: `มีรายการจ่าย Supplier ${supplierNoName.length} รายการที่ยังไม่ได้ระบุชื่อ Supplier`,
+    });
+  }
+  
   return { errors, warnings, hasIssues: errors.length > 0 || warnings.length > 0 };
 }
 
@@ -791,6 +815,8 @@ function restoreMainState() {
     if (savedCash) Object.assign(cashCount, JSON.parse(savedCash));
     const savedPay = safeStorage.get('sf_paymentList');
     if (savedPay) paymentList = JSON.parse(savedPay);
+    const savedCashflow = safeStorage.get('sf_cashflowList');
+    if (savedCashflow) cashflowList = JSON.parse(savedCashflow);
     const savedStmts = safeStorage.get('sf_statementsByBank');
     if (savedStmts) {
       statementsByBank = JSON.parse(savedStmts);
@@ -2377,6 +2403,314 @@ async function renderPayments(el) {
   render();
 }
 
+// ══════════════════════════════════════════════════════════════
+// Render Cashflow Page (เงินเข้าออก: Deposit, Withdrawal, Supplier, Transfer)
+// ══════════════════════════════════════════════════════════════
+async function renderCashflow(el) {
+  let filterType = 'ALL';
+  let filterDateFrom = '';
+  let filterDateTo = '';
+
+  function render() {
+    let data = [...cashflowList];
+    if (filterType !== 'ALL') data = data.filter(c => c.type === filterType);
+    if (filterDateFrom || filterDateTo) {
+      data = data.filter(c => {
+        const d = toISODate(c.date);
+        if (!d) return true;
+        if (filterDateFrom && d < filterDateFrom) return false;
+        if (filterDateTo && d > filterDateTo) return false;
+        return true;
+      });
+    }
+    // Sort: วันใหม่ก่อน
+    data.sort((a,b) => (parseThaiDate(b.date)||0) - (parseThaiDate(a.date)||0));
+
+    // Summary
+    const totals = {
+      deposit: cashflowList.filter(c=>c.type==='deposit').reduce((s,c)=>s+Number(c.amount||0),0),
+      supplier: cashflowList.filter(c=>c.type==='supplier').reduce((s,c)=>s+Number(c.amount||0),0),
+      transfer: cashflowList.filter(c=>c.type==='transfer').reduce((s,c)=>s+Number(c.amount||0),0),
+      misc: cashflowList.filter(c=>c.type==='misc').reduce((s,c)=>s+Number(c.amount||0),0),
+    };
+    const matchedCount = cashflowList.filter(c=>c.match_status==='matched').length;
+
+    el.innerHTML = `
+      <div class="flex justify-between items-center mb-3">
+        <div class="page-title">💸 เงินเข้าออก (Cash Movement)</div>
+        <div class="flex gap-2 flex-wrap">
+          <button class="btn btn-primary btn-sm" id="btn-add-deposit" title="นำเงินสดไปฝากธนาคาร">
+            ${ICONS.plus} 🏦 นำเงินฝากธนาคาร
+          </button>
+          <button class="btn btn-outline btn-sm" id="btn-add-supplier" style="background:rgba(239,87,87,.12);color:var(--danger);border-color:var(--danger)" title="จ่าย Supplier">
+            ${ICONS.plus} 🏭 จ่าย Supplier
+          </button>
+          <button class="btn btn-outline btn-sm" id="btn-add-transfer" title="โอนระหว่างบัญชี">
+            ${ICONS.plus} 🔄 โอนระหว่างบัญชี
+          </button>
+          <button class="btn btn-outline btn-sm" id="btn-add-misc" title="รายการอื่นๆ">
+            ${ICONS.plus} 💫 อื่นๆ
+          </button>
+          <button class="btn btn-success btn-sm" id="btn-save-cashflow">${ICONS.check} บันทึก</button>
+        </div>
+      </div>
+
+      <p class="text-sm text-dim mb-3">บันทึกรายการเงินเข้า-ออกที่ไม่ใช่จากการขายปกติ → ใช้ matching กับ Statement ได้</p>
+
+      <!-- Summary Cards -->
+      <div class="flex gap-3 flex-wrap mb-3 stagger">
+        ${statCard('ฝากธนาคาร', '฿'+fmtNum(totals.deposit), cashflowList.filter(c=>c.type==='deposit').length+' ครั้ง', 'var(--success)', ICONS.dollar)}
+        ${statCard('จ่าย Supplier', '฿'+fmtNum(totals.supplier), cashflowList.filter(c=>c.type==='supplier').length+' ครั้ง', 'var(--danger)', ICONS.card)}
+        ${statCard('โอนระหว่างบัญชี', '฿'+fmtNum(totals.transfer), cashflowList.filter(c=>c.type==='transfer').length+' ครั้ง', 'var(--info)', ICONS.pulse)}
+        ${statCard('อื่นๆ', '฿'+fmtNum(totals.misc), cashflowList.filter(c=>c.type==='misc').length+' ครั้ง', 'var(--warn)', ICONS.file)}
+      </div>
+
+      <!-- Filters -->
+      <div class="flex gap-2 mb-3 flex-wrap items-center">
+        <button class="pill ${filterType==='ALL'?'active':''}" data-ft="ALL">ทั้งหมด (${cashflowList.length})</button>
+        <button class="pill ${filterType==='deposit'?'active':''}" data-ft="deposit" style="--pill-color:var(--success)">🏦 ฝาก</button>
+        <button class="pill ${filterType==='supplier'?'active':''}" data-ft="supplier" style="--pill-color:var(--danger)">🏭 Supplier</button>
+        <button class="pill ${filterType==='transfer'?'active':''}" data-ft="transfer" style="--pill-color:var(--info)">🔄 โอน</button>
+        <button class="pill ${filterType==='misc'?'active':''}" data-ft="misc" style="--pill-color:var(--warn)">💫 อื่นๆ</button>
+        <span style="flex:1"></span>
+        <input type="date" class="input" id="cf-date-from" value="${filterDateFrom}" style="width:140px;font-size:.8rem" placeholder="จาก">
+        <input type="date" class="input" id="cf-date-to" value="${filterDateTo}" style="width:140px;font-size:.8rem" placeholder="ถึง">
+      </div>
+
+      <!-- Table -->
+      <div class="card-flat">
+        <div class="table-wrap" style="max-height:520px;overflow-y:auto">
+          <table>
+            <thead>
+              <tr>
+                <th style="width:40px">#</th>
+                <th>วันที่</th>
+                <th>ประเภท</th>
+                <th style="text-align:right">ยอดเงิน</th>
+                <th>จาก / ไป</th>
+                <th>ธนาคาร</th>
+                <th>อ้างอิง</th>
+                <th>หมายเหตุ</th>
+                <th style="text-align:center">สถานะ Match</th>
+                <th style="text-align:center">จัดการ</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${data.length === 0 ? 
+                `<tr><td colspan="10" style="text-align:center;padding:40px;color:var(--text3)">
+                  ยังไม่มีรายการ — กดปุ่มด้านบนเพื่อเพิ่ม<br>
+                  <span class="text-xs">เช่น "🏦 นำเงินฝากธนาคาร" หลังปิดยอดทุกวัน</span>
+                </td></tr>` :
+                data.map((c, idx) => {
+                  const typeInfo = {
+                    deposit:   { label:'🏦 ฝาก', color:'var(--success)', dir:'เงินสด → บัญชี' },
+                    supplier:  { label:'🏭 Supplier', color:'var(--danger)', dir:'บัญชี → Supplier' },
+                    transfer:  { label:'🔄 โอน', color:'var(--info)', dir:'บัญชี ↔ บัญชี' },
+                    misc:      { label:'💫 อื่นๆ', color:'var(--warn)', dir:'-' },
+                  }[c.type] || { label:c.type, color:'var(--text2)', dir:'-' };
+                  
+                  const realIdx = cashflowList.indexOf(c);
+                  const isMatched = c.match_status === 'matched';
+                  const rowStyle = isMatched ? 'background:rgba(45,212,160,.06)' : '';
+                  
+                  return `<tr data-cfidx="${realIdx}" style="${rowStyle}">
+                    <td class="text-xs text-muted">${idx+1}</td>
+                    <td class="text-xs">${fmtDate(c.date)}</td>
+                    <td><span class="badge" style="background:${typeInfo.color}22;color:${typeInfo.color}">${typeInfo.label}</span></td>
+                    <td style="text-align:right;font-weight:700;color:${typeInfo.color}">
+                      ${c.type==='supplier'?'-':''}฿${fmtNum(c.amount||0)}
+                    </td>
+                    <td class="text-xs">
+                      ${c.from_account ? `<div>จาก: ${c.from_account}</div>` : ''}
+                      ${c.to_account ? `<div>ไป: ${c.to_account}</div>` : ''}
+                      ${c.counterparty ? `<div style="color:var(--text2)">${c.counterparty}</div>` : ''}
+                    </td>
+                    <td>${c.bank ? `<span class="badge" style="background:${(bankColors[c.bank]||'#555')}22;color:${bankColors[c.bank]||'#aaa'}">${c.bank}</span>` : '-'}</td>
+                    <td class="text-xs" style="font-family:var(--mono)">${c.reference||'-'}</td>
+                    <td class="text-xs" style="max-width:160px">${c.note||'-'}</td>
+                    <td style="text-align:center">${isMatched?'<span class="badge badge-success">✓ Matched</span>':'<span class="badge badge-warn">⏳ รอ Match</span>'}</td>
+                    <td style="text-align:center">
+                      <button class="btn btn-ghost btn-sm btn-cf-edit" data-idx="${realIdx}" title="แก้ไข">${ICONS.edit}</button>
+                      <button class="btn btn-ghost btn-sm btn-cf-delete" data-idx="${realIdx}" title="ลบ" style="color:var(--danger)">🗑️</button>
+                    </td>
+                  </tr>`;
+                }).join('')
+              }
+            </tbody>
+          </table>
+        </div>
+        <div class="flex justify-between items-center" style="padding:10px 14px;border-top:1px solid var(--border)">
+          <span class="text-sm text-dim">${data.length} / ${cashflowList.length} รายการ</span>
+          <span class="text-sm"><span style="color:var(--success)">Matched ${matchedCount}</span> · <span style="color:var(--warn)">รอ Match ${cashflowList.length-matchedCount}</span></span>
+        </div>
+      </div>
+    `;
+
+    // Filter handlers
+    el.querySelectorAll('.pill[data-ft]').forEach(btn => {
+      btn.addEventListener('click', () => { filterType = btn.dataset.ft; render(); });
+    });
+    document.getElementById('cf-date-from')?.addEventListener('change', e => { filterDateFrom = e.target.value; render(); });
+    document.getElementById('cf-date-to')?.addEventListener('change', e => { filterDateTo = e.target.value; render(); });
+
+    // Add buttons
+    document.getElementById('btn-add-deposit')?.addEventListener('click', () => openCashflowModal('deposit'));
+    document.getElementById('btn-add-supplier')?.addEventListener('click', () => openCashflowModal('supplier'));
+    document.getElementById('btn-add-transfer')?.addEventListener('click', () => openCashflowModal('transfer'));
+    document.getElementById('btn-add-misc')?.addEventListener('click', () => openCashflowModal('misc'));
+    document.getElementById('btn-save-cashflow')?.addEventListener('click', async () => {
+      toast('กำลังบันทึก...', 'info');
+      const res = await api('saveCashflow', { records: cashflowList, created_by: currentUser?.display_name || 'Admin' });
+      if (res.success) toast(`บันทึกสำเร็จ ${cashflowList.length} รายการ`, 'success');
+      else toast(res.error || 'บันทึกไม่สำเร็จ', 'error');
+    });
+
+    // Edit / Delete
+    el.querySelectorAll('.btn-cf-edit').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const idx = Number(btn.dataset.idx);
+        openCashflowModal(cashflowList[idx].type, idx);
+      });
+    });
+    el.querySelectorAll('.btn-cf-delete').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const idx = Number(btn.dataset.idx);
+        const c = cashflowList[idx];
+        if (!confirm(`ลบรายการนี้?\n${c.type} · ฿${fmtNum(c.amount)} · ${fmtDate(c.date)}`)) return;
+        cashflowList.splice(idx, 1);
+        persistMainState();
+        toast('ลบแล้ว', 'success');
+        render();
+      });
+    });
+  }
+
+  function openCashflowModal(type, editIdx) {
+    const existing = editIdx !== undefined ? cashflowList[editIdx] : null;
+    const isEdit = !!existing;
+    
+    const config = {
+      deposit:  { title:'🏦 นำเงินฝากธนาคาร', color:'var(--success)', 
+        desc:'บันทึกเงินสดที่เอาไปฝากเข้าบัญชีธนาคาร',
+        fromLabel:'เงินสดจาก Station', fromPlaceholder:'เช่น Front1, Front2, รวมทุกโต๊ะ',
+        toLabel:'ฝากเข้าบัญชี', toPlaceholder:'เลขบัญชีหรือชื่อบัญชี',
+        showCounterparty: false },
+      supplier: { title:'🏭 จ่าย Supplier', color:'var(--danger)',
+        desc:'บันทึกเงินโอนจ่าย Supplier / ค่าใช้จ่าย',
+        fromLabel:'โอนจากบัญชี', fromPlaceholder:'เช่น KTB / KBANK',
+        toLabel:'โอนไปบัญชี Supplier', toPlaceholder:'บัญชีผู้รับ (ถ้ามี)',
+        showCounterparty: true, counterpartyLabel:'ชื่อ Supplier' },
+      transfer: { title:'🔄 โอนระหว่างบัญชี', color:'var(--info)',
+        desc:'โอนเงินระหว่างบัญชีของตัวเอง (จะเกิด 2 รายการใน Statement: โอนออก + โอนเข้า)',
+        fromLabel:'จากบัญชี', fromPlaceholder:'KTB / KBANK / BBL',
+        toLabel:'ไปบัญชี', toPlaceholder:'KTB / KBANK / BBL',
+        showCounterparty: false },
+      misc:     { title:'💫 รายการอื่นๆ', color:'var(--warn)',
+        desc:'เช่น ดอกเบี้ยรับ, ค่าธรรมเนียม, เงินมัดจำลูกค้า, อื่นๆ',
+        fromLabel:'จาก', fromPlaceholder:'-',
+        toLabel:'ไป', toPlaceholder:'-',
+        showCounterparty: true, counterpartyLabel:'คู่กรณี' },
+    }[type];
+
+    openModal(config.title, `
+      <div class="flex-col gap-3">
+        <p class="text-sm text-dim" style="padding:8px 12px;background:${config.color}15;border-radius:6px">${config.desc}</p>
+        
+        <div class="flex gap-2">
+          <div class="input-group flex-1">
+            <label>วันที่</label>
+            <input type="date" class="input" id="cf-date" value="${existing?toISODate(existing.date):todayISO()}">
+          </div>
+          <div class="input-group flex-1">
+            <label>ยอดเงิน *</label>
+            <input type="number" class="input" id="cf-amount" value="${existing?.amount||''}" placeholder="0.00" step="0.01" autofocus>
+          </div>
+        </div>
+
+        <div class="flex gap-2">
+          <div class="input-group flex-1">
+            <label>${config.fromLabel}</label>
+            <input class="input" id="cf-from" value="${existing?.from_account||''}" placeholder="${config.fromPlaceholder}">
+          </div>
+          <div class="input-group flex-1">
+            <label>${config.toLabel}</label>
+            <input class="input" id="cf-to" value="${existing?.to_account||''}" placeholder="${config.toPlaceholder}">
+          </div>
+        </div>
+
+        ${config.showCounterparty ? `
+          <div class="input-group">
+            <label>${config.counterpartyLabel}</label>
+            <input class="input" id="cf-counterparty" value="${existing?.counterparty||''}" placeholder="ชื่อ / บริษัท">
+          </div>
+        ` : ''}
+
+        <div class="flex gap-2">
+          <div class="input-group flex-1">
+            <label>ธนาคาร (ที่เงินเคลื่อน)</label>
+            <select class="select" id="cf-bank">
+              ${['','KTB','KBANK','BBL','SCB','BAY','TMB','Other'].map(b=>`<option value="${b}" ${existing?.bank===b?'selected':''}>${b||'-'}</option>`).join('')}
+            </select>
+          </div>
+          <div class="input-group flex-1">
+            <label>เลขที่อ้างอิง / Slip</label>
+            <input class="input" id="cf-ref" value="${existing?.reference||''}" placeholder="เลข slip / ref">
+          </div>
+        </div>
+
+        <div class="input-group">
+          <label>หมายเหตุ</label>
+          <input class="input" id="cf-note" value="${existing?.note||''}" placeholder="รายละเอียดเพิ่มเติม">
+        </div>
+
+        <div class="flex gap-2 mt-2">
+          <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ยกเลิก</button>
+          <button class="btn btn-primary btn-sm flex-1" id="cf-save" style="background:${config.color};color:#fff">
+            ${ICONS.check} ${isEdit?'อัปเดต':'บันทึก'}
+          </button>
+        </div>
+      </div>
+    `);
+
+    document.getElementById('cf-save')?.addEventListener('click', () => {
+      const amount = Number(document.getElementById('cf-amount').value);
+      if (!amount || amount <= 0) { toast('กรอกยอดเงิน', 'error'); return; }
+      
+      const record = {
+        id: existing?.id || ('CF-' + Date.now()),
+        date: document.getElementById('cf-date').value || todayISO(),
+        type: type,
+        amount: amount,
+        from_account: document.getElementById('cf-from').value,
+        to_account: document.getElementById('cf-to').value,
+        counterparty: config.showCounterparty ? document.getElementById('cf-counterparty')?.value || '' : '',
+        bank: document.getElementById('cf-bank').value,
+        reference: document.getElementById('cf-ref').value,
+        note: document.getElementById('cf-note').value,
+        match_status: existing?.match_status || 'pending',
+        match_stmt_ref: existing?.match_stmt_ref || '',
+        created_by: currentUser?.display_name || 'Admin',
+        created_at: existing?.created_at || new Date().toISOString(),
+      };
+      
+      if (isEdit) {
+        cashflowList[editIdx] = record;
+      } else {
+        cashflowList.push(record);
+      }
+      persistMainState();
+      closeModal();
+      toast(isEdit?'อัปเดตสำเร็จ':'บันทึกสำเร็จ', 'success');
+      render();
+    });
+  }
+
+  render();
+}
+
+
 function toISODate(d) {
   if (!d && d !== 0) return '';
 
@@ -2532,6 +2866,7 @@ const NAV_ITEMS = [
   { id:'dashboard', icon:'home',    label:'แดชบอร์ด' },
   { id:'main',      icon:'dollar',  label:'Main' },
   { id:'payments',  icon:'card',    label:'Payments (SP)' },
+  { id:'cashflow',  icon:'bar',     label:'เงินเข้าออก' },
   { id:'matching',  icon:'pulse',   label:'Matching' },
   { id:'debt',      icon:'card',    label:'ติดตามหนี้' },
   { id:'data',      icon:'folder',  label:'จัดการข้อมูล' },
@@ -2655,6 +2990,7 @@ const PAGE_RENDERERS = {
   dashboard: renderDashboard,
   main: renderMain,
   payments: renderPayments,
+  cashflow: renderCashflow,
   debt: renderDebt,
   sales: renderSales,
   matching: renderMatching,
@@ -2686,12 +3022,23 @@ async function renderDashboard(el) {
   );
   const chequesOverdue = chequesAwaitingClear.filter(b => b.expected_clear_date && toISODate(b.expected_clear_date) < today);
   const unmatchedStmts = getAllStatements().filter(s => s.match_status !== 'matched');
+  const cashflowPending = (cashflowList||[]).filter(c => c.match_status !== 'matched' && (c.type === 'deposit' || c.type === 'supplier' || c.type === 'transfer'));
   
-  const totalUnmatched = unmatchedBillsTransfer.length + chequesAwaitingClear.length + unmatchedStmts.length;
+  const totalUnmatched = unmatchedBillsTransfer.length + chequesAwaitingClear.length + unmatchedStmts.length + cashflowPending.length;
 
   el.innerHTML = `
     <div class="page-title">แดชบอร์ด</div>
     <p class="text-dim mb-4 text-sm">ภาพรวมระบบ — ${fmtDate(new Date())}</p>
+    
+    <!-- Quick Actions -->
+    <div class="flex gap-2 flex-wrap mb-4">
+      <button class="btn btn-success btn-sm" onclick="openQuickPaymentModal()" style="background:var(--success);color:#fff">💰 รับชำระเร็ว</button>
+      <button class="btn btn-primary btn-sm" onclick="navigateTo('cashflow');setTimeout(()=>document.getElementById('btn-add-deposit')?.click(),200)">🏦 ฝากเงิน</button>
+      <button class="btn btn-outline btn-sm" onclick="navigateTo('cashflow');setTimeout(()=>document.getElementById('btn-add-supplier')?.click(),200)" style="color:var(--danger);border-color:var(--danger)">🏭 จ่าย Supplier</button>
+      <button class="btn btn-outline btn-sm" onclick="navigateTo('main')">📊 หน้า Main</button>
+      <button class="btn btn-outline btn-sm" onclick="navigateTo('matching')">🔍 Matching</button>
+    </div>
+    
     <div class="flex gap-3 flex-wrap mb-4 stagger">
       ${statCard('ยอดหนี้คงค้าง', '฿'+fmtNum(debt.total||0), debt.debtors+' ราย', 'var(--warn)', ICONS.card)}
       ${statCard('เกินกำหนด', debt.overdue||0, 'ต้องดำเนินการ', 'var(--danger)', ICONS.alert)}
@@ -2729,6 +3076,13 @@ async function renderDashboard(el) {
               <div class="text-xs text-dim">Statement ยังไม่ match</div>
               <div style="font-size:1.4rem;font-weight:700;color:var(--danger)">${unmatchedStmts.length}</div>
               <div class="text-xs text-muted">฿${fmtNum(unmatchedStmts.reduce((s,x)=>s+Number(x.amount||0),0))}</div>
+            </div>
+          ` : ''}
+          ${cashflowPending.length > 0 ? `
+            <div style="padding:12px;background:rgba(79,156,249,.08);border-radius:8px;min-width:200px;flex:1;cursor:pointer" onclick="navigateTo('cashflow')">
+              <div class="text-xs text-dim">เงินเข้า-ออก รอ Match</div>
+              <div style="font-size:1.4rem;font-weight:700;color:var(--info)">${cashflowPending.length}</div>
+              <div class="text-xs text-muted">ฝาก/จ่าย Supplier/โอน</div>
             </div>
           ` : ''}
         </div>
@@ -2823,6 +3177,7 @@ async function renderDebt(el) {
         <div class="page-title">ติดตามลูกหนี้</div>
         <div class="flex gap-2">
           <input class="input" placeholder="ค้นหา ชื่อ / cust_id / เบอร์" id="debt-search" value="${searchText}" style="width:240px">
+          <button class="btn btn-primary btn-sm" id="btn-quick-payment" style="background:var(--success);color:#fff">💰 รับชำระเร็ว</button>
           <button class="btn btn-outline btn-sm" id="btn-check-alerts">${ICONS.pulse} ตรวจสอบสถานะ</button>
         </div>
       </div>
@@ -2909,6 +3264,9 @@ async function renderDebt(el) {
         toast(r.error||'ไม่สำเร็จ', 'error');
       }
     });
+    
+    // Quick Payment — ลูกค้ามาจ่ายหนี้สดๆ ที่ร้าน
+    document.getElementById('btn-quick-payment')?.addEventListener('click', () => openQuickPaymentModal());
 
     // Payment button
     el.querySelectorAll('button[data-pay]').forEach(btn => {
@@ -2919,7 +3277,256 @@ async function renderDebt(el) {
   loadAndRender();
 }
 
-// ── Payment Modal ──
+// ══════════════════════════════════════════════════════════════
+// Quick Payment Modal — รับชำระจากลูกค้าแบบเร็ว
+// Step 1: ค้นหาลูกค้า → Step 2: เลือกบิลที่จะตัด → Step 3: บันทึก
+// ══════════════════════════════════════════════════════════════
+async function openQuickPaymentModal() {
+  let step = 1;
+  let selectedCustomer = null;
+  let searchResults = [];
+  
+  function renderStep1() {
+    openModal('💰 รับชำระจากลูกค้า — Step 1: เลือกลูกค้า', `
+      <div class="flex-col gap-3">
+        <p class="text-sm text-dim">พิมพ์ชื่อ / รหัส / เบอร์โทร ของลูกค้า</p>
+        <input class="input" id="qp-search" placeholder="ค้นหาลูกค้า..." autofocus style="font-size:1.05rem;padding:10px">
+        <div id="qp-results" style="max-height:300px;overflow-y:auto;border:1px solid var(--border);border-radius:8px">
+          <div style="padding:20px;text-align:center;color:var(--text3)">พิมพ์เพื่อค้นหา...</div>
+        </div>
+      </div>
+    `);
+    
+    const searchInput = document.getElementById('qp-search');
+    searchInput?.focus();
+    searchInput?.addEventListener('input', debounce(async (e) => {
+      const q = e.target.value.trim();
+      if (!q) {
+        document.getElementById('qp-results').innerHTML = '<div style="padding:20px;text-align:center;color:var(--text3)">พิมพ์เพื่อค้นหา...</div>';
+        return;
+      }
+      
+      const res = await api('getArLedger');
+      const allDebtors = res.data || [];
+      const matches = allDebtors.filter(d => {
+        if (Number(d.total_outstanding||0) <= 0) return false;
+        const s = q.toLowerCase();
+        return (d.cust_name||'').toLowerCase().includes(s) ||
+               (d.cust_id||'').toLowerCase().includes(s) ||
+               (d.phone||'').includes(q);
+      }).slice(0, 10);
+      
+      searchResults = matches;
+      const container = document.getElementById('qp-results');
+      if (!container) return;
+      
+      container.innerHTML = matches.length === 0 
+        ? '<div style="padding:20px;text-align:center;color:var(--text3)">ไม่พบลูกค้าที่มีหนี้</div>'
+        : matches.map((d, i) => {
+          const status = d.credit_status || 'active';
+          const statusColor = {active:'var(--success)', overdue:'var(--danger)', credit_break:'var(--warn)'}[status] || 'var(--text2)';
+          return `
+            <div class="qp-result" data-cust-id="${d.cust_id}" style="padding:12px;border-bottom:1px solid var(--border);cursor:pointer">
+              <div class="flex justify-between items-center">
+                <div>
+                  <div class="font-semi" style="color:var(--text)">${d.cust_name}</div>
+                  <div class="text-xs text-muted">${d.cust_id} · ${d.phone||'ไม่มีเบอร์'}</div>
+                  <span class="badge" style="background:${statusColor}22;color:${statusColor};font-size:.7rem">${status}</span>
+                </div>
+                <div style="text-align:right">
+                  <div style="font-weight:700;color:var(--warn)">฿${fmtNum(d.total_outstanding)}</div>
+                  <div class="text-xs text-muted">${Object.keys(d.months||{}).length} เดือน</div>
+                </div>
+              </div>
+            </div>
+          `;
+        }).join('');
+      
+      container.querySelectorAll('.qp-result').forEach(row => {
+        row.addEventListener('click', () => {
+          const custId = row.dataset.custId;
+          selectedCustomer = matches.find(m => m.cust_id === custId);
+          renderStep2();
+        });
+        row.addEventListener('mouseenter', () => row.style.background = 'rgba(79,156,249,.1)');
+        row.addEventListener('mouseleave', () => row.style.background = '');
+      });
+    }, 300));
+  }
+  
+  async function renderStep2() {
+    if (!selectedCustomer) return;
+    
+    // ดึงบิลที่ค้างของลูกค้า
+    const res = await api('getArLedger', { cust_id: selectedCustomer.cust_id });
+    const cust = (res.data || [])[0] || selectedCustomer;
+    const outstandingBills = [];
+    
+    // หา bills จาก months structure
+    Object.entries(cust.months || {}).forEach(([month, data]) => {
+      (data.bills || []).forEach(b => {
+        if (Number(b.remaining||b.amount||0) > 0) {
+          outstandingBills.push({
+            ...b,
+            month,
+            remaining: Number(b.remaining||b.amount||0),
+          });
+        }
+      });
+    });
+    
+    outstandingBills.sort((a,b) => (a.due_date||'').localeCompare(b.due_date||''));
+    const totalOutstanding = outstandingBills.reduce((s,b) => s + b.remaining, 0);
+    
+    openModal(`💰 ${selectedCustomer.cust_name} — Step 2: เลือกบิลที่ตัดชำระ`, `
+      <div class="flex-col gap-3">
+        <div style="padding:10px;background:rgba(245,166,35,.08);border-radius:8px;display:flex;justify-content:space-between">
+          <div>
+            <div class="text-xs text-dim">${selectedCustomer.cust_id}</div>
+            <div class="font-semi">${selectedCustomer.cust_name}</div>
+          </div>
+          <div style="text-align:right">
+            <div class="text-xs text-dim">ยอดค้างรวม</div>
+            <div style="font-weight:700;color:var(--warn);font-size:1.2rem">฿${fmtNum(totalOutstanding)}</div>
+          </div>
+        </div>
+        
+        <div class="flex gap-2">
+          <div class="input-group flex-1">
+            <label>ยอดที่รับชำระ *</label>
+            <input type="number" class="input" id="qp-amount" step="0.01" placeholder="0.00" autofocus style="font-size:1.1rem">
+          </div>
+          <div class="input-group flex-1">
+            <label>วันที่รับ</label>
+            <input type="date" class="input" id="qp-paydate" value="${todayISO()}">
+          </div>
+        </div>
+        
+        <div class="flex gap-2">
+          <div class="input-group flex-1">
+            <label>วิธีรับ</label>
+            <select class="select" id="qp-method">
+              <option value="Cash">เงินสด</option>
+              <option value="Transfer">โอน</option>
+              <option value="Cheque">เช็ค</option>
+              <option value="Other">อื่นๆ</option>
+            </select>
+          </div>
+          <div class="input-group flex-1">
+            <label>ธนาคาร (ถ้าโอน)</label>
+            <select class="select" id="qp-bank">
+              ${['','KTB','KBANK','BBL','SCB','BAY','TMB','Other'].map(b=>`<option value="${b}">${b||'-'}</option>`).join('')}
+            </select>
+          </div>
+        </div>
+        
+        <div class="input-group">
+          <label>เลขที่อ้างอิง / Slip</label>
+          <input class="input" id="qp-ref" placeholder="เลข slip, เลขเช็ค, หรืออ้างอิงอื่น">
+        </div>
+        
+        <div>
+          <label class="text-sm font-semi">บิลที่จะตัดชำระ <span class="text-xs text-muted">(เลือก FIFO อัตโนมัติ หรือคลิกเลือกเอง)</span></label>
+          <div style="max-height:200px;overflow-y:auto;border:1px solid var(--border);border-radius:8px;margin-top:6px">
+            ${outstandingBills.length === 0 ? 
+              '<div style="padding:20px;text-align:center;color:var(--text3)">ไม่มีบิลค้างชำระ</div>' :
+              outstandingBills.map(b => `
+                <div style="padding:8px 12px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">
+                  <label style="display:flex;align-items:center;gap:8px;flex:1;cursor:pointer">
+                    <input type="checkbox" class="qp-bill" data-bill="${b.bill_no}" data-amount="${b.remaining}" checked>
+                    <div>
+                      <div class="text-sm font-semi">${b.bill_no}</div>
+                      <div class="text-xs text-muted">${fmtDate(b.bill_date||b.date)} · ${b.month} ${b.due_date?'· Due '+fmtDate(b.due_date):''}</div>
+                    </div>
+                  </label>
+                  <div style="font-weight:600;color:var(--danger)">฿${fmtNum(b.remaining)}</div>
+                </div>
+              `).join('')
+            }
+          </div>
+        </div>
+        
+        <div class="input-group">
+          <label>หมายเหตุ</label>
+          <input class="input" id="qp-note" placeholder="หมายเหตุเพิ่มเติม">
+        </div>
+        
+        <div class="flex gap-2 mt-2">
+          <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ยกเลิก</button>
+          <button class="btn btn-sm flex-1" id="qp-back" style="background:var(--surface2)">← ย้อนกลับ</button>
+          <button class="btn btn-success btn-sm flex-1" id="qp-confirm">${ICONS.check} บันทึกรับชำระ</button>
+        </div>
+      </div>
+    `);
+    
+    // Auto-set amount = total outstanding  
+    document.getElementById('qp-amount').value = totalOutstanding.toFixed(2);
+    
+    // Back button
+    document.getElementById('qp-back')?.addEventListener('click', renderStep1);
+    
+    // Confirm
+    document.getElementById('qp-confirm')?.addEventListener('click', async () => {
+      const amount = Number(document.getElementById('qp-amount').value);
+      if (!amount || amount <= 0) { toast('กรอกยอดที่รับชำระ', 'error'); return; }
+      
+      const selectedBills = Array.from(document.querySelectorAll('.qp-bill:checked')).map(cb => ({
+        bill_no: cb.dataset.bill,
+        amount: Number(cb.dataset.amount),
+      }));
+      
+      if (selectedBills.length === 0) {
+        if (!confirm('ไม่ได้เลือกบิล — จะบันทึกเป็นยอดทั่วไป (ไม่ตัดบิลเฉพาะ)?')) return;
+      }
+      
+      toast('กำลังบันทึก...', 'info');
+      const res = await api('recordPayment', {
+        cust_id: selectedCustomer.cust_id,
+        amount: amount,
+        payment_date: document.getElementById('qp-paydate').value,
+        payment_method: document.getElementById('qp-method').value,
+        reference: document.getElementById('qp-ref').value,
+        bills_cleared: selectedBills,
+        note: document.getElementById('qp-note').value,
+        action_by: currentUser?.display_name || 'Admin',
+      });
+      
+      if (res.success) {
+        // สร้าง SP ชั่วคราวใน paymentList — รอ SP จริงมาแก้ทีหลัง
+        const tempSpNo = 'SP-TEMP-' + String(Date.now()).slice(-6);
+        paymentList.push({
+          sp_no: tempSpNo,
+          date: document.getElementById('qp-paydate').value,
+          cust_id: selectedCustomer.cust_id,
+          cust_name: selectedCustomer.cust_name,
+          amount: amount,
+          total: amount,
+          cash: document.getElementById('qp-method').value === 'Cash' ? amount : 0,
+          transfer: document.getElementById('qp-method').value === 'Transfer' ? amount : 0,
+          cheque: document.getElementById('qp-method').value === 'Cheque' ? amount : 0,
+          bills: selectedBills.map(b => ({ bill_no: b.bill_no, amount: b.amount, doc_type:'(Quick Payment)' })),
+          match_status: 'pending',
+          note: 'Quick Payment: ' + (document.getElementById('qp-note').value || ''),
+          reference: document.getElementById('qp-ref').value,
+          is_temp: true,
+        });
+        persistMainState();
+        
+        closeModal();
+        toast(`รับชำระสำเร็จ ฿${fmtNum(amount)} จาก ${selectedCustomer.cust_name} · สร้าง ${tempSpNo}`, 'success');
+        // re-render debt page
+        if (currentPage === 'debt') navigateTo('debt');
+      } else {
+        toast(res.error || 'บันทึกไม่สำเร็จ', 'error');
+      }
+    });
+  }
+  
+  renderStep1();
+}
+
+
+// ── Payment Modal (legacy - จากหน้า ติดตามหนี้ คลิกแต่ละราย) ──
 async function openPaymentModal(custId) {
   const res = await api('getArLedger', { cust_id: custId });
   const debtors = res.data || [];
@@ -3305,11 +3912,26 @@ async function renderMatching(el) {
         const stmtAmt = Number(stmt.amount) || 0;
         
         // หาบิล candidate: ยอดตรง/ใกล้เคียง + ยังไม่ match
-        const candidates = billList.filter(b => {
+        const cashflowCandidates = (cashflowList||[])
+          .filter(c => c.match_status !== 'matched')
+          .map(c => ({
+            bill_no: c.id,
+            amount: c.type === 'supplier' ? -Math.abs(c.amount) : c.amount,
+            date: c.date,
+            station: 'Cashflow (' + c.type + ')',
+            type: c.type === 'deposit' ? 'ฝากเงิน' : c.type === 'supplier' ? 'จ่าย Supplier' : c.type === 'transfer' ? 'โอน' : 'อื่นๆ',
+            remarks1: c.counterparty || c.from_account || c.to_account || '',
+            _cashflow: c,
+          }));
+        
+        const candidates = [...billList.filter(b => {
           if (b.match_status === 'matched' || b.match_status === 'paid') return false;
           const amtDiff = Math.abs(Number(b.amount) - stmtAmt);
-          return amtDiff < 1 || amtDiff < stmtAmt * 0.05; // ยอดตรง หรือต่างไม่เกิน 5%
-        });
+          return amtDiff < 1 || amtDiff < stmtAmt * 0.05;
+        }), ...cashflowCandidates.filter(c => {
+          const amtDiff = Math.abs(Number(c.amount) - stmtAmt);
+          return amtDiff < 1 || amtDiff < stmtAmt * 0.05;
+        })];
         // Sort: ยอดตรง + วันที่ใกล้ที่สุด
         candidates.sort((a, b) => {
           const aExact = Math.abs(Number(a.amount) - stmtAmt) < 0.01 ? 0 : 1;
@@ -3473,8 +4095,16 @@ async function renderMatching(el) {
       }
 
       // ── Fallback: Client-side match จากข้อมูลที่โหลดมาแล้ว (จับคู่โดย วันที่ + ยอด) ──
-      // รวมทั้ง billList (Main) และ uploadedSales
-      const allSales = [...(billList||[]), ...(uploadedSales||[])];
+      // รวมทั้ง billList (Main), uploadedSales, และ cashflowList (deposit/supplier/transfer)
+      const cashflowAsSales = (cashflowList||[]).map(c => ({
+        bill_no: c.id,
+        amount: c.type === 'supplier' ? -Math.abs(c.amount) : c.amount,
+        date: c.date,
+        station: 'Cashflow',
+        type: 'Transfer',
+        _cashflow: c, // reference back
+      }));
+      const allSales = [...(billList||[]), ...(uploadedSales||[]), ...cashflowAsSales];
       if (data.length > 0 && allSales.length > 0) {
         let clientMatched = 0;
         let skippedAlreadyMatched = 0;
@@ -3525,6 +4155,11 @@ async function renderMatching(el) {
             stmt.match_station = match.station || match.Station || '';
             stmt.match_bill = match.bill_no || match['Bill Number'] || '';
             stmt.matched_at = new Date().toISOString();
+            // ถ้า match กับ cashflow → mark cashflow ด้วย
+            if (match._cashflow) {
+              match._cashflow.match_status = 'matched';
+              match._cashflow.match_stmt_ref = stmt.ref_no || '';
+            }
             clientMatched++;
           }
         });
