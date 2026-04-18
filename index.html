@@ -1700,14 +1700,23 @@ async function renderMain(el) {
   }
 
   // ── คำนวณเงินสดในลิ้นชัก = รวมบิลที่ Type=Cash (จาก SS/OS/SP/SC/JS) ──
+  // สำหรับข้อมูลนำเข้าจาก JSON summary (ไม่มีบิล Cash แยก) → ใช้ค่าใน mainSummary['cashDrawer_*']
   function calcCashFromBills(station) {
-    return getBillsForSelectedDate().filter(b => {
+    // ลองดูบิล Cash ของวันที่เลือกก่อน
+    var fromBills = getBillsForSelectedDate().filter(b => {
       const st = (b.station || '').trim();
       const ty = (b.type || '').trim();
       const no = (b.bill_no || '').toUpperCase();
       const isTargetBill = no.startsWith('SS') || no.startsWith('OS') || no.startsWith('SP') || no.startsWith('SC') || no.startsWith('JS');
       return st === station && ty === 'Cash' && (isTargetBill || !no);
     }).reduce((s, b) => s + (Number(b.amount) || 0), 0);
+    
+    // ถ้ามีบิล Cash อยู่แล้ว ใช้ค่านั้น (user กรอกเอง/Generate Smart)
+    if (fromBills !== 0) return fromBills;
+    
+    // ไม่มีบิล Cash — อาจเป็นข้อมูลนำเข้าจาก JSON → ใช้ mainSummary['cashDrawer_*']
+    var fromSummary = Number(mainSummary['cashDrawer_' + station]) || 0;
+    return fromSummary;
   }
   function calcAutoValue(type, station) {
     return getBillsForSelectedDate().filter(b => {
@@ -2715,6 +2724,13 @@ async function renderMain(el) {
     document.getElementById('main-date')?.addEventListener('change', e => { 
       selectedDate = e.target.value; 
       invalidateBillsCache();  // ← clear cache when date changes
+      
+      // ── Clear summary keys เสมอก่อน (ไม่งั้นค่าจากวันก่อนหน้าจะค้าง) ──
+      Object.keys(mainSummary).forEach(k => {
+        if (k === '__byDate') return;
+        if (k.includes('_')) delete mainSummary[k];
+      });
+      
       // Load summary for this date if available
       if (mainSummary.__byDate && mainSummary.__byDate[selectedDate]) {
         const LABEL_MAP = {
@@ -2722,12 +2738,7 @@ async function renderMain(el) {
           'ยอดคืนสินค้า': 'returns', 'Cash Drawer': 'cashDrawer',
           'Transfer': 'transfer', 'Card': 'card', 'Cheque': 'cheque', 'Refund': 'refund',
         };
-        // Clear old summary keys first
-        Object.keys(mainSummary).forEach(k => {
-          if (k === '__byDate') return;
-          if (k.includes('_')) delete mainSummary[k];
-        });
-        // Set new
+        // Set new (cleared already above)
         const sum = mainSummary.__byDate[selectedDate];
         Object.entries(sum).forEach(([thLabel, stations]) => {
           const prefix = LABEL_MAP[thLabel];
@@ -2737,8 +2748,9 @@ async function renderMain(el) {
             if (val != null && val !== 0) mainSummary[prefix + '_' + st] = val;
           });
         });
-        render();
       }
+      // Render เสมอ (ทั้งกรณีมีและไม่มีข้อมูล — ให้ UI update แสดง "-" ถ้าว่าง)
+      render();
     });
 
     // Filter pills
