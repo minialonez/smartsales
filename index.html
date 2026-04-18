@@ -6672,6 +6672,77 @@ function showApp() {
   document.getElementById('sidebar-user').textContent = `${currentUser.display_name} (${currentUser.role})`;
   renderNav();
   navigateTo('main');
+  // โหลด meta data จาก backend (กันกรณีล้าง localStorage)
+  loadMetaFromBackend().catch(err => console.warn('loadMeta failed:', err));
+}
+
+// ── โหลด summary/cash_count/change ย้อนหลังจาก backend → merge เข้า mainSummary, cashCount ──
+// เรียกครั้งเดียวหลัง login (กันกรณี localStorage ถูกล้างแต่ backend ยังเก็บอยู่)
+async function loadMetaFromBackend() {
+  try {
+    // โหลดปีปัจจุบัน + ปีที่แล้ว (กันเวลาใช้ข้ามปี)
+    var now = new Date();
+    var years = [String(now.getFullYear()), String(now.getFullYear() - 1)];
+    
+    for (var y of years) {
+      var res = await api('getDailyMeta', { year: y });
+      if (!res || !res.success) continue;
+      var d = res.data || {};
+      
+      // ── Merge summary.__byDate (ไม่ override ของใน memory ถ้าไม่ว่าง) ──
+      if (d.summary && d.summary.__byDate) {
+        if (!mainSummary.__byDate) mainSummary.__byDate = {};
+        Object.keys(d.summary.__byDate).forEach(function(dateISO) {
+          // backend มี, local ยังไม่มี → copy
+          if (!mainSummary.__byDate[dateISO]) {
+            mainSummary.__byDate[dateISO] = d.summary.__byDate[dateISO];
+          }
+        });
+      }
+      
+      // ── Merge cash_count.__byDate ──
+      if (d.cash_count && d.cash_count.__byDate) {
+        if (!cashCount.__byDate) cashCount.__byDate = {};
+        Object.keys(d.cash_count.__byDate).forEach(function(dateISO) {
+          if (!cashCount.__byDate[dateISO]) {
+            cashCount.__byDate[dateISO] = d.cash_count.__byDate[dateISO];
+          } else {
+            // merge per-key (ของใน memory ชนะถ้ามี)
+            Object.keys(d.cash_count.__byDate[dateISO]).forEach(function(k) {
+              if (cashCount.__byDate[dateISO][k] == null) {
+                cashCount.__byDate[dateISO][k] = d.cash_count.__byDate[dateISO][k];
+              }
+            });
+          }
+        });
+      }
+      
+      // ── Merge change_data → cashCount (change data เก็บรวมกับ cash_count ได้) ──
+      if (d.change_data && typeof d.change_data === 'object') {
+        if (!cashCount.__byDate) cashCount.__byDate = {};
+        Object.entries(d.change_data).forEach(function([dateISO, stationData]) {
+          if (!cashCount.__byDate[dateISO]) cashCount.__byDate[dateISO] = {};
+          Object.entries(stationData || {}).forEach(function([station, denoms]) {
+            Object.entries(denoms || {}).forEach(function([denom, count]) {
+              var key = denom + '_' + station;
+              // Change data เป็นข้อมูลเตรียมทอน → ใส่ถ้ายังไม่มี
+              if (cashCount.__byDate[dateISO][key] == null) {
+                cashCount.__byDate[dateISO][key] = Number(count) || 0;
+              }
+            });
+          });
+        });
+      }
+    }
+    
+    persistMainState();
+    // Re-render ถ้าอยู่หน้า Main
+    if (typeof currentPage !== 'undefined' && currentPage === 'main') {
+      navigateTo('main');
+    }
+  } catch (err) {
+    console.warn('loadMetaFromBackend error:', err);
+  }
 }
 
 function renderNav() {
