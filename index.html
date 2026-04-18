@@ -2175,11 +2175,51 @@ async function renderMain(el) {
             billsAdded++;
           });
           
-          // ── Main Summary ──
+          // ── Main Summary — Store per-date + flatten for currently selected date ──
+          // Legacy keys: sales_Front1, cashIn_Front2 etc. (flat)
+          // New keys: dailySummaries[date] = full nested summary
           if (!mainSummary || typeof mainSummary !== 'object') mainSummary = {};
+          if (!mainSummary.__byDate) mainSummary.__byDate = {};
+          
+          // Map Thai labels → legacy key prefix
+          const LABEL_MAP = {
+            'นำเงินเข้า': 'cashIn',
+            'ยอดขาย': 'sales',
+            'นำเงินออก': 'cashOut',
+            'ยอดคืนสินค้า': 'returns',
+            'Cash Drawer': 'cashDrawer',
+            'Transfer': 'transfer',
+            'Card': 'card',
+            'Cheque': 'cheque',
+            'Refund': 'refund',
+          };
+          
+          let summaryDates = [];
           Object.entries(data.mainSummary || {}).forEach(([date, summary]) => {
-            mainSummary[date] = summary;
+            // Store full summary by date (for later switching)
+            mainSummary.__byDate[date] = summary;
+            summaryDates.push(date);
           });
+          
+          // Apply summary of most recent date as "active" (flat keys)
+          // so that Main page summary table shows numbers
+          if (summaryDates.length > 0) {
+            summaryDates.sort();
+            const activeDate = summaryDates[summaryDates.length - 1];
+            const activeSummary = mainSummary.__byDate[activeDate];
+            if (activeSummary) {
+              Object.entries(activeSummary).forEach(([thLabel, stations]) => {
+                const prefix = LABEL_MAP[thLabel];
+                if (!prefix) return;
+                ['Front1', 'Front2', 'Front3', 'Front4', 'Invoice', 'Order', 'Payment', 'Invoice Credit', 'Order Credit'].forEach(st => {
+                  const val = stations[st];
+                  if (val != null && val !== 0) {
+                    mainSummary[prefix + '_' + st] = val;
+                  }
+                });
+              });
+            }
+          }
           
           // ── Statements ──
           if (mode === 'replace') {
@@ -2427,7 +2467,33 @@ async function renderMain(el) {
       if (res.success) toast(`บันทึกสำเร็จ — ${billList.length} รายการ`, 'success');
       else toast(res.error || 'บันทึกไม่สำเร็จ', 'error');
     }
-    document.getElementById('main-date')?.addEventListener('change', e => { selectedDate = e.target.value; });
+    document.getElementById('main-date')?.addEventListener('change', e => { 
+      selectedDate = e.target.value; 
+      // Load summary for this date if available
+      if (mainSummary.__byDate && mainSummary.__byDate[selectedDate]) {
+        const LABEL_MAP = {
+          'นำเงินเข้า': 'cashIn', 'ยอดขาย': 'sales', 'นำเงินออก': 'cashOut',
+          'ยอดคืนสินค้า': 'returns', 'Cash Drawer': 'cashDrawer',
+          'Transfer': 'transfer', 'Card': 'card', 'Cheque': 'cheque', 'Refund': 'refund',
+        };
+        // Clear old summary keys first
+        Object.keys(mainSummary).forEach(k => {
+          if (k === '__byDate') return;
+          if (k.includes('_')) delete mainSummary[k];
+        });
+        // Set new
+        const sum = mainSummary.__byDate[selectedDate];
+        Object.entries(sum).forEach(([thLabel, stations]) => {
+          const prefix = LABEL_MAP[thLabel];
+          if (!prefix) return;
+          ['Front1', 'Front2', 'Front3', 'Front4', 'Invoice', 'Order', 'Payment', 'Invoice Credit', 'Order Credit'].forEach(st => {
+            const val = stations[st];
+            if (val != null && val !== 0) mainSummary[prefix + '_' + st] = val;
+          });
+        });
+        render();
+      }
+    });
 
     // Filter pills
     el.querySelectorAll('.pill[data-fs]').forEach(btn => {
