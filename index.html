@@ -358,18 +358,46 @@ function debounce(fn, ms = 300) {
   let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); };
 }
 
-// ── Excel File Parser ──
+// ── Excel / CSV File Parser ──
 function parseExcelFile(file) {
+  const name = (file.name || '').toLowerCase();
+  const isCsv = name.endsWith('.csv');
+  
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
+    
     reader.onload = (e) => {
       try {
+        if (isCsv) {
+          // CSV → ลองอ่านเป็น TIS-620 (CP874) ก่อน ถ้าเป็นไทย
+          const bytes = new Uint8Array(e.target.result);
+          let text = '';
+          try {
+            // ลอง TIS-620 ก่อน (สำหรับ BBL/KTB/KBANK export CSV)
+            text = new TextDecoder('tis-620').decode(bytes);
+            // ถ้ามี char UTF-8 BOM หรือ char แปลก → ใช้ UTF-8 แทน
+            if (text.charCodeAt(0) === 0xFEFF || /[\uFFFD]{3,}/.test(text.substring(0, 500))) {
+              text = new TextDecoder('utf-8').decode(bytes);
+            }
+          } catch (err) {
+            text = new TextDecoder('utf-8').decode(bytes);
+          }
+          // Parse CSV
+          const workbook = XLSX.read(text, { type: 'string', cellDates: false, raw: true });
+          const result = {};
+          workbook.SheetNames.forEach(nm => {
+            result[nm] = XLSX.utils.sheet_to_json(workbook.Sheets[nm], { header: 1, defval: '', raw: true });
+          });
+          resolve({ sheets: result, sheetNames: workbook.SheetNames, isCsv: true, rawText: text });
+          return;
+        }
+        
+        // Excel (.xls/.xlsx/.xlsm)
         const data = new Uint8Array(e.target.result);
         const workbook = XLSX.read(data, { type: 'array', cellDates: true, cellNF: false, cellText: false });
         const result = {};
-        workbook.SheetNames.forEach(name => {
-          // raw: true → ได้ Date object สำหรับ date cells (ไม่แปลงเป็น string)
-          result[name] = XLSX.utils.sheet_to_json(workbook.Sheets[name], { header: 1, defval: '', raw: true });
+        workbook.SheetNames.forEach(nm => {
+          result[nm] = XLSX.utils.sheet_to_json(workbook.Sheets[nm], { header: 1, defval: '', raw: true });
         });
         resolve({ sheets: result, sheetNames: workbook.SheetNames });
       } catch (err) {
@@ -408,15 +436,26 @@ function handleStmtUpload(result, fileName) {
   let bank = 'UNKNOWN';
   if (nameLC.includes('ktb') || nameLC.includes('กรุงไทย')) bank = 'KTB';
   else if (nameLC.includes('kbank') || nameLC.includes('kasikorn') || nameLC.includes('กสิกร')) bank = 'KBANK';
-  else if (nameLC.includes('bbl') || nameLC.includes('กรุงเทพ')) bank = 'BBL';
+  else if (nameLC.includes('bbl nw') || nameLC.includes('bblnw') || nameLC.includes('nwbbl')) bank = 'BBL NW';
+  else if (nameLC.includes('activity') || nameLC.includes('bbl') || nameLC.includes('กรุงเทพ')) bank = 'BBL';
 
   // ลอง auto-detect จากเนื้อหา
   const firstSheet = result.sheets[result.sheetNames[0]] || [];
-  for (const row of firstSheet.slice(0, 10)) {
-    const joined = row.join(' ').toLowerCase();
-    if (joined.includes('ktb') || joined.includes('กรุงไทย')) { bank = 'KTB'; break; }
-    if (joined.includes('kasikorn') || joined.includes('กสิกร') || joined.includes('k-deposit')) { bank = 'KBANK'; break; }
-    if (joined.includes('bbl') || joined.includes('กรุงเทพ') || joined.includes('bangkok bank')) { bank = 'BBL'; break; }
+  const contentJoin = firstSheet.slice(0, 15).map(r => (r||[]).join(' ')).join(' ');
+  const contentLC = contentJoin.toLowerCase();
+  
+  // BBL: เช็คเลขบัญชี 266-4-448384 (บริษัท) vs อื่นๆ (NW)
+  if (contentJoin.includes('266-4-448384')) {
+    bank = 'BBL'; // บัญชีบริษัท
+  } else if (contentJoin.includes('วันที่ทำรายการ') && contentJoin.includes('หักบัญชี')) {
+    // BBL CSV Activity format detected
+    if (bank === 'UNKNOWN') bank = 'BBL';
+  } else if (contentLC.includes('ktb') || contentJoin.includes('กรุงไทย')) {
+    bank = 'KTB';
+  } else if (contentLC.includes('kasikorn') || contentJoin.includes('กสิกร') || contentLC.includes('k-deposit')) {
+    bank = 'KBANK';
+  } else if (contentLC.includes('bbl') || contentJoin.includes('กรุงเทพ') || contentLC.includes('bangkok bank')) {
+    if (bank === 'UNKNOWN') bank = 'BBL';
   }
 
   // helper: แปลง date โดยตรวจจับ พ.ศ. พิเศษ
@@ -465,18 +504,81 @@ function handleStmtUpload(result, fileName) {
     }
   } else if (bank === 'BBL') {
     const sheet = firstSheet;
-    let hRow = 3;
-    for (let i = 0; i < Math.min(8, sheet.length); i++) {
-      if (sheet[i] && sheet[i].some(c => String(c).includes('วันที่') || String(c).includes('รายละเอียด'))) { hRow = i; break; }
+    
+    // ── Detect BBL format: "Activity" CSV vs Excel ──
+    // CSV Activity: วันที่ทำรายการ | วันที่มีผล | คำอธิบาย | หักบัญชี | เข้าบัญชี | ยอดคงเหลือ | ช่องทาง
+    // Excel: (ของเดิม - header row 4, cols different)
+    
+    let isCsvActivity = false;
+    let hRow = -1;
+    for (let i = 0; i < Math.min(10, sheet.length); i++) {
+      const joined = (sheet[i]||[]).join('|');
+      if (joined.includes('วันที่ทำรายการ') && joined.includes('หักบัญชี') && joined.includes('เข้าบัญชี')) {
+        hRow = i; isCsvActivity = true; break;
+      }
     }
-    for (let i = hRow + 1; i < sheet.length; i++) {
-      const r = sheet[i];
-      const dateVal = r[1];
-      const credit = Number(r[4]) || 0;
-      const debit = Number(r[3]) || 0;
-      if (!dateVal || (!credit && !debit)) continue;
-      if (String(r[2]||'').includes('ยอดรวม') || String(r[0]||'').includes('หมายเหตุ')) continue;
-      rows.push({ bank, date: convertDate(dateVal), time: extractTimeStr(dateVal), ref_no: String(r[7]||''), description: String(r[2]||''), amount: credit || -debit, match_status: 'unmatched', match_station: '', match_bill: '' });
+    
+    if (isCsvActivity) {
+      // BBL CSV Activity export
+      for (let i = hRow + 1; i < sheet.length; i++) {
+        const r = sheet[i];
+        if (!r || !r[0]) continue;
+        const dateStr = String(r[0]||'').trim();
+        if (!dateStr) continue;
+        // Parse date: "17 เม.ย. 2569 03:20"
+        const dateMatch = dateStr.match(/^(\d{1,2})\s+(\S+)\s+(\d{4})(?:\s+(\d{1,2}:\d{2}))?/);
+        let isoDate = '';
+        let timeStr = '';
+        if (dateMatch) {
+          const [, day, monthTh, year, time] = dateMatch;
+          const thMonths = {'ม.ค.':'01','ก.พ.':'02','มี.ค.':'03','เม.ย.':'04','พ.ค.':'05','มิ.ย.':'06','ก.ค.':'07','ส.ค.':'08','ก.ย.':'09','ต.ค.':'10','พ.ย.':'11','ธ.ค.':'12'};
+          const mo = thMonths[monthTh] || '01';
+          let y = Number(year);
+          if (y > 2400) y -= 543; // พ.ศ. → ค.ศ.
+          isoDate = `${y}-${mo}-${String(day).padStart(2,'0')}`;
+          timeStr = time || '';
+        } else {
+          isoDate = convertDate(dateStr);
+        }
+        
+        const description = String(r[2]||'').trim();
+        const debit = Number(String(r[3]||'').replace(/,/g,'')) || 0;  // หักบัญชี (ออก)
+        const credit = Number(String(r[4]||'').replace(/,/g,'')) || 0; // เข้าบัญชี
+        const balance = String(r[5]||'');
+        const channel = String(r[6]||'');
+        
+        if (!credit && !debit) continue;
+        // ข้ามหัวข้อพวก "ยอดเงินคงเหลือ" ที่อยู่ด้านบน
+        if (description.includes('คงเหลือ') || description.includes('เลขที่บัญชี')) continue;
+        
+        rows.push({
+          bank,
+          date: isoDate,
+          time: timeStr,
+          ref_no: channel, // BBL CSV ไม่มี ref ตรงๆ ใช้ช่องทางแทน
+          description: description,
+          amount: credit || -debit, // บวก = รับ, ลบ = จ่าย
+          balance: balance,
+          match_status: 'unmatched',
+          match_station: '',
+          match_bill: '',
+        });
+      }
+    } else {
+      // BBL Excel format (ของเดิม)
+      hRow = 3;
+      for (let i = 0; i < Math.min(8, sheet.length); i++) {
+        if (sheet[i] && sheet[i].some(c => String(c).includes('วันที่') || String(c).includes('รายละเอียด'))) { hRow = i; break; }
+      }
+      for (let i = hRow + 1; i < sheet.length; i++) {
+        const r = sheet[i];
+        const dateVal = r[1];
+        const credit = Number(r[4]) || 0;
+        const debit = Number(r[3]) || 0;
+        if (!dateVal || (!credit && !debit)) continue;
+        if (String(r[2]||'').includes('ยอดรวม') || String(r[0]||'').includes('หมายเหตุ')) continue;
+        rows.push({ bank, date: convertDate(dateVal), time: extractTimeStr(dateVal), ref_no: String(r[7]||''), description: String(r[2]||''), amount: credit || -debit, match_status: 'unmatched', match_station: '', match_bill: '' });
+      }
     }
   } else {
     // Unknown format — ลองอ่าน sheet แรกเป็น generic
@@ -505,7 +607,7 @@ function handleStmtUpload(result, fileName) {
 }
 
 // ── Statement Storage by Bank (สะสมได้ + แยกธนาคาร) ──
-let statementsByBank = { KTB: [], KBANK: [], BBL: [], UNKNOWN: [] };
+let statementsByBank = { KTB: [], KBANK: [], 'BBL NW': [], BBL: [], UNKNOWN: [] };
 
 function addStatementRows(bank, rows) {
   if (!statementsByBank[bank]) statementsByBank[bank] = [];
@@ -551,7 +653,7 @@ function getAllStatements() {
 
 function clearStatementsByBank(bank) {
   if (bank === 'ALL') {
-    statementsByBank = { KTB: [], KBANK: [], BBL: [], UNKNOWN: [] };
+    statementsByBank = { KTB: [], KBANK: [], 'BBL NW': [], BBL: [], UNKNOWN: [] };
   } else {
     statementsByBank[bank] = [];
   }
@@ -2404,16 +2506,40 @@ async function renderPayments(el) {
 }
 
 // ══════════════════════════════════════════════════════════════
-// Render Cashflow Page (เงินเข้าออก: Deposit, Withdrawal, Supplier, Transfer)
+// Business Rules (บจก. จงกลณีฯ)
+//   VAT:   KTB (รับลูกหนี้ VAT)  ←→  KBANK (จ่ายเจ้าหนี้ VAT)
+//   NOVAT: BBL NW (รับ-จ่าย NOVAT)
+//   BBL:   บัญชีบริษัท (Statement)
+// ══════════════════════════════════════════════════════════════
+const BANK_ACCOUNTS = {
+  KTB:      { label:'KTB · รับโอนลูกหนี้ VAT',  vat:'VAT',   flow:['receive'] },
+  KBANK:    { label:'KBANK · จ่ายเจ้าหนี้ VAT', vat:'VAT',   flow:['pay','receive'] },
+  'BBL NW': { label:'BBL NW · รับ-จ่าย NOVAT',  vat:'NOVAT', flow:['receive','pay'] },
+  BBL:      { label:'BBL · บัญชีบริษัท',         vat:'MIXED', flow:['receive','pay'] },
+};
+
+function getAllowedBanks(vat, direction) {
+  return Object.keys(BANK_ACCOUNTS).filter(k => {
+    const b = BANK_ACCOUNTS[k];
+    if (vat && vat !== 'MIXED' && b.vat !== vat && b.vat !== 'MIXED') return false;
+    if (direction && !b.flow.includes(direction)) return false;
+    return true;
+  });
+}
+
+// ══════════════════════════════════════════════════════════════
+// Render Cashflow Page (เงินเข้าออก: Deposit, Supplier, Transfer)
 // ══════════════════════════════════════════════════════════════
 async function renderCashflow(el) {
   let filterType = 'ALL';
+  let filterVat = 'ALL';
   let filterDateFrom = '';
   let filterDateTo = '';
 
   function render() {
     let data = [...cashflowList];
     if (filterType !== 'ALL') data = data.filter(c => c.type === filterType);
+    if (filterVat !== 'ALL') data = data.filter(c => c.vat === filterVat);
     if (filterDateFrom || filterDateTo) {
       data = data.filter(c => {
         const d = toISODate(c.date);
@@ -2466,12 +2592,19 @@ async function renderCashflow(el) {
       </div>
 
       <!-- Filters -->
-      <div class="flex gap-2 mb-3 flex-wrap items-center">
+      <div class="flex gap-2 mb-2 flex-wrap items-center">
+        <span class="text-xs text-dim">ประเภท:</span>
         <button class="pill ${filterType==='ALL'?'active':''}" data-ft="ALL">ทั้งหมด (${cashflowList.length})</button>
         <button class="pill ${filterType==='deposit'?'active':''}" data-ft="deposit" style="--pill-color:var(--success)">🏦 ฝาก</button>
         <button class="pill ${filterType==='supplier'?'active':''}" data-ft="supplier" style="--pill-color:var(--danger)">🏭 Supplier</button>
         <button class="pill ${filterType==='transfer'?'active':''}" data-ft="transfer" style="--pill-color:var(--info)">🔄 โอน</button>
         <button class="pill ${filterType==='misc'?'active':''}" data-ft="misc" style="--pill-color:var(--warn)">💫 อื่นๆ</button>
+      </div>
+      <div class="flex gap-2 mb-3 flex-wrap items-center">
+        <span class="text-xs text-dim">VAT:</span>
+        <button class="pill ${filterVat==='ALL'?'active':''}" data-fv="ALL">ทั้งหมด</button>
+        <button class="pill ${filterVat==='VAT'?'active':''}" data-fv="VAT" style="--pill-color:#4f9cf9">VAT (KTB/KBANK)</button>
+        <button class="pill ${filterVat==='NOVAT'?'active':''}" data-fv="NOVAT" style="--pill-color:#8e44ad">NOVAT (BBL NW)</button>
         <span style="flex:1"></span>
         <input type="date" class="input" id="cf-date-from" value="${filterDateFrom}" style="width:140px;font-size:.8rem" placeholder="จาก">
         <input type="date" class="input" id="cf-date-to" value="${filterDateTo}" style="width:140px;font-size:.8rem" placeholder="ถึง">
@@ -2486,6 +2619,7 @@ async function renderCashflow(el) {
                 <th style="width:40px">#</th>
                 <th>วันที่</th>
                 <th>ประเภท</th>
+                <th style="text-align:center">VAT</th>
                 <th style="text-align:right">ยอดเงิน</th>
                 <th>จาก / ไป</th>
                 <th>ธนาคาร</th>
@@ -2497,18 +2631,19 @@ async function renderCashflow(el) {
             </thead>
             <tbody>
               ${data.length === 0 ? 
-                `<tr><td colspan="10" style="text-align:center;padding:40px;color:var(--text3)">
+                `<tr><td colspan="11" style="text-align:center;padding:40px;color:var(--text3)">
                   ยังไม่มีรายการ — กดปุ่มด้านบนเพื่อเพิ่ม<br>
                   <span class="text-xs">เช่น "🏦 นำเงินฝากธนาคาร" หลังปิดยอดทุกวัน</span>
                 </td></tr>` :
                 data.map((c, idx) => {
                   const typeInfo = {
-                    deposit:   { label:'🏦 ฝาก', color:'var(--success)', dir:'เงินสด → บัญชี' },
-                    supplier:  { label:'🏭 Supplier', color:'var(--danger)', dir:'บัญชี → Supplier' },
-                    transfer:  { label:'🔄 โอน', color:'var(--info)', dir:'บัญชี ↔ บัญชี' },
-                    misc:      { label:'💫 อื่นๆ', color:'var(--warn)', dir:'-' },
-                  }[c.type] || { label:c.type, color:'var(--text2)', dir:'-' };
+                    deposit:   { label:'🏦 ฝาก', color:'var(--success)' },
+                    supplier:  { label:'🏭 Supplier', color:'var(--danger)' },
+                    transfer:  { label:'🔄 โอน', color:'var(--info)' },
+                    misc:      { label:'💫 อื่นๆ', color:'var(--warn)' },
+                  }[c.type] || { label:c.type, color:'var(--text2)' };
                   
+                  const vatColor = c.vat === 'VAT' ? '#4f9cf9' : c.vat === 'NOVAT' ? '#8e44ad' : 'var(--text3)';
                   const realIdx = cashflowList.indexOf(c);
                   const isMatched = c.match_status === 'matched';
                   const rowStyle = isMatched ? 'background:rgba(45,212,160,.06)' : '';
@@ -2517,6 +2652,7 @@ async function renderCashflow(el) {
                     <td class="text-xs text-muted">${idx+1}</td>
                     <td class="text-xs">${fmtDate(c.date)}</td>
                     <td><span class="badge" style="background:${typeInfo.color}22;color:${typeInfo.color}">${typeInfo.label}</span></td>
+                    <td style="text-align:center"><span class="badge" style="background:${vatColor}22;color:${vatColor};font-size:.75rem;font-weight:700">${c.vat||'-'}</span></td>
                     <td style="text-align:right;font-weight:700;color:${typeInfo.color}">
                       ${c.type==='supplier'?'-':''}฿${fmtNum(c.amount||0)}
                     </td>
@@ -2549,6 +2685,9 @@ async function renderCashflow(el) {
     // Filter handlers
     el.querySelectorAll('.pill[data-ft]').forEach(btn => {
       btn.addEventListener('click', () => { filterType = btn.dataset.ft; render(); });
+    });
+    el.querySelectorAll('.pill[data-fv]').forEach(btn => {
+      btn.addEventListener('click', () => { filterVat = btn.dataset.fv; render(); });
     });
     document.getElementById('cf-date-from')?.addEventListener('change', e => { filterDateFrom = e.target.value; render(); });
     document.getElementById('cf-date-to')?.addEventListener('change', e => { filterDateTo = e.target.value; render(); });
@@ -2591,32 +2730,77 @@ async function renderCashflow(el) {
     const existing = editIdx !== undefined ? cashflowList[editIdx] : null;
     const isEdit = !!existing;
     
-    const config = {
+    // VAT/NOVAT ที่เลือก (ถ้าแก้ไขเอาของเดิม, ถ้าใหม่ default VAT)
+    let selectedVat = existing?.vat || (type === 'deposit' ? 'VAT' : 'VAT');
+    
+    const typeConfig = {
       deposit:  { title:'🏦 นำเงินฝากธนาคาร', color:'var(--success)', 
         desc:'บันทึกเงินสดที่เอาไปฝากเข้าบัญชีธนาคาร',
-        fromLabel:'เงินสดจาก Station', fromPlaceholder:'เช่น Front1, Front2, รวมทุกโต๊ะ',
-        toLabel:'ฝากเข้าบัญชี', toPlaceholder:'เลขบัญชีหรือชื่อบัญชี',
-        showCounterparty: false },
-      supplier: { title:'🏭 จ่าย Supplier', color:'var(--danger)',
-        desc:'บันทึกเงินโอนจ่าย Supplier / ค่าใช้จ่าย',
-        fromLabel:'โอนจากบัญชี', fromPlaceholder:'เช่น KTB / KBANK',
-        toLabel:'โอนไปบัญชี Supplier', toPlaceholder:'บัญชีผู้รับ (ถ้ามี)',
-        showCounterparty: true, counterpartyLabel:'ชื่อ Supplier' },
-      transfer: { title:'🔄 โอนระหว่างบัญชี', color:'var(--info)',
-        desc:'โอนเงินระหว่างบัญชีของตัวเอง (จะเกิด 2 รายการใน Statement: โอนออก + โอนเข้า)',
-        fromLabel:'จากบัญชี', fromPlaceholder:'KTB / KBANK / BBL',
-        toLabel:'ไปบัญชี', toPlaceholder:'KTB / KBANK / BBL',
-        showCounterparty: false },
+        showFrom:true, fromLabel:'เงินสดจาก Station', fromPlaceholder:'Front1, Front2, รวมทุกโต๊ะ',
+        showTo:true, toLabel:'ฝากเข้าบัญชี', 
+        showCounterparty:false, bankDirection:'receive' },
+      supplier: { title:'🏭 จ่ายเจ้าหนี้ (Supplier)', color:'var(--danger)',
+        desc:'โอนจ่าย Supplier · VAT: จาก KBANK | NOVAT: จาก BBL NW',
+        showFrom:true, fromLabel:'โอนจากบัญชี (บริษัท)', fromPlaceholder:'',
+        showTo:true, toLabel:'บัญชี Supplier ปลายทาง', toPlaceholder:'เลขบัญชี Supplier',
+        showCounterparty:true, counterpartyLabel:'ชื่อ Supplier / เจ้าหนี้', bankDirection:'pay' },
+      transfer: { title:'🔄 โอนระหว่างบัญชี (บริษัท)', color:'var(--info)',
+        desc:'โอนเงินระหว่างบัญชีบริษัท · กรณี VAT ปกติ: KTB → KBANK เมื่อเงินไม่พอ',
+        showFrom:true, fromLabel:'จากบัญชี', fromPlaceholder:'',
+        showTo:true, toLabel:'ไปบัญชี', toPlaceholder:'',
+        showCounterparty:false, bankDirection:null },
       misc:     { title:'💫 รายการอื่นๆ', color:'var(--warn)',
-        desc:'เช่น ดอกเบี้ยรับ, ค่าธรรมเนียม, เงินมัดจำลูกค้า, อื่นๆ',
-        fromLabel:'จาก', fromPlaceholder:'-',
-        toLabel:'ไป', toPlaceholder:'-',
-        showCounterparty: true, counterpartyLabel:'คู่กรณี' },
+        desc:'ดอกเบี้ยรับ · ค่าธรรมเนียม · มัดจำลูกค้า · อื่นๆ',
+        showFrom:true, fromLabel:'จาก', fromPlaceholder:'-',
+        showTo:true, toLabel:'ไป', toPlaceholder:'-',
+        showCounterparty:true, counterpartyLabel:'คู่กรณี', bankDirection:null },
     }[type];
 
-    openModal(config.title, `
+    function renderBankOptions(vat, dir) {
+      const allowed = getAllowedBanks(vat, dir);
+      const options = [{val:'', label:'— เลือกบัญชี —'}].concat(
+        allowed.map(k => ({ val:k, label:BANK_ACCOUNTS[k].label }))
+      );
+      return options.map(o => 
+        `<option value="${o.val}" ${existing?.bank===o.val?'selected':''}>${o.label}</option>`
+      ).join('');
+    }
+    
+    // คำแนะนำ Business Rules
+    function getRuleHint(vat, type) {
+      if (type === 'supplier') {
+        return vat === 'VAT' 
+          ? '💡 จ่ายเจ้าหนี้ VAT → โอนจาก <strong>KBANK</strong> เท่านั้น'
+          : '💡 จ่ายเจ้าหนี้ NOVAT → โอนจาก <strong>BBL NW</strong> เท่านั้น';
+      }
+      if (type === 'deposit') {
+        return vat === 'VAT'
+          ? '💡 ฝาก VAT → บัญชี <strong>KTB</strong> (รับลูกหนี้ VAT)'
+          : '💡 ฝาก NOVAT → บัญชี <strong>BBL NW</strong> (รับลูกหนี้ NOVAT)';
+      }
+      if (type === 'transfer' && vat === 'VAT') {
+        return '💡 โอนภายใน VAT ปกติ: <strong>KTB → KBANK</strong> (เมื่อ KBANK เงินไม่พอจ่าย Supplier)';
+      }
+      return '';
+    }
+
+    openModal(typeConfig.title, `
       <div class="flex-col gap-3">
-        <p class="text-sm text-dim" style="padding:8px 12px;background:${config.color}15;border-radius:6px">${config.desc}</p>
+        <p class="text-sm text-dim" style="padding:8px 12px;background:${typeConfig.color}15;border-radius:6px">${typeConfig.desc}</p>
+        
+        <!-- VAT / NOVAT Selector -->
+        <div class="input-group">
+          <label>ประเภทการโอน *</label>
+          <div class="flex gap-2">
+            <button type="button" class="btn ${selectedVat==='VAT'?'btn-primary':'btn-outline'} btn-sm flex-1 cf-vat-btn" data-vat="VAT" style="${selectedVat==='VAT'?'background:#4f9cf9;color:#fff':''}">
+              🔵 VAT <span class="text-xs" style="opacity:.7">(KTB / KBANK)</span>
+            </button>
+            <button type="button" class="btn ${selectedVat==='NOVAT'?'btn-primary':'btn-outline'} btn-sm flex-1 cf-vat-btn" data-vat="NOVAT" style="${selectedVat==='NOVAT'?'background:#8e44ad;color:#fff':''}">
+              🟣 NOVAT <span class="text-xs" style="opacity:.7">(BBL NW)</span>
+            </button>
+          </div>
+          <div id="cf-rule-hint" class="text-xs" style="margin-top:6px;color:var(--info);padding:6px 10px;background:rgba(79,156,249,.08);border-radius:6px"></div>
+        </div>
         
         <div class="flex gap-2">
           <div class="input-group flex-1">
@@ -2629,29 +2813,35 @@ async function renderCashflow(el) {
           </div>
         </div>
 
-        <div class="flex gap-2">
-          <div class="input-group flex-1">
-            <label>${config.fromLabel}</label>
-            <input class="input" id="cf-from" value="${existing?.from_account||''}" placeholder="${config.fromPlaceholder}">
+        ${typeConfig.showFrom || typeConfig.showTo ? `
+          <div class="flex gap-2">
+            ${typeConfig.showFrom ? `
+              <div class="input-group flex-1">
+                <label>${typeConfig.fromLabel}</label>
+                <input class="input" id="cf-from" value="${existing?.from_account||''}" placeholder="${typeConfig.fromPlaceholder}">
+              </div>
+            ` : ''}
+            ${typeConfig.showTo ? `
+              <div class="input-group flex-1">
+                <label>${typeConfig.toLabel}</label>
+                <input class="input" id="cf-to" value="${existing?.to_account||''}" placeholder="${typeConfig.toPlaceholder||''}">
+              </div>
+            ` : ''}
           </div>
-          <div class="input-group flex-1">
-            <label>${config.toLabel}</label>
-            <input class="input" id="cf-to" value="${existing?.to_account||''}" placeholder="${config.toPlaceholder}">
-          </div>
-        </div>
+        ` : ''}
 
-        ${config.showCounterparty ? `
+        ${typeConfig.showCounterparty ? `
           <div class="input-group">
-            <label>${config.counterpartyLabel}</label>
+            <label>${typeConfig.counterpartyLabel}</label>
             <input class="input" id="cf-counterparty" value="${existing?.counterparty||''}" placeholder="ชื่อ / บริษัท">
           </div>
         ` : ''}
 
         <div class="flex gap-2">
           <div class="input-group flex-1">
-            <label>ธนาคาร (ที่เงินเคลื่อน)</label>
+            <label>บัญชีบริษัท *</label>
             <select class="select" id="cf-bank">
-              ${['','KTB','KBANK','BBL','SCB','BAY','TMB','Other'].map(b=>`<option value="${b}" ${existing?.bank===b?'selected':''}>${b||'-'}</option>`).join('')}
+              ${renderBankOptions(selectedVat, typeConfig.bankDirection)}
             </select>
           </div>
           <div class="input-group flex-1">
@@ -2667,26 +2857,63 @@ async function renderCashflow(el) {
 
         <div class="flex gap-2 mt-2">
           <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ยกเลิก</button>
-          <button class="btn btn-primary btn-sm flex-1" id="cf-save" style="background:${config.color};color:#fff">
+          <button class="btn btn-primary btn-sm flex-1" id="cf-save" style="background:${typeConfig.color};color:#fff">
             ${ICONS.check} ${isEdit?'อัปเดต':'บันทึก'}
           </button>
         </div>
       </div>
     `);
-
+    
+    // VAT/NOVAT button toggle → update bank dropdown
+    function updateModalState() {
+      document.querySelectorAll('.cf-vat-btn').forEach(btn => {
+        const isActive = btn.dataset.vat === selectedVat;
+        btn.classList.toggle('btn-primary', isActive);
+        btn.classList.toggle('btn-outline', !isActive);
+        if (isActive) {
+          btn.style.background = selectedVat === 'VAT' ? '#4f9cf9' : '#8e44ad';
+          btn.style.color = '#fff';
+        } else {
+          btn.style.background = '';
+          btn.style.color = '';
+        }
+      });
+      const bankSelect = document.getElementById('cf-bank');
+      if (bankSelect) bankSelect.innerHTML = renderBankOptions(selectedVat, typeConfig.bankDirection);
+      const hint = document.getElementById('cf-rule-hint');
+      if (hint) hint.innerHTML = getRuleHint(selectedVat, type);
+    }
+    updateModalState();
+    
+    document.querySelectorAll('.cf-vat-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        selectedVat = btn.dataset.vat;
+        updateModalState();
+      });
+    });
+    
     document.getElementById('cf-save')?.addEventListener('click', () => {
       const amount = Number(document.getElementById('cf-amount').value);
       if (!amount || amount <= 0) { toast('กรอกยอดเงิน', 'error'); return; }
+      const bank = document.getElementById('cf-bank').value;
+      if (!bank) { toast('เลือกบัญชีบริษัท', 'error'); return; }
+      
+      // Validate rules
+      const bankDef = BANK_ACCOUNTS[bank];
+      if (bankDef && bankDef.vat !== 'MIXED' && bankDef.vat !== selectedVat) {
+        if (!confirm(`⚠️ บัญชี ${bank} เป็นประเภท ${bankDef.vat} แต่คุณเลือก ${selectedVat}\nยืนยันว่าต้องการบันทึกแบบนี้?`)) return;
+      }
       
       const record = {
         id: existing?.id || ('CF-' + Date.now()),
         date: document.getElementById('cf-date').value || todayISO(),
         type: type,
+        vat: selectedVat, // VAT | NOVAT
         amount: amount,
-        from_account: document.getElementById('cf-from').value,
-        to_account: document.getElementById('cf-to').value,
-        counterparty: config.showCounterparty ? document.getElementById('cf-counterparty')?.value || '' : '',
-        bank: document.getElementById('cf-bank').value,
+        from_account: document.getElementById('cf-from')?.value || '',
+        to_account: document.getElementById('cf-to')?.value || '',
+        counterparty: typeConfig.showCounterparty ? document.getElementById('cf-counterparty')?.value || '' : '',
+        bank: bank,
         reference: document.getElementById('cf-ref').value,
         note: document.getElementById('cf-note').value,
         match_status: existing?.match_status || 'pending',
@@ -4115,7 +4342,7 @@ async function renderSales(el) {
 // ── Matching ────────────────────────────────────────────────
 async function renderMatching(el) {
   let bankFilter = 'ALL', matchDate = todayISO();
-  const bankColors = { KTB:'#00a4e4', KBANK:'#138f2d', BBL:'#1e3a7b' };
+  const bankColors = { KTB:'#00a4e4', KBANK:'#138f2d', 'BBL NW':'#ff7b00', BBL:'#1e3a7b' };
 
   async function render() {
     const res = await api('getStatements', { date: formatDateKey(matchDate), bank: bankFilter });
@@ -4133,6 +4360,7 @@ async function renderMatching(el) {
     const bankCounts = {
       KTB: (statementsByBank.KTB || []).length,
       KBANK: (statementsByBank.KBANK || []).length,
+      'BBL NW': (statementsByBank['BBL NW'] || []).length,
       BBL: (statementsByBank.BBL || []).length,
     };
 
@@ -4150,11 +4378,11 @@ async function renderMatching(el) {
       </div>
       <div class="flex justify-between items-center mb-3">
         <div class="flex gap-2 flex-wrap items-center">
-          ${['ALL','KTB','KBANK','BBL'].map(b => {
-            const count = b === 'ALL' ? (bankCounts.KTB+bankCounts.KBANK+bankCounts.BBL) : bankCounts[b] || 0;
+          ${['ALL','KTB','KBANK','BBL NW','BBL'].map(b => {
+            const count = b === 'ALL' ? (bankCounts.KTB+bankCounts.KBANK+(bankCounts['BBL NW']||0)+bankCounts.BBL) : bankCounts[b] || 0;
             return `<button class="pill ${bankFilter===b?'active':''}" data-bank="${b}" ${b!=='ALL'?`style="--pill-color:${bankColors[b]}"`:''}>${b}${count?` <span style="opacity:.7">(${count})</span>`:''}</button>`;
           }).join('')}
-          ${(bankCounts.KTB+bankCounts.KBANK+bankCounts.BBL) > 0 ? '<button class="btn btn-ghost btn-sm" id="btn-clear-stmts" style="color:var(--danger)">✕ ล้าง Statement</button>' : ''}
+          ${(bankCounts.KTB+bankCounts.KBANK+(bankCounts['BBL NW']||0)+bankCounts.BBL) > 0 ? '<button class="btn btn-ghost btn-sm" id="btn-clear-stmts" style="color:var(--danger)">✕ ล้าง Statement</button>' : ''}
         </div>
         <button class="btn btn-ghost btn-sm">${ICONS.file} ดู Match Log</button>
       </div>
