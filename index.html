@@ -2219,7 +2219,7 @@ async function renderMain(el) {
             </div>
             
             <div class="input-group">
-              <label><input type="checkbox" id="di-skip-dup" checked> ข้ามบิลซ้ำ (bill_no ซ้ำ)</label>
+              <label><input type="checkbox" id="di-skip-dup" checked> ข้ามบิลซ้ำ (bill_no + type + ยอด ตรงกัน)</label>
               <label><input type="checkbox" id="di-skip-stmt-dup" checked> ข้าม statement ซ้ำ (ref + date + amount)</label>
             </div>
             
@@ -2250,11 +2250,15 @@ async function renderMain(el) {
           if (mode === 'replace') {
             billList = [];
           }
-          const existingBillSet = skipDup ? new Set(billList.filter(b => b.bill_no).map(b => b.bill_no)) : null;
+          // Composite dedup key: bill_no + type + amount (เก็บ split payment ได้)
+          // เลขบิลเดียวกันที่จ่ายคนละ method/ยอดจะไม่ถูกมองว่าซ้ำ
+          const makeDupKey = (b) => `${b.bill_no||''}|${b.type||b.pay_method||''}|${Number(b.amount)||0}`;
+          const existingBillSet = skipDup ? new Set(billList.filter(b => b.bill_no).map(makeDupKey)) : null;
           
           data.billList.forEach(b => {
-            // Skip dup by bill_no
-            if (skipDup && b.bill_no && existingBillSet.has(b.bill_no)) {
+            // Skip dup by composite key (bill_no เปล่าจะผ่านเสมอ เพราะไม่มี bill_no ให้ dedup)
+            const dupKey = makeDupKey(b);
+            if (skipDup && b.bill_no && existingBillSet.has(dupKey)) {
               billsSkipped++;
               return;
             }
@@ -2275,7 +2279,7 @@ async function renderMain(el) {
               source_file: b.source_file || '',
             };
             billList.push(newBill);
-            if (b.bill_no && existingBillSet) existingBillSet.add(b.bill_no);
+            if (b.bill_no && existingBillSet) existingBillSet.add(dupKey);
             billsAdded++;
           });
           
