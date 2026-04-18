@@ -2566,83 +2566,122 @@ async function renderMain(el) {
     async function actuallySaveMain() {
       const CHUNK_SIZE = 500; // รายการต่อ chunk (ลด URL/body size + หลีกเลี่ยง 6-min timeout)
       
-      // ── 1. บันทึก Bills (แบ่ง chunk ถ้า > 500) ──
+      // ── 1. บันทึก Bills — group ตามวันที่ก่อน แล้วส่งแยก daily_YYYYMMDD ──
       const bills = Array.isArray(billList) ? billList : [];
       const totalBills = bills.length;
-      let savedBills = 0;
       
       if (totalBills === 0) {
         toast('ไม่มีบิลให้บันทึก', 'warn');
         return;
       }
       
-      toast(`กำลังบันทึก ${totalBills} บิล...`, 'info');
+      // Helper: แปลงวันที่รูปแบบต่างๆ เป็น YYYYMMDD
+      function billDateToKey(val) {
+        if (!val) return '';
+        var str = String(val).trim();
+        // dd/mm/yyyy (อาจมี พ.ศ.)
+        var m1 = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+        if (m1) {
+          var y = Number(m1[3]); if (y > 2400) y -= 543;
+          return String(y) + String(m1[2]).padStart(2,'0') + String(m1[1]).padStart(2,'0');
+        }
+        // yyyy-mm-dd
+        var m2 = str.match(/^(\d{4})-(\d{2})-(\d{2})/);
+        if (m2) {
+          var y2 = Number(m2[1]); if (y2 > 2400) y2 -= 543;
+          return String(y2) + m2[2] + m2[3];
+        }
+        // yyyymmdd
+        if (/^\d{8}$/.test(str)) return str;
+        return '';
+      }
       
+      // Group bills by date key
+      var billsByDate = {};
+      var billsNoDate = [];
+      bills.forEach(function(b) {
+        var key = billDateToKey(b.date);
+        if (!key) {
+          billsNoDate.push(b);
+          return;
+        }
+        if (!billsByDate[key]) billsByDate[key] = [];
+        billsByDate[key].push(b);
+      });
+      
+      // บิลไม่มีวันที่ → ใส่ในวันที่เลือก (fallback)
+      if (billsNoDate.length > 0) {
+        var fallbackKey = formatDateKey(selectedDate);
+        if (!billsByDate[fallbackKey]) billsByDate[fallbackKey] = [];
+        billsByDate[fallbackKey] = billsByDate[fallbackKey].concat(billsNoDate);
+      }
+      
+      var dateKeys = Object.keys(billsByDate).sort();
+      toast('กำลังบันทึก ' + totalBills + ' บิล (' + dateKeys.length + ' วัน)...', 'info');
+      
+      var savedBills = 0;
       try {
-        for (let i = 0; i < totalBills; i += CHUNK_SIZE) {
-          const chunk = bills.slice(i, i + CHUNK_SIZE);
-          const res = await api('saveDailySales', {
-            date: formatDateKey(selectedDate),
-            rows: chunk,
-            // ส่ง summary + cash_count เฉพาะ chunk แรก (กันเขียนทับ)
-            summary: i === 0 ? mainSummary : undefined,
-            cash_count: i === 0 ? cashCount : undefined,
-            created_by: currentUser?.display_name || 'Admin',
-          });
-          if (!res || !res.success) {
-            toast(`บันทึกบิลล้มเหลวที่ chunk ${Math.floor(i/CHUNK_SIZE)+1}: ${res?.error||''}`, 'error');
-            return;
-          }
-          savedBills += chunk.length;
-          if (totalBills > CHUNK_SIZE) {
-            toast(`กำลังบันทึก... ${savedBills}/${totalBills} บิล`, 'info');
+        for (var di = 0; di < dateKeys.length; di++) {
+          var dateKey = dateKeys[di];
+          var billsOfDate = billsByDate[dateKey];
+          for (var ci = 0; ci < billsOfDate.length; ci += CHUNK_SIZE) {
+            var chunk = billsOfDate.slice(ci, ci + CHUNK_SIZE);
+            var res = await api('saveDailySales', {
+              date: dateKey,
+              rows: chunk,
+              // ส่ง summary + cash_count เฉพาะเมื่อเป็นวันที่เลือก + chunk แรก
+              summary: (dateKey === formatDateKey(selectedDate) && ci === 0) ? mainSummary : undefined,
+              cash_count: (dateKey === formatDateKey(selectedDate) && ci === 0) ? cashCount : undefined,
+              created_by: currentUser?.display_name || 'Admin',
+            });
+            if (!res || !res.success) {
+              toast('บันทึกบิลล้มเหลวที่วัน ' + dateKey + ': ' + (res?.error||''), 'error');
+              return;
+            }
+            savedBills += chunk.length;
+            if (totalBills > CHUNK_SIZE) {
+              toast('กำลังบันทึก... ' + savedBills + '/' + totalBills + ' บิล', 'info');
+            }
           }
         }
         
         // ── 2. บันทึก Statements (ทั้ง 3 ธนาคาร) — ใหม่ ที่ยังไม่เคยทำ ──
-        const allStmts = typeof getAllStatements === 'function' ? getAllStatements() : [];
+        var allStmts = typeof getAllStatements === 'function' ? getAllStatements() : [];
         if (allStmts.length > 0) {
           // Group by date เพื่อเก็บลง stmt_YYYYMMDD
-          const byDate = {};
-          allStmts.forEach(s => {
-            const dateKey = (s.date || '').replace(/-/g, '').replace(/\//g, '');
-            // รองรับ YYYYMMDD หรือ dd/mm/yyyy → YYYYMMDD
-            let key = '';
-            if (/^\d{8}$/.test(dateKey)) key = dateKey;
-            else if (/^\d{2}\d{2}\d{4}$/.test(dateKey)) {
-              // ddmmyyyy → yyyymmdd
-              key = dateKey.slice(4) + dateKey.slice(2, 4) + dateKey.slice(0, 2);
-            }
+          var byDateStmt = {};
+          allStmts.forEach(function(s) {
+            var key = billDateToKey(s.date);
             if (!key) return;
-            if (!byDate[key]) byDate[key] = [];
-            byDate[key].push(s);
+            if (!byDateStmt[key]) byDateStmt[key] = [];
+            byDateStmt[key].push(s);
           });
           
-          const dateKeys = Object.keys(byDate);
-          let savedStmts = 0;
-          const totalStmts = allStmts.length;
-          toast(`กำลังบันทึก Statement ${totalStmts} รายการ (${dateKeys.length} วัน)...`, 'info');
+          var stmtDateKeys = Object.keys(byDateStmt).sort();
+          var savedStmts = 0;
+          var totalStmts = allStmts.length;
+          toast('กำลังบันทึก Statement ' + totalStmts + ' รายการ (' + stmtDateKeys.length + ' วัน)...', 'info');
           
-          for (const dateKey of dateKeys) {
-            const stmtsOfDate = byDate[dateKey];
-            // Chunk per date too
-            for (let i = 0; i < stmtsOfDate.length; i += CHUNK_SIZE) {
-              const chunk = stmtsOfDate.slice(i, i + CHUNK_SIZE);
-              const res = await api('saveStatements', {
-                date: dateKey,
-                rows: chunk,
+          for (var si = 0; si < stmtDateKeys.length; si++) {
+            var sDateKey = stmtDateKeys[si];
+            var stmtsOfDate = byDateStmt[sDateKey];
+            for (var i = 0; i < stmtsOfDate.length; i += CHUNK_SIZE) {
+              var sChunk = stmtsOfDate.slice(i, i + CHUNK_SIZE);
+              var sRes = await api('saveStatements', {
+                date: sDateKey,
+                rows: sChunk,
               });
-              if (!res || !res.success) {
-                toast(`บันทึก Statement วันที่ ${dateKey} ล้มเหลว: ${res?.error||''}`, 'error');
+              if (!sRes || !sRes.success) {
+                toast('บันทึก Statement วัน ' + sDateKey + ' ล้มเหลว: ' + (sRes?.error||''), 'error');
                 return;
               }
-              savedStmts += chunk.length;
+              savedStmts += sChunk.length;
             }
           }
           
-          toast(`✅ บันทึกสำเร็จ — ${savedBills} บิล + ${savedStmts} statements`, 'success', 5000);
+          toast('✅ บันทึกสำเร็จ — ' + savedBills + ' บิล (' + dateKeys.length + ' วัน) + ' + savedStmts + ' statements', 'success', 5000);
         } else {
-          toast(`✅ บันทึกสำเร็จ — ${savedBills} บิล`, 'success');
+          toast('✅ บันทึกสำเร็จ — ' + savedBills + ' บิล (' + dateKeys.length + ' วัน)', 'success');
         }
       } catch (err) {
         console.error('Save error:', err);
