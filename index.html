@@ -487,12 +487,74 @@ function handleStmtUpload(result, fileName) {
     }
   }
 
-  uploadedStatements = rows;
-  const bhMsg = buddhistCount > 0 ? ` (แปลง พ.ศ.→ค.ศ. ${buddhistCount} รายการ)` : '';
-  toast(`อ่าน Statement ${bank} สำเร็จ — ${rows.length} รายการ${bhMsg}`, 'success');
+  // เก็บแยกธนาคาร + เรียงตามวันที่
+  const { added, skipped } = addStatementRows(bank, rows);
+  
+  // Backward compat: uploadedStatements = รวมทุกธนาคารที่ sort แล้ว
+  uploadedStatements = getAllStatements();
+  
+  // Persist
+  try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(e) {}
+  
+  const bhMsg = buddhistCount > 0 ? ` · แปลง พ.ศ.→ค.ศ. ${buddhistCount} รายการ` : '';
+  const dupMsg = skipped > 0 ? ` · ข้าม ${skipped} ซ้ำ` : '';
+  toast(`อ่าน Statement ${bank} สำเร็จ — เพิ่ม ${added} รายการ${dupMsg}${bhMsg}`, 'success');
 
   // Re-render matching page with uploaded data
   if (currentPage === 'matching') navigateTo('matching');
+}
+
+// ── Statement Storage by Bank (สะสมได้ + แยกธนาคาร) ──
+let statementsByBank = { KTB: [], KBANK: [], BBL: [], UNKNOWN: [] };
+
+function addStatementRows(bank, rows) {
+  if (!statementsByBank[bank]) statementsByBank[bank] = [];
+  
+  // Dedup key = bank + date + amount + ref_no + description
+  // ถ้าซ้ำกัน → skip ของใหม่ คงของเก่าไว้ (ซึ่งอาจ matched แล้ว)
+  const existingKeys = new Set(statementsByBank[bank].map(r => `${r.date}|${r.amount}|${r.ref_no}|${r.description}`));
+  const uniqueRows = rows.filter(r => {
+    const key = `${r.date}|${r.amount}|${r.ref_no}|${r.description}`;
+    return !existingKeys.has(key);
+  });
+  
+  statementsByBank[bank] = statementsByBank[bank].concat(uniqueRows);
+  
+  // Sort ASC by date
+  statementsByBank[bank].sort((a, b) => {
+    const da = parseThaiDate(a.date);
+    const db = parseThaiDate(b.date);
+    return (da || 0) - (db || 0);
+  });
+  
+  return { added: uniqueRows.length, skipped: rows.length - uniqueRows.length };
+}
+
+function parseThaiDate(s) {
+  if (!s) return 0;
+  if (s instanceof Date) return s.getTime();
+  const m = String(s).match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+  if (!m) return 0;
+  let y = Number(m[3]); if (y > 2400) y -= 543;
+  return new Date(y, Number(m[2])-1, Number(m[1])).getTime();
+}
+
+function getAllStatements() {
+  // รวมทุกธนาคาร + เรียงตามวันที่
+  const all = [];
+  Object.keys(statementsByBank).forEach(bank => {
+    all.push(...statementsByBank[bank]);
+  });
+  all.sort((a, b) => (parseThaiDate(a.date) || 0) - (parseThaiDate(b.date) || 0));
+  return all;
+}
+
+function clearStatementsByBank(bank) {
+  if (bank === 'ALL') {
+    statementsByBank = { KTB: [], KBANK: [], BBL: [], UNKNOWN: [] };
+  } else {
+    statementsByBank[bank] = [];
+  }
 }
 
 // ── Sales Import Handler ──
@@ -510,6 +572,215 @@ function persistMainState() {
   } catch (e) { console.warn('Could not persist:', e); }
 }
 
+// ══════════════════════════════════════════════════════════════
+// VALIDATION SYSTEM — ตรวจสอบความสมบูรณ์ของข้อมูล
+// Levels:
+//   'error'   → ห้ามบันทึก (bug ข้อมูล)
+//   'warn'    → เตือน แต่บันทึกได้ (ต้องยืนยัน)
+//   'info'    → แค่แจ้ง
+// ══════════════════════════════════════════════════════════════
+function validateBill(b, idx, allBills) {
+  const issues = [];
+  const billNo = b.bill_no || `(แถว ${idx+1})`;
+  
+  // ── ERRORS (ห้ามบันทึก) ──
+  if (!b.date) {
+    issues.push({ level:'error', billIdx:idx, field:'date', msg:`${billNo}: ไม่มีวันที่` });
+  }
+  if (!b.amount || Number(b.amount) === 0) {
+    issues.push({ level:'error', billIdx:idx, field:'amount', msg:`${billNo}: ยอดเงินเป็น 0` });
+  }
+  
+  // ── WARNINGS ──
+  if (b.type === '' || b.type === undefined || b.type === null) {
+    // POS บิลขายสดไม่ต้องเตือน Type (auto-fill ไว้แล้ว)
+    if (b.source !== 'pos' && !['Invoice Credit', 'Order Credit'].includes(b.station)) {
+      issues.push({ level:'warn', billIdx:idx, field:'type', msg:`${billNo}: ยังไม่ได้เลือก Type` });
+    }
+  }
+  if (b.type === 'Transfer' && !b.bank) {
+    issues.push({ level:'warn', billIdx:idx, field:'bank', msg:`${billNo}: Type=Transfer แต่ยังไม่ได้เลือก Bank` });
+  }
+  if (b.type === 'Cheque' && !b.expected_clear_date && b.match_status !== 'matched' && b.match_status !== 'bounced') {
+    issues.push({ level:'warn', billIdx:idx, field:'expected_clear_date', msg:`${billNo}: Type=Cheque แต่ไม่มีวันที่คาดว่าเช็คเข้า` });
+  }
+  if ((b.station === 'Invoice Credit' || b.station === 'Order Credit') && !b.due_date) {
+    issues.push({ level:'warn', billIdx:idx, field:'due_date', msg:`${billNo}: บิลเครดิตแต่ยังไม่มี Due Date` });
+  }
+  
+  return issues;
+}
+
+function findDuplicateBills() {
+  // หาบิลที่เลขบิลซ้ำกัน (ยกเว้นเลขว่าง)
+  const byBillNo = {};
+  billList.forEach((b, i) => {
+    const no = (b.bill_no || '').trim();
+    if (!no || no.startsWith('MANUAL-')) return;
+    if (!byBillNo[no]) byBillNo[no] = [];
+    byBillNo[no].push(i);
+  });
+  
+  const dupes = [];
+  Object.keys(byBillNo).forEach(no => {
+    if (byBillNo[no].length > 1) {
+      dupes.push({
+        bill_no: no,
+        indices: byBillNo[no],
+        count: byBillNo[no].length,
+      });
+    }
+  });
+  return dupes;
+}
+
+function findSimilarBills() {
+  // หาบิลที่น่าสงสัย: วันเดียวกัน + ยอดเดียวกัน + station เดียวกัน (เลขบิลต่าง)
+  const groups = {};
+  billList.forEach((b, i) => {
+    const key = `${toISODate(b.date)}|${Number(b.amount)}|${b.station}|${b.type}`;
+    if (!groups[key]) groups[key] = [];
+    groups[key].push(i);
+  });
+  
+  const suspicious = [];
+  Object.keys(groups).forEach(key => {
+    if (groups[key].length > 1) {
+      const bills = groups[key].map(i => billList[i]);
+      const bn = bills.map(b => b.bill_no).filter(Boolean);
+      // ถ้าเลขบิลต่างกัน = น่าสงสัย
+      if (new Set(bn).size > 1) {
+        suspicious.push({ key, indices: groups[key], bills });
+      }
+    }
+  });
+  return suspicious;
+}
+
+function validateAll() {
+  const issues = [];
+  const errors = [];
+  const warnings = [];
+  
+  // ── ตรวจทีละบิล ──
+  billList.forEach((b, i) => {
+    const billIssues = validateBill(b, i, billList);
+    billIssues.forEach(iss => {
+      if (iss.level === 'error') errors.push(iss);
+      else warnings.push(iss);
+    });
+  });
+  
+  // ── บิลซ้ำ ──
+  const dupes = findDuplicateBills();
+  dupes.forEach(d => {
+    errors.push({
+      level: 'error',
+      category: 'duplicate',
+      msg: `เลขบิลซ้ำ: ${d.bill_no} (${d.count} รายการ ที่แถว ${d.indices.map(i=>i+1).join(', ')})`,
+      billIdx: d.indices[0],
+    });
+  });
+  
+  // ── บิลน่าสงสัย (วัน+ยอด+station ตรง) ──
+  const similar = findSimilarBills();
+  similar.forEach(s => {
+    warnings.push({
+      level: 'warn',
+      category: 'similar',
+      msg: `น่าสงสัย — ${s.bills.length} บิล วันเดียวกัน ยอดเดียวกัน station เดียวกัน: ${s.bills.map(b=>b.bill_no||'(ว่าง)').join(', ')}`,
+      billIdx: s.indices[0],
+    });
+  });
+  
+  // ── SP ชั่วคราวที่ยังไม่แก้ ──
+  const tempSPs = paymentList.filter(p => /^SP-TEMP-/.test(p.sp_no));
+  if (tempSPs.length > 0) {
+    warnings.push({
+      level: 'warn',
+      category: 'temp_sp',
+      msg: `มี SP ชั่วคราว ${tempSPs.length} รายการ ที่ยังไม่แก้เป็นเลข SP จริง (${tempSPs.map(p=>p.sp_no).slice(0,3).join(', ')}${tempSPs.length>3?'...':''})`,
+    });
+  }
+  
+  // ── SP ยอดไม่ตรงกับบิลที่ตัด ──
+  paymentList.forEach(p => {
+    if (p.is_temp || !p.bills || p.bills.length === 0) return;
+    const childSum = p.bills.reduce((s, b) => s + Number(b.amount || 0), 0);
+    if (Math.abs(childSum - Number(p.total||0)) > 1) {
+      errors.push({
+        level: 'error',
+        category: 'sp_mismatch',
+        msg: `${p.sp_no}: ยอดรวมบิลที่ตัด (฿${fmtNum(childSum)}) ≠ ยอด SP (฿${fmtNum(p.total)})`,
+      });
+    }
+  });
+  
+  // ── เช็คเลยวันที่คาด ──
+  const today = todayISO();
+  const chequesOverdue = billList.filter(b => 
+    b.type === 'Cheque' && b.expected_clear_date && toISODate(b.expected_clear_date) < today &&
+    b.match_status !== 'matched' && b.match_status !== 'bounced'
+  );
+  if (chequesOverdue.length > 0) {
+    warnings.push({
+      level: 'warn',
+      category: 'cheque_overdue',
+      msg: `มีเช็ค ${chequesOverdue.length} ฉบับเลยวันที่คาดว่าเข้าแล้ว — ตรวจสอบว่าเข้าหรือเด้ง`,
+    });
+  }
+  
+  return { errors, warnings, hasIssues: errors.length > 0 || warnings.length > 0 };
+}
+
+function showValidationModal(validation, onContinue) {
+  const { errors, warnings } = validation;
+  
+  if (errors.length === 0 && warnings.length === 0) {
+    // สมบูรณ์ทั้งหมด
+    if (onContinue) onContinue();
+    return;
+  }
+  
+  const html = `
+    <div class="flex-col gap-3">
+      ${errors.length > 0 ? `
+        <div style="padding:12px;background:rgba(239,87,87,.12);border-radius:8px;border-left:3px solid var(--danger)">
+          <div class="font-semi" style="color:var(--danger);margin-bottom:8px">🚨 ข้อผิดพลาด ${errors.length} รายการ (ต้องแก้ไขก่อนบันทึก)</div>
+          <div style="max-height:200px;overflow-y:auto">
+            ${errors.map(e => `<div class="text-sm" style="padding:4px 0;border-bottom:1px solid var(--border)">• ${e.msg}</div>`).join('')}
+          </div>
+        </div>
+      ` : ''}
+      ${warnings.length > 0 ? `
+        <div style="padding:12px;background:rgba(245,166,35,.10);border-radius:8px;border-left:3px solid var(--warn)">
+          <div class="font-semi" style="color:var(--warn);margin-bottom:8px">⚠️ คำเตือน ${warnings.length} รายการ</div>
+          <div style="max-height:200px;overflow-y:auto">
+            ${warnings.map(w => `<div class="text-sm" style="padding:4px 0;border-bottom:1px solid var(--border)">• ${w.msg}</div>`).join('')}
+          </div>
+        </div>
+      ` : ''}
+      <div class="flex gap-2 mt-2">
+        <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">${errors.length?'ปิด':'ยกเลิก'}</button>
+        ${errors.length === 0 && onContinue ? `<button class="btn btn-warn btn-sm flex-1" id="val-continue" style="background:var(--warn);color:#fff">${ICONS.check} ยืนยันบันทึก (ยังมีคำเตือน)</button>` : ''}
+        ${errors.length > 0 ? '<div class="text-xs text-muted" style="align-self:center;flex:1;text-align:center">แก้ไข error ก่อนจะบันทึกได้</div>' : ''}
+      </div>
+    </div>
+  `;
+  
+  const title = errors.length > 0 
+    ? '❌ พบปัญหาที่ต้องแก้ไข' 
+    : '⚠️ ตรวจสอบก่อนบันทึก';
+  openModal(title, html);
+  
+  if (errors.length === 0 && onContinue) {
+    document.getElementById('val-continue')?.addEventListener('click', () => {
+      closeModal();
+      onContinue();
+    });
+  }
+}
+
 function restoreMainState() {
   try {
     const savedBills = safeStorage.get('sf_billList');
@@ -520,6 +791,11 @@ function restoreMainState() {
     if (savedCash) Object.assign(cashCount, JSON.parse(savedCash));
     const savedPay = safeStorage.get('sf_paymentList');
     if (savedPay) paymentList = JSON.parse(savedPay);
+    const savedStmts = safeStorage.get('sf_statementsByBank');
+    if (savedStmts) {
+      statementsByBank = JSON.parse(savedStmts);
+      uploadedStatements = getAllStatements();
+    }
   } catch (e) { console.warn('Could not restore state:', e); }
 }
 
@@ -926,7 +1202,17 @@ function generateBillList(result, fileName) {
   const duplicateCount = newBills.length - uniqueNewBills.length;
   billList = billList.concat(uniqueNewBills);
   persistMainState();
-  toast(`Generate สำเร็จ — ${uniqueNewBills.length} รายการใหม่${duplicateCount ? ` (ข้าม ${duplicateCount} ที่ซ้ำ)` : ''}`, 'success');
+  
+  // ── ตรวจสอบบิลซ้ำหลัง import ──
+  const dupes = findDuplicateBills();
+  
+  let msg = `Generate สำเร็จ — ${uniqueNewBills.length} รายการใหม่`;
+  if (duplicateCount > 0) msg += ` (ข้าม ${duplicateCount} ที่ซ้ำ)`;
+  toast(msg, 'success');
+  
+  if (dupes.length > 0) {
+    setTimeout(() => toast(`⚠️ พบบิลซ้ำ ${dupes.length} กลุ่ม — กด "🔍 ตรวจสอบ" เพื่อดูรายละเอียด`, 'warn'), 800);
+  }
 
   if (currentPage === 'main' || currentPage === 'billlist') navigateTo('main');
 }
@@ -1111,9 +1397,22 @@ async function renderMain(el) {
           <button class="btn btn-primary btn-sm" id="btn-gen-smart">${ICONS.download} Smart (SS/OS/OR/SR)</button>
           <button class="btn btn-info btn-sm" id="btn-import-pos" style="background:var(--info);color:#fff">${ICONS.download} Front POS</button>
           <button class="btn ${showChange?'btn-primary':'btn-outline'} btn-sm" id="btn-toggle-change">🪙 นับธนบัตร</button>
+          <button class="btn btn-outline btn-sm" id="btn-check-issues">🔍 ตรวจสอบ</button>
           <button class="btn btn-success btn-sm" id="btn-save-main">${ICONS.check} บันทึก</button>
         </div>
       </div>
+      
+      ${(() => {
+        const v = validateAll();
+        if (v.errors.length === 0 && v.warnings.length === 0) {
+          return `<div class="text-xs" style="padding:8px 12px;background:rgba(45,212,160,.08);border-radius:6px;color:var(--success);margin-bottom:12px">✓ ข้อมูลสมบูรณ์ พร้อมบันทึก</div>`;
+        }
+        return `<div class="text-xs" style="padding:8px 12px;background:${v.errors.length?'rgba(239,87,87,.08)':'rgba(245,166,35,.08)'};border-radius:6px;color:${v.errors.length?'var(--danger)':'var(--warn)'};margin-bottom:12px;cursor:pointer" id="val-status-bar">
+          ${v.errors.length > 0 ? `🚨 ${v.errors.length} ข้อผิดพลาด` : ''}
+          ${v.warnings.length > 0 ? `${v.errors.length?' · ':''}⚠️ ${v.warnings.length} คำเตือน` : ''}
+          · <span style="text-decoration:underline">คลิกเพื่อดูรายละเอียด</span>
+        </div>`;
+      })()}
 
       <!-- ═══════ SECTION 1: Summary Table (ส่วนบน) ═══════ -->
       <div class="card-flat mb-3">
@@ -1297,18 +1596,60 @@ async function renderMain(el) {
                 <th>Remarks2</th>
                 <th>Bank</th>
                 <th>Due Date</th>
+                <th>เช็ครอเคลียร์</th>
               </tr>
             </thead>
             <tbody>
-              ${data.length === 0 ? '<tr><td colspan="12" style="text-align:center;padding:40px;color:var(--text3)">ยังไม่มีข้อมูล — กด "Generate จาก Smart" เพื่อเริ่มต้น</td></tr>' :
-                data.map((b, idx) => {
+              ${data.length === 0 ? '<tr><td colspan="13" style="text-align:center;padding:40px;color:var(--text3)">ยังไม่มีข้อมูล — กด "Generate จาก Smart" เพื่อเริ่มต้น</td></tr>' :
+                (() => {
+                  // หา bill_no ที่ซ้ำ
+                  const billNoCounts = {};
+                  billList.forEach(b => {
+                    const no = (b.bill_no||'').trim();
+                    if (no && !no.startsWith('MANUAL-')) billNoCounts[no] = (billNoCounts[no]||0) + 1;
+                  });
+                  const dupeBillNos = new Set(Object.keys(billNoCounts).filter(n => billNoCounts[n] > 1));
+                  
+                  return data.map((b, idx) => {
                   const realIdx = billList.indexOf(b);
                   const badgeCls = b.source==='smart'?'badge-success':b.source==='pos'?'badge-info':'badge-warn';
                   const badgeText = b.source==='smart'?'Smart':b.source==='pos'?'POS':b.source==='manual'?'Manual':'Summary';
-                  const isPaid = b.match_status === 'paid';
-                  const rowStyle = isPaid ? 'background:rgba(45,212,160,.08);opacity:.85' : '';
+                  
+                  // ── Row status (สีไฮไลต์ตามสถานะ) ──
+                  const isPaid = b.match_status === 'paid' || b.match_status === 'matched';
+                  const isAwaitingClear = b.match_status === 'awaiting_clear' || (b.type === 'Cheque' && b.match_status !== 'matched' && b.match_status !== 'bounced');
+                  const isBounced = b.match_status === 'bounced';
+                  const isPendingMatch = !isPaid && !isAwaitingClear && !isBounced && 
+                    (b.type === 'Transfer' || b.type === 'Card') &&
+                    b.station !== 'Invoice Credit' && b.station !== 'Order Credit';
+                  const isDuplicate = b.bill_no && dupeBillNos.has(b.bill_no);
+                  const isMissingAmount = !b.amount || Number(b.amount) === 0;
+                  
+                  let rowStyle = '';
+                  let statusBadge = '';
+                  
+                  if (isDuplicate) {
+                    rowStyle = 'background:rgba(239,87,87,.15);border-left:4px solid var(--danger);outline:1px solid var(--danger)';
+                    statusBadge = `<br><span class="badge badge-danger" style="margin-top:2px">🔁 เลขซ้ำ</span>`;
+                  } else if (isMissingAmount) {
+                    rowStyle = 'background:rgba(239,87,87,.15);border-left:4px solid var(--danger)';
+                    statusBadge = `<br><span class="badge badge-danger" style="margin-top:2px">❌ ยอด=0</span>`;
+                  } else if (isPaid) {
+                    rowStyle = 'background:rgba(45,212,160,.08)';
+                    statusBadge = `<br><span class="badge badge-success" style="margin-top:2px" title="จ่ายแล้วโดย ${b.paid_by_sp||''}">✓ ${b.paid_by_sp?'จ่ายแล้ว':'Matched'}</span>`;
+                  } else if (isBounced) {
+                    rowStyle = 'background:rgba(239,87,87,.12);border-left:3px solid var(--danger)';
+                    statusBadge = `<br><span class="badge badge-danger" style="margin-top:2px">🚫 เช็คเด้ง</span>`;
+                  } else if (isAwaitingClear) {
+                    rowStyle = 'background:rgba(245,166,35,.10);border-left:3px solid var(--warn)';
+                    statusBadge = `<br><span class="badge badge-warn" style="margin-top:2px" title="เช็ครอเคลียร์">⏳ รอเช็คเข้า</span>`;
+                  } else if (isPendingMatch) {
+                    rowStyle = 'background:rgba(245,166,35,.05);border-left:3px solid rgba(245,166,35,.5)';
+                    statusBadge = `<br><span class="badge badge-warn" style="margin-top:2px;opacity:.8">⏳ รอ Match</span>`;
+                  }
+                  
                   return `<tr data-idx="${realIdx}" style="${rowStyle}">
-                    <td class="text-xs text-muted">${idx+1} <span class="badge ${badgeCls}" style="margin-left:4px">${badgeText}</span>${isPaid?'<br><span class="badge badge-success" style="margin-top:2px" title="จ่ายแล้วโดย '+(b.paid_by_sp||'')+'">✓ จ่ายแล้ว</span>':''}</td>
+                    <td class="text-xs text-muted">${idx+1} <span class="badge ${badgeCls}" style="margin-left:4px">${badgeText}</span>${statusBadge}</td>
                     <td style="font-weight:600;color:var(--text)">${b.bill_no||'-'}${isPaid&&b.paid_by_sp?`<br><span class="text-xs" style="color:var(--success)">← ${b.paid_by_sp}</span>`:''}</td>
                     <td style="position:relative"><input type="date" class="input bl-cell" data-field="date" value="${toISODate(b.date)}" style="padding:3px 6px;font-size:.78rem;width:130px">
                       <button class="btn-copy-down" data-idx="${realIdx}" data-field="date" title="คัดลอกลงทุกแถวที่เหลือ (Ctrl+↓)" style="background:none;border:1px solid var(--border);color:var(--text2);padding:0 6px;margin-left:2px;border-radius:4px;cursor:pointer;font-size:.75rem">⬇️</button>
@@ -1346,8 +1687,15 @@ async function renderMain(el) {
                       <input type="date" class="input bl-cell" data-field="due_date" value="${toISODate(b.due_date)}" style="padding:3px 6px;font-size:.78rem;width:130px">
                       <button class="btn-copy-down" data-idx="${realIdx}" data-field="due_date" title="คัดลอกลงทุกแถว" style="background:none;border:1px solid var(--border);color:var(--text2);padding:0 4px;margin-left:2px;border-radius:4px;cursor:pointer;font-size:.75rem">⬇️</button>
                     </td>
+                    ${b.type === 'Cheque' ? `
+                      <td style="white-space:nowrap">
+                        <input type="date" class="input bl-cell" data-field="expected_clear_date" value="${toISODate(b.expected_clear_date)}" title="วันที่เช็คคาดว่าจะเข้า" style="padding:3px 6px;font-size:.78rem;width:130px">
+                        ${!isPaid && !isBounced ? `<button class="btn btn-ghost btn-sm btn-bounce-cheque" data-idx="${realIdx}" title="เช็คเด้ง" style="margin-left:2px;color:var(--danger);font-size:.75rem">🚫</button>` : ''}
+                      </td>
+                    ` : '<td></td>'}
                   </tr>`;
                 }).join('')
+                })()
               }
             </tbody>
           </table>
@@ -1574,7 +1922,41 @@ async function renderMain(el) {
       toast(`ตั้ง Due Date อัตโนมัติ ${count} รายการ (วันที่ 20 ของเดือนถัดไป)`, 'success');
       render();
     });
+    // ── Check issues button (เปิด modal validation) ──
+    document.getElementById('btn-check-issues')?.addEventListener('click', () => {
+      const v = validateAll();
+      if (v.errors.length === 0 && v.warnings.length === 0) {
+        toast('✓ ไม่พบปัญหาใดๆ ข้อมูลสมบูรณ์', 'success');
+      } else {
+        showValidationModal(v, null);
+      }
+    });
+    document.getElementById('val-status-bar')?.addEventListener('click', () => {
+      document.getElementById('btn-check-issues')?.click();
+    });
+    
     document.getElementById('btn-save-main')?.addEventListener('click', async () => {
+      // ── Pre-save validation ──
+      const v = validateAll();
+      
+      if (v.errors.length > 0) {
+        showValidationModal(v, null);
+        return; // ห้ามบันทึก
+      }
+      
+      if (v.warnings.length > 0) {
+        // มีคำเตือน → ถามก่อน
+        showValidationModal(v, async () => {
+          await actuallySaveMain();
+        });
+        return;
+      }
+      
+      // ไม่มีปัญหา → save เลย
+      await actuallySaveMain();
+    });
+    
+    async function actuallySaveMain() {
       toast('กำลังบันทึก...', 'info');
       const res = await api('saveDailySales', {
         date: formatDateKey(selectedDate),
@@ -1585,7 +1967,7 @@ async function renderMain(el) {
       });
       if (res.success) toast(`บันทึกสำเร็จ — ${billList.length} รายการ`, 'success');
       else toast(res.error || 'บันทึกไม่สำเร็จ', 'error');
-    });
+    }
     document.getElementById('main-date')?.addEventListener('change', e => { selectedDate = e.target.value; });
 
     // Filter pills
@@ -1663,6 +2045,22 @@ async function renderMain(el) {
         });
         persistMainState();
         toast(`คัดลอกลง ${count} แถว`, 'success');
+        render();
+      });
+    });
+    
+    // ── Cheque bounce button ──
+    el.querySelectorAll('.btn-bounce-cheque').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const idx = Number(btn.dataset.idx);
+        const b = billList[idx];
+        if (!b) return;
+        if (!confirm(`บันทึกว่าเช็ค ${b.bill_no||'บิลนี้'} เด้ง?\nยอด: ฿${fmtNum(b.amount)}`)) return;
+        b.match_status = 'bounced';
+        b.bounced_at = new Date().toISOString();
+        persistMainState();
+        toast('บันทึกเช็คเด้งแล้ว', 'error');
         render();
       });
     });
@@ -2274,6 +2672,22 @@ async function renderDashboard(el) {
   const stations = sales.by_station || {};
   const maxStation = Math.max(...Object.values(stations), 1);
   const alerts = d.recent_alerts || [];
+  
+  // ── คำนวณ Unmatched Summary จากข้อมูล client ──
+  const today = todayISO();
+  const unmatchedBillsTransfer = billList.filter(b => 
+    (b.type === 'Transfer' || b.type === 'Card') && 
+    b.match_status !== 'matched' && b.match_status !== 'paid' &&
+    b.station !== 'Invoice Credit' && b.station !== 'Order Credit'
+  );
+  const chequesAwaitingClear = billList.filter(b => 
+    b.type === 'Cheque' && 
+    b.match_status !== 'matched' && b.match_status !== 'bounced' && b.match_status !== 'paid'
+  );
+  const chequesOverdue = chequesAwaitingClear.filter(b => b.expected_clear_date && toISODate(b.expected_clear_date) < today);
+  const unmatchedStmts = getAllStatements().filter(s => s.match_status !== 'matched');
+  
+  const totalUnmatched = unmatchedBillsTransfer.length + chequesAwaitingClear.length + unmatchedStmts.length;
 
   el.innerHTML = `
     <div class="page-title">แดชบอร์ด</div>
@@ -2284,6 +2698,52 @@ async function renderDashboard(el) {
       ${statCard('ยอดขายวันนี้', '฿'+fmtNum(sales.total||0), (sales.count||0)+' รายการ', 'var(--success)', ICONS.dollar)}
       ${statCard('Matched', (matching.matched||0)+'/'+(matching.total||0), 'รายการ', 'var(--info)', ICONS.pulse)}
     </div>
+    
+    ${totalUnmatched > 0 ? `
+      <!-- Unmatched Summary (การ์ดเตือน) -->
+      <div class="card mb-4" style="border-left:4px solid var(--warn)">
+        <div class="flex justify-between items-center mb-3">
+          <div class="font-semi">⚠️ รายการที่ต้องติดตาม</div>
+          <span class="badge badge-warn">${totalUnmatched} รายการ</span>
+        </div>
+        <div class="flex gap-3 flex-wrap">
+          ${unmatchedBillsTransfer.length > 0 ? `
+            <div style="padding:12px;background:rgba(245,166,35,.08);border-radius:8px;min-width:200px;flex:1;cursor:pointer" onclick="navigateTo('main')">
+              <div class="text-xs text-dim">บิลโอน/บัตรรอ Match</div>
+              <div style="font-size:1.4rem;font-weight:700;color:var(--warn)">${unmatchedBillsTransfer.length}</div>
+              <div class="text-xs text-muted">฿${fmtNum(unmatchedBillsTransfer.reduce((s,b)=>s+Number(b.amount||0),0))}</div>
+            </div>
+          ` : ''}
+          ${chequesAwaitingClear.length > 0 ? `
+            <div style="padding:12px;background:rgba(245,166,35,.08);border-radius:8px;min-width:200px;flex:1;cursor:pointer" onclick="navigateTo('main')">
+              <div class="text-xs text-dim">เช็ครอเคลียร์</div>
+              <div style="font-size:1.4rem;font-weight:700;color:var(--warn)">${chequesAwaitingClear.length}</div>
+              <div class="text-xs text-muted">
+                ฿${fmtNum(chequesAwaitingClear.reduce((s,b)=>s+Number(b.amount||0),0))}
+                ${chequesOverdue.length > 0 ? ` · <span style="color:var(--danger)">เลยวัน ${chequesOverdue.length}</span>` : ''}
+              </div>
+            </div>
+          ` : ''}
+          ${unmatchedStmts.length > 0 ? `
+            <div style="padding:12px;background:rgba(239,87,87,.08);border-radius:8px;min-width:200px;flex:1;cursor:pointer" onclick="navigateTo('matching')">
+              <div class="text-xs text-dim">Statement ยังไม่ match</div>
+              <div style="font-size:1.4rem;font-weight:700;color:var(--danger)">${unmatchedStmts.length}</div>
+              <div class="text-xs text-muted">฿${fmtNum(unmatchedStmts.reduce((s,x)=>s+Number(x.amount||0),0))}</div>
+            </div>
+          ` : ''}
+        </div>
+        ${chequesOverdue.length > 0 ? `
+          <div style="margin-top:12px;padding:10px;background:rgba(239,87,87,.08);border-radius:8px">
+            <div class="text-sm" style="color:var(--danger);font-weight:600">🚨 เช็คเลยกำหนดรอเคลียร์ ${chequesOverdue.length} ฉบับ:</div>
+            <div class="text-xs text-muted mt-1">
+              ${chequesOverdue.slice(0,3).map(b => `${b.bill_no||'(ไม่มีเลข)'} (฿${fmtNum(b.amount)} ${fmtDate(b.expected_clear_date)})`).join(', ')}
+              ${chequesOverdue.length>3?` และอีก ${chequesOverdue.length-3} ฉบับ`:''}
+            </div>
+          </div>
+        ` : ''}
+      </div>
+    ` : ''}
+    
     <div class="flex gap-3" style="display:grid;grid-template-columns:1fr 1fr">
       <div class="card">
         <div class="font-semi mb-3">ยอดขายตาม Station วันนี้</div>
@@ -2745,6 +3205,16 @@ async function renderMatching(el) {
     if (uploadedStatements.length > 0) {
       data = [...data, ...uploadedStatements.filter(s => bankFilter === 'ALL' || s.bank === bankFilter)];
     }
+    
+    // Sort ASC by date (รองรับ descending format จาก BBL)
+    data.sort((a, b) => (parseThaiDate(a.date) || 0) - (parseThaiDate(b.date) || 0));
+
+    // Bank counts (แสดงจำนวนแต่ละธนาคารที่นำเข้าแล้ว)
+    const bankCounts = {
+      KTB: (statementsByBank.KTB || []).length,
+      KBANK: (statementsByBank.KBANK || []).length,
+      BBL: (statementsByBank.BBL || []).length,
+    };
 
     const matched = data.filter(s=>s.match_status==='matched').length;
     const unmatched = data.length - matched;
@@ -2759,8 +3229,12 @@ async function renderMatching(el) {
         </div>
       </div>
       <div class="flex justify-between items-center mb-3">
-        <div class="flex gap-2">
-          ${['ALL','KTB','KBANK','BBL'].map(b=>`<button class="pill ${bankFilter===b?'active':''}" data-bank="${b}" ${b!=='ALL'?`style="--pill-color:${bankColors[b]}"`:''}>${b}</button>`).join('')}
+        <div class="flex gap-2 flex-wrap items-center">
+          ${['ALL','KTB','KBANK','BBL'].map(b => {
+            const count = b === 'ALL' ? (bankCounts.KTB+bankCounts.KBANK+bankCounts.BBL) : bankCounts[b] || 0;
+            return `<button class="pill ${bankFilter===b?'active':''}" data-bank="${b}" ${b!=='ALL'?`style="--pill-color:${bankColors[b]}"`:''}>${b}${count?` <span style="opacity:.7">(${count})</span>`:''}</button>`;
+          }).join('')}
+          ${(bankCounts.KTB+bankCounts.KBANK+bankCounts.BBL) > 0 ? '<button class="btn btn-ghost btn-sm" id="btn-clear-stmts" style="color:var(--danger)">✕ ล้าง Statement</button>' : ''}
         </div>
         <button class="btn btn-ghost btn-sm">${ICONS.file} ดู Match Log</button>
       </div>
@@ -2773,8 +3247,14 @@ async function renderMatching(el) {
           <table>
             <thead><tr><th>ธนาคาร</th><th>วันที่</th><th>เวลา</th><th>Ref.</th><th style="text-align:right">จำนวนเงิน</th><th>รายละเอียด</th><th>Station</th><th>Bill</th><th>สถานะ</th></tr></thead>
             <tbody>
-              ${data.length ? data.map(s=>`
-                <tr class="${s.match_status!=='matched'?'row-danger':''}">
+              ${data.length ? data.map((s,i)=>{
+                const isMatched = s.match_status === 'matched';
+                const isManual = s.match_method === 'manual';
+                const rowStyle = isMatched 
+                  ? 'background:rgba(45,212,160,.06)' 
+                  : 'background:rgba(239,87,87,.06);border-left:3px solid var(--danger)';
+                return `
+                <tr style="${rowStyle}" data-stmt-idx="${i}">
                   <td><span class="badge" style="background:${(bankColors[s.bank]||'#555')}22;color:${bankColors[s.bank]||'#aaa'}">${s.bank}</span></td>
                   <td>${fmtDate(s.date)}</td>
                   <td>${s.time}</td>
@@ -2783,12 +3263,12 @@ async function renderMatching(el) {
                   <td class="truncate" style="max-width:170px;color:var(--text)">${s.description}</td>
                   <td>${s.match_station?`<span class="badge badge-info">${s.match_station}</span>`:'-'}</td>
                   <td class="text-xs">${s.match_bill||'-'}</td>
-                  <td>${s.match_status==='matched'
-                    ? `<span class="badge badge-success">✓</span> <button class="btn btn-ghost btn-icon" title="Re-match">${ICONS.edit}</button>`
-                    : `<span class="badge badge-danger">✗ ไม่พบ</span> <button class="btn btn-outline btn-sm">${ICONS.search} Match</button>`
+                  <td>${isMatched
+                    ? `<span class="badge badge-success">✓ ${isManual?'Manual':'Auto'}</span> <button class="btn btn-ghost btn-sm btn-unmatch" data-stmt-idx="${i}" title="ยกเลิก match">${ICONS.edit}</button>`
+                    : `<span class="badge badge-danger">✗ ไม่พบ</span> <button class="btn btn-primary btn-sm btn-manual-match" data-stmt-idx="${i}">${ICONS.search} Match เอง</button>`
                   }</td>
                 </tr>
-              `).join('') : '<tr><td colspan="9" style="text-align:center;padding:30px;color:var(--text3)">ไม่มีข้อมูล Statement ในวันที่เลือก</td></tr>'}
+              `}).join('') : '<tr><td colspan="9" style="text-align:center;padding:30px;color:var(--text3)">ไม่มีข้อมูล Statement ในวันที่เลือก</td></tr>'}
             </tbody>
           </table>
         </div>
@@ -2801,6 +3281,184 @@ async function renderMatching(el) {
     document.getElementById('match-date')?.addEventListener('change', e => { matchDate = e.target.value; render(); });
     document.getElementById('btn-stmt-upload')?.addEventListener('click', () => {
       triggerFileUpload('file-stmt', (result, name) => { handleStmtUpload(result, name); render(); });
+    });
+    document.getElementById('btn-clear-stmts')?.addEventListener('click', () => {
+      const target = bankFilter === 'ALL' ? 'ทุกธนาคาร' : bankFilter;
+      if (confirm(`ล้าง Statement ${target}?`)) {
+        clearStatementsByBank(bankFilter);
+        uploadedStatements = getAllStatements();
+        try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(e) {}
+        toast(`ล้าง Statement ${target} แล้ว`, 'success');
+        render();
+      }
+    });
+
+    // ── Manual Match: เลือก Statement → เลือก Bill → ผูก ──
+    el.querySelectorAll('.btn-manual-match').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const stmtIdx = Number(btn.dataset.stmtIdx);
+        const stmt = data[stmtIdx];
+        if (!stmt) return;
+        
+        const stmtDate = toISODate(stmt.date);
+        const stmtAmt = Number(stmt.amount) || 0;
+        
+        // หาบิล candidate: ยอดตรง/ใกล้เคียง + ยังไม่ match
+        const candidates = billList.filter(b => {
+          if (b.match_status === 'matched' || b.match_status === 'paid') return false;
+          const amtDiff = Math.abs(Number(b.amount) - stmtAmt);
+          return amtDiff < 1 || amtDiff < stmtAmt * 0.05; // ยอดตรง หรือต่างไม่เกิน 5%
+        });
+        // Sort: ยอดตรง + วันที่ใกล้ที่สุด
+        candidates.sort((a, b) => {
+          const aExact = Math.abs(Number(a.amount) - stmtAmt) < 0.01 ? 0 : 1;
+          const bExact = Math.abs(Number(b.amount) - stmtAmt) < 0.01 ? 0 : 1;
+          if (aExact !== bExact) return aExact - bExact;
+          const aDate = toISODate(a.date), bDate = toISODate(b.date);
+          return Math.abs(new Date(aDate) - new Date(stmtDate)) - Math.abs(new Date(bDate) - new Date(stmtDate));
+        });
+        
+        openModal(`🔍 Match Statement → Bill`, `
+          <div class="flex-col gap-3">
+            <div style="padding:10px;background:var(--surface2);border-radius:8px">
+              <div class="flex justify-between items-center">
+                <div>
+                  <div class="text-sm font-semi">${stmt.bank} · ${fmtDate(stmt.date)} · ${stmt.time||''}</div>
+                  <div class="text-xs text-muted">${stmt.description||stmt.ref_no||''}</div>
+                </div>
+                <div style="font-size:1.2rem;font-weight:700;color:var(--success)">฿${fmtNum(stmtAmt)}</div>
+              </div>
+            </div>
+            
+            <div class="input-group">
+              <label>ค้นหาบิล</label>
+              <input class="input" id="mm-search" placeholder="เลขบิล / ชื่อลูกค้า / ยอดเงิน" autofocus>
+            </div>
+            
+            <div class="text-xs text-dim">
+              ${candidates.length?`🎯 เจอบิลที่ยอดใกล้เคียง ${candidates.length} รายการ (แนะนำด้านบน)`:'⚠️ ไม่เจอบิลยอดตรง — ค้นหาด้วยตนเอง'}
+            </div>
+            
+            <div id="mm-bill-list" style="max-height:300px;overflow-y:auto;border:1px solid var(--border);border-radius:8px"></div>
+            
+            <div class="input-group">
+              <label>หมายเหตุ (ทำไมถึง match ด้วยตัวเอง)</label>
+              <input class="input" id="mm-reason" placeholder="เช่น ลูกค้าโอนผิดยอด, รวมยอด 2 บิล">
+            </div>
+            
+            <div class="flex gap-2 mt-2">
+              <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ยกเลิก</button>
+              <button class="btn btn-primary btn-sm flex-1" id="mm-confirm" disabled>${ICONS.check} ยืนยัน Match</button>
+            </div>
+          </div>
+        `);
+        
+        let selectedBill = null;
+        
+        function renderBillList(searchText) {
+          let list = searchText ? billList.filter(b => {
+            const s = searchText.toLowerCase();
+            return (b.match_status !== 'matched' && b.match_status !== 'paid') &&
+              ((b.bill_no||'').toLowerCase().includes(s) ||
+               (b.remarks1||'').toLowerCase().includes(s) ||
+               String(b.amount).includes(s));
+          }) : candidates.slice(0, 20);
+          
+          const bc = document.getElementById('mm-bill-list');
+          if (!bc) return;
+          bc.innerHTML = list.length ? list.map((b, i) => {
+            const realIdx = billList.indexOf(b);
+            const amtDiff = Math.abs(Number(b.amount) - stmtAmt);
+            const isExact = amtDiff < 0.01;
+            return `
+              <div class="mm-item" data-bill-idx="${realIdx}" style="padding:10px;border-bottom:1px solid var(--border);cursor:pointer;display:flex;justify-content:space-between;align-items:center">
+                <div>
+                  <div class="font-semi">${b.bill_no||'(ไม่มีเลข)'}</div>
+                  <div class="text-xs text-muted">${fmtDate(b.date)} · ${b.station||''} · ${b.type||''} · ${b.remarks1||''}</div>
+                </div>
+                <div style="text-align:right">
+                  <div style="font-weight:700;color:${isExact?'var(--success)':'var(--warn)'}">฿${fmtNum(b.amount)}</div>
+                  ${isExact?'<div class="text-xs" style="color:var(--success)">✓ ตรงเป๊ะ</div>':`<div class="text-xs text-muted">ต่าง ${fmtNum(amtDiff)}</div>`}
+                </div>
+              </div>
+            `;
+          }).join('') : '<div style="padding:20px;text-align:center;color:var(--text3)">ไม่พบบิล</div>';
+          
+          bc.querySelectorAll('.mm-item').forEach(item => {
+            item.addEventListener('click', () => {
+              bc.querySelectorAll('.mm-item').forEach(i => i.style.background = '');
+              item.style.background = 'rgba(79,156,249,.15)';
+              selectedBill = Number(item.dataset.billIdx);
+              document.getElementById('mm-confirm').disabled = false;
+            });
+          });
+        }
+        
+        renderBillList('');
+        document.getElementById('mm-search')?.addEventListener('input', debounce(e => renderBillList(e.target.value), 200));
+        
+        document.getElementById('mm-confirm')?.addEventListener('click', () => {
+          if (selectedBill === null) return;
+          const bill = billList[selectedBill];
+          const reason = document.getElementById('mm-reason').value || '';
+          
+          // อัปเดต Statement
+          stmt.match_status = 'matched';
+          stmt.match_method = 'manual';
+          stmt.match_station = bill.station || '';
+          stmt.match_bill = bill.bill_no || '';
+          stmt.matched_at = new Date().toISOString();
+          stmt.matched_by = currentUser?.display_name || 'Admin';
+          stmt.match_reason = reason;
+          
+          // อัปเดต Bill
+          bill.match_status = 'matched';
+          bill.matched_stmt_ref = stmt.ref_no || '';
+          bill.matched_at = new Date().toISOString();
+          
+          // Persist
+          try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(e) {}
+          persistMainState();
+          
+          closeModal();
+          toast(`Match สำเร็จ: ${stmt.bank} ↔ ${bill.bill_no}`, 'success');
+          render();
+        });
+      });
+    });
+    
+    // ── Unmatch: ยกเลิก match ──
+    el.querySelectorAll('.btn-unmatch').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const stmtIdx = Number(btn.dataset.stmtIdx);
+        const stmt = data[stmtIdx];
+        if (!stmt) return;
+        
+        if (!confirm(`ยกเลิกการ match กับ ${stmt.match_bill}?`)) return;
+        
+        // ปลด bill ด้วย (ถ้าเจอ)
+        const bill = billList.find(b => b.bill_no === stmt.match_bill);
+        if (bill && !bill.paid_by_sp) {
+          bill.match_status = 'pending';
+          delete bill.matched_stmt_ref;
+          delete bill.matched_at;
+        }
+        
+        stmt.match_status = 'unmatched';
+        delete stmt.match_bill;
+        delete stmt.match_station;
+        delete stmt.match_method;
+        delete stmt.matched_at;
+        delete stmt.matched_by;
+        delete stmt.match_reason;
+        
+        try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(e) {}
+        persistMainState();
+        toast('ยกเลิก match แล้ว', 'success');
+        render();
+      });
     });
     document.getElementById('btn-auto-match')?.addEventListener('click', async () => {
       toast('กำลัง Auto Match...', 'info');
@@ -2819,13 +3477,30 @@ async function renderMatching(el) {
       const allSales = [...(billList||[]), ...(uploadedSales||[])];
       if (data.length > 0 && allSales.length > 0) {
         let clientMatched = 0;
+        let skippedAlreadyMatched = 0;
+        
+        // ── สร้าง Set ของบิลที่ถูก match ไปแล้ว (จาก Statement ที่ matched) ──
+        // ป้องกันการหยิบบิลเดียวกันไปใช้ซ้ำ
+        const alreadyMatchedBillNos = new Set(
+          data.filter(s => s.match_status === 'matched' && s.match_bill)
+              .map(s => s.match_bill)
+        );
+        
         const transferSales = allSales.filter(s => {
           const type = (s.type || s.pay_method || s.Type || '').toLowerCase();
-          return type === 'transfer';
+          if (type !== 'transfer') return false;
+          // ข้ามบิลที่เคย matched ไปแล้ว
+          const billNo = s.bill_no || s['Bill Number'] || '';
+          if (billNo && alreadyMatchedBillNos.has(billNo)) return false;
+          return true;
         });
 
         data.forEach(stmt => {
-          if (stmt.match_status === 'matched') return;
+          // ── ไม่แตะรายการที่ matched แล้ว ──
+          if (stmt.match_status === 'matched') {
+            skippedAlreadyMatched++;
+            return;
+          }
           const stmtAmt = Number(stmt.amount || 0);
           const stmtDate = toISODate(stmt.date || stmt.trans_date);
           if (!stmtAmt || stmtAmt <= 0) return;
@@ -2849,13 +3524,20 @@ async function renderMatching(el) {
             stmt.match_status = 'matched';
             stmt.match_station = match.station || match.Station || '';
             stmt.match_bill = match.bill_no || match['Bill Number'] || '';
+            stmt.matched_at = new Date().toISOString();
             clientMatched++;
           }
         });
 
+        // Persist updated statements (เก็บสถานะ matched ไว้)
         if (clientMatched > 0) {
-          toast(`Auto Match (Client) — จับคู่ได้ ${clientMatched} รายการ (ตรงทั้งวันที่ + ยอด)`, 'success');
+          try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(e) {}
+          const skipMsg = skippedAlreadyMatched > 0 ? ` · ข้าม ${skippedAlreadyMatched} ที่ match แล้ว (ไม่ทับ)` : '';
+          toast(`Auto Match สำเร็จ — จับคู่เพิ่ม ${clientMatched} รายการ${skipMsg}`, 'success');
           render();
+          return;
+        } else if (skippedAlreadyMatched > 0) {
+          toast(`ไม่มีรายการใหม่ให้ match — มีอยู่แล้ว ${skippedAlreadyMatched} รายการ`, 'info');
           return;
         }
       }
