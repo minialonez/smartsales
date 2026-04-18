@@ -723,24 +723,52 @@ let transferLog = {
 };
 
 // ── Persist state to localStorage — function only, restore happens after mainSummary/cashCount declared ──
+// แก้ปัญหา lag กับ billList 8,000+ records: cache invalidate ทันที, localStorage I/O debounce
+var _persistTimer = null;
 function persistMainState() {
-  // Invalidate validation cache on state change
+  // Invalidate validation cache ทันที (sync) — เพื่อให้ validateAll() re-run ถูกต้อง
   if (typeof validateAll !== 'undefined') {
     validateAll._cache = null;
     validateAll._cacheKey = null;
   }
-  try {
-    safeStorage.set('sf_billList', JSON.stringify(billList));
-    safeStorage.set('sf_mainSummary', JSON.stringify(mainSummary));
-    safeStorage.set('sf_cashCount', JSON.stringify(cashCount));
-    safeStorage.set('sf_paymentList', JSON.stringify(paymentList));
-    safeStorage.set('sf_cashflowList', JSON.stringify(cashflowList));
-    safeStorage.set('sf_supplierList', JSON.stringify(supplierList));
-    safeStorage.set('sf_supplierPayments', JSON.stringify(supplierPayments));
-    safeStorage.set('sf_ppReport', JSON.stringify(ppReport));
-    safeStorage.set('sf_transferLog', JSON.stringify(transferLog));
-  } catch (e) { console.warn('Could not persist:', e); }
+  // ── Debounce localStorage writes 500ms — เดิมเขียน 1-2 MB ทุก keystroke = lag หนัก ──
+  if (_persistTimer) clearTimeout(_persistTimer);
+  _persistTimer = setTimeout(function() {
+    _persistTimer = null;
+    try {
+      safeStorage.set('sf_billList', JSON.stringify(billList));
+      safeStorage.set('sf_mainSummary', JSON.stringify(mainSummary));
+      safeStorage.set('sf_cashCount', JSON.stringify(cashCount));
+      safeStorage.set('sf_paymentList', JSON.stringify(paymentList));
+      safeStorage.set('sf_cashflowList', JSON.stringify(cashflowList));
+      safeStorage.set('sf_supplierList', JSON.stringify(supplierList));
+      safeStorage.set('sf_supplierPayments', JSON.stringify(supplierPayments));
+      safeStorage.set('sf_ppReport', JSON.stringify(ppReport));
+      safeStorage.set('sf_transferLog', JSON.stringify(transferLog));
+    } catch (e) { console.warn('Could not persist:', e); }
+  }, 500);
 }
+
+// Flush pending writes ทันที (เรียกก่อน save หรือปิดหน้า)
+function flushPersistState() {
+  if (_persistTimer) {
+    clearTimeout(_persistTimer);
+    _persistTimer = null;
+    try {
+      safeStorage.set('sf_billList', JSON.stringify(billList));
+      safeStorage.set('sf_mainSummary', JSON.stringify(mainSummary));
+      safeStorage.set('sf_cashCount', JSON.stringify(cashCount));
+      safeStorage.set('sf_paymentList', JSON.stringify(paymentList));
+      safeStorage.set('sf_cashflowList', JSON.stringify(cashflowList));
+      safeStorage.set('sf_supplierList', JSON.stringify(supplierList));
+      safeStorage.set('sf_supplierPayments', JSON.stringify(supplierPayments));
+      safeStorage.set('sf_ppReport', JSON.stringify(ppReport));
+      safeStorage.set('sf_transferLog', JSON.stringify(transferLog));
+    } catch (e) { console.warn('Could not persist:', e); }
+  }
+}
+// ป้องกันข้อมูลหายเมื่อปิด tab ระหว่าง debounce timer
+window.addEventListener('beforeunload', flushPersistState);
 
 // ══════════════════════════════════════════════════════════════
 // VALIDATION SYSTEM — ตรวจสอบความสมบูรณ์ของข้อมูล
@@ -2566,7 +2594,10 @@ async function renderMain(el) {
     async function actuallySaveMain() {
       const CHUNK_SIZE = 500; // รายการต่อ chunk (ลด URL/body size + หลีกเลี่ยง 6-min timeout)
       
-      // ── 1. บันทึก Bills — group ตามวันที่ก่อน แล้วส่งแยก daily_YYYYMMDD ──
+      // Flush pending localStorage writes ก่อน save (กันกรณี debounce ยังไม่ถึงเวลา)
+      if (typeof flushPersistState === 'function') flushPersistState();
+      
+      // ── 1. บันทึก Bills — group ตามปี (backend ใช้ bills_YYYY, 1 sheet ต่อปี) ──
       const bills = Array.isArray(billList) ? billList : [];
       const totalBills = bills.length;
       
@@ -2575,67 +2606,57 @@ async function renderMain(el) {
         return;
       }
       
-      // Helper: แปลงวันที่รูปแบบต่างๆ เป็น YYYYMMDD
-      function billDateToKey(val) {
+      // Helper: ดึง YYYY จากวันที่รูปแบบต่างๆ
+      function yearFromDate(val) {
         if (!val) return '';
         var str = String(val).trim();
-        // dd/mm/yyyy (อาจมี พ.ศ.)
         var m1 = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
-        if (m1) {
-          var y = Number(m1[3]); if (y > 2400) y -= 543;
-          return String(y) + String(m1[2]).padStart(2,'0') + String(m1[1]).padStart(2,'0');
-        }
-        // yyyy-mm-dd
+        if (m1) { var y = Number(m1[3]); if (y > 2400) y -= 543; return String(y); }
         var m2 = str.match(/^(\d{4})-(\d{2})-(\d{2})/);
-        if (m2) {
-          var y2 = Number(m2[1]); if (y2 > 2400) y2 -= 543;
-          return String(y2) + m2[2] + m2[3];
-        }
-        // yyyymmdd
-        if (/^\d{8}$/.test(str)) return str;
+        if (m2) { var y2 = Number(m2[1]); if (y2 > 2400) y2 -= 543; return String(y2); }
+        if (/^\d{8}$/.test(str)) { var y3 = Number(str.substring(0,4)); if (y3 > 2400) y3 -= 543; return String(y3); }
         return '';
       }
       
-      // Group bills by date key
-      var billsByDate = {};
+      // Group bills by year
+      var billsByYear = {};
       var billsNoDate = [];
       bills.forEach(function(b) {
-        var key = billDateToKey(b.date);
-        if (!key) {
-          billsNoDate.push(b);
-          return;
-        }
-        if (!billsByDate[key]) billsByDate[key] = [];
-        billsByDate[key].push(b);
+        var year = yearFromDate(b.date);
+        if (!year) { billsNoDate.push(b); return; }
+        if (!billsByYear[year]) billsByYear[year] = [];
+        billsByYear[year].push(b);
       });
       
-      // บิลไม่มีวันที่ → ใส่ในวันที่เลือก (fallback)
+      // บิลไม่มีวันที่ → ใส่ในปีของวันที่เลือก (fallback)
       if (billsNoDate.length > 0) {
-        var fallbackKey = formatDateKey(selectedDate);
-        if (!billsByDate[fallbackKey]) billsByDate[fallbackKey] = [];
-        billsByDate[fallbackKey] = billsByDate[fallbackKey].concat(billsNoDate);
+        var fallbackYear = yearFromDate(selectedDate) || String(new Date().getFullYear());
+        if (!billsByYear[fallbackYear]) billsByYear[fallbackYear] = [];
+        billsByYear[fallbackYear] = billsByYear[fallbackYear].concat(billsNoDate);
       }
       
-      var dateKeys = Object.keys(billsByDate).sort();
-      toast('กำลังบันทึก ' + totalBills + ' บิล (' + dateKeys.length + ' วัน)...', 'info');
+      var yearKeys = Object.keys(billsByYear).sort();
+      toast('กำลังบันทึก ' + totalBills + ' บิล (' + yearKeys.length + ' ปี)...', 'info');
       
       var savedBills = 0;
       try {
-        for (var di = 0; di < dateKeys.length; di++) {
-          var dateKey = dateKeys[di];
-          var billsOfDate = billsByDate[dateKey];
-          for (var ci = 0; ci < billsOfDate.length; ci += CHUNK_SIZE) {
-            var chunk = billsOfDate.slice(ci, ci + CHUNK_SIZE);
+        for (var yi = 0; yi < yearKeys.length; yi++) {
+          var year = yearKeys[yi];
+          var billsOfYear = billsByYear[year];
+          // ส่งวันแรกของปีเป็น pivot — backend จะใช้เฉพาะ year ในการหา sheet name
+          var pivotDate = year + '0101';
+          for (var ci = 0; ci < billsOfYear.length; ci += CHUNK_SIZE) {
+            var chunk = billsOfYear.slice(ci, ci + CHUNK_SIZE);
             var res = await api('saveDailySales', {
-              date: dateKey,
+              date: pivotDate,
               rows: chunk,
-              // ส่ง summary + cash_count เฉพาะเมื่อเป็นวันที่เลือก + chunk แรก
-              summary: (dateKey === formatDateKey(selectedDate) && ci === 0) ? mainSummary : undefined,
-              cash_count: (dateKey === formatDateKey(selectedDate) && ci === 0) ? cashCount : undefined,
+              // ส่ง summary + cash_count เฉพาะ chunk แรกของปีที่มี selectedDate
+              summary: (year === yearFromDate(selectedDate) && ci === 0) ? mainSummary : undefined,
+              cash_count: (year === yearFromDate(selectedDate) && ci === 0) ? cashCount : undefined,
               created_by: currentUser?.display_name || 'Admin',
             });
             if (!res || !res.success) {
-              toast('บันทึกบิลล้มเหลวที่วัน ' + dateKey + ': ' + (res?.error||''), 'error');
+              toast('บันทึกบิลล้มเหลวปี ' + year + ': ' + (res?.error||''), 'error');
               return;
             }
             savedBills += chunk.length;
@@ -2645,43 +2666,46 @@ async function renderMain(el) {
           }
         }
         
-        // ── 2. บันทึก Statements (ทั้ง 3 ธนาคาร) — ใหม่ ที่ยังไม่เคยทำ ──
+        // ── 2. บันทึก Statements (group ตามปีเหมือนกัน) ──
         var allStmts = typeof getAllStatements === 'function' ? getAllStatements() : [];
         if (allStmts.length > 0) {
-          // Group by date เพื่อเก็บลง stmt_YYYYMMDD
-          var byDateStmt = {};
+          var byYearStmt = {};
           allStmts.forEach(function(s) {
-            var key = billDateToKey(s.date);
-            if (!key) return;
-            if (!byDateStmt[key]) byDateStmt[key] = [];
-            byDateStmt[key].push(s);
+            var y = yearFromDate(s.date);
+            if (!y) return;
+            if (!byYearStmt[y]) byYearStmt[y] = [];
+            byYearStmt[y].push(s);
           });
           
-          var stmtDateKeys = Object.keys(byDateStmt).sort();
+          var stmtYearKeys = Object.keys(byYearStmt).sort();
           var savedStmts = 0;
           var totalStmts = allStmts.length;
-          toast('กำลังบันทึก Statement ' + totalStmts + ' รายการ (' + stmtDateKeys.length + ' วัน)...', 'info');
+          toast('กำลังบันทึก Statement ' + totalStmts + ' รายการ (' + stmtYearKeys.length + ' ปี)...', 'info');
           
-          for (var si = 0; si < stmtDateKeys.length; si++) {
-            var sDateKey = stmtDateKeys[si];
-            var stmtsOfDate = byDateStmt[sDateKey];
-            for (var i = 0; i < stmtsOfDate.length; i += CHUNK_SIZE) {
-              var sChunk = stmtsOfDate.slice(i, i + CHUNK_SIZE);
+          for (var si = 0; si < stmtYearKeys.length; si++) {
+            var sYear = stmtYearKeys[si];
+            var stmtsOfYear = byYearStmt[sYear];
+            var sPivot = sYear + '0101';
+            for (var i = 0; i < stmtsOfYear.length; i += CHUNK_SIZE) {
+              var sChunk = stmtsOfYear.slice(i, i + CHUNK_SIZE);
               var sRes = await api('saveStatements', {
-                date: sDateKey,
+                date: sPivot,
                 rows: sChunk,
               });
               if (!sRes || !sRes.success) {
-                toast('บันทึก Statement วัน ' + sDateKey + ' ล้มเหลว: ' + (sRes?.error||''), 'error');
+                toast('บันทึก Statement ปี ' + sYear + ' ล้มเหลว: ' + (sRes?.error||''), 'error');
                 return;
               }
               savedStmts += sChunk.length;
+              if (totalStmts > CHUNK_SIZE) {
+                toast('กำลังบันทึก Statement... ' + savedStmts + '/' + totalStmts, 'info');
+              }
             }
           }
           
-          toast('✅ บันทึกสำเร็จ — ' + savedBills + ' บิล (' + dateKeys.length + ' วัน) + ' + savedStmts + ' statements', 'success', 5000);
+          toast('✅ บันทึกสำเร็จ — ' + savedBills + ' บิล + ' + savedStmts + ' statements (' + yearKeys.length + ' ปี)', 'success', 5000);
         } else {
-          toast('✅ บันทึกสำเร็จ — ' + savedBills + ' บิล (' + dateKeys.length + ' วัน)', 'success');
+          toast('✅ บันทึกสำเร็จ — ' + savedBills + ' บิล (' + yearKeys.length + ' ปี)', 'success');
         }
       } catch (err) {
         console.error('Save error:', err);
