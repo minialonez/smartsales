@@ -250,12 +250,14 @@ const API_URL = 'https://script.google.com/macros/s/AKfycbxKFt7Dcq1PPyYEy_zEwTuu
 let currentUser = null;
 let currentPage = 'dashboard';
 
-// ── API Helper (ใช้ GET เสมอ เพราะ Apps Script redirect ทำให้ POST body หาย) ──
+// ── API Helper — auto GET/POST: GET สำหรับ read, POST สำหรับ write ใหญ่ๆ ──
+// Apps Script handleRequest() parse e.postData.contents เป็น JSON อยู่แล้ว
+// Content-Type: text/plain เลี่ยง CORS preflight (simple request)
 async function api(action, params = {}) {
   try {
     if (!API_URL) return demoResponse(action, params);
 
-    // ใช้ GET — ส่ง parameters ผ่าน URL query string
+    // สร้าง URL query string (ใช้สำหรับ GET หรือเช็คขนาด)
     const qs = new URLSearchParams({ action });
     Object.keys(params).forEach(k => {
       const v = params[k];
@@ -264,13 +266,26 @@ async function api(action, params = {}) {
       }
     });
 
-    const res = await fetch(API_URL + '?' + qs.toString(), { redirect: 'follow' });
-    const text = await res.text();
+    const url = API_URL + '?' + qs.toString();
+    let res;
 
+    // URL < 4000 chars → GET (Apps Script limit ~8KB, ใช้ 4K เพื่อความปลอดภัย)
+    // URL ≥ 4000 chars → POST with text/plain (ไม่เกิด CORS preflight)
+    if (url.length < 4000) {
+      res = await fetch(url, { redirect: 'follow' });
+    } else {
+      res = await fetch(API_URL, {
+        method: 'POST',
+        redirect: 'follow',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify(Object.assign({ action }, params)),
+      });
+    }
+
+    const text = await res.text();
     try {
       return JSON.parse(text);
     } catch {
-      // Apps Script อาจ return HTML (error page)
       console.error('API response not JSON:', text.substring(0, 300));
       return demoResponse(action, params);
     }
@@ -357,6 +372,30 @@ function toast(msg, type = 'info') {
 function debounce(fn, ms = 300) {
   let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); };
 }
+
+// ══════════════════════════════════════════════════════════════
+// 🚀 PERF HELPERS — ป้องกัน page ค้างเมื่อข้อมูลเยอะ
+// ══════════════════════════════════════════════════════════════
+const PERF_MAX_VISIBLE_ROWS = 500;
+const PERF_THRESHOLD = 200; // ถ้ามากกว่านี้ จะ auto-truncate
+
+function truncateForRender(arr) {
+  if (!Array.isArray(arr)) return { visible: [], total: 0, truncated: false };
+  if (arr.length <= PERF_MAX_VISIBLE_ROWS) {
+    return { visible: arr, total: arr.length, truncated: false };
+  }
+  return {
+    visible: arr.slice(0, PERF_MAX_VISIBLE_ROWS),
+    total: arr.length,
+    truncated: true,
+  };
+}
+
+function truncationFooter(totalCount, origTotal) {
+  if (totalCount <= PERF_MAX_VISIBLE_ROWS) return '';
+  return `<span style="color:var(--warn);margin-left:8px">⚠️ แสดง ${PERF_MAX_VISIBLE_ROWS} จาก ${totalCount} — กรองเพื่อเห็นเฉพาะที่ต้องการ</span>`;
+}
+
 
 // ── Excel / CSV File Parser ──
 function parseExcelFile(file) {
@@ -685,6 +724,11 @@ let transferLog = {
 
 // ── Persist state to localStorage — function only, restore happens after mainSummary/cashCount declared ──
 function persistMainState() {
+  // Invalidate validation cache on state change
+  if (typeof validateAll !== 'undefined') {
+    validateAll._cache = null;
+    validateAll._cacheKey = null;
+  }
   try {
     safeStorage.set('sf_billList', JSON.stringify(billList));
     safeStorage.set('sf_mainSummary', JSON.stringify(mainSummary));
@@ -788,6 +832,12 @@ function findSimilarBills() {
 }
 
 function validateAll() {
+  // ── PERF: Cache result based on billList length (quick proxy for changes) ──
+  const cacheKey = `${billList.length}|${paymentList.length}|${cashflowList.length}`;
+  if (validateAll._cacheKey === cacheKey && validateAll._cache) {
+    return validateAll._cache;
+  }
+  
   const issues = [];
   const errors = [];
   const warnings = [];
@@ -931,7 +981,10 @@ function validateAll() {
     }
   });
   
-  return { errors, warnings, hasIssues: errors.length > 0 || warnings.length > 0 };
+  const result = { errors, warnings, hasIssues: errors.length > 0 || warnings.length > 0 };
+  validateAll._cacheKey = cacheKey;
+  validateAll._cache = result;
+  return result;
 }
 
 function showValidationModal(validation, onContinue) {
@@ -1594,19 +1647,42 @@ async function renderMain(el) {
   const STATION_OPTIONS = ['', 'Front1', 'Front2', 'Front3', 'Front4', 'Invoice', 'Invoice Credit', 'Order', 'Order Credit', 'Payment'];
   const SUMMARY_STATIONS = ['Front1', 'Front2', 'Front3', 'Front4', 'Invoice', 'Order', 'Payment', 'Invoice Credit', 'Order Credit'];
 
+  // ══════════════════════════════════════════════════════════════
+  // PERFORMANCE FIX: Cache bills filtered by selectedDate
+  // Previously calcSales/calcCashFromBills filtered entire billList (8000+ rows)
+  // every time — causing Sum calculation to use all dates (negative Sum) and
+  // making the page extremely slow.
+  // ══════════════════════════════════════════════════════════════
+  let _billsForSelectedDateCache = null;
+  let _billsForSelectedDateCacheKey = null;
+  
+  function getBillsForSelectedDate() {
+    const cacheKey = selectedDate + '|' + billList.length;
+    if (_billsForSelectedDateCacheKey === cacheKey && _billsForSelectedDateCache) {
+      return _billsForSelectedDateCache;
+    }
+    _billsForSelectedDateCacheKey = cacheKey;
+    _billsForSelectedDateCache = billList.filter(b => toISODate(b.date) === selectedDate);
+    return _billsForSelectedDateCache;
+  }
+  
+  function invalidateBillsCache() {
+    _billsForSelectedDateCache = null;
+    _billsForSelectedDateCacheKey = null;
+  }
+
   // ── คำนวณเงินสดในลิ้นชัก = รวมบิลที่ Type=Cash (จาก SS/OS/SP/SC/JS) ──
   function calcCashFromBills(station) {
-    return billList.filter(b => {
+    return getBillsForSelectedDate().filter(b => {
       const st = (b.station || '').trim();
       const ty = (b.type || '').trim();
       const no = (b.bill_no || '').toUpperCase();
-      // Station ตรงกัน + Type = Cash + บิลประเภท SS/OS/SP/SC/JS
       const isTargetBill = no.startsWith('SS') || no.startsWith('OS') || no.startsWith('SP') || no.startsWith('SC') || no.startsWith('JS');
       return st === station && ty === 'Cash' && (isTargetBill || !no);
     }).reduce((s, b) => s + (Number(b.amount) || 0), 0);
   }
   function calcAutoValue(type, station) {
-    return billList.filter(b => {
+    return getBillsForSelectedDate().filter(b => {
       const st = (b.station || '').trim();
       const ty = (b.type || '').trim();
       return st === station && ty === type;
@@ -1615,12 +1691,10 @@ async function renderMain(el) {
 
   // คำนวณ ยอดขาย (Sales) row — Invoice/Order/Payment = SUMIFS, Front1-4 = กรอกเอง
   function calcSales(station) {
-    // ถ้าเป็น Invoice/Order/Payment → รวมทุกบิลที่ station นั้น
     if (['Invoice', 'Invoice Credit', 'Order', 'Order Credit', 'Payment'].includes(station)) {
-      return billList.filter(b => (b.station || '').trim() === station)
+      return getBillsForSelectedDate().filter(b => (b.station || '').trim() === station)
         .reduce((s, b) => s + (Number(b.amount) || 0), 0);
     }
-    // Front1-4 กรอกเอง
     return Number(mainSummary['sales_' + station]) || 0;
   }
 
@@ -1652,12 +1726,23 @@ async function renderMain(el) {
   function render() {
     // ── Filter bill list ──
     let data = billList;
+    
+    // ── PERF: If > 200 bills and no explicit date range → default to selectedDate only ──
+    // ป้องกันค้างเมื่อมีข้อมูลย้อนหลังหลายพันบิล
+    if (billList.length > 200 && !filterDateFrom && !filterDateTo) {
+      data = getBillsForSelectedDate();
+    }
+    
     if (filterStation !== 'ALL') data = data.filter(b => b.station === filterStation);
     if (filterType !== 'ALL') data = data.filter(b => b.type === filterType);
     if (hidePaid) data = data.filter(b => b.match_status !== 'paid');
     
-    // Filter by date range
+    // Filter by date range (overrides default filter)
     if (filterDateFrom || filterDateTo) {
+      data = billList;
+      if (filterStation !== 'ALL') data = data.filter(b => b.station === filterStation);
+      if (filterType !== 'ALL') data = data.filter(b => b.type === filterType);
+      if (hidePaid) data = data.filter(b => b.match_status !== 'paid');
       data = data.filter(b => {
         const bd = toISODate(b.date);
         if (!bd) return true;
@@ -1669,8 +1754,20 @@ async function renderMain(el) {
 
     const totalAmount = data.reduce((s, b) => b.match_status === 'void' ? s : s + (Number(b.amount) || 0), 0);
     const paidCount = billList.filter(b => b.match_status === 'paid').length;
-    const stations = [...new Set(billList.map(b => b.station).filter(Boolean))];
-    const types = [...new Set(billList.map(b => b.type))];
+    
+    // ── PERF: Cap table rendering to first 500 rows to prevent lag on massive datasets ──
+    const MAX_VISIBLE_ROWS = 500;
+    const totalDataCount = data.length;
+    const truncated = data.length > MAX_VISIBLE_ROWS;
+    const visibleData = truncated ? data.slice(0, MAX_VISIBLE_ROWS) : data;
+    
+    // Stations/types calc: only for reasonable list sizes
+    const stations = billList.length < 10000 
+      ? [...new Set(billList.map(b => b.station).filter(Boolean))]
+      : ['Front1','Front2','Front3','Front4','Invoice','Invoice Credit','Order','Order Credit','Payment'];
+    const types = billList.length < 10000
+      ? [...new Set(billList.map(b => b.type))]
+      : ['Transfer','Cash','Card','Cheque','Refund','Unknown',''];
 
     el.innerHTML = `
       <div class="flex justify-between items-center mb-3">
@@ -1889,16 +1986,18 @@ async function renderMain(el) {
             <tbody>
               ${data.length === 0 ? '<tr><td colspan="13" style="text-align:center;padding:40px;color:var(--text3)">ยังไม่มีข้อมูล — กด "Generate จาก Smart" เพื่อเริ่มต้น</td></tr>' :
                 (() => {
-                  // หา bill_no ที่ซ้ำ
+                  // หา bill_no ที่ซ้ำ (limit for perf)
                   const billNoCounts = {};
-                  billList.forEach(b => {
+                  const billIndexMap = new Map(); // bill → index (O(1) lookup)
+                  billList.forEach((b, i) => {
+                    billIndexMap.set(b, i);
                     const no = (b.bill_no||'').trim();
                     if (no && !no.startsWith('MANUAL-')) billNoCounts[no] = (billNoCounts[no]||0) + 1;
                   });
                   const dupeBillNos = new Set(Object.keys(billNoCounts).filter(n => billNoCounts[n] > 1));
                   
-                  return data.map((b, idx) => {
-                  const realIdx = billList.indexOf(b);
+                  return visibleData.map((b, idx) => {
+                  const realIdx = billIndexMap.get(b) ?? idx;
                   const badgeCls = b.source==='smart'?'badge-success':b.source==='pos'?'badge-info':'badge-warn';
                   const badgeText = b.source==='smart'?'Smart':b.source==='pos'?'POS':b.source==='manual'?'Manual':'Summary';
                   
@@ -1997,7 +2096,12 @@ async function renderMain(el) {
           </table>
         </div>
         <div class="flex justify-between items-center" style="padding:10px 14px;border-top:1px solid var(--border)">
-          <span class="text-sm text-dim">${data.length} / ${billList.length} รายการ</span>
+          <span class="text-sm text-dim">
+            แสดง ${visibleData.length} / ${totalDataCount} 
+            ${totalDataCount < billList.length ? `(กรอง) จากทั้งหมด ${billList.length}` : ''}
+            ${truncated ? `<span style="color:var(--warn);margin-left:8px">⚠️ แสดงเฉพาะ ${MAX_VISIBLE_ROWS} แถวแรก — กรองเพื่อเห็นทั้งหมด</span>` : ''}
+            ${billList.length > 200 && !filterDateFrom && !filterDateTo ? `<span style="color:var(--info);margin-left:8px">📅 กรองเฉพาะวันที่ ${fmtDate(selectedDate)}</span>` : ''}
+          </span>
           <span class="font-bold">รวม: ฿${fmtNum(totalAmount)}</span>
         </div>
       </div>
@@ -2456,19 +2560,94 @@ async function renderMain(el) {
     });
     
     async function actuallySaveMain() {
-      toast('กำลังบันทึก...', 'info');
-      const res = await api('saveDailySales', {
-        date: formatDateKey(selectedDate),
-        rows: billList,
-        summary: mainSummary,
-        cash_count: cashCount,
-        created_by: currentUser?.display_name || 'Admin'
-      });
-      if (res.success) toast(`บันทึกสำเร็จ — ${billList.length} รายการ`, 'success');
-      else toast(res.error || 'บันทึกไม่สำเร็จ', 'error');
+      const CHUNK_SIZE = 500; // รายการต่อ chunk (ลด URL/body size + หลีกเลี่ยง 6-min timeout)
+      
+      // ── 1. บันทึก Bills (แบ่ง chunk ถ้า > 500) ──
+      const bills = Array.isArray(billList) ? billList : [];
+      const totalBills = bills.length;
+      let savedBills = 0;
+      
+      if (totalBills === 0) {
+        toast('ไม่มีบิลให้บันทึก', 'warn');
+        return;
+      }
+      
+      toast(`กำลังบันทึก ${totalBills} บิล...`, 'info');
+      
+      try {
+        for (let i = 0; i < totalBills; i += CHUNK_SIZE) {
+          const chunk = bills.slice(i, i + CHUNK_SIZE);
+          const res = await api('saveDailySales', {
+            date: formatDateKey(selectedDate),
+            rows: chunk,
+            // ส่ง summary + cash_count เฉพาะ chunk แรก (กันเขียนทับ)
+            summary: i === 0 ? mainSummary : undefined,
+            cash_count: i === 0 ? cashCount : undefined,
+            created_by: currentUser?.display_name || 'Admin',
+          });
+          if (!res || !res.success) {
+            toast(`บันทึกบิลล้มเหลวที่ chunk ${Math.floor(i/CHUNK_SIZE)+1}: ${res?.error||''}`, 'error');
+            return;
+          }
+          savedBills += chunk.length;
+          if (totalBills > CHUNK_SIZE) {
+            toast(`กำลังบันทึก... ${savedBills}/${totalBills} บิล`, 'info');
+          }
+        }
+        
+        // ── 2. บันทึก Statements (ทั้ง 3 ธนาคาร) — ใหม่ ที่ยังไม่เคยทำ ──
+        const allStmts = typeof getAllStatements === 'function' ? getAllStatements() : [];
+        if (allStmts.length > 0) {
+          // Group by date เพื่อเก็บลง stmt_YYYYMMDD
+          const byDate = {};
+          allStmts.forEach(s => {
+            const dateKey = (s.date || '').replace(/-/g, '').replace(/\//g, '');
+            // รองรับ YYYYMMDD หรือ dd/mm/yyyy → YYYYMMDD
+            let key = '';
+            if (/^\d{8}$/.test(dateKey)) key = dateKey;
+            else if (/^\d{2}\d{2}\d{4}$/.test(dateKey)) {
+              // ddmmyyyy → yyyymmdd
+              key = dateKey.slice(4) + dateKey.slice(2, 4) + dateKey.slice(0, 2);
+            }
+            if (!key) return;
+            if (!byDate[key]) byDate[key] = [];
+            byDate[key].push(s);
+          });
+          
+          const dateKeys = Object.keys(byDate);
+          let savedStmts = 0;
+          const totalStmts = allStmts.length;
+          toast(`กำลังบันทึก Statement ${totalStmts} รายการ (${dateKeys.length} วัน)...`, 'info');
+          
+          for (const dateKey of dateKeys) {
+            const stmtsOfDate = byDate[dateKey];
+            // Chunk per date too
+            for (let i = 0; i < stmtsOfDate.length; i += CHUNK_SIZE) {
+              const chunk = stmtsOfDate.slice(i, i + CHUNK_SIZE);
+              const res = await api('saveStatements', {
+                date: dateKey,
+                rows: chunk,
+              });
+              if (!res || !res.success) {
+                toast(`บันทึก Statement วันที่ ${dateKey} ล้มเหลว: ${res?.error||''}`, 'error');
+                return;
+              }
+              savedStmts += chunk.length;
+            }
+          }
+          
+          toast(`✅ บันทึกสำเร็จ — ${savedBills} บิล + ${savedStmts} statements`, 'success', 5000);
+        } else {
+          toast(`✅ บันทึกสำเร็จ — ${savedBills} บิล`, 'success');
+        }
+      } catch (err) {
+        console.error('Save error:', err);
+        toast('บันทึกล้มเหลว: ' + err.message, 'error');
+      }
     }
     document.getElementById('main-date')?.addEventListener('change', e => { 
       selectedDate = e.target.value; 
+      invalidateBillsCache();  // ← clear cache when date changes
       // Load summary for this date if available
       if (mainSummary.__byDate && mainSummary.__byDate[selectedDate]) {
         const LABEL_MAP = {
@@ -2694,6 +2873,10 @@ async function renderPayments(el) {
         (p.cust_id||'').toLowerCase().includes(s)
       );
     }
+    
+    // PERF: truncate rendering
+    const _t = truncateForRender(data);
+    const visibleData = _t.visible;
 
     const totalAmt = paymentList.reduce((s,p) => s + (Number(p.total)||0), 0);
     const totalChildBills = paymentList.reduce((s,p) => s + (p.bills?.length||0), 0);
@@ -2745,7 +2928,7 @@ async function renderPayments(el) {
             </thead>
             <tbody>
               ${data.length === 0 ? '<tr><td colspan="7" style="text-align:center;padding:40px;color:var(--text3)">ยังไม่มีข้อมูล SP — กด "นำเข้า SP" เพื่อเริ่มต้น</td></tr>' :
-                data.map((p, idx) => {
+                visibleData.map((p, idx) => {
                   const isOpen = expandedSP.has(p.sp_no);
                   const statusCls = p.match_status === 'matched' ? 'badge-success' : 'badge-warn';
                   const statusLabel = p.match_status === 'matched' ? '✓ Matched' : '⏳ รอ Match';
@@ -3047,6 +3230,10 @@ async function renderCashflow(el) {
     }
     // Sort: วันใหม่ก่อน
     data.sort((a,b) => (parseThaiDate(b.date)||0) - (parseThaiDate(a.date)||0));
+    
+    // PERF: truncate
+    const _t = truncateForRender(data);
+    const visibleData = _t.visible;
 
     // Summary
     const totals = {
@@ -3131,7 +3318,11 @@ async function renderCashflow(el) {
                   ยังไม่มีรายการ — กดปุ่มด้านบนเพื่อเพิ่ม<br>
                   <span class="text-xs">เช่น "🏦 นำเงินฝากธนาคาร" หลังปิดยอดทุกวัน</span>
                 </td></tr>` :
-                data.map((c, idx) => {
+                (() => {
+                  // O(1) index map
+                  const cfIndexMap = new Map();
+                  cashflowList.forEach((c, i) => cfIndexMap.set(c, i));
+                  return visibleData.map((c, idx) => {
                   const typeInfo = {
                     deposit:   { label:'🏦 ฝาก', color:'var(--success)' },
                     supplier:  { label:'🏭 Supplier', color:'var(--danger)' },
@@ -3140,7 +3331,7 @@ async function renderCashflow(el) {
                   }[c.type] || { label:c.type, color:'var(--text2)' };
                   
                   const vatColor = c.vat === 'VAT' ? '#4f9cf9' : c.vat === 'NOVAT' ? '#8e44ad' : 'var(--text3)';
-                  const realIdx = cashflowList.indexOf(c);
+                  const realIdx = cfIndexMap.get(c) ?? idx;
                   const isMatched = c.match_status === 'matched';
                   const rowStyle = isMatched ? 'background:rgba(45,212,160,.06)' : '';
                   
@@ -3166,13 +3357,17 @@ async function renderCashflow(el) {
                       <button class="btn btn-ghost btn-sm btn-cf-delete" data-idx="${realIdx}" title="ลบ" style="color:var(--danger)">🗑️</button>
                     </td>
                   </tr>`;
-                }).join('')
+                }).join('');
+                })()
               }
             </tbody>
           </table>
         </div>
         <div class="flex justify-between items-center" style="padding:10px 14px;border-top:1px solid var(--border)">
-          <span class="text-sm text-dim">${data.length} / ${cashflowList.length} รายการ</span>
+          <span class="text-sm text-dim">
+            ${visibleData.length} / ${data.length} (กรองจาก ${cashflowList.length})
+            ${truncationFooter(data.length)}
+          </span>
           <span class="text-sm"><span style="color:var(--success)">Matched ${matchedCount}</span> · <span style="color:var(--warn)">รอ Match ${cashflowList.length-matchedCount}</span></span>
         </div>
       </div>
@@ -3486,6 +3681,10 @@ async function renderSupplier(el) {
       return (toISODate(b.transfer_date||b.created_date)||'').localeCompare(toISODate(a.transfer_date||a.created_date)||'');
     });
     
+    // PERF: truncate
+    const _t = truncateForRender(data);
+    const visibleData = _t.visible;
+    
     // Summary
     const statusCounts = {
       pending: supplierPayments.filter(p => p.status === 'pending').length,
@@ -3569,7 +3768,10 @@ async function renderSupplier(el) {
                   ยังไม่มีรายการ — กด <strong>+ รายการโอนใหม่</strong><br>
                   <span class="text-xs">1) บันทึกรายการที่จะโอน 2) เมื่อโอนแล้วใส่เลข PP</span>
                 </td></tr>` :
-                data.map((p, idx) => {
+                (() => {
+                  const spIndexMap = new Map();
+                  supplierPayments.forEach((p, i) => spIndexMap.set(p, i));
+                  return visibleData.map((p, idx) => {
                   const statusMap = {
                     pending: { label:'⏳ รอโอน', color:'var(--warn)' },
                     scheduled: { label:'📅 นัดโอน', color:'var(--info)' },
@@ -3577,7 +3779,7 @@ async function renderSupplier(el) {
                     cancelled: { label:'❌ ยกเลิก', color:'var(--text3)' },
                   };
                   const st = statusMap[p.status] || statusMap.pending;
-                  const realIdx = supplierPayments.indexOf(p);
+                  const realIdx = spIndexMap.get(p) ?? idx;
                   const vatColor = p.vat === 'VAT' ? '#4f9cf9' : '#8e44ad';
                   const isMatched = p.match_status === 'matched';
                   const rowStyle = p.status === 'cancelled' ? 'opacity:.5;text-decoration:line-through' : 
@@ -3611,13 +3813,17 @@ async function renderSupplier(el) {
                       <button class="btn btn-ghost btn-sm btn-sp-delete" data-idx="${realIdx}" title="ลบ" style="color:var(--danger)">🗑️</button>
                     </td>
                   </tr>`;
-                }).join('')
+                }).join('');
+                })()
               }
             </tbody>
           </table>
         </div>
         <div class="flex justify-between items-center" style="padding:10px 14px;border-top:1px solid var(--border)">
-          <span class="text-sm text-dim">${data.length} / ${supplierPayments.length} รายการ</span>
+          <span class="text-sm text-dim">
+            ${visibleData.length} / ${data.length} (จาก ${supplierPayments.length})
+            ${truncationFooter(data.length)}
+          </span>
           <span class="font-bold">รวม: ฿${fmtNum(data.reduce((s,p)=>s+Number(p.amount||0),0))}</span>
         </div>
       </div>
@@ -4547,6 +4753,10 @@ async function renderPPReport(el) {
       );
     }
     
+    // PERF: truncate
+    const _t = truncateForRender(data);
+    const visibleData = _t.visible;
+    
     const totalAmount = data.reduce((s,p) => s + Number(p.net||0), 0);
     const vatCount = ppReport.merged.filter(p => p.vat === 'V').length;
     const novatCount = ppReport.merged.filter(p => p.vat === 'N').length;
@@ -4682,7 +4892,7 @@ async function renderPPReport(el) {
                     'ยังไม่มีข้อมูล — กด <strong>"📥 Import 3 ไฟล์ (รวด)"</strong> ด้านบน' :
                     'ไม่พบข้อมูลในเงื่อนไขที่กรอง'}
                 </td></tr>` :
-                data.map((p, idx) => {
+                visibleData.map((p, idx) => {
                   const vatColor = p.vat === 'V' ? '#4f9cf9' : p.vat === 'N' ? '#8e44ad' : p.vat === 'MIX' ? 'var(--warn)' : p.vat === 'PX' ? 'var(--warn)' : 'var(--text3)';
                   // 3-way status: Supplier Payment (ระบบ) + Transfer Log (JKN file) + Statement Match
                   const spIcon = p.linked_sp 
@@ -4725,7 +4935,10 @@ async function renderPPReport(el) {
           </table>
         </div>
         <div class="flex justify-between items-center" style="padding:10px 14px;border-top:1px solid var(--border)">
-          <span class="text-sm text-dim">${data.length} / ${ppReport.merged.length} PP</span>
+          <span class="text-sm text-dim">
+            ${visibleData.length} / ${data.length} (จาก ${ppReport.merged.length})
+            ${truncationFooter(data.length)}
+          </span>
           <span class="font-bold">รวม: ฿${fmtNum(totalAmount)}</span>
         </div>
       </div>
@@ -5317,6 +5530,10 @@ async function renderTransferLog(el) {
     // Sort: newest first
     data.sort((a,b) => (toISODate(b.transfer_date)||'').localeCompare(toISODate(a.transfer_date)||''));
     
+    // PERF: truncate
+    const _t = truncateForRender(data);
+    const visibleData = _t.visible;
+    
     // Stats — ใช้ transfer_amount (ยอดโอนจริง = amount - หัก) ไม่ใช่ amount (ยอดตามใบแจ้งยอด)
     const totalAmount = data.reduce((s,t) => s + Number(t.transfer_amount ?? t.amount ?? 0), 0);
     const vatCount = transferLog.vatTransfers.length;
@@ -5409,7 +5626,7 @@ async function renderTransferLog(el) {
                 `<tr><td colspan="13" style="text-align:center;padding:40px;color:var(--text3)">
                   ยังไม่มีข้อมูล — กด <strong>"📥 Import ไฟล์ JKN"</strong>
                 </td></tr>` :
-                data.map((t, idx) => {
+                visibleData.map((t, idx) => {
                   const vatColor = t.vat === 'VAT' ? '#4f9cf9' : '#8e44ad';
                   const matchIcon = t.match_status === 'stmt_matched' ? '✓✓' : t.pp_no ? '✓' : '⏳';
                   const matchColor = t.match_status === 'stmt_matched' ? 'var(--success)' : t.pp_no ? 'var(--info)' : 'var(--text3)';
@@ -5439,7 +5656,7 @@ async function renderTransferLog(el) {
           </table>
         </div>
         <div class="flex justify-between items-center" style="padding:10px 14px;border-top:1px solid var(--border)">
-          <span class="text-sm text-dim">${data.length} / ${vatCount+novatCount} รายการ</span>
+          <span class="text-sm text-dim">${visibleData.length} / ${data.length} · ทั้งหมด ${vatCount+novatCount} ${truncationFooter(data.length)}</span>
           <span class="font-bold">รวม: ฿${fmtNum(totalAmount)}</span>
         </div>
       </div>
@@ -7322,6 +7539,10 @@ async function renderSales(el) {
     const totalSales = data.filter(s=>getAmt(s)>0).reduce((a,s)=>a+getAmt(s),0);
     const totalReturns = data.filter(s=>getAmt(s)<0).reduce((a,s)=>a+getAmt(s),0);
     const ent = getEntry();
+    
+    // PERF: truncate for render
+    const _t = truncateForRender(data);
+    const visibleData = _t.visible;
 
     const billColor = b => b.startsWith('OS')?'var(--info)':b.startsWith('OR')?'var(--purple)':b.startsWith('SS')?'var(--success)':b.startsWith('SR')?'var(--danger)':'var(--text2)';
 
@@ -7409,7 +7630,7 @@ async function renderSales(el) {
           <table>
             <thead><tr><th>Bill Number</th><th>Bill Date</th><th>Station</th><th>Type</th><th style="text-align:right">Baht</th><th>Confirmation</th><th>Pay Date</th><th>Remarks</th></tr></thead>
             <tbody>
-              ${data.length ? data.map(s=>`<tr>
+              ${data.length ? visibleData.map(s=>`<tr>
                 <td style="color:${billColor(s.bill_no||s['Bill Number']||'')};font-weight:600">${s.bill_no||s['Bill Number']||''}</td>
                 <td>${fmtDate(s.date||s['Bill Date']||'')}</td>
                 <td><span class="badge badge-info">${s.station||s['Station']||''}</span></td>
@@ -7423,7 +7644,7 @@ async function renderSales(el) {
           </table>
         </div>
         <div class="flex justify-between items-center" style="padding:12px 16px;border-top:1px solid var(--border)">
-          <span class="text-sm text-dim">${data.length} รายการ</span>
+          <span class="text-sm text-dim">${visibleData.length} / ${data.length} รายการ ${truncationFooter(data.length)}</span>
           <span class="font-bold">รวม: ฿${fmtNum(data.reduce((a,s)=>a+getAmt(s),0))}</span>
         </div>
       </div>
@@ -7490,6 +7711,10 @@ async function renderMatching(el) {
     
     // Sort ASC by date (รองรับ descending format จาก BBL)
     data.sort((a, b) => (parseThaiDate(a.date) || 0) - (parseThaiDate(b.date) || 0));
+    
+    // PERF: truncate for render
+    const _t = truncateForRender(data);
+    const visibleData = _t.visible;
 
     // Bank counts (แสดงจำนวนแต่ละธนาคารที่นำเข้าแล้ว)
     const bankCounts = {
@@ -7530,7 +7755,7 @@ async function renderMatching(el) {
           <table>
             <thead><tr><th>ธนาคาร</th><th>วันที่</th><th>เวลา</th><th>Ref.</th><th style="text-align:right">จำนวนเงิน</th><th>รายละเอียด</th><th>Station</th><th>Bill</th><th>สถานะ</th></tr></thead>
             <tbody>
-              ${data.length ? data.map((s,i)=>{
+              ${data.length ? visibleData.map((s,i)=>{
                 const isMatched = s.match_status === 'matched';
                 const isManual = s.match_method === 'manual';
                 const rowStyle = isMatched 
@@ -8628,7 +8853,9 @@ async function renderAlerts(el) {
       <div class="flex-col gap-3">
         ${filtered.length === 0 ? 
           '<div class="card text-dim text-sm" style="text-align:center;padding:40px">✅ ไม่มีแจ้งเตือนในหมวดนี้</div>' :
-          filtered.map(a => {
+          (() => {
+            const _t = truncateForRender(filtered);
+            return _t.visible.map(a => {
             const color = a.priority === 1 ? 'var(--danger)' : a.priority === 2 ? 'var(--warn)' : 'var(--info)';
             return `<div class="card" style="border-left:4px solid ${color}">
               <div class="flex justify-between items-center flex-wrap gap-3">
@@ -8644,7 +8871,8 @@ async function renderAlerts(el) {
                 </div>
               </div>
             </div>`;
-          }).join('')
+          }).join('') + (_t.truncated ? `<div class="card text-sm text-muted" style="text-align:center;padding:12px">${truncationFooter(_t.total)}</div>` : '');
+          })()
         }
       </div>
     `;
