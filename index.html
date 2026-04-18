@@ -7217,25 +7217,6 @@ async function openBillStatusModal(custId, billNo) {
   });
 }
 
-    // Bindings
-    document.getElementById('debt-search')?.addEventListener('input', debounce(e => { searchText = e.target.value; loadAndRender(); }, 300));
-    el.querySelectorAll('.pill[data-fs]').forEach(btn => {
-      btn.addEventListener('click', () => { filterStatus = btn.dataset.fs; loadAndRender(); });
-    });
-    document.getElementById('btn-check-alerts')?.addEventListener('click', async () => {
-      toast('กำลังตรวจสอบสถานะลูกหนี้...', 'info');
-      const r = await api('checkAlerts');
-      if (r.success) {
-        toast(`ตรวจสอบเสร็จ — เปลี่ยนสถานะ ${r.data?.status_changed||0} ราย | แจ้งเตือน ${r.data?.alerts?.length||0} ราย`, 'success');
-        loadAndRender();
-      } else {
-        toast(r.error||'ไม่สำเร็จ', 'error');
-      }
-    });
-    
-    // Quick Payment — ลูกค้ามาจ่ายหนี้สดๆ ที่ร้าน
-    document.getElementById('btn-quick-payment')?.addEventListener('click', () => openQuickPaymentModal());
-
 // ══════════════════════════════════════════════════════════════
 // Quick Payment Modal — รับชำระจากลูกค้าแบบเร็ว
 // Step 1: ค้นหาลูกค้า → Step 2: เลือกบิลที่จะตัด → Step 3: บันทึก
