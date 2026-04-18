@@ -2902,11 +2902,27 @@ async function renderPayments(el) {
 //          BBL (บริษัท 266-4-448384 — VAT)
 //   NOVAT: BBL NW (รับ-จ่าย NOVAT)
 // ══════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════
+// BANK_ACCOUNTS — Business Rules ของ 4 บัญชี
+// 
+// flow:
+//   'receive'     = รับโอนจากลูกค้า
+//   'pay'         = จ่ายโอนให้ supplier
+//   'cheque_out'  = เช็คขึ้นเงิน (withdraw)
+//
+// รับเงินจากลูกค้า:
+//   VAT (SS/SR)  → KTB, KBANK, BBL   (ทุกบัญชี VAT)
+//   NOVAT (OS/OR) → BBL NW           (เฉพาะ NOVAT)
+//
+// จ่ายเจ้าหนี้:
+//   VAT          → KBANK (หลัก)     + เช็คผ่าน KTB
+//   NOVAT        → BBL NW
+// ══════════════════════════════════════════════════════════════
 const BANK_ACCOUNTS = {
-  KTB:      { label:'KTB · รับโอนลูกหนี้ VAT · จ่ายเช็ค', vat:'VAT',   flow:['receive','cheque_out'] },
-  KBANK:    { label:'KBANK · จ่ายเจ้าหนี้ VAT',          vat:'VAT',   flow:['pay','receive'] },
-  BBL:      { label:'BBL · บัญชีบริษัท VAT',              vat:'VAT',   flow:['receive','pay'] },
-  'BBL NW': { label:'BBL NW · รับ-จ่าย NOVAT',            vat:'NOVAT', flow:['receive','pay'] },
+  KTB:      { label:'KTB · รับโอน VAT · จ่ายเช็ค',        vat:'VAT',   flow:['receive','cheque_out'],    allowed_docs:['SS','SR','SP'] },
+  KBANK:    { label:'KBANK · รับ-จ่าย VAT',               vat:'VAT',   flow:['receive','pay'],           allowed_docs:['SS','SR','SP'] },
+  BBL:      { label:'BBL · บัญชีบริษัท VAT',              vat:'VAT',   flow:['receive','pay'],           allowed_docs:['SS','SR','SP'] },
+  'BBL NW': { label:'BBL NW · รับ-จ่าย NOVAT',            vat:'NOVAT', flow:['receive','pay'],           allowed_docs:['OS','OR','SP'] },
 };
 
 function getAllowedBanks(vat, direction) {
@@ -2916,6 +2932,29 @@ function getAllowedBanks(vat, direction) {
     if (direction && !b.flow.includes(direction)) return false;
     return true;
   });
+}
+
+// ══════════════════════════════════════════════════════════════
+// ตรวจว่าเป็นกรณี "ลูกค้าโอนผิดธนาคาร" หรือไม่
+// - SS/SR โอนเข้า BBL NW → wrong (VAT → NOVAT bank)
+// - OS/OR โอนเข้า KTB/KBANK/BBL → wrong (NOVAT → VAT bank)
+// - ระบบไม่บล็อก แต่จะ flag ให้ผู้ใช้เห็น
+// ══════════════════════════════════════════════════════════════
+function detectMisroutedPayment(billNo, bank) {
+  if (!billNo || !bank) return null;
+  const prefix = String(billNo).substring(0, 2).toUpperCase();
+  const bankDef = BANK_ACCOUNTS[bank];
+  if (!bankDef) return null;
+  
+  // VAT docs (SS, SR) — should go to VAT banks
+  if (['SS', 'SR'].includes(prefix) && bankDef.vat !== 'VAT') {
+    return { type:'vat_to_novat', msg:`บิล ${prefix} (VAT) โอนเข้า ${bank} (NOVAT) — ผิดบัญชี` };
+  }
+  // NOVAT docs (OS, OR) — should go to BBL NW
+  if (['OS', 'OR'].includes(prefix) && bankDef.vat !== 'NOVAT') {
+    return { type:'novat_to_vat', msg:`บิล ${prefix} (NOVAT) โอนเข้า ${bank} (VAT) — ผิดบัญชี` };
+  }
+  return null; // ok
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -8458,6 +8497,24 @@ async function renderAlerts(el) {
     });
   });
   
+  // 9. Misrouted Payments — ลูกค้าโอนผิดธนาคาร
+  // SS/SR (VAT) → โอนเข้า BBL NW = ผิด
+  // OS/OR (NOVAT) → โอนเข้า KTB/KBANK/BBL = ผิด
+  billList.filter(b => b.match_status === 'matched' && b.bill_no && b.bank).forEach(b => {
+    const misroute = detectMisroutedPayment(b.bill_no, b.bank);
+    if (!misroute) return;
+    alerts.push({
+      category: 'misrouted_payment',
+      priority: 2,
+      title: `⚠️ บิล ${b.bill_no} โอนผิดธนาคาร`,
+      detail: `${misroute.msg} · ฿${fmtNum(b.amount)}`,
+      meta: `${b.remarks1||b.station||''}${b.date?' · '+fmtDate(b.date):''}`,
+      type: 'misrouted_payment',
+      action: 'main',
+      data: b,
+    });
+  });
+  
   // Sort by priority
   alerts.sort((a, b) => a.priority - b.priority);
   
@@ -8472,6 +8529,7 @@ async function renderAlerts(el) {
     supplier_pending: alerts.filter(a => a.category === 'supplier_pending').length,
     supplier_unmatched: alerts.filter(a => a.category === 'supplier_unmatched').length,
     supplier_cheque_stale: alerts.filter(a => a.category === 'supplier_cheque_stale').length,
+    misrouted_payment: alerts.filter(a => a.category === 'misrouted_payment').length,
   };
   
   let filterCat = 'all';
@@ -8498,6 +8556,7 @@ async function renderAlerts(el) {
         ${categories.sp_temp > 0 ? `<button class="pill ${filterCat==='sp_temp'?'active':''}" data-cat="sp_temp" style="--pill-color:var(--info)">🔷 SP ชั่วคราว (${categories.sp_temp})</button>` : ''}
         ${categories.stmt_unmatched > 0 ? `<button class="pill ${filterCat==='stmt_unmatched'?'active':''}" data-cat="stmt_unmatched" style="--pill-color:var(--info)">🏦 Statement ค้าง (${categories.stmt_unmatched})</button>` : ''}
         ${categories.supplier_cheque_stale > 0 ? `<button class="pill ${filterCat==='supplier_cheque_stale'?'active':''}" data-cat="supplier_cheque_stale" style="--pill-color:var(--warn)">📝 เช็คค้างขึ้นเงิน (${categories.supplier_cheque_stale})</button>` : ''}
+        ${categories.misrouted_payment > 0 ? `<button class="pill ${filterCat==='misrouted_payment'?'active':''}" data-cat="misrouted_payment" style="--pill-color:var(--warn)">🔀 โอนผิดธนาคาร (${categories.misrouted_payment})</button>` : ''}
       </div>
       
       <div class="flex-col gap-3">
