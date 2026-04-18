@@ -5065,6 +5065,10 @@ async function renderTransferLog(el) {
         </div>
         <div class="flex gap-2 flex-wrap">
           <button class="btn btn-primary btn-sm" id="btn-tl-import">${ICONS.download} Import ไฟล์ JKN</button>
+          <label class="btn btn-outline btn-sm" style="cursor:pointer" title="Import JSON ที่ convert ไว้แล้ว">
+            📂 Import JSON
+            <input type="file" id="btn-tl-import-json" accept=".json" style="display:none">
+          </label>
           <button class="btn btn-success btn-sm" id="btn-tl-save">${ICONS.check} บันทึกเข้า Sheet</button>
           <button class="btn btn-outline btn-sm" id="btn-tl-sync">🔗 Sync → Supplier Payments</button>
           <button class="btn btn-ghost btn-sm" id="btn-tl-clear" style="color:var(--danger)">🗑️ ล้าง</button>
@@ -5513,6 +5517,64 @@ async function renderTransferLog(el) {
       btn.addEventListener('click', () => { tab = btn.dataset.tab; render(); });
     });
     document.getElementById('btn-tl-import')?.addEventListener('click', () => openImportModal());
+    
+    // Import JSON (converted offline)
+    document.getElementById('btn-tl-import-json')?.addEventListener('change', async e => {
+      const f = e.target.files[0];
+      if (!f) return;
+      try {
+        const text = await f.text();
+        const data = JSON.parse(text);
+        
+        // Validate structure
+        if (!Array.isArray(data.vatTransfers) || !Array.isArray(data.novatTransfers)) {
+          toast('ไฟล์ JSON ไม่ถูก format (ต้องมี vatTransfers, novatTransfers, ...)', 'error');
+          return;
+        }
+        
+        if (!confirm(`จะ Import:
+• VAT Transfers: ${data.vatTransfers?.length||0}
+• NoVAT Transfers: ${data.novatTransfers?.length||0}
+• Supplier VAT: ${data.vatSuppliers?.length||0}
+• Supplier NoVAT: ${data.novatSuppliers?.length||0}
+• ตรวจ: ${Object.keys(data.monthlyChecks||{}).length} เดือน
+
+*ข้อมูลเดิมจะถูกแทนที่*`)) return;
+        
+        transferLog.vatTransfers = data.vatTransfers || [];
+        transferLog.novatTransfers = data.novatTransfers || [];
+        transferLog.vatSuppliers = data.vatSuppliers || [];
+        transferLog.novatSuppliers = data.novatSuppliers || [];
+        transferLog.monthlyChecks = data.monthlyChecks || {};
+        
+        // Auto-link transfers กับ PP จาก monthlyChecks (invoice_no + amount)
+        const checksByKey = {};
+        Object.values(transferLog.monthlyChecks).forEach(arr => {
+          arr.forEach(c => {
+            if (c.pp_no && c.invoice_no) {
+              checksByKey[`${c.invoice_no}|${Math.round(Number(c.amount_paid))}`] = c.pp_no;
+            }
+          });
+        });
+        [...transferLog.vatTransfers, ...transferLog.novatTransfers].forEach(t => {
+          const key = `${t.invoice_no}|${Math.round(Number(t.amount))}`;
+          if (checksByKey[key]) {
+            t.pp_no = checksByKey[key];
+            t.match_status = 'matched';
+          }
+        });
+        
+        persistMainState();
+        const total = (data.vatTransfers?.length||0) + (data.novatTransfers?.length||0);
+        toast(`✓ Import JSON สำเร็จ — ${total} รายการ`, 'success');
+        render();
+      } catch (err) {
+        console.error(err);
+        toast('Import ไม่สำเร็จ: ' + err.message, 'error');
+      }
+      e.target.value = '';
+    });
+    
     document.getElementById('btn-tl-save')?.addEventListener('click', async () => {
       toast('กำลังบันทึก...', 'info');
       const res = await api('saveTransferLog', { data: transferLog });
