@@ -524,83 +524,181 @@ function restoreMainState() {
 }
 
 // ══════════════════════════════════════════════════════════════
-// Parse Front POS Report (rpt_sql_pssdailybycashierbybill.xls)
-// Format: Bill S2604001XXX-YYYYYYY โดย XXX = 001(F1), 002(F2), 003(F3), 004(F4)
-//         R = คืนเงิน, S = ขาย
-// Col: 1=Bill | 2=Cashier | 3=ยอดบิล | 6=ยอดขายสุทธิ | 7=เงินสด | 8=โอน/บัตร | 9=เช็ค
+// Parse Front POS Report (rpt_sql_pssdailybycshbypaytype.xls) - NEW FORMAT
+// โครงสร้าง: แยกตาม Cashier แล้วมี เงินสด / บัตรเครดิต / เงินโอน (แยกทีละบิล)
+// Station = ดูจาก bill prefix (001/002/003/004) — ชัวร์ 100%
+// Cashier-Station mapping = สร้างจากข้อมูลในไฟล์ (ไม่ hardcode เพราะอาจสลับได้)
 // ══════════════════════════════════════════════════════════════
 function parseFrontPosReport(result, fileName) {
   const newBills = [];
-  let count = 0;
+  let count = 0, transferCount = 0;
+  
+  // summary ต่อ station (สำหรับใส่ในตาราง Summary ด้านบน)
+  const stationSummary = {
+    Front1: { cash: 0, card: 0, transfer: 0, sales: 0, refund: 0, cashier: '' },
+    Front2: { cash: 0, card: 0, transfer: 0, sales: 0, refund: 0, cashier: '' },
+    Front3: { cash: 0, card: 0, transfer: 0, sales: 0, refund: 0, cashier: '' },
+    Front4: { cash: 0, card: 0, transfer: 0, sales: 0, refund: 0, cashier: '' },
+  };
 
-  // ใช้ sheet แรก
+  // Dynamic mapping: cashier → station (จาก bill prefix ในไฟล์นี้)
+  const cashierToStation = {}; // key: "CAS008" → value: "Front1"
+
   const sheetName = result.sheetNames[0];
   const sheet = result.sheets[sheetName] || [];
 
-  // หา header row (แถวที่มีคอลัมน์ "ยอดบิล" หรือ "รับเงินสด")
-  let headerRow = -1;
-  for (let i = 0; i < Math.min(10, sheet.length); i++) {
-    const row = sheet[i] || [];
-    const joined = row.map(c => String(c)).join('|');
-    if (joined.includes('ยอดบิล') || joined.includes('รับเงินสด') || joined.includes('ยอดขายสุทธิ')) {
-      headerRow = i; break;
+  // Helper: ดึง Station จาก bill prefix
+  function getStationFromBill(billNo) {
+    const match = String(billNo).match(/^[SR]\d{7}(\d{3})-/);
+    if (!match) return '';
+    const code = match[1];
+    return { '001':'Front1', '002':'Front2', '003':'Front3', '004':'Front4' }[code] || '';
+  }
+
+  // Helper: ดึง cashier code (เช่น CAS008)
+  function getCashierCode(cashierStr) {
+    const m = String(cashierStr).match(/\((CAS\d+)\)/);
+    return m ? m[1] : '';
+  }
+
+  // ── PASS 1: สแกนเลขบิล → สร้าง cashier↔station mapping ──
+  let scanCashier = '';
+  for (let i = 0; i < sheet.length; i++) {
+    const r = sheet[i] || [];
+    const c1 = String(r[0] || '').trim();
+    const c2 = String(r[1] || '').trim();
+    
+    // จับ cashier header
+    const cashMatch = c1.match(/^\((CAS\d+)\)/);
+    if (cashMatch) { scanCashier = cashMatch[1]; continue; }
+    
+    // จับ bill ของ cashier นี้ → ดู station จาก bill
+    if (c2.startsWith('หมายเลข') && scanCashier) {
+      const billNo = String(r[2] || '').trim();
+      const st = getStationFromBill(billNo);
+      if (st && !cashierToStation[scanCashier]) {
+        cashierToStation[scanCashier] = st;
+      }
     }
   }
-  if (headerRow === -1) headerRow = 1;
 
-  for (let i = headerRow + 1; i < sheet.length; i++) {
+  // ── PASS 2: อ่านข้อมูลจริง ──
+  let currentStation = '';
+  let currentCashier = '';
+  let currentCashierName = '';
+
+  for (let i = 0; i < sheet.length; i++) {
     const r = sheet[i] || [];
-    const billNo = String(r[0] || '').trim();
-    if (!billNo) continue;
+    const c1 = String(r[0] || '').trim();
+    const c2 = String(r[1] || '').trim();
 
-    // หยุดที่บรรทัดสรุปท้ายไฟล์
-    if (billNo.includes('ยอดขายสุทธิ') || billNo.includes('คูปอง') || billNo.startsWith('**') || billNo.includes('Page') || billNo.includes('.rpt')) break;
+    // หยุดที่แถวท้ายไฟล์
+    if (c1.includes('**คูปอง') || c1.includes('.rpt') || c2.includes('Page')) break;
 
-    // ต้องเป็น format S/R ตามด้วยตัวเลข และมี -
-    if (!/^[SR]\d{8,}-\d+$/.test(billNo)) continue;
+    // แถว Cashier header
+    const cashierMatch = c1.match(/^\((CAS\d+)\)\s*(.+?)$/);
+    if (cashierMatch) {
+      currentCashier = cashierMatch[1];
+      currentCashierName = cashierMatch[2].trim();
+      currentStation = cashierToStation[currentCashier] || '';
+      
+      if (currentStation && stationSummary[currentStation]) {
+        stationSummary[currentStation].cashier = currentCashierName;
+        stationSummary[currentStation].sales = Number(r[1]) || 0;
+        stationSummary[currentStation].refund = Math.abs(Number(r[2]) || 0);
+      }
+      continue;
+    }
 
-    const prefix = billNo.split('-')[0];
-    const stationCode = prefix.slice(-3);
-    const stationMap = { '001': 'Front1', '002': 'Front2', '003': 'Front3', '004': 'Front4' };
-    const station = stationMap[stationCode] || 'Front1';
+    // แถว "เงินสด"
+    if (c2 === 'เงินสด') {
+      const amt = Number(r[7]) || Number(r[2]) || 0;
+      if (currentStation && stationSummary[currentStation]) {
+        stationSummary[currentStation].cash = amt;
+      }
+      continue;
+    }
+    
+    // แถว "บัตรเครดิต"
+    if (c2 === 'บัตรเครดิต') {
+      const amt = Number(r[7]) || Number(r[2]) || 0;
+      if (currentStation && stationSummary[currentStation]) {
+        stationSummary[currentStation].card = amt;
+      }
+      continue;
+    }
 
-    const cashier = String(r[1] || '').trim();
-    const netSales = Number(r[5]) || 0;
-    const cash = Number(r[6]) || 0;
-    const transfer = Number(r[7]) || 0;
-    const cheque = Number(r[8]) || 0;
+    // แถวเงินโอน (มีเลขบิลจริง)
+    if (c2.startsWith('หมายเลข')) {
+      const billNo = String(r[2] || '').trim();
+      if (!/^[SR]\d+-\d+$/.test(billNo)) continue;
+      
+      const date = r[4] || '';
+      const amount = Number(r[6]) || 0;
+      if (!amount) continue;
 
-    let type = '';
-    if (cash > 0) type = 'Cash';
-    else if (transfer > 0) type = 'Transfer';
-    else if (cheque > 0) type = 'Cheque';
-    else type = 'Cash';
+      const refMatch = c2.match(/เงินโอน\s+(.+?)$/);
+      const transferRef = refMatch ? refMatch[1].trim() : '';
 
-    const isReturn = billNo.startsWith('R');
-    const finalAmount = isReturn ? -Math.abs(netSales) : netSales;
-    if (isReturn) type = 'Refund';
+      // Station จากเลขบิล (ชัวร์กว่า cashier mapping)
+      const station = getStationFromBill(billNo) || currentStation || 'Front1';
+      
+      const isOther = c2.includes('OTHER');
+      const type = isOther ? 'Other' : 'Transfer';
+      
+      const isReturn = billNo.startsWith('R');
+      const finalAmount = isReturn ? -Math.abs(amount) : amount;
 
-    newBills.push({
-      bill_no: billNo,
-      date: todayISO(),
-      station: station,
-      type: type,
-      amount: finalAmount,
-      confirmation: '',
-      pay_date: '',
-      remarks1: cashier,
-      remarks2: '',
-      bank: '',
-      due_date: '',
-      match_status: 'pending',
-      source: 'pos',
-    });
-    count++;
+      newBills.push({
+        bill_no: billNo,
+        date: fmtDate(date) || todayISO(),
+        source_date: fmtDate(date) || todayISO(),
+        station: station,
+        type: isReturn ? 'Refund' : type,
+        amount: finalAmount,
+        confirmation: transferRef,
+        pay_date: '',
+        remarks1: currentCashierName ? `${currentCashier} ${currentCashierName}` : currentCashier,
+        remarks2: transferRef,
+        bank: '',
+        due_date: '',
+        match_status: 'pending',
+        source: 'pos',
+      });
+      count++;
+      transferCount++;
+      
+      if (station && stationSummary[station] && !isReturn) {
+        stationSummary[station].transfer += amount;
+      }
+    }
   }
 
-  billList = billList.concat(newBills);
+  // เก็บ summary + cashier-station mapping
+  Object.keys(stationSummary).forEach(st => {
+    const s = stationSummary[st];
+    if (s.sales > 0) {
+      mainSummary['sales_' + st] = s.sales;
+      // เก็บชื่อ cashier ประจำ station วันนี้
+      mainSummary['cashier_' + st] = s.cashier;
+    }
+  });
+
+  // รวมเข้า billList
+  const existingKeys = new Set(billList.map(b => b.bill_no).filter(Boolean));
+  const uniqueNewBills = newBills.filter(b => !b.bill_no || !existingKeys.has(b.bill_no));
+  const dup = newBills.length - uniqueNewBills.length;
+  billList = billList.concat(uniqueNewBills);
   persistMainState();
-  toast(`นำเข้า Front POS สำเร็จ — ${count} รายการ`, 'success');
+  
+  // แสดง Cashier-Station ของวันนี้
+  const mappingStr = Object.entries(cashierToStation)
+    .map(([cas, st]) => `${st}=${cas}`)
+    .join(', ');
+  
+  toast(`นำเข้า Front POS สำเร็จ — ${uniqueNewBills.length} บิลเงินโอน${dup?` (ข้าม ${dup} ซ้ำ)`:''}`, 'success');
+  if (mappingStr) setTimeout(() => toast('Cashier วันนี้: ' + mappingStr, 'info'), 600);
+  
   if (currentPage === 'main') navigateTo('main');
 }
 
@@ -706,11 +804,31 @@ function generateBillList(result, fileName) {
   const newBills = [];
   let smartCount = 0, posCount = 0, mainCount = 0;
 
-  // ── 1. อ่าน "SS OR SR OR" (Smart bills) ──
-  const smartSheetName = result.sheetNames.find(n => /ss|or|sr/i.test(n) && !n.toLowerCase().includes('main')) || 'SS OR SR OR';
-  const smartSheet = result.sheets[smartSheetName] || [];
+  // ── 1. อ่าน Smart bills (SS/OS/SR/OR/SC/SP) — รองรับทุกชื่อ Sheet ──
+  // ขั้นที่ 1: ลองหา sheet ที่มีชื่อตรงเป๊ะก่อน
+  let smartSheetName = result.sheetNames.find(n => /^(ss|or|sr|os).*(or|sr|os|ss)/i.test(n.replace(/\s+/g,'')));
+  
+  // ขั้นที่ 2: ถ้าไม่เจอ → scan ทุก sheet หาที่มี bill pattern SS/OS/SR/OR ใน col แรก
+  if (!smartSheetName) {
+    for (const name of result.sheetNames) {
+      const sh = result.sheets[name] || [];
+      // ตรวจ 20 แถวแรกว่ามีเลขบิลไหม
+      const hasBills = sh.slice(0, 30).some(row => {
+        const c0 = String((row||[])[0] || '').trim().toUpperCase();
+        return /^(SS|OS|SR|OR|SC|SP|JS|JR)\d+-\d+/.test(c0);
+      });
+      if (hasBills) { smartSheetName = name; break; }
+    }
+  }
+  
+  const smartSheet = smartSheetName ? (result.sheets[smartSheetName] || []) : [];
+  
+  if (!smartSheetName) {
+    toast('ไม่พบข้อมูลบิลในไฟล์ (ต้องมี SS/OS/SR/OR/SC/SP)', 'error');
+    return;
+  }
 
-  // หา header row (ที่มีคอลัมน์ Amount/Bill)
+  // หา header row (ที่มีคอลัมน์ Amount/Bill) — ถ้าไม่เจอก็ไม่เป็นไร จะ skip แถวที่ไม่ใช่บิลเอง
   let smartHdr = -1;
   for (let i = 0; i < Math.min(10, smartSheet.length); i++) {
     const row = smartSheet[i] || [];
@@ -718,17 +836,19 @@ function generateBillList(result, fileName) {
       smartHdr = i; break;
     }
   }
-  // ถ้าไม่เจอ header — เริ่มจากแถวที่ 1 (index 2 จริง) ตามไฟล์จริง
-  const startRow = smartHdr >= 0 ? smartHdr + 1 : 2;
+  const startRow = smartHdr >= 0 ? smartHdr + 1 : 0;
 
   for (let i = startRow; i < smartSheet.length; i++) {
     const r = smartSheet[i] || [];
     const billNo = String(r[0] || '').trim();
     if (!billNo) continue;
+    
+    // Skip non-bill rows (เช่น "พนักงานขาย : ไม่ได้กำหนด")
+    if (!/^(SS|OS|SR|OR|SC|SP|JS|JR)\d+-\d+/i.test(billNo)) continue;
 
     // Amount Incl VAT (col 8) หรือ col สุดท้าย
     const amount = Number(r[8]) || Number(r[6]) || 0;
-    const customer = String(r[2] || '').replace(/^\[[^\]]+\]/, '').trim();
+    const customer = String(r[2] || '').replace(/^\[[^\]]+\]/, '').replace(/\n/g,' ').trim();
     const date = fmtDate(r[3]) || todayISO();
 
     const bill = transformBill(billNo, amount, customer, date);
@@ -1003,7 +1123,13 @@ async function renderMain(el) {
               <tr>
                 <th style="min-width:110px;text-align:center;background:var(--surface3)">All Station</th>
                 <th style="min-width:90px;text-align:center;background:var(--surface3)">รายการ</th>
-                ${SUMMARY_STATIONS.map(s=>`<th style="min-width:95px;text-align:center;background:var(--surface3)">${s}</th>`).join('')}
+                ${SUMMARY_STATIONS.map(s=>{
+                  const cashier = mainSummary['cashier_'+s];
+                  return `<th style="min-width:95px;text-align:center;background:var(--surface3)">
+                    ${s}
+                    ${cashier?`<div class="text-xs" style="font-weight:400;color:var(--text2);margin-top:2px">${cashier}</div>`:''}
+                  </th>`;
+                }).join('')}
               </tr>
             </thead>
             <tbody>
@@ -1598,12 +1724,13 @@ async function renderPayments(el) {
         <div class="flex gap-2">
           <input class="input" placeholder="ค้นหา SP / ลูกค้า" id="pay-search" value="${searchText}" style="width:240px">
           <button class="btn btn-primary btn-sm" id="btn-import-sp">${ICONS.download} นำเข้า SP</button>
+          <button class="btn btn-warn btn-sm" id="btn-add-temp-sp" style="background:var(--warn);color:#fff">${ICONS.plus} SP ชั่วคราว</button>
           <button class="btn btn-outline btn-sm" id="btn-clear-pay">ล้าง</button>
           <button class="btn btn-success btn-sm" id="btn-save-pay">${ICONS.check} บันทึก</button>
         </div>
       </div>
 
-      <p class="text-sm text-dim mb-3">นำเข้าไฟล์ SP Payment Report (.xls) — ระบบจะแสดง SP แต่ละตัวพร้อมบิลที่ตัด (SS/OS/SR/OR/JR)</p>
+      <p class="text-sm text-dim mb-3">นำเข้าไฟล์ SP Payment Report (.xls) หรือสร้าง SP ชั่วคราว (SP-TEMP-xxx) เมื่อเห็นเงินเข้าแต่ยังไม่มีเลข SP จริง</p>
 
       <!-- Summary cards -->
       <div class="flex gap-3 flex-wrap mb-3 stagger">
@@ -1640,10 +1767,14 @@ async function renderPayments(el) {
                   const isOpen = expandedSP.has(p.sp_no);
                   const statusCls = p.match_status === 'matched' ? 'badge-success' : 'badge-warn';
                   const statusLabel = p.match_status === 'matched' ? '✓ Matched' : '⏳ รอ Match';
+                  const isTemp = /^SP-TEMP-/.test(p.sp_no);
                   return `
-                    <tr class="sp-row" data-sp="${p.sp_no}" style="cursor:pointer;${isOpen?'background:var(--surface2)':''}">
+                    <tr class="sp-row" data-sp="${p.sp_no}" style="cursor:pointer;${isOpen?'background:var(--surface2)':''}${isTemp?';border-left:3px solid var(--warn)':''}">
                       <td style="text-align:center">${isOpen ? '▼' : '▶'}</td>
-                      <td style="font-weight:700;color:var(--primary)">${p.sp_no}</td>
+                      <td style="font-weight:700;color:${isTemp?'var(--warn)':'var(--primary)'}">
+                        ${p.sp_no}
+                        ${isTemp?'<span class="badge badge-warn" style="margin-left:6px;font-size:.7rem">ชั่วคราว</span>':''}
+                      </td>
                       <td class="text-xs">${fmtDate(p.date)}</td>
                       <td>
                         <div class="text-sm">${p.cust_name||'-'}</div>
@@ -1651,7 +1782,10 @@ async function renderPayments(el) {
                       </td>
                       <td style="text-align:right;font-weight:700;color:var(--success)">฿${fmtNum(p.total||0)}</td>
                       <td style="text-align:center">${p.bills?.length||0} บิล</td>
-                      <td><span class="badge ${statusCls}">${statusLabel}</span></td>
+                      <td>
+                        <span class="badge ${statusCls}">${statusLabel}</span>
+                        ${isTemp?`<button class="btn btn-primary btn-sm btn-rename-sp" data-sp="${p.sp_no}" style="margin-left:4px;padding:2px 8px;font-size:.75rem" title="แก้ไขเป็นเลข SP จริง">✏️ แก้</button>`:''}
+                      </td>
                     </tr>
                     ${isOpen && p.bills?.length ? `
                       <tr><td colspan="7" style="padding:0">
@@ -1707,6 +1841,117 @@ async function renderPayments(el) {
     // Bindings
     document.getElementById('pay-search')?.addEventListener('input', debounce(e => { searchText = e.target.value; render(); }, 300));
     document.getElementById('btn-import-sp')?.addEventListener('click', () => triggerFileUpload('file-sales', parseSPReport));
+    
+    // ── สร้าง SP ชั่วคราว ──
+    document.getElementById('btn-add-temp-sp')?.addEventListener('click', () => {
+      const tempNo = 'SP-TEMP-' + String(Date.now()).slice(-6);
+      openModal('➕ สร้าง SP ชั่วคราว', `
+        <div class="flex-col gap-3">
+          <div class="input-group">
+            <label>เลข SP ชั่วคราว</label>
+            <input class="input" id="tsp-no" value="${tempNo}" placeholder="SP-TEMP-xxx">
+            <div class="text-xs text-muted mt-1">ระบบจะสร้างให้อัตโนมัติ (แก้ได้) — เปลี่ยนเป็นเลขจริงภายหลังได้</div>
+          </div>
+          <div class="flex gap-2">
+            <div class="input-group flex-1">
+              <label>วันที่</label>
+              <input type="date" class="input" id="tsp-date" value="${todayISO()}">
+            </div>
+            <div class="input-group flex-1">
+              <label>ยอดเงิน</label>
+              <input type="number" class="input" id="tsp-amount" placeholder="0.00" step="0.01">
+            </div>
+          </div>
+          <div class="flex gap-2">
+            <div class="input-group flex-1">
+              <label>รหัสลูกค้า (ถ้ามี)</label>
+              <input class="input" id="tsp-cust-id" placeholder="เช่น BA-00494">
+            </div>
+            <div class="input-group flex-1">
+              <label>ชื่อลูกค้า</label>
+              <input class="input" id="tsp-cust-name" placeholder="ชื่อลูกค้า / บริษัท">
+            </div>
+          </div>
+          <div class="input-group">
+            <label>หมายเหตุ</label>
+            <input class="input" id="tsp-note" placeholder="เช่น รอเลข SP จาก Smart, โอนมา KTB ยังไม่ทราบจากใคร">
+          </div>
+          <div class="flex gap-2 mt-2">
+            <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ยกเลิก</button>
+            <button class="btn btn-warn btn-sm flex-1" id="tsp-confirm" style="background:var(--warn);color:#fff">${ICONS.check} สร้าง SP ชั่วคราว</button>
+          </div>
+        </div>
+      `);
+      document.getElementById('tsp-confirm')?.addEventListener('click', () => {
+        const spNo = document.getElementById('tsp-no').value.trim() || tempNo;
+        const amount = Number(document.getElementById('tsp-amount').value) || 0;
+        if (!amount) { toast('กรอกยอดเงิน', 'error'); return; }
+        paymentList.push({
+          sp_no: spNo,
+          date: document.getElementById('tsp-date').value,
+          cust_id: document.getElementById('tsp-cust-id').value,
+          cust_name: document.getElementById('tsp-cust-name').value || '(ยังไม่ทราบ)',
+          amount: amount,
+          total: amount,
+          cash: 0,
+          transfer: amount,
+          cheque: 0,
+          bills: [],
+          match_status: 'pending',
+          note: document.getElementById('tsp-note').value,
+          is_temp: true,
+        });
+        persistMainState();
+        closeModal();
+        toast(`สร้าง ${spNo} สำเร็จ — อย่าลืมมาแก้เป็นเลข SP จริงภายหลัง`, 'success');
+        render();
+      });
+    });
+    
+    // ── Rename SP ชั่วคราว → SP จริง ──
+    el.querySelectorAll('.btn-rename-sp').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const oldSp = btn.dataset.sp;
+        const sp = paymentList.find(p => p.sp_no === oldSp);
+        if (!sp) return;
+        
+        openModal(`✏️ แก้ไขเลข SP — ${oldSp}`, `
+          <div class="flex-col gap-3">
+            <p class="text-sm text-dim">ใส่เลข SP จริงที่ได้จากโปรแกรม Smart — ระบบจะอัปเดต Bill List ที่ผูกไว้อัตโนมัติ</p>
+            <div class="input-group">
+              <label>เลข SP จริง</label>
+              <input class="input" id="rename-sp-new" placeholder="เช่น SP00126-001032" autofocus>
+            </div>
+            <div class="flex gap-2 mt-2">
+              <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ยกเลิก</button>
+              <button class="btn btn-primary btn-sm flex-1" id="rename-sp-confirm">${ICONS.check} อัปเดตเลข SP</button>
+            </div>
+          </div>
+        `);
+        document.getElementById('rename-sp-confirm')?.addEventListener('click', () => {
+          const newSp = document.getElementById('rename-sp-new').value.trim();
+          if (!newSp) { toast('กรอกเลข SP ใหม่', 'error'); return; }
+          if (paymentList.find(p => p.sp_no === newSp)) { toast('เลข SP นี้มีอยู่แล้ว', 'error'); return; }
+          
+          // เปลี่ยนใน paymentList
+          sp.sp_no = newSp;
+          sp.is_temp = false;
+          
+          // อัปเดต billList ที่ผูก paid_by_sp = oldSp → newSp
+          let linked = 0;
+          billList.forEach(b => {
+            if (b.paid_by_sp === oldSp) { b.paid_by_sp = newSp; linked++; }
+          });
+          
+          persistMainState();
+          closeModal();
+          toast(`อัปเดต ${oldSp} → ${newSp}${linked?` (อัปเดต ${linked} บิลที่ผูกไว้)`:''}`, 'success');
+          render();
+        });
+      });
+    });
+    
     document.getElementById('btn-clear-pay')?.addEventListener('click', () => {
       if (confirm('ล้างข้อมูล SP ทั้งหมด?')) { paymentList = []; persistMainState(); render(); }
     });
@@ -1720,7 +1965,9 @@ async function renderPayments(el) {
       btn.addEventListener('click', () => { filterStatus = btn.dataset.fs; render(); });
     });
     el.querySelectorAll('.sp-row').forEach(row => {
-      row.addEventListener('click', () => {
+      row.addEventListener('click', (e) => {
+        // ถ้าคลิกปุ่ม rename → ไม่ toggle
+        if (e.target.closest('.btn-rename-sp')) return;
         const sp = row.dataset.sp;
         if (expandedSP.has(sp)) expandedSP.delete(sp);
         else expandedSP.add(sp);
