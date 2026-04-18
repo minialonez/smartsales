@@ -6668,6 +6668,7 @@ const NAV_ITEMS = [
   { id:'data',      icon:'folder',  label:'จัดการข้อมูล' },
   { id:'alerts',    icon:'bell',    label:'แจ้งเตือน', badge: true },
   { id:'reports',   icon:'file',    label:'รายงานบัญชี' },
+  { id:'tax_export',icon:'file',    label:'📋 Export สรรพากร' },
   { id:'users',     icon:'users',   label:'จัดการผู้ใช้' },
 ];
 
@@ -6867,6 +6868,7 @@ const PAGE_RENDERERS = {
   data: renderData,
   alerts: renderAlerts,
   reports: renderReports,
+  tax_export: renderTaxExport,
   users: renderUsers,
 };
 
@@ -9489,6 +9491,199 @@ function renderReports(el) {
   }
   
   render();
+}
+
+// ══════════════════════════════════════════════════════════════
+// Tax Export — สำหรับยื่นสรรพากร (PP ฝั่งเจ้าหนี้ + SP ฝั่งลูกหนี้)
+// ══════════════════════════════════════════════════════════════
+async function renderTaxExport(el) {
+  // Default: เดือนปัจจุบัน
+  var now = new Date();
+  var defaultMonth = String(now.getFullYear()) + String(now.getMonth() + 1).padStart(2, '0');
+  var state = {
+    mode: 'PP',          // PP หรือ SP
+    month: defaultMonth, // YYYYMM
+    data: null,          // ข้อมูลที่ดึงมา
+    expanded: {},        // expand state ต่อ row
+    loading: false,
+  };
+  
+  async function fetchData() {
+    state.loading = true;
+    renderInner();
+    var action = state.mode === 'PP' ? 'exportPPReportForTax' : 'exportSPReportForTax';
+    var res = await api(action, { month: state.month });
+    state.loading = false;
+    if (res && res.success) {
+      state.data = res.data;
+    } else {
+      toast('ดึงข้อมูลไม่สำเร็จ: ' + (res && res.error || 'unknown'), 'error');
+      state.data = null;
+    }
+    renderInner();
+  }
+  
+  function fmtTH(iso) {
+    // YYYY-MM-DD → dd/mm/yyyy (ค.ศ.)
+    if (!iso) return '';
+    var s = String(iso);
+    var m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (m) return m[3] + '/' + m[2] + '/' + m[1];
+    return s;
+  }
+  
+  function exportCSV() {
+    if (!state.data || !state.data.rows || !state.data.rows.length) {
+      toast('ไม่มีข้อมูลให้ export', 'warn');
+      return;
+    }
+    var rows = state.data.rows;
+    var lines = [];
+    // Header
+    if (state.mode === 'PP') {
+      lines.push(['PP No.', 'วันที่บิลผู้จำหน่าย', 'เลขบิล/ใบกำกับภาษี', 'ชื่อผู้จำหน่าย', 'ยอดเงินรวม', 'PP เดิม'].join(','));
+      rows.forEach(function(r) {
+        // Parent line
+        lines.push([r.pp_no, fmtTH(r.supplier_bill_date), r.supplier_invoice_no, '"'+r.supplier_name+'"', r.amount, r.pp_no_original].join(','));
+        // Child bills
+        (r.bills || []).forEach(function(b) {
+          lines.push(['  →', fmtTH(b.bill_date), b.bill_no + ' ('+b.bill_type+')', '"'+r.supplier_name+'"', b.amount, ''].join(','));
+        });
+      });
+    } else {
+      lines.push(['SP No.', 'วันที่รับชำระ', 'เลขบิล/ใบกำกับภาษี', 'ชื่อลูกค้า', 'ยอดเงินรวม', 'SP เดิม'].join(','));
+      rows.forEach(function(r) {
+        lines.push([r.sp_no, fmtTH(r.pay_date), r.customer_invoice_no, '"'+r.customer_name+'"', r.amount, r.sp_no_original].join(','));
+        (r.bills || []).forEach(function(b) {
+          lines.push(['  →', fmtTH(b.bill_date), b.bill_no + ' ('+b.bill_type+')', '"'+r.customer_name+'"', b.amount, ''].join(','));
+        });
+      });
+    }
+    // Download
+    var csv = '\uFEFF' + lines.join('\n'); // BOM for Excel UTF-8
+    var blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = state.mode + '_Tax_' + state.month + '.csv';
+    a.click();
+    URL.revokeObjectURL(url);
+    toast('Export สำเร็จ', 'success');
+  }
+  
+  function renderInner() {
+    var d = state.data;
+    var rows = (d && d.rows) || [];
+    var totalAmt = rows.reduce(function(s, r) { return s + (Number(r.amount) || 0); }, 0);
+    
+    el.innerHTML = '' +
+    '<div class="flex justify-between items-center mb-3">' +
+      '<div class="page-title">📋 Export สำหรับยื่นสรรพากร</div>' +
+      '<div class="flex gap-2">' +
+        '<button class="btn btn-outline btn-sm" id="btn-tax-csv">📄 Export CSV</button>' +
+      '</div>' +
+    '</div>' +
+    '<div class="card-flat mb-3" style="padding:14px">' +
+      '<div class="flex gap-3 items-center flex-wrap">' +
+        '<div class="pill-group">' +
+          '<button class="pill ' + (state.mode==='PP'?'active':'') + '" data-mode="PP">📤 PP (เจ้าหนี้ - ภาษีซื้อ)</button>' +
+          '<button class="pill ' + (state.mode==='SP'?'active':'') + '" data-mode="SP">📥 SP (ลูกหนี้ - ภาษีขาย)</button>' +
+        '</div>' +
+        '<div style="flex:1"></div>' +
+        '<label class="text-sm">เดือน:</label>' +
+        '<input type="month" class="input" id="tax-month" value="' + (state.month.substring(0,4)+'-'+state.month.substring(4,6)) + '" style="width:160px">' +
+        '<button class="btn btn-primary btn-sm" id="btn-fetch">🔄 ดึงข้อมูล</button>' +
+      '</div>' +
+      '<div class="text-xs text-dim" style="margin-top:8px">' +
+        (state.mode === 'PP' 
+          ? 'แสดงเฉพาะ <strong>VAT docs</strong>: PS, PR, PX, PC · เลข PP ใหม่ format: PP' + state.month + '-####'
+          : 'แสดงเฉพาะ <strong>VAT docs</strong>: SS, SR, SC · เลข SP ใหม่ format: SP' + state.month + '-####'
+        ) +
+      '</div>' +
+    '</div>' +
+    (state.loading 
+      ? '<div class="card text-center" style="padding:40px"><div class="text-dim">กำลังโหลด...</div></div>'
+      : !d
+        ? '<div class="card text-center" style="padding:40px"><div class="text-dim">กด "ดึงข้อมูล" เพื่อเริ่ม</div></div>'
+        : rows.length === 0
+          ? '<div class="card text-center" style="padding:40px"><div class="text-dim">ไม่มีข้อมูลในเดือน ' + state.month.substring(4,6) + '/' + state.month.substring(0,4) + '</div></div>'
+          : '' +
+            '<div class="card-flat" style="padding:12px;background:var(--surface2);margin-bottom:12px">' +
+              '<div class="flex justify-between">' +
+                '<div>📊 <strong>' + rows.length + '</strong> ' + (state.mode==='PP'?'PP':'SP') + ' · รวม <strong style="color:var(--success)">฿' + fmtNum(totalAmt) + '</strong></div>' +
+                '<div class="text-xs text-dim">คลิก ▶ เพื่อดู bills ลูก</div>' +
+              '</div>' +
+            '</div>' +
+            '<div class="card-flat table-wrap" style="overflow-x:auto">' +
+              '<table style="min-width:900px">' +
+                '<thead><tr>' +
+                  '<th style="width:40px"></th>' +
+                  '<th style="width:140px">' + (state.mode==='PP'?'PP No.':'SP No.') + '</th>' +
+                  '<th style="width:110px">วันที่บิล' + (state.mode==='PP'?'ผู้จำหน่าย':'ลูกค้า') + '</th>' +
+                  '<th style="width:140px">เลขบิล/ใบกำกับภาษี</th>' +
+                  '<th>ชื่อ' + (state.mode==='PP'?'ผู้จำหน่าย':'ลูกค้า') + '</th>' +
+                  '<th style="width:130px;text-align:right">ยอดเงินรวม</th>' +
+                  '<th style="width:120px;text-align:center">เลขเดิม</th>' +
+                '</tr></thead>' +
+                '<tbody>' +
+                  rows.map(function(r, i) {
+                    var exp = state.expanded[i];
+                    var bills = r.bills || [];
+                    var mainNo = state.mode==='PP' ? r.pp_no : r.sp_no;
+                    var origNo = state.mode==='PP' ? r.pp_no_original : r.sp_no_original;
+                    var billDate = state.mode==='PP' ? r.supplier_bill_date : r.customer_bill_date;
+                    var invNo = state.mode==='PP' ? r.supplier_invoice_no : r.customer_invoice_no;
+                    var name = state.mode==='PP' ? r.supplier_name : r.customer_name;
+                    return '<tr class="tax-parent" data-i="' + i + '" style="cursor:pointer">' +
+                      '<td style="text-align:center"><span style="font-size:1rem">' + (exp?'▼':'▶') + '</span></td>' +
+                      '<td><strong style="color:var(--primary)">' + mainNo + '</strong></td>' +
+                      '<td>' + fmtTH(billDate) + '</td>' +
+                      '<td style="font-family:monospace;font-size:.85rem">' + (invNo||'-') + '</td>' +
+                      '<td>' + (name||'-') + '</td>' +
+                      '<td style="text-align:right;font-weight:700">฿' + fmtNum(r.amount) + '</td>' +
+                      '<td style="text-align:center;font-size:.78rem;color:var(--text3)">' + (origNo||'-') + '</td>' +
+                    '</tr>' +
+                    (exp ? bills.map(function(b) {
+                      return '<tr style="background:var(--surface2)">' +
+                        '<td></td>' +
+                        '<td style="padding-left:30px;color:var(--text2);font-family:monospace;font-size:.85rem">↳ ' + (b.bill_no||'') + '</td>' +
+                        '<td>' + fmtTH(b.bill_date) + '</td>' +
+                        '<td><span class="badge badge-' + (b.bill_type==='PC'||b.bill_type==='SC'?'warn':'info') + '">' + b.bill_type + '</span></td>' +
+                        '<td class="text-dim">' + (b.vat || '-') + '</td>' +
+                        '<td style="text-align:right;color:var(--text2)">฿' + fmtNum(b.amount) + '</td>' +
+                        '<td></td>' +
+                      '</tr>';
+                    }).join('') : '');
+                  }).join('') +
+                '</tbody>' +
+              '</table>' +
+            '</div>'
+    );
+    
+    // Bind events
+    el.querySelectorAll('.pill[data-mode]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        state.mode = btn.dataset.mode;
+        state.data = null;
+        state.expanded = {};
+        renderInner();
+      });
+    });
+    document.getElementById('tax-month')?.addEventListener('change', function(e) {
+      state.month = e.target.value.replace('-', '');
+    });
+    document.getElementById('btn-fetch')?.addEventListener('click', fetchData);
+    document.getElementById('btn-tax-csv')?.addEventListener('click', exportCSV);
+    el.querySelectorAll('.tax-parent').forEach(function(tr) {
+      tr.addEventListener('click', function() {
+        var idx = Number(tr.dataset.i);
+        state.expanded[idx] = !state.expanded[idx];
+        renderInner();
+      });
+    });
+  }
+  
+  renderInner();
 }
 
 // ── Users ───────────────────────────────────────────────────
