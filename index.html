@@ -1723,24 +1723,37 @@ async function renderMain(el) {
     _billsForSelectedDateCacheKey = null;
   }
 
-  // ── คำนวณเงินสดในลิ้นชัก = รวมบิลที่ Type=Cash (จาก SS/OS/SP/SC/JS) ──
-  // สำหรับข้อมูลนำเข้าจาก JSON summary (ไม่มีบิล Cash แยก) → ใช้ค่าใน mainSummary['cashDrawer_*']
+  // ══════════════════════════════════════════════════════════════
+  // Business Rule: บิลที่ "ใช้ลิ้นชักเงินสดร่วมกัน" (ชำระเป็นเงินสด แล้วเงินเข้าลิ้นชัก)
+  // ══════════════════════════════════════════════════════════════
+  // SS = Invoice (ขายเงินสด มี VAT)
+  // OS = Order (ขายเงินสด ไม่มี VAT)
+  // SP = Payment (ตัดชำระลูกหนี้)
+  // SC = Invoice + Credit CN (เครดิตโน้ต + ใบกำกับ)
+  // JS = Order CN
+  // บิลเหล่านี้ถ้า type=Cash → นับรวมเป็น Cash Drawer ของ station นั้น
+  const CASH_DRAWER_BILL_TYPES = ['SS', 'OS', 'SP', 'SC', 'JS'];
+  const isCashDrawerBill = (billNo) => {
+    if (!billNo) return false;
+    const up = String(billNo).toUpperCase();
+    return CASH_DRAWER_BILL_TYPES.some(t => up.startsWith(t));
+  };
+
+  // ── คำนวณเงินสดในลิ้นชัก ต่อ station ──
+  // รวมบิลที่ (station ตรง, type=Cash, bill_no เริ่มด้วย SS/OS/SP/SC/JS หรือไม่มี bill_no)
+  // fallback → mainSummary['cashDrawer_*'] (กรณีข้อมูล import ที่ไม่มีบิล Cash แยก)
   function calcCashFromBills(station) {
-    // ลองดูบิล Cash ของวันที่เลือกก่อน
     var fromBills = getBillsForSelectedDate().filter(b => {
       const st = (b.station || '').trim();
       const ty = (b.type || '').trim();
-      const no = (b.bill_no || '').toUpperCase();
-      const isTargetBill = no.startsWith('SS') || no.startsWith('OS') || no.startsWith('SP') || no.startsWith('SC') || no.startsWith('JS');
-      return st === station && ty === 'Cash' && (isTargetBill || !no);
+      const no = b.bill_no || '';
+      return st === station && ty === 'Cash' && (isCashDrawerBill(no) || !no);
     }).reduce((s, b) => s + (Number(b.amount) || 0), 0);
     
-    // ถ้ามีบิล Cash อยู่แล้ว ใช้ค่านั้น (user กรอกเอง/Generate Smart)
     if (fromBills !== 0) return fromBills;
     
-    // ไม่มีบิล Cash — อาจเป็นข้อมูลนำเข้าจาก JSON → ใช้ mainSummary['cashDrawer_*']
-    var fromSummary = Number(mainSummary['cashDrawer_' + station]) || 0;
-    return fromSummary;
+    // ไม่มีบิล Cash — อาจเป็นข้อมูลนำเข้าจาก JSON summary → ใช้ fallback
+    return Number(mainSummary['cashDrawer_' + station]) || 0;
   }
   function calcAutoValue(type, station) {
     return getBillsForSelectedDate().filter(b => {
@@ -1766,22 +1779,32 @@ async function renderMain(el) {
   }
 
   // ── Sum check: เงินเข้า vs เงินออก ──
+  // Front1-4 (POS stations): inflow = cashIn + sales + cashOut + returns, outflow = drawer + transfer + card + cheque + refund
+  // Invoice/Invoice Credit/Order Credit (ไม่มีลิ้นชัก POS): inflow = sales เท่านั้น (cashIn/cashOut/returns ไม่นับ)
+  // Formula ตาม Excel template: diff = outflow - inflow → balance → "OK"
   function calcSumCheck(station) {
-    const cashIn = Number(mainSummary['cashIn_' + station]) || 0;
     const sales = calcSales(station);
-    const cashOut = Number(mainSummary['cashOut_' + station]) || 0;
-    const returns = Number(mainSummary['returns_' + station]) || 0;
-    const drawer = calcCashFromBills(station); // auto
+    const drawer = calcCashFromBills(station);
     const transfer = calcAutoValue('Transfer', station);
     const card = calcAutoValue('Card', station);
     const cheque = calcAutoValue('Cheque', station);
     const refund = calcAutoValue('Refund', station);
-
-    // Inflow = cashIn + sales + cashOut + returns (cashOut/returns เป็น negative)
-    // Outflow = drawer + transfer + card + cheque + refund
-    const inflow = cashIn + sales + cashOut + returns;
     const outflow = drawer + transfer + card + cheque + refund;
-    const diff = inflow - outflow;
+
+    // Front1-4 → รวม cashIn/cashOut/returns
+    // Invoice/Credit → ดูแค่ sales
+    let inflow;
+    if (['Front1', 'Front2', 'Front3', 'Front4'].includes(station)) {
+      const cashIn = Number(mainSummary['cashIn_' + station]) || 0;
+      const cashOut = Number(mainSummary['cashOut_' + station]) || 0;
+      const returns = Number(mainSummary['returns_' + station]) || 0;
+      inflow = cashIn + sales + cashOut + returns;
+    } else {
+      // Invoice, Invoice Credit, Order Credit
+      inflow = sales;
+    }
+
+    const diff = outflow - inflow;  // ตาม Excel: SUM(7,8:11) - SUM(3:6)
     return { diff, isOk: Math.abs(diff) < 0.01 };
   }
 
