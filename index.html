@@ -1679,6 +1679,10 @@ async function renderMain(el) {
           <input type="date" class="input" value="${selectedDate}" id="main-date" style="width:160px">
           <button class="btn btn-primary btn-sm" id="btn-gen-smart">${ICONS.download} Smart (SS/OS/OR/SR)</button>
           <button class="btn btn-info btn-sm" id="btn-import-pos" style="background:var(--info);color:#fff">${ICONS.download} Front POS</button>
+          <label class="btn btn-outline btn-sm" style="cursor:pointer" title="Import Daily JSON ที่ convert ไว้แล้ว (หลายวันรวด)">
+            📅 Batch Import (JSON)
+            <input type="file" id="btn-import-daily-json" accept=".json" style="display:none">
+          </label>
           <button class="btn ${showChange?'btn-primary':'btn-outline'} btn-sm" id="btn-toggle-change">🪙 นับธนบัตร</button>
           <button class="btn btn-outline btn-sm" id="btn-check-issues">🔍 ตรวจสอบ</button>
           <button class="btn btn-success btn-sm" id="btn-save-main">${ICONS.check} บันทึก</button>
@@ -2059,6 +2063,169 @@ async function renderMain(el) {
     });
     document.getElementById('btn-import-pos')?.addEventListener('click', () => {
       triggerFileUpload('file-sales', parseFrontPosReport);
+    });
+    
+    // ══════════════════════════════════════════════════════════════
+    // Batch Daily JSON Import — หลายวันรวดเดียว
+    // รองรับ JSON ที่สร้างจาก batch_convert_daily.py
+    // Structure: { billList, mainSummary, statementsByBank, filesProcessed }
+    // ══════════════════════════════════════════════════════════════
+    document.getElementById('btn-import-daily-json')?.addEventListener('change', async e => {
+      const f = e.target.files[0];
+      if (!f) return;
+      try {
+        const text = await f.text();
+        const data = JSON.parse(text);
+        
+        if (!Array.isArray(data.billList)) {
+          toast('ไฟล์ JSON ไม่ถูก format (ต้องมี billList, statementsByBank)', 'error');
+          return;
+        }
+        
+        const nBills = data.billList?.length || 0;
+        const nKtb = data.statementsByBank?.KTB?.length || 0;
+        const nKbank = data.statementsByBank?.KBANK?.length || 0;
+        const nBblNw = data.statementsByBank?.['BBL NW']?.length || 0;
+        const nSummary = Object.keys(data.mainSummary || {}).length;
+        const nFiles = data.filesProcessed?.length || 0;
+        const dateList = data.filesProcessed?.map(f => f.date).sort() || [];
+        const dateRange = dateList.length > 0 ? `${dateList[0]} → ${dateList[dateList.length-1]}` : '';
+        
+        openModal(`📅 Import Daily Files — ${nFiles} ไฟล์`, `
+          <div class="flex-col gap-3">
+            <div style="padding:12px;background:rgba(79,156,249,.08);border-radius:8px">
+              <div class="text-sm font-semi">${nFiles} ไฟล์ · ${dateRange}</div>
+              <div class="text-xs text-muted" style="margin-top:6px;line-height:1.8">
+                • 📄 Bills: <strong>${nBills}</strong> รายการ<br>
+                • 🏦 KTB Statement: <strong>${nKtb}</strong> ธุรกรรม<br>
+                • 🏦 KBANK Statement: <strong>${nKbank}</strong> ธุรกรรม<br>
+                • 🏦 BBL NW Statement: <strong>${nBblNw}</strong> ธุรกรรม<br>
+                • 📊 Daily Summary: <strong>${nSummary}</strong> วัน
+              </div>
+            </div>
+            
+            <div class="input-group">
+              <label>โหมดการ import</label>
+              <div class="flex gap-2" id="di-mode-pills">
+                <button type="button" class="pill active" data-mode="merge">🔀 Merge (เพิ่มเข้าของเดิม)</button>
+                <button type="button" class="pill" data-mode="replace">🗑 Replace (แทนที่ทั้งหมด)</button>
+              </div>
+              <input type="hidden" id="di-mode" value="merge">
+              <div class="text-xs text-muted mt-1">Merge: เก็บบิลเดิมทั้งหมด + เพิ่มบิลใหม่ · Replace: ลบของเดิมทิ้ง</div>
+            </div>
+            
+            <div class="input-group">
+              <label><input type="checkbox" id="di-skip-dup" checked> ข้ามบิลซ้ำ (bill_no ซ้ำ)</label>
+              <label><input type="checkbox" id="di-skip-stmt-dup" checked> ข้าม statement ซ้ำ (ref + date + amount)</label>
+            </div>
+            
+            <div class="flex gap-2 mt-2">
+              <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ยกเลิก</button>
+              <button class="btn btn-primary btn-sm flex-1" id="di-confirm">${ICONS.check} ยืนยัน Import</button>
+            </div>
+          </div>
+        `);
+        
+        document.querySelectorAll('#di-mode-pills [data-mode]').forEach(btn => {
+          btn.addEventListener('click', () => {
+            const m = btn.dataset.mode;
+            document.querySelectorAll('#di-mode-pills .pill').forEach(p => p.classList.toggle('active', p.dataset.mode === m));
+            document.getElementById('di-mode').value = m;
+          });
+        });
+        
+        document.getElementById('di-confirm')?.addEventListener('click', () => {
+          const mode = document.getElementById('di-mode').value;
+          const skipDup = document.getElementById('di-skip-dup').checked;
+          const skipStmtDup = document.getElementById('di-skip-stmt-dup').checked;
+          
+          let billsAdded = 0, billsSkipped = 0;
+          let stmtAdded = 0, stmtSkipped = 0;
+          
+          // ── Bills ──
+          if (mode === 'replace') {
+            billList = [];
+          }
+          const existingBillSet = skipDup ? new Set(billList.filter(b => b.bill_no).map(b => b.bill_no)) : null;
+          
+          data.billList.forEach(b => {
+            // Skip dup by bill_no
+            if (skipDup && b.bill_no && existingBillSet.has(b.bill_no)) {
+              billsSkipped++;
+              return;
+            }
+            // Normalize bill format ให้ตรงกับระบบ
+            const newBill = {
+              bill_no: b.bill_no || '',
+              date: b.date_th || b.date || '',
+              station: b.station || '',
+              type: b.type || '',
+              amount: Number(b.amount) || 0,
+              confirmation: b.confirmation || '',
+              pay_date: b.pay_date || '',
+              remarks1: b.remarks1 || '',
+              remarks2: b.remarks2 || '',
+              bank: b.confirmation || '', // bank ที่ confirmation คือ KTB/BBL NW ฯลฯ
+              match_status: 'pending',
+              source: 'daily_import',
+              source_file: b.source_file || '',
+            };
+            billList.push(newBill);
+            if (b.bill_no && existingBillSet) existingBillSet.add(b.bill_no);
+            billsAdded++;
+          });
+          
+          // ── Main Summary ──
+          if (!mainSummary || typeof mainSummary !== 'object') mainSummary = {};
+          Object.entries(data.mainSummary || {}).forEach(([date, summary]) => {
+            mainSummary[date] = summary;
+          });
+          
+          // ── Statements ──
+          if (mode === 'replace') {
+            statementsByBank = { KTB: [], KBANK: [], 'BBL NW': [], BBL: [], UNKNOWN: [] };
+          } else {
+            if (!statementsByBank) statementsByBank = { KTB: [], KBANK: [], 'BBL NW': [], BBL: [], UNKNOWN: [] };
+            ['KTB', 'KBANK', 'BBL NW', 'BBL', 'UNKNOWN'].forEach(k => {
+              if (!Array.isArray(statementsByBank[k])) statementsByBank[k] = [];
+            });
+          }
+          
+          ['KTB', 'KBANK', 'BBL NW'].forEach(bankKey => {
+            const incoming = data.statementsByBank[bankKey] || [];
+            const existing = statementsByBank[bankKey] || [];
+            const dupSet = skipStmtDup ? new Set(existing.map(s => `${s.ref_no||''}|${s.date}|${s.amount}`)) : null;
+            
+            incoming.forEach(s => {
+              const key = `${s.ref_no||''}|${s.date}|${s.amount}`;
+              if (skipStmtDup && dupSet.has(key)) {
+                stmtSkipped++;
+                return;
+              }
+              existing.push(s);
+              if (dupSet) dupSet.add(key);
+              stmtAdded++;
+            });
+            statementsByBank[bankKey] = existing;
+          });
+          
+          // Persist
+          try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(e) {}
+          persistMainState();
+          
+          closeModal();
+          toast(
+            `✅ Import สำเร็จ — บิล ${billsAdded}${billsSkipped?' ('+billsSkipped+' ซ้ำ)':''} · Statement ${stmtAdded}${stmtSkipped?' ('+stmtSkipped+' ซ้ำ)':''}`,
+            'success',
+            5000
+          );
+          render();
+        });
+      } catch (err) {
+        console.error(err);
+        toast('Import ไม่สำเร็จ: ' + err.message, 'error');
+      }
+      e.target.value = '';
     });
     document.getElementById('btn-toggle-change')?.addEventListener('click', () => {
       showChange = !showChange; render();
@@ -5045,12 +5212,12 @@ async function renderTransferLog(el) {
     // Sort: newest first
     data.sort((a,b) => (toISODate(b.transfer_date)||'').localeCompare(toISODate(a.transfer_date)||''));
     
-    // Stats
-    const totalAmount = data.reduce((s,t) => s+Number(t.amount||0), 0);
+    // Stats — ใช้ transfer_amount (ยอดโอนจริง = amount - หัก) ไม่ใช่ amount (ยอดตามใบแจ้งยอด)
+    const totalAmount = data.reduce((s,t) => s + Number(t.transfer_amount ?? t.amount ?? 0), 0);
     const vatCount = transferLog.vatTransfers.length;
     const novatCount = transferLog.novatTransfers.length;
-    const vatAmount = transferLog.vatTransfers.reduce((s,t)=>s+Number(t.amount||0),0);
-    const novatAmount = transferLog.novatTransfers.reduce((s,t)=>s+Number(t.amount||0),0);
+    const vatAmount = transferLog.vatTransfers.reduce((s,t)=>s + Number(t.transfer_amount ?? t.amount ?? 0),0);
+    const novatAmount = transferLog.novatTransfers.reduce((s,t)=>s + Number(t.transfer_amount ?? t.amount ?? 0),0);
     const matchedPP = data.filter(t => t.pp_no).length;
     const matchedStmt = data.filter(t => t.match_status === 'stmt_matched').length;
     
@@ -5152,9 +5319,9 @@ async function renderTransferLog(el) {
                       ${t.supplier_account ? `<div class="text-xs text-muted" style="font-family:var(--mono)">${t.supplier_bank||''} ${t.supplier_account}</div>` : ''}
                     </td>
                     <td class="text-xs" style="font-family:var(--mono)">${t.invoice_no||'-'}</td>
-                    <td style="text-align:right">฿${fmtNum(t.amount_billed||0)}</td>
+                    <td style="text-align:right">฿${fmtNum(t.amount||0)}</td>
                     <td style="text-align:right;color:${t.deduct_total>0?'var(--danger)':'var(--text3)'}">${t.deduct_total>0?'-':''}฿${fmtNum(t.deduct_total||0)}</td>
-                    <td style="text-align:right;font-weight:700;color:var(--success)">฿${fmtNum(t.amount||0)}</td>
+                    <td style="text-align:right;font-weight:700;color:var(--success)">฿${fmtNum(t.transfer_amount ?? t.amount ?? 0)}</td>
                     <td class="text-xs">${t.from_bank||'-'}</td>
                     <td class="text-xs" style="font-family:var(--mono);font-weight:600">${t.pp_no||'-'}</td>
                     <td style="text-align:center">
