@@ -1656,10 +1656,34 @@ let mainSummary = {
   // Key format: "row_station" e.g. "cashIn_Front1"
 };
 let cashCount = {
-  // ธนบัตร/เหรียญ ต่อ Station
-  // Key format: "denomination_Station" e.g. "1000_Front1"
+  // NEW: เก็บต่อวันที่ — __byDate[dateISO] = { denomination_Station: count }
+  // เดิม: flat { denomination_Station: count } ทั่วไป (ทุกวันใช้ร่วมกัน)
+  __byDate: {},
 };
 const DENOMINATIONS = [1000, 500, 100, 50, 20, 10, 5, 1];
+
+// ── Helper: ดึง/สร้าง cash count dict ของวันที่ระบุ ──
+function getCashForDate(dateISO) {
+  if (!cashCount.__byDate) cashCount.__byDate = {};
+  if (!cashCount.__byDate[dateISO]) cashCount.__byDate[dateISO] = {};
+  return cashCount.__byDate[dateISO];
+}
+
+// ── Migrate: ถ้ามีข้อมูลเก่า (flat structure) ย้ายไปเป็นของวันนี้ ──
+(function migrateCashCount() {
+  if (!cashCount.__byDate) cashCount.__byDate = {};
+  var flatKeys = Object.keys(cashCount).filter(function(k) {
+    return k !== '__byDate' && /^\d+_/.test(k);  // pattern: "1000_Front1"
+  });
+  if (flatKeys.length > 0) {
+    var todayKey = new Date().toISOString().slice(0, 10);
+    if (!cashCount.__byDate[todayKey]) cashCount.__byDate[todayKey] = {};
+    flatKeys.forEach(function(k) {
+      cashCount.__byDate[todayKey][k] = cashCount[k];
+      delete cashCount[k];
+    });
+  }
+})();
 
 // ── Render Main Page (Summary + Bill List + Change Counting) ──
 async function renderMain(el) {
@@ -1737,7 +1761,8 @@ async function renderMain(el) {
 
   // คำนวณยอดรวมธนบัตรใน Cash Drawer
   function calcCashDrawer(station) {
-    return DENOMINATIONS.reduce((s, d) => s + d * (Number(cashCount[d + '_' + station]) || 0), 0);
+    const dayCash = getCashForDate(selectedDate);
+    return DENOMINATIONS.reduce((s, d) => s + d * (Number(dayCash[d + '_' + station]) || 0), 0);
   }
 
   // ── Sum check: เงินเข้า vs เงินออก ──
@@ -1915,8 +1940,11 @@ async function renderMain(el) {
       ${showChange ? `
       <div class="card-flat mb-3">
         <div style="padding:10px 14px;background:var(--surface2);border-bottom:1px solid var(--border)" class="flex justify-between items-center">
-          <div class="font-semi">🪙 นับธนบัตร/เหรียญ (ตรวจสอบกับระบบ)</div>
-          <div class="text-xs text-dim">ใส่จำนวนธนบัตร/เหรียญจริง → เปรียบเทียบกับ Cash Drawer (คำนวณจากบิล Cash)</div>
+          <div>
+            <div class="font-semi">🪙 นับธนบัตร/เหรียญ — วันที่ <span style="color:var(--primary)">${fmtDate(selectedDate)}</span></div>
+            <div class="text-xs text-dim" style="margin-top:2px">ใส่จำนวนธนบัตร/เหรียญจริง → เปรียบเทียบกับ Cash Drawer (คำนวณจากบิล Cash) · ข้อมูลแยกตามวันที่</div>
+          </div>
+          <div class="text-xs" style="color:var(--warn)">💡 เปลี่ยนวันด้านบน → เปลี่ยน cash count ตามวัน</div>
         </div>
         <div class="table-wrap" style="overflow-x:auto">
           <table style="font-size:.82rem;min-width:700px">
@@ -1928,17 +1956,20 @@ async function renderMain(el) {
               </tr>
             </thead>
             <tbody>
-              ${DENOMINATIONS.map(d => `
-                <tr>
-                  <td style="font-weight:700;color:var(--primary);text-align:center">฿${fmtInt(d)}</td>
-                  ${['Front1','Front2','Front3','Front4','Invoice'].map(s => `
-                    <td><input type="number" class="input cash-cell" data-denom="${d}" data-station="${s}" value="${cashCount[d+'_'+s]||''}" min="0" step="1" placeholder="0" style="width:95%;padding:3px 6px;font-size:.78rem;text-align:right"></td>
-                  `).join('')}
-                  <td style="text-align:right;font-weight:600;color:var(--success)" data-denom-total="${d}">
-                    ${fmtNum(['Front1','Front2','Front3','Front4','Invoice'].reduce((s,st)=>s+(d*(Number(cashCount[d+'_'+st])||0)),0))}
-                  </td>
-                </tr>
-              `).join('')}
+              ${(() => {
+                const dayCash = getCashForDate(selectedDate);
+                return DENOMINATIONS.map(d => `
+                  <tr>
+                    <td style="font-weight:700;color:var(--primary);text-align:center">฿${fmtInt(d)}</td>
+                    ${['Front1','Front2','Front3','Front4','Invoice'].map(s => `
+                      <td><input type="number" class="input cash-cell" data-denom="${d}" data-station="${s}" value="${dayCash[d+'_'+s]||''}" min="0" step="1" placeholder="0" style="width:95%;padding:3px 6px;font-size:.78rem;text-align:right"></td>
+                    `).join('')}
+                    <td style="text-align:right;font-weight:600;color:var(--success)" data-denom-total="${d}">
+                      ${fmtNum(['Front1','Front2','Front3','Front4','Invoice'].reduce((s,st)=>s+(d*(Number(dayCash[d+'_'+st])||0)),0))}
+                    </td>
+                  </tr>
+                `).join('');
+              })()}
               <tr style="border-top:2px solid var(--border);background:var(--surface2)">
                 <td style="font-weight:800">นับได้ (จริง)</td>
                 ${['Front1','Front2','Front3','Front4','Invoice'].map(s => `
@@ -2422,7 +2453,33 @@ async function renderMain(el) {
       showChange = !showChange; render();
     });
     document.getElementById('btn-clear-bl')?.addEventListener('click', () => {
-      if (confirm('ล้างข้อมูล Bill List ทั้งหมด?')) { billList = []; persistMainState(); render(); }
+      if (!confirm('ล้างข้อมูลของวัน ' + fmtDate(selectedDate) + ' ทั้งหมด?\n\n• Bill List\n• Summary (นำเงินเข้า/ยอดขาย/Cash Drawer ฯลฯ)\n• Cash counting (นับธนบัตร)')) return;
+      
+      // 1) ล้างบิลของวันที่เลือก (เก็บวันอื่น)
+      billList = billList.filter(function(b) {
+        var d = String(b.date || '').trim();
+        // เทียบในรูปแบบเดิม: dd/mm/yyyy หรือ yyyy-mm-dd
+        var selectedDisplay = fmtDate(selectedDate);
+        return d !== selectedDisplay && d !== selectedDate;
+      });
+      
+      // 2) ล้าง summary flat keys (ของวันปัจจุบัน — __byDate[selectedDate] ด้วย)
+      Object.keys(mainSummary).forEach(function(k) {
+        if (k === '__byDate') return;
+        if (k.includes('_')) delete mainSummary[k];
+      });
+      if (mainSummary.__byDate && mainSummary.__byDate[selectedDate]) {
+        delete mainSummary.__byDate[selectedDate];
+      }
+      
+      // 3) ล้าง cash count ของวันนี้
+      if (cashCount.__byDate && cashCount.__byDate[selectedDate]) {
+        delete cashCount.__byDate[selectedDate];
+      }
+      
+      persistMainState();
+      render();
+      toast('ล้างข้อมูลของ ' + fmtDate(selectedDate) + ' แล้ว', 'success');
     });
 
     // Date range filter handlers
@@ -2777,16 +2834,17 @@ async function renderMain(el) {
       }, 200));
     });
 
-    // Cash counting cells
+    // Cash counting cells — บันทึกลง cashCount ของวันที่เลือก
     el.querySelectorAll('.cash-cell').forEach(inp => {
       inp.addEventListener('input', debounce(() => {
+        const dayCash = getCashForDate(selectedDate);
         const k = inp.dataset.denom + '_' + inp.dataset.station;
-        cashCount[k] = parseInt(inp.value) || 0;
+        dayCash[k] = parseInt(inp.value) || 0;
         persistMainState();
         // Update totals
         const denom = Number(inp.dataset.denom);
         const rowTotal = ['Front1','Front2','Front3','Front4','Invoice']
-          .reduce((s, st) => s + denom * (Number(cashCount[denom+'_'+st]) || 0), 0);
+          .reduce((s, st) => s + denom * (Number(dayCash[denom+'_'+st]) || 0), 0);
         const totalEl = el.querySelector(`[data-denom-total="${denom}"]`);
         if (totalEl) totalEl.textContent = fmtNum(rowTotal);
         
