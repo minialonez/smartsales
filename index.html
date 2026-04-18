@@ -3142,112 +3142,434 @@ function statCard(label, value, sub, color, icon) {
 async function renderDebt(el) {
   let filterStatus = 'ALL';
   let searchText = '';
+  let expandedCust = new Set(); // ลูกค้าที่ expand (cust_id)
+  let expandedMonth = new Set(); // "custid|monthKey"
 
-  const statusMap = {
-    active: { label:'ปกติ', cls:'badge-success', color:'var(--success)' },
-    cash_only: { label:'เงินสด', cls:'badge-info', color:'var(--info)' },
-    overdue: { label:'เลยกำหนดชำระ', cls:'badge-danger', color:'var(--danger)' },
-    credit_break: { label:'เบรกเครดิต', cls:'badge-warn', color:'var(--warn)' },
+  // 13 สถานะบิล
+  const BILL_STATUS = {
+    active:          { label:'ยังไม่ถึงกำหนด',  color:'var(--success)', emoji:'🟢' },
+    due_today:       { label:'ครบกำหนดวันนี้',  color:'var(--warn)',    emoji:'🟡' },
+    overdue:         { label:'เกินกำหนด',        color:'#ff9945',         emoji:'🟠' },
+    overdue_warning: { label:'เกินนาน',          color:'var(--danger)',  emoji:'🔴' },
+    credit_break:    { label:'เบรกเครดิต',       color:'#c92a2a',         emoji:'🔴' },
+    partial_paid:    { label:'จ่ายบางส่วน',      color:'var(--info)',    emoji:'🔵' },
+    paid:            { label:'จ่ายแล้ว',          color:'var(--success)', emoji:'✅' },
+    disputed:        { label:'มีข้อพิพาท',        color:'#8e44ad',         emoji:'🟣' },
+    cheque_pending:  { label:'รอเช็คเข้า',        color:'var(--warn)',    emoji:'🟡' },
+    cheque_bounced:  { label:'เช็คเด้ง',          color:'var(--danger)',  emoji:'🚫' },
+    extended:        { label:'ต่ออายุหนี้',       color:'var(--info)',    emoji:'🔵' },
+    bad_debt:        { label:'หนี้สูญ',           color:'#333',            emoji:'⚫' },
+    disputed_legal:  { label:'ฟ้องร้อง',          color:'#6d28d9',         emoji:'⚖️' },
   };
+  
+  // Customer-level status priority (เลือกเอาที่แย่ที่สุด)
+  const STATUS_PRIORITY = ['bad_debt','disputed_legal','credit_break','cheque_bounced','disputed','overdue_warning','overdue','partial_paid','extended','cheque_pending','due_today','active','paid'];
+  
+  function computeBillStatus(bill, today) {
+    // ถ้ามี manual status ตั้งไว้ → ใช้
+    if (bill.manual_status && BILL_STATUS[bill.manual_status]) return bill.manual_status;
+    // ถ้าจ่ายแล้ว
+    if (bill.paid_by_sp || bill.match_status === 'paid' || Number(bill.remaining||0) <= 0.01) return 'paid';
+    if (Number(bill.paid_amount||0) > 0 && Number(bill.remaining||0) > 0.01) return 'partial_paid';
+    if (bill.type === 'Cheque') {
+      if (bill.match_status === 'bounced') return 'cheque_bounced';
+      if (bill.match_status !== 'matched') return 'cheque_pending';
+    }
+    // ตาม Due Date
+    if (!bill.due_date) return 'active';
+    const dueIso = toISODate(bill.due_date);
+    if (!dueIso) return 'active';
+    if (dueIso > today) return 'active';
+    if (dueIso === today) return 'due_today';
+    // เลยกำหนด
+    const daysDiff = Math.floor((new Date(today) - new Date(dueIso)) / 86400000);
+    // เบรกเครดิต: วันที่ 25 ของเดือนถัดไปจาก due date
+    const [dy, dm] = dueIso.split('-').map(Number);
+    const breakDate = new Date(dy, dm, 25); // dm เป็น 1-indexed → มันคือ (month+1)-1 = next month
+    if (new Date(today) >= breakDate) return 'credit_break';
+    if (daysDiff > 5) return 'overdue_warning';
+    return 'overdue';
+  }
+  
+  function computeCustStatus(bills) {
+    const statuses = bills.filter(b => b.status !== 'paid').map(b => b.status);
+    if (statuses.length === 0) return 'paid';
+    for (const s of STATUS_PRIORITY) {
+      if (statuses.includes(s)) return s;
+    }
+    return 'active';
+  }
+  
+  function daysOverdue(bill, today) {
+    if (!bill.due_date) return 0;
+    const dueIso = toISODate(bill.due_date);
+    if (!dueIso || dueIso >= today) return 0;
+    return Math.floor((new Date(today) - new Date(dueIso)) / 86400000);
+  }
+  
+  function formatMonthTH(monthKey) {
+    // monthKey = "2026-04" → "เมษายน 2569"
+    const thMonths = ['มกราคม','กุมภาพันธ์','มีนาคม','เมษายน','พฤษภาคม','มิถุนายน','กรกฎาคม','สิงหาคม','กันยายน','ตุลาคม','พฤศจิกายน','ธันวาคม'];
+    const m = monthKey.match(/^(\d{4})-(\d{1,2})/);
+    if (!m) return monthKey;
+    const y = Number(m[1]) + 543; // ค.ศ. → พ.ศ.
+    const mo = Number(m[2]) - 1;
+    return `${thMonths[mo]} ${y}`;
+  }
 
   async function loadAndRender() {
+    // โหลด ar_ledger
     const res = await api('getArLedger');
     let debtors = res.data || [];
-
-    // กรอง — ไม่แสดง cash_only ในหน้านี้
+    const today = todayISO();
+    
+    // ── Process: สำหรับแต่ละลูกค้า คำนวณสถานะบิล + รวม SP ที่ตัดบิลนั้น ──
+    debtors = debtors.map(d => {
+      const months = {}; // monthKey → { total, bills: [] }
+      let allBills = d.bills || [];
+      
+      // ถ้า d.months เป็นแบบเก่า (monthKey → amount) ต้องรวมเอาบิลจากที่อื่น
+      // ที่นี่สมมติ d.bills มีอยู่แล้ว; ถ้าไม่มี ใช้ d.months เป็น fallback
+      
+      allBills.forEach(b => {
+        // ตรวจว่า SP ตัดบิลนี้ไหม (จาก paymentList)
+        let paidBySp = null;
+        let paidAmount = 0;
+        paymentList.forEach(sp => {
+          (sp.bills || []).forEach(childBill => {
+            if (childBill.bill_no === b.bill_no) {
+              if (!paidBySp) paidBySp = [];
+              paidBySp.push({ sp_no: sp.sp_no, date: sp.date, amount: childBill.amount });
+              paidAmount += Number(childBill.amount || 0);
+            }
+          });
+        });
+        b.paid_by_sp_list = paidBySp || [];
+        b.paid_amount = paidAmount;
+        b.remaining = Math.max(0, Number(b.amount||0) - paidAmount);
+        b.status = computeBillStatus(b, today);
+        b.days_overdue = daysOverdue(b, today);
+        
+        // จัดกลุ่มเดือน
+        const billDate = toISODate(b.bill_date || b.date) || '';
+        const monthKey = billDate.slice(0, 7) || 'unknown';
+        if (!months[monthKey]) months[monthKey] = { total: 0, remaining: 0, bills: [] };
+        months[monthKey].total += Number(b.amount||0);
+        months[monthKey].remaining += b.remaining;
+        months[monthKey].bills.push(b);
+      });
+      
+      const unpaidBills = allBills.filter(b => b.status !== 'paid');
+      const totalOutstanding = unpaidBills.reduce((s,b) => s + b.remaining, 0);
+      const monthsUnpaid = Object.keys(months).filter(mk => months[mk].remaining > 0.01).length;
+      const maxDaysOverdue = unpaidBills.length ? Math.max(...unpaidBills.map(b => b.days_overdue)) : 0;
+      const custStatus = computeCustStatus(allBills);
+      
+      return {
+        ...d,
+        bills_processed: allBills,
+        months_grouped: months,
+        total_outstanding: totalOutstanding,
+        months_unpaid: monthsUnpaid,
+        max_days_overdue: maxDaysOverdue,
+        computed_status: custStatus,
+      };
+    });
+    
+    // Filter — ไม่แสดง cash_only
     debtors = debtors.filter(d => d.credit_status !== 'cash_only');
-
-    // Filter status
+    // ไม่แสดงลูกค้าที่จ่ายหมดแล้ว
+    debtors = debtors.filter(d => Number(d.total_outstanding) > 0.01);
+    
+    // Filter status (ใช้ computed_status)
     if (filterStatus !== 'ALL') {
-      debtors = debtors.filter(d => d.credit_status === filterStatus);
+      debtors = debtors.filter(d => d.computed_status === filterStatus);
     }
     // Search
     if (searchText) {
       const s = searchText.toLowerCase();
-      debtors = debtors.filter(d => (d.cust_name||'').toLowerCase().includes(s) || (d.cust_id||'').toLowerCase().includes(s) || (d.phone||'').includes(s));
+      debtors = debtors.filter(d => 
+        (d.cust_name||'').toLowerCase().includes(s) || 
+        (d.cust_id||'').toLowerCase().includes(s) || 
+        (d.phone||'').includes(s) ||
+        (d.contact_person||'').toLowerCase().includes(s)
+      );
     }
-
-    const allMonths = [...new Set(debtors.flatMap(d => Object.keys(d.months||{})))].sort();
+    
+    // Sort: เลย-กำหนดนานสุดก่อน
+    debtors.sort((a,b) => (b.max_days_overdue||0) - (a.max_days_overdue||0));
+    
     const totalDebt = debtors.reduce((s,d) => s + (Number(d.total_outstanding)||0), 0);
-    const overdueCount = debtors.filter(d=>d.credit_status==='overdue').length;
-    const breakCount = debtors.filter(d=>d.credit_status==='credit_break').length;
+    const statusCounts = {};
+    debtors.forEach(d => {
+      statusCounts[d.computed_status] = (statusCounts[d.computed_status]||0) + 1;
+    });
 
     el.innerHTML = `
       <div class="flex justify-between items-center mb-3">
         <div class="page-title">ติดตามลูกหนี้</div>
-        <div class="flex gap-2">
-          <input class="input" placeholder="ค้นหา ชื่อ / cust_id / เบอร์" id="debt-search" value="${searchText}" style="width:240px">
+        <div class="flex gap-2 flex-wrap">
+          <input class="input" placeholder="ค้นหา ชื่อ / cust_id / เบอร์ / ผู้ติดต่อ" id="debt-search" value="${searchText}" style="width:280px">
           <button class="btn btn-primary btn-sm" id="btn-quick-payment" style="background:var(--success);color:#fff">💰 รับชำระเร็ว</button>
           <button class="btn btn-outline btn-sm" id="btn-check-alerts">${ICONS.pulse} ตรวจสอบสถานะ</button>
+          <button class="btn btn-outline btn-sm" id="btn-expand-all">📂 เปิดทั้งหมด</button>
+          <button class="btn btn-outline btn-sm" id="btn-collapse-all">📁 ปิดทั้งหมด</button>
         </div>
       </div>
 
       <!-- Summary cards -->
       <div class="flex gap-3 flex-wrap mb-3 stagger">
-        ${statCard('ลูกหนี้ทั้งหมด', debtors.length, '', 'var(--info)', ICONS.card)}
+        ${statCard('ลูกหนี้ค้างชำระ', debtors.length, '', 'var(--info)', ICONS.card)}
         ${statCard('ยอดค้างรวม', '฿'+fmtNum(totalDebt), '', 'var(--warn)', ICONS.dollar)}
-        ${statCard('เลยกำหนด', overdueCount, 'รายที่ต้องติดตาม', 'var(--danger)', ICONS.alert)}
-        ${statCard('เบรกเครดิต', breakCount, 'รายที่หยุดขายเครดิต', 'var(--purple)', ICONS.alert)}
+        ${statCard('เลยกำหนด', (statusCounts.overdue||0)+(statusCounts.overdue_warning||0), 'รายที่ต้องติดตาม', 'var(--danger)', ICONS.alert)}
+        ${statCard('เบรกเครดิต', statusCounts.credit_break||0, 'หยุดขายเครดิต', 'var(--purple)', ICONS.alert)}
       </div>
 
-      <!-- Filter pills -->
-      <div class="flex gap-2 mb-3 flex-wrap">
-        <button class="pill ${filterStatus==='ALL'?'active':''}" data-fs="ALL">ทั้งหมด</button>
-        <button class="pill ${filterStatus==='active'?'active':''}" data-fs="active" style="border-color:var(--success)">ปกติ</button>
-        <button class="pill ${filterStatus==='overdue'?'active':''}" data-fs="overdue" style="border-color:var(--danger)">เลยกำหนดชำระ</button>
-        <button class="pill ${filterStatus==='credit_break'?'active':''}" data-fs="credit_break" style="border-color:var(--warn)">เบรกเครดิต</button>
+      <!-- Filter pills (รวม 13 สถานะ) -->
+      <div class="flex gap-2 mb-3 flex-wrap" style="font-size:.82rem">
+        <button class="pill ${filterStatus==='ALL'?'active':''}" data-fs="ALL">ทั้งหมด (${debtors.length})</button>
+        ${Object.keys(BILL_STATUS).filter(k => k !== 'paid' && statusCounts[k]).map(k => {
+          const s = BILL_STATUS[k];
+          return `<button class="pill ${filterStatus===k?'active':''}" data-fs="${k}" style="--pill-color:${s.color};border-color:${s.color}33">${s.emoji} ${s.label} (${statusCounts[k]||0})</button>`;
+        }).join('')}
       </div>
 
+      <!-- Hierarchical Customer List -->
       <div class="card-flat">
-        <div class="table-wrap" style="max-height:540px;overflow-y:auto">
-          <table>
-            <thead>
-              <tr>
-                <th>ลูกหนี้</th>
-                <th>ผู้ติดต่อ</th>
-                <th>เบอร์โทร</th>
-                ${allMonths.map(m => {
-                  const yr = m.split('-')[0].slice(-2);
-                  const mo = m.split('-')[1];
-                  return `<th style="text-align:right">${mo}/${yr}</th>`;
-                }).join('')}
-                <th style="text-align:right">ยอดค้าง</th>
-                <th>กำหนดชำระ</th>
-                <th>สถานะ</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody>
-              ${debtors.length === 0 ? `<tr><td colspan="99" style="text-align:center;padding:40px;color:var(--text3)">ไม่มีลูกหนี้ในสถานะที่เลือก</td></tr>` :
-                debtors.map(d => {
-                  const total = Number(d.total_outstanding) || Object.values(d.months||{}).reduce((a,b)=>a+b,0);
-                  const st = statusMap[d.credit_status] || statusMap.active;
-                  const limit = Number(d.credit_limit) || 0;
-                  return `<tr>
-                    <td>
-                      <div class="font-semi" style="color:var(--text)">${d.cust_name||'-'}</div>
-                      <div class="text-xs text-muted">${d.cust_id||''}</div>
-                    </td>
-                    <td class="text-xs">${d.contact_person||'-'}</td>
-                    <td class="text-xs" style="font-family:var(--mono)">${d.phone||'-'}</td>
-                    ${allMonths.map(m=>{
-                      const amt = (d.months||{})[m];
-                      return `<td style="text-align:right;color:${amt?'var(--text)':'var(--text3)'}">${amt?fmtNum(amt):'-'}</td>`;
+        ${debtors.length === 0 ? 
+          `<div style="padding:40px;text-align:center;color:var(--text3)">ไม่มีลูกหนี้ในสถานะที่เลือก</div>` :
+          debtors.map(d => {
+            const st = BILL_STATUS[d.computed_status] || BILL_STATUS.active;
+            const isOpenCust = expandedCust.has(d.cust_id);
+            const monthsSorted = Object.keys(d.months_grouped).sort((a,b) => b.localeCompare(a)); // ใหม่ก่อน
+            const unpaidMonths = monthsSorted.filter(mk => d.months_grouped[mk].remaining > 0.01);
+            
+            return `
+              <!-- LEVEL 1: CUSTOMER -->
+              <div class="cust-block" style="border-bottom:1px solid var(--border)">
+                <div class="cust-row" data-cust-id="${d.cust_id}" style="padding:14px 16px;cursor:pointer;display:flex;align-items:center;gap:12px;${isOpenCust?'background:var(--surface2);border-left:4px solid '+st.color:'border-left:4px solid transparent'}">
+                  <div style="font-size:1.1rem;color:var(--text2);width:20px">${isOpenCust?'▼':'▶'}</div>
+                  <div style="flex:1;min-width:0">
+                    <div class="flex items-center gap-2 flex-wrap">
+                      <span class="font-semi" style="color:var(--text);font-size:1rem">${d.cust_name||'-'}</span>
+                      <span class="badge" style="background:${st.color}22;color:${st.color};border:1px solid ${st.color}66">${st.emoji} ${st.label}</span>
+                      ${d.max_days_overdue > 0 ? `<span class="badge badge-danger" style="font-size:.7rem">เลย ${d.max_days_overdue} วัน</span>` : ''}
+                      ${unpaidMonths.length > 0 ? `<span class="text-xs text-muted">ค้าง ${unpaidMonths.length} เดือน</span>` : ''}
+                    </div>
+                    <div class="text-xs text-muted" style="margin-top:2px">
+                      ${d.cust_id||''} 
+                      ${d.contact_person?' · '+d.contact_person:''} 
+                      ${d.phone?' · 📞 '+d.phone:''}
+                    </div>
+                  </div>
+                  <div style="text-align:right">
+                    <div style="font-weight:700;color:var(--warn);font-size:1.15rem">฿${fmtNum(d.total_outstanding)}</div>
+                    <div class="text-xs text-muted">${d.bills_processed.filter(b=>b.status!=='paid').length} บิล</div>
+                  </div>
+                  <button class="btn btn-primary btn-sm btn-pay-cust" data-pay="${d.cust_id}" onclick="event.stopPropagation()" style="background:var(--success);color:#fff">${ICONS.dollar} รับชำระ</button>
+                </div>
+                
+                ${isOpenCust ? `
+                  <!-- LEVEL 2: MONTHS -->
+                  <div style="padding:0 16px 8px 40px;background:var(--surface2)">
+                    ${unpaidMonths.map(mk => {
+                      const mData = d.months_grouped[mk];
+                      const monthKey = d.cust_id + '|' + mk;
+                      const isOpenMonth = expandedMonth.has(monthKey);
+                      const monthBills = mData.bills.filter(b => b.status !== 'paid');
+                      const monthPaidBills = mData.bills.filter(b => b.status === 'paid');
+                      
+                      return `
+                        <div class="month-block" style="border-left:2px solid var(--border);margin-left:8px">
+                          <div class="month-row" data-cust-id="${d.cust_id}" data-month="${mk}" style="padding:10px 12px;cursor:pointer;display:flex;align-items:center;gap:10px;${isOpenMonth?'background:var(--surface3)':''}">
+                            <div style="font-size:.9rem;color:var(--text2);width:16px">${isOpenMonth?'▼':'▶'}</div>
+                            <div style="flex:1">
+                              <div class="text-sm font-semi" style="color:var(--text)">📅 ${formatMonthTH(mk)}</div>
+                              <div class="text-xs text-muted">
+                                ${monthBills.length} บิลค้าง ${monthPaidBills.length > 0 ? '· '+monthPaidBills.length+' บิลจ่ายแล้ว' : ''}
+                              </div>
+                            </div>
+                            <div style="text-align:right">
+                              <div style="font-weight:700;color:var(--warn)">฿${fmtNum(mData.remaining)}</div>
+                              <div class="text-xs text-muted">จาก ฿${fmtNum(mData.total)}</div>
+                            </div>
+                          </div>
+                          
+                          ${isOpenMonth ? `
+                            <!-- LEVEL 3: BILLS -->
+                            <div style="padding:4px 8px 8px 20px;background:var(--surface1);border-left:2px solid ${st.color}">
+                              ${mData.bills.map(b => {
+                                const bs = BILL_STATUS[b.status] || BILL_STATUS.active;
+                                const isPaid = b.status === 'paid';
+                                return `
+                                  <div style="padding:10px 12px;margin:4px 0;background:${isPaid?'rgba(45,212,160,.05)':'var(--surface2)'};border-radius:6px;border-left:3px solid ${bs.color}">
+                                    <div class="flex items-center gap-2 flex-wrap">
+                                      <span class="font-semi" style="font-family:var(--mono);color:var(--text)">${b.bill_no||'-'}</span>
+                                      <span class="badge" style="background:${bs.color}22;color:${bs.color};font-size:.7rem">${bs.emoji} ${bs.label}</span>
+                                      ${b.days_overdue > 0 && !isPaid ? `<span class="text-xs" style="color:var(--danger)">· เลย ${b.days_overdue} วัน</span>` : ''}
+                                    </div>
+                                    <div class="flex items-center gap-4 flex-wrap text-xs text-muted" style="margin-top:3px">
+                                      <span>ออก: ${fmtDate(b.bill_date||b.date)}</span>
+                                      ${b.due_date ? `<span>ครบกำหนด: ${fmtDate(b.due_date)}</span>` : ''}
+                                      <span style="color:var(--text)">ยอด: ฿${fmtNum(b.amount||0)}</span>
+                                      ${b.paid_amount > 0 ? `<span style="color:var(--info)">· จ่ายแล้ว ฿${fmtNum(b.paid_amount)}</span>` : ''}
+                                      ${b.remaining > 0 ? `<span style="color:var(--warn)">· เหลือ ฿${fmtNum(b.remaining)}</span>` : ''}
+                                    </div>
+                                    ${b.paid_by_sp_list && b.paid_by_sp_list.length ? `
+                                      <div class="text-xs" style="margin-top:4px;color:var(--success)">
+                                        ✓ ตัดโดย SP: ${b.paid_by_sp_list.map(sp => `${sp.sp_no} (฿${fmtNum(sp.amount)} · ${fmtDate(sp.date)})`).join(', ')}
+                                      </div>
+                                    ` : ''}
+                                    <div style="margin-top:6px">
+                                      <button class="btn btn-ghost btn-sm btn-bill-status" data-bill="${b.bill_no}" data-cust="${d.cust_id}" style="font-size:.7rem;padding:3px 8px">🏷️ เปลี่ยนสถานะ</button>
+                                    </div>
+                                  </div>
+                                `;
+                              }).join('')}
+                            </div>
+                          ` : ''}
+                        </div>
+                      `;
                     }).join('')}
-                    <td style="text-align:right;font-weight:700;color:${total>limit && limit>0?'var(--danger)':'var(--warn)'}">฿${fmtNum(total)}</td>
-                    <td class="text-xs">${fmtDate(d.due_date)}</td>
-                    <td><span class="badge ${st.cls}">${st.label}</span></td>
-                    <td>
-                      <button class="btn btn-primary btn-sm" data-pay="${d.cust_id}">${ICONS.dollar} ตัดชำระ</button>
-                    </td>
-                  </tr>`;
-                }).join('')
-              }
-            </tbody>
-          </table>
-        </div>
+                  </div>
+                ` : ''}
+              </div>
+            `;
+          }).join('')
+        }
       </div>
     `;
+
+    // ── Event Handlers ──
+    document.getElementById('debt-search')?.addEventListener('input', debounce(e => { searchText = e.target.value; loadAndRender(); }, 300));
+    el.querySelectorAll('.pill[data-fs]').forEach(btn => {
+      btn.addEventListener('click', () => { filterStatus = btn.dataset.fs; loadAndRender(); });
+    });
+    document.getElementById('btn-check-alerts')?.addEventListener('click', async () => {
+      toast('กำลังตรวจสอบสถานะ...', 'info');
+      const r = await api('checkAlerts');
+      if (r.success) { toast(`เสร็จ — เปลี่ยนสถานะ ${r.data?.status_changed||0} ราย`, 'success'); loadAndRender(); }
+      else toast(r.error||'ไม่สำเร็จ', 'error');
+    });
+    document.getElementById('btn-quick-payment')?.addEventListener('click', () => openQuickPaymentModal());
+    
+    document.getElementById('btn-expand-all')?.addEventListener('click', () => {
+      debtors.forEach(d => {
+        expandedCust.add(d.cust_id);
+        Object.keys(d.months_grouped).forEach(mk => {
+          if (d.months_grouped[mk].remaining > 0.01) expandedMonth.add(d.cust_id + '|' + mk);
+        });
+      });
+      loadAndRender();
+    });
+    document.getElementById('btn-collapse-all')?.addEventListener('click', () => {
+      expandedCust.clear();
+      expandedMonth.clear();
+      loadAndRender();
+    });
+    
+    // Toggle customer expand
+    el.querySelectorAll('.cust-row').forEach(row => {
+      row.addEventListener('click', (e) => {
+        if (e.target.closest('.btn-pay-cust')) return;
+        const cid = row.dataset.custId;
+        if (expandedCust.has(cid)) {
+          expandedCust.delete(cid);
+          // ปิด months ของ cust นี้ด้วย
+          Array.from(expandedMonth).forEach(k => { if (k.startsWith(cid+'|')) expandedMonth.delete(k); });
+        } else {
+          expandedCust.add(cid);
+        }
+        loadAndRender();
+      });
+    });
+    
+    // Toggle month expand
+    el.querySelectorAll('.month-row').forEach(row => {
+      row.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const key = row.dataset.custId + '|' + row.dataset.month;
+        if (expandedMonth.has(key)) expandedMonth.delete(key);
+        else expandedMonth.add(key);
+        loadAndRender();
+      });
+    });
+    
+    // Pay button
+    el.querySelectorAll('.btn-pay-cust').forEach(btn => {
+      btn.addEventListener('click', () => openPaymentModal(btn.dataset.pay));
+    });
+    
+    // Bill status change
+    el.querySelectorAll('.btn-bill-status').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        openBillStatusModal(btn.dataset.cust, btn.dataset.bill);
+      });
+    });
+  }
+
+  loadAndRender();
+}
+
+// ── Bill status change modal ──
+async function openBillStatusModal(custId, billNo) {
+  const STATUSES = [
+    { val:'active',          label:'🟢 ยังไม่ถึงกำหนด' },
+    { val:'overdue',         label:'🟠 เกินกำหนด' },
+    { val:'overdue_warning', label:'🔴 เกินนาน' },
+    { val:'credit_break',    label:'🔴 เบรกเครดิต' },
+    { val:'partial_paid',    label:'🔵 จ่ายบางส่วน' },
+    { val:'paid',            label:'✅ จ่ายแล้ว' },
+    { val:'disputed',        label:'🟣 มีข้อพิพาท' },
+    { val:'cheque_pending',  label:'🟡 รอเช็คเข้า' },
+    { val:'cheque_bounced',  label:'🚫 เช็คเด้ง' },
+    { val:'extended',        label:'🔵 ต่ออายุหนี้' },
+    { val:'bad_debt',        label:'⚫ หนี้สูญ' },
+    { val:'disputed_legal',  label:'⚖️ ฟ้องร้อง' },
+  ];
+  
+  openModal(`🏷️ เปลี่ยนสถานะบิล — ${billNo}`, `
+    <div class="flex-col gap-3">
+      <p class="text-sm text-dim">ระบบจะคำนวณสถานะอัตโนมัติจากวันครบกำหนด แต่ถ้ามีเหตุการณ์พิเศษ (เช่น ลูกค้าขอเลื่อน, ข้อพิพาท, ฟ้องร้อง) สามารถ override ได้ที่นี่</p>
+      <div class="input-group">
+        <label>สถานะใหม่</label>
+        <select class="select" id="bs-status">
+          <option value="">(อัตโนมัติ - คำนวณจากวันครบกำหนด)</option>
+          ${STATUSES.map(s => `<option value="${s.val}">${s.label}</option>`).join('')}
+        </select>
+      </div>
+      <div class="input-group">
+        <label>หมายเหตุ / เหตุผล</label>
+        <textarea class="input" id="bs-note" rows="3" placeholder="เช่น ลูกค้าขอเลื่อนจ่าย 30 วัน, ข้อพิพาทเรื่องคุณภาพสินค้า, เริ่มดำเนินคดีวันที่ ..."></textarea>
+      </div>
+      <div class="flex gap-2 mt-2">
+        <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ยกเลิก</button>
+        <button class="btn btn-primary btn-sm flex-1" id="bs-confirm">${ICONS.check} บันทึกสถานะ</button>
+      </div>
+    </div>
+  `);
+  
+  document.getElementById('bs-confirm')?.addEventListener('click', async () => {
+    const newStatus = document.getElementById('bs-status').value;
+    const note = document.getElementById('bs-note').value;
+    toast('กำลังบันทึก...', 'info');
+    const res = await api('updateBillStatus', {
+      cust_id: custId,
+      bill_no: billNo,
+      manual_status: newStatus,
+      note: note,
+      action_by: currentUser?.display_name || 'Admin',
+    });
+    if (res.success) {
+      toast('บันทึกสถานะสำเร็จ', 'success');
+      closeModal();
+      if (currentPage === 'debt') navigateTo('debt');
+    } else {
+      toast(res.error || 'บันทึกไม่สำเร็จ', 'error');
+    }
+  });
+}
 
     // Bindings
     document.getElementById('debt-search')?.addEventListener('input', debounce(e => { searchText = e.target.value; loadAndRender(); }, 300));
@@ -3267,15 +3589,6 @@ async function renderDebt(el) {
     
     // Quick Payment — ลูกค้ามาจ่ายหนี้สดๆ ที่ร้าน
     document.getElementById('btn-quick-payment')?.addEventListener('click', () => openQuickPaymentModal());
-
-    // Payment button
-    el.querySelectorAll('button[data-pay]').forEach(btn => {
-      btn.addEventListener('click', () => openPaymentModal(btn.dataset.pay));
-    });
-  }
-
-  loadAndRender();
-}
 
 // ══════════════════════════════════════════════════════════════
 // Quick Payment Modal — รับชำระจากลูกค้าแบบเร็ว
