@@ -1798,13 +1798,19 @@ async function renderMain(el) {
     const truncated = data.length > MAX_VISIBLE_ROWS;
     const visibleData = truncated ? data.slice(0, MAX_VISIBLE_ROWS) : data;
     
-    // Stations/types calc: only for reasonable list sizes
+    // Stations/types — เรียงตาม canonical order เสมอ (ไม่งั้น Front1 อาจกระโดดไปท้ายเพราะ Set ตาม first-seen)
+    const STATION_ORDER = ['Front1','Front2','Front3','Front4','Invoice','Invoice Credit','Order','Order Credit','Payment','Cancel'];
+    const TYPE_ORDER = ['Transfer','Cash','Card','Cheque','Refund','Unknown',''];
+    const sortByOrder = (arr, order) => {
+      const rank = (v) => { const i = order.indexOf(v); return i === -1 ? 999 : i; };
+      return [...arr].sort((a, b) => rank(a) - rank(b));
+    };
     const stations = billList.length < 10000 
-      ? [...new Set(billList.map(b => b.station).filter(Boolean))]
-      : ['Front1','Front2','Front3','Front4','Invoice','Invoice Credit','Order','Order Credit','Payment'];
+      ? sortByOrder([...new Set(billList.map(b => b.station).filter(Boolean))], STATION_ORDER)
+      : STATION_ORDER.slice(0, 9);
     const types = billList.length < 10000
-      ? [...new Set(billList.map(b => b.type))]
-      : ['Transfer','Cash','Card','Cheque','Refund','Unknown',''];
+      ? sortByOrder([...new Set(billList.map(b => b.type))], TYPE_ORDER)
+      : TYPE_ORDER;
 
     el.innerHTML = `
       <div class="flex justify-between items-center mb-3">
