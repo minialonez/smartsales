@@ -1325,6 +1325,41 @@ async function restoreMainState() {
     });
     if (cleaned > 0) console.log(`Cleaned bank field from ${cleaned} SP/SC/JS/JR bills`);
   }
+  
+  // ── Auto-sync: บิล matched ที่ขาด confirmation → เติมจาก statement ที่ match ──
+  if (billList.length > 0 && uploadedStatements.length > 0) {
+    let synced = 0;
+    // สร้าง index: match_bill → statement
+    const stmtByBill = {};
+    uploadedStatements.forEach(s => {
+      if (s.match_status === 'matched' && s.match_bill) {
+        stmtByBill[s.match_bill] = s;
+      }
+    });
+    
+    billList.forEach(b => {
+      if (b.match_status !== 'matched') return;
+      if (b.confirmation) return; // มีแล้ว ไม่แทน
+      
+      // หา statement คู่
+      let stmt = null;
+      if (b.bill_no && stmtByBill[b.bill_no]) {
+        stmt = stmtByBill[b.bill_no];
+      } else {
+        // หาจาก generated key: station|type|amount (ตรงวันด้วย)
+        const key1 = `${b.station}|${b.type}|฿${b.amount}`;
+        const key2 = `${b.station}|${b.type}|${b.amount}`;
+        stmt = stmtByBill[key1] || stmtByBill[key2];
+      }
+      
+      if (stmt && stmt.bank) {
+        b.confirmation = stmt.bank;
+        if (!b.pay_date) b.pay_date = b.date;
+        synced++;
+      }
+    });
+    if (synced > 0) console.log(`Auto-synced confirmation for ${synced} matched bills`);
+  }
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -8874,6 +8909,8 @@ async function renderMatching(el) {
               targetLabel = `💰 CF ${match.bill_no}`;
             } else {
               match.match_status = 'matched';
+              match.confirmation = stmt.bank || ''; // ใส่ธนาคาร
+              match.pay_date = match.date; // ใส่วันโอน
               match.matched_stmt_ref = stmt.ref_no || '';
               match.matched_at = new Date().toISOString();
               targetLabel = `📄 ${match.bill_no}`;
@@ -8922,8 +8959,11 @@ async function renderMatching(el) {
         const bill = billList.find(b => b.bill_no === stmt.match_bill);
         if (bill && !bill.paid_by_sp) {
           bill.match_status = 'pending';
+          delete bill.confirmation;    // ล้างธนาคาร (auto-filled)
+          delete bill.pay_date;        // ล้างวันโอน (auto-filled)
           delete bill.matched_stmt_ref;
           delete bill.matched_at;
+          // ⚠️ ไม่ลบ bill.bank — เป็นช่อง manual ที่ user กรอกเอง
         }
         
         stmt.match_status = 'unmatched';
