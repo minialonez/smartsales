@@ -6,6 +6,9 @@
 <title>Smart Finance</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/themes/dark.css">
+<script src="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.js"></script>
 <style>
 /* ── Reset & Variables ── */
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
@@ -444,6 +447,44 @@ function sortByDateDesc(arr, getDate) {
   return arr.sort((a, b) => (parseThaiDate(getDate(b)) || 0) - (parseThaiDate(getDate(a)) || 0));
 }
 
+// ══════════════════════════════════════════════════════════
+// Flatpickr — บังคับ dd/mm/yyyy ทุกเบราว์เซอร์
+//   - value = yyyy-mm-dd (เหมือนเดิม, logic ไม่ต้องแก้)
+//   - แสดง = dd/mm/yyyy (altInput ของ flatpickr)
+//   เรียกหลัง render() เพื่อ apply ให้ทุก <input type="date">
+// ══════════════════════════════════════════════════════════
+function applyFlatpickrAll() {
+  if (typeof flatpickr === 'undefined') return;
+  document.querySelectorAll('input[type="date"]').forEach(inp => {
+    if (inp._flatpickr) return; // already applied
+    try {
+      flatpickr(inp, {
+        dateFormat: 'Y-m-d',        // value ที่ส่งออก = yyyy-mm-dd (เหมือนเดิม)
+        altFormat: 'd/m/Y',         // ที่แสดงในช่อง = 17/04/2026
+        altInput: true,             // สร้างช่องแสดงใหม่ซ้อนทับ
+        allowInput: true,
+      });
+    } catch(e) {}
+  });
+}
+
+// Auto-apply flatpickr เมื่อมี date input ใหม่เพิ่มใน DOM (modal, re-render)
+if (typeof window !== 'undefined') {
+  const _fpObserver = new MutationObserver(() => {
+    // debounce: รอ 50ms หลังเปลี่ยนแปลง
+    clearTimeout(window._fpTimer);
+    window._fpTimer = setTimeout(applyFlatpickrAll, 50);
+  });
+  // เริ่มสังเกตหลัง DOM พร้อม
+  if (document.body) {
+    _fpObserver.observe(document.body, { childList: true, subtree: true });
+  } else {
+    document.addEventListener('DOMContentLoaded', () => {
+      _fpObserver.observe(document.body, { childList: true, subtree: true });
+    });
+  }
+}
+
 
 // ── Excel / CSV File Parser ──
 function parseExcelFile(file) {
@@ -830,16 +871,20 @@ let statementsByBank = { KTB: [], KBANK: [], 'BBL NW': [], BBL: [], UNKNOWN: [] 
 function addStatementRows(bank, rows) {
   if (!statementsByBank[bank]) statementsByBank[bank] = [];
   
-  // Dedup key = date + time + amount + ref_no (ตรงเป๊ะ ไม่พึ่ง description)
+  // Dedup key = date + time(HH:MM only) + amount + ref_no
+  // ใช้ HH:MM เท่านั้น (ไม่สน seconds) เพื่อให้ดักซ้ำได้แม้ format ต่าง
+  function normTime(t) {
+    const m = String(t||'').match(/^(\d{1,2}):(\d{2})/);
+    return m ? (m[1].padStart(2,'0') + ':' + m[2]) : '';
+  }
   function makeKey(r) {
-    return `${r.date||''}|${r.time||''}|${Math.round(Number(r.amount)||0)}|${r.ref_no||''}`;
+    return `${r.date||''}|${normTime(r.time)}|${Math.round(Number(r.amount)||0)}|${r.ref_no||''}`;
   }
   const existingKeys = new Set(statementsByBank[bank].map(makeKey));
   const uniqueRows = rows.filter(r => !existingKeys.has(makeKey(r)));
   
   statementsByBank[bank] = statementsByBank[bank].concat(uniqueRows);
   
-  // Sort ASC by date
   statementsByBank[bank].sort((a, b) => {
     const da = parseThaiDate(a.date);
     const db = parseThaiDate(b.date);
@@ -849,8 +894,12 @@ function addStatementRows(bank, rows) {
   return { added: uniqueRows.length, skipped: rows.length - uniqueRows.length };
 }
 
-// ── ลบ statement ซ้ำใน statementsByBank ทั้งหมด (ใช้ตอนโหลด) ──
+// ── ลบ statement ซ้ำทั้งหมดใน statementsByBank (manual trigger ผ่าน UI) ──
 function dedupAllStatements() {
+  function normTime(t) {
+    const m = String(t||'').match(/^(\d{1,2}):(\d{2})/);
+    return m ? (m[1].padStart(2,'0') + ':' + m[2]) : '';
+  }
   let totalRemoved = 0;
   Object.keys(statementsByBank).forEach(bank => {
     const arr = statementsByBank[bank] || [];
@@ -858,7 +907,7 @@ function dedupAllStatements() {
     const seen = new Map();
     const unique = [];
     arr.forEach(r => {
-      const key = `${r.date||''}|${r.time||''}|${Math.round(Number(r.amount)||0)}|${r.ref_no||''}`;
+      const key = `${r.date||''}|${normTime(r.time)}|${Math.round(Number(r.amount)||0)}|${r.ref_no||''}`;
       if (seen.has(key)) {
         // ถ้าซ้ำ — เก็บตัวที่ matched ไว้ (ถ้ามี)
         const existing = seen.get(key);
@@ -7736,6 +7785,8 @@ function navigateTo(page) {
   const renderer = PAGE_RENDERERS[page];
   if (renderer) renderer(main);
   else main.innerHTML = `<div class="card"><p class="text-dim">หน้า "${page}" กำลังพัฒนา</p></div>`;
+  // Apply dd/mm/yyyy date picker (flatpickr) after render
+  setTimeout(applyFlatpickrAll, 100);
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -8992,6 +9043,7 @@ async function renderMatching(el) {
         <div class="page-title">Statement Matching</div>
         <div class="flex gap-2 items-center">
           <button class="btn btn-outline btn-sm" id="btn-stmt-upload">${ICONS.file} วาง Statement</button>
+          <button class="btn btn-outline btn-sm" id="btn-dedup-stmts" title="ลบ statement ซ้ำ (date+time HH:MM+amount+ref)">🧹 ลบซ้ำ</button>
           <button class="btn btn-primary btn-sm" id="btn-auto-match">${ICONS.pulse} Auto Match</button>
         </div>
       </div>
@@ -9077,6 +9129,57 @@ async function renderMatching(el) {
     document.getElementById('btn-stmt-upload')?.addEventListener('click', () => {
       triggerFileUpload('file-stmt', (result, name) => { handleStmtUpload(result, name); render(); });
     });
+    
+    // ── Dedup Statement (manual, safe — preview before delete) ──
+    document.getElementById('btn-dedup-stmts')?.addEventListener('click', () => {
+      // Count potential duplicates first (dry-run) — clone
+      function normTime(t) {
+        const m = String(t||'').match(/^(\d{1,2}):(\d{2})/);
+        return m ? (m[1].padStart(2,'0') + ':' + m[2]) : '';
+      }
+      const preview = { byBank: {}, total: 0 };
+      Object.keys(statementsByBank).forEach(bank => {
+        const arr = statementsByBank[bank] || [];
+        const seen = new Map();
+        let dup = 0;
+        arr.forEach(r => {
+          const key = `${r.date||''}|${normTime(r.time)}|${Math.round(Number(r.amount)||0)}|${r.ref_no||''}`;
+          if (seen.has(key)) { dup++; } else { seen.set(key, 1); }
+        });
+        if (arr.length > 0) preview.byBank[bank] = { total: arr.length, dup: dup };
+        preview.total += dup;
+      });
+      
+      if (preview.total === 0) {
+        toast('ไม่พบ Statement ซ้ำ', 'info');
+        return;
+      }
+      
+      let msg = `พบ Statement ซ้ำ ${preview.total} รายการ\n\n`;
+      Object.keys(preview.byBank).forEach(bank => {
+        const r = preview.byBank[bank];
+        if (r.dup > 0) msg += `  ${bank}: ${r.total} → เหลือ ${r.total - r.dup} (ลบ ${r.dup})\n`;
+      });
+      msg += `\n⚠️ ลบแล้วกู้คืนไม่ได้\nยืนยันลบ?`;
+      
+      if (!confirm(msg)) return;
+      
+      // Actually dedup now
+      const removed = dedupAllStatements();
+      uploadedStatements = getAllStatements();
+      
+      // Save
+      const req = indexedDB.open('SmartFinanceDB', 1);
+      req.onsuccess = (e) => {
+        const tx = e.target.result.transaction('data', 'readwrite');
+        tx.objectStore('data').put(JSON.stringify(statementsByBank), 'sf_statementsByBank');
+        tx.oncomplete = () => {
+          toast(`✅ ลบ ${removed} รายการซ้ำแล้ว · เหลือ ${uploadedStatements.length}`, 'success', 6000);
+          render();
+        };
+      };
+    });
+    
     document.getElementById('btn-clear-stmts')?.addEventListener('click', () => {
       const target = bankFilter === 'ALL' ? 'ทุกธนาคาร' : bankFilter;
       if (confirm(`ล้าง Statement ${target}?`)) {
@@ -9409,7 +9512,7 @@ async function renderMatching(el) {
       openModal('🔍 Auto Match — เลือกช่วงวันที่', `
         <div class="flex-col gap-3">
           <div style="padding:10px;background:rgba(79,156,249,.08);border-radius:6px" class="text-xs">
-            <strong>📅 Statement ในระบบ:</strong> ${minDate} → ${maxDate} (${stmtDates.length} รายการ)
+            <strong>📅 Statement ในระบบ:</strong> ${fmtDate(minDate)} → ${fmtDate(maxDate)} (${stmtDates.length} รายการ)
           </div>
           <div class="input-group">
             <label>จากวันที่</label>
@@ -9466,7 +9569,7 @@ async function renderMatching(el) {
     // Auto Match — ช่วงวันที่ที่ระบุ
     // ══════════════════════════════════════════════════════════
     async function runAutoMatchRange(dateFrom, dateTo) {
-      toast(`กำลัง Auto Match: ${dateFrom} → ${dateTo}...`, 'info');
+      toast(`กำลัง Auto Match: ${fmtDate(dateFrom)} → ${fmtDate(dateTo)}...`, 'info');
 
       const BAD_PREFIX = ['SR','OR','SC','JS','JR','PR','PS','MR','MS','PC','BR','BS'];
       const GOOD_TYPE = ['Transfer']; // Card ไม่ต้อง auto match (user manual เท่านั้น)
@@ -9638,7 +9741,7 @@ async function renderMatching(el) {
         store.put(JSON.stringify(billList), 'sf_billList');
         store.put(JSON.stringify(statementsByBank), 'sf_statementsByBank');
         tx.oncomplete = () => {
-          let msg = `✅ Auto Match ${dateFrom} → ${dateTo}\n\n`;
+          let msg = `✅ Auto Match ${fmtDate(dateFrom)} → ${fmtDate(dateTo)}\n\n`;
           msg += `💰 เงินเข้า (SS/OS/SP): ${matched}\n`;
           msg += `💸 เงินออก (PP/PS): ${matchedExp}\n`;
           msg += `✗ ไม่เจอคู่: ${noMatch}\n\n`;
