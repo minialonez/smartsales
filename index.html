@@ -358,6 +358,11 @@ function fmtDiff(n) {
   const formatted = isWhole ? abs.toLocaleString('th-TH') : new Intl.NumberFormat('th-TH',{minimumFractionDigits:2,maximumFractionDigits:2}).format(abs);
   return (n >= 0 ? '+' : '-') + formatted;
 }
+// Sum color: OK=green, เงินเกิน(+)=orange, เงินขาด(-)=red
+function sumColor(isOk, diff) {
+  if (isOk) return 'var(--success)';
+  return diff > 0 ? 'var(--warn)' : 'var(--danger)';
+}
 function fmtInt(n) { return new Intl.NumberFormat('th-TH').format(n); }
 
 function extractTimeStr(val) {
@@ -1114,6 +1119,19 @@ function restoreMainState() {
       uploadedStatements = getAllStatements();
     }
   } catch (e) { console.warn('Could not restore state:', e); }
+  
+  // ── Cleanup: SP/SC/JS/JR bills ไม่ควรมี bank (เป็นเลขตัดชำระ/ใบลดหนี้ ไม่ใช่ธุรกรรมธนาคาร) ──
+  if (billList.length > 0) {
+    let cleaned = 0;
+    billList.forEach(b => {
+      const prefix = String(b.bill_no || '').toUpperCase();
+      if ((prefix.startsWith('SP') || prefix.startsWith('SC') || prefix.startsWith('JS') || prefix.startsWith('JR')) && b.bank) {
+        b.bank = '';
+        cleaned++;
+      }
+    });
+    if (cleaned > 0) console.log(`Cleaned bank field from ${cleaned} SP/SC/JS/JR bills`);
+  }
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -2144,7 +2162,7 @@ async function renderMain(el) {
                       // รวม 3 stations (Invoice+Order+Payment) เป็น cell เดียว colspan=3
                       const {diff, isOk, empty} = calcSumCheck('Invoice');
                       const content = empty ? '-' : (isOk ? '✓ OK' : fmtDiff(diff));
-                      const color = empty ? 'var(--text3)' : (isOk ? 'var(--success)' : 'var(--danger)');
+                      const color = empty ? 'var(--text3)' : (sumColor(isOk, diff));
                       cells.push(`<td colspan="3" data-sum-station="Invoice" style="text-align:center;font-weight:700;color:${color};border-left:1px dashed var(--border);border-right:1px dashed var(--border);background:rgba(91,124,250,.08)" title="รวม Invoice + Order + Payment">${content}</td>`);
                       return;
                     }
@@ -2157,7 +2175,7 @@ async function renderMain(el) {
                       cells.push(`<td data-sum-station="${s}" style="text-align:center;color:var(--text3)">-</td>`);
                       return;
                     }
-                    cells.push(`<td data-sum-station="${s}" style="text-align:center;font-weight:700;color:${isOk?'var(--success)':'var(--danger)'}">${isOk?'✓ OK':fmtDiff(diff)}</td>`);
+                    cells.push(`<td data-sum-station="${s}" style="text-align:center;font-weight:700;color:${sumColor(isOk, diff)}">${isOk?'✓ OK':fmtDiff(diff)}</td>`);
                   });
                   return cells.join('');
                 })()}
@@ -3320,7 +3338,7 @@ async function renderMain(el) {
         cell.style.color = 'var(--success)';
       } else {
         cell.textContent = fmtDiff(diff);
-        cell.style.color = 'var(--danger)';
+        cell.style.color = sumColor(false, diff);
       }
     });
   }
