@@ -483,31 +483,38 @@ function handleStmtUpload(result, fileName) {
   const rows = [];
   const nameLC = fileName.toLowerCase();
 
-  // ตรวจว่าเป็น Statement ธนาคารไหน
+  // ══════════════════════════════════════════════════════════
+  // Auto-detect ธนาคารจากชื่อไฟล์ + เนื้อหา
+  // 
+  // KTB:    ไฟล์ .xls ชื่อเป็นตัวเลข (เช่น 20260418083243968.xls)
+  //         หรือมี "Account No." + "909-" / "Teller Id"
+  // KBANK:  ชื่อไฟล์ resultFile_* หรือมี "K-DEPOSIT" / "กสิกร"
+  // BBL NW: ชื่อไฟล์ MyDownLoad* หรือเลขบัญชี 266-4-414113
+  // BBL:    ชื่อไฟล์ Activity-* หรือเลขบัญชี 266-4-448384
+  // ══════════════════════════════════════════════════════════
   let bank = 'UNKNOWN';
-  if (nameLC.includes('ktb') || nameLC.includes('กรุงไทย')) bank = 'KTB';
+  
+  // 1) ตรวจจากชื่อไฟล์
+  if (/^\d+\.xls/i.test(fileName)) bank = 'KTB';
+  else if (nameLC.startsWith('resultfile')) bank = 'KBANK';
+  else if (nameLC.startsWith('mydownload')) bank = 'BBL NW';
+  else if (nameLC.startsWith('activity')) bank = 'BBL';
+  else if (nameLC.includes('ktb') || nameLC.includes('กรุงไทย')) bank = 'KTB';
   else if (nameLC.includes('kbank') || nameLC.includes('kasikorn') || nameLC.includes('กสิกร')) bank = 'KBANK';
-  else if (nameLC.includes('bbl nw') || nameLC.includes('bblnw') || nameLC.includes('nwbbl')) bank = 'BBL NW';
-  else if (nameLC.includes('activity') || nameLC.includes('bbl') || nameLC.includes('กรุงเทพ')) bank = 'BBL';
+  else if (nameLC.includes('bbl nw') || nameLC.includes('bblnw')) bank = 'BBL NW';
+  else if (nameLC.includes('bbl') || nameLC.includes('กรุงเทพ')) bank = 'BBL';
 
-  // ลอง auto-detect จากเนื้อหา
+  // 2) ตรวจจากเนื้อหา (override ถ้าชัดเจนกว่า)
   const firstSheet = result.sheets[result.sheetNames[0]] || [];
   const contentJoin = firstSheet.slice(0, 15).map(r => (r||[]).join(' ')).join(' ');
   const contentLC = contentJoin.toLowerCase();
   
-  // BBL: เช็คเลขบัญชี 266-4-448384 (บริษัท) vs อื่นๆ (NW)
-  if (contentJoin.includes('266-4-448384')) {
-    bank = 'BBL'; // บัญชีบริษัท
-  } else if (contentJoin.includes('วันที่ทำรายการ') && contentJoin.includes('หักบัญชี')) {
-    // BBL CSV Activity format detected
-    if (bank === 'UNKNOWN') bank = 'BBL';
-  } else if (contentLC.includes('ktb') || contentJoin.includes('กรุงไทย')) {
-    bank = 'KTB';
-  } else if (contentLC.includes('kasikorn') || contentJoin.includes('กสิกร') || contentLC.includes('k-deposit')) {
-    bank = 'KBANK';
-  } else if (contentLC.includes('bbl') || contentJoin.includes('กรุงเทพ') || contentLC.includes('bangkok bank')) {
-    if (bank === 'UNKNOWN') bank = 'BBL';
-  }
+  if (contentJoin.includes('266-4-448384')) bank = 'BBL';
+  else if (contentJoin.includes('266-4-414113')) bank = 'BBL NW';
+  else if (contentJoin.includes('909-0-77302') || contentLC.includes('teller id')) bank = 'KTB';
+  else if (contentLC.includes('k-deposit') || contentJoin.includes('กสิกร')) bank = 'KBANK';
+  else if (contentJoin.includes('วันที่ทำรายการ') && contentJoin.includes('หักบัญชี') && bank === 'UNKNOWN') bank = 'BBL';
+  else if (contentJoin.includes('วันที่') && contentJoin.includes('หักบัญชี') && bank === 'UNKNOWN') bank = 'BBL NW';
 
   // helper: แปลง date โดยตรวจจับ พ.ศ. พิเศษ
   let buddhistCount = 0;
