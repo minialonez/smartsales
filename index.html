@@ -8353,10 +8353,10 @@ async function renderSales(el) {
 // ── Matching ────────────────────────────────────────────────
 async function renderMatching(el) {
   let bankFilter = 'ALL', matchFilter = 'ALL';
+  let dateFrom = '', dateTo = '';
   const bankColors = { KTB:'#00a4e4', KBANK:'#138f2d', 'BBL NW':'#ff7b00', BBL:'#1e3a7b' };
 
   function render() {
-    // ── ใช้ข้อมูลจาก localStorage เท่านั้น (ไม่ call API — เร็วมาก) ──
     let data = uploadedStatements.length > 0 ? [...uploadedStatements] : [];
     
     // Filter by bank
@@ -8366,12 +8366,24 @@ async function renderMatching(el) {
     if (matchFilter === 'matched') data = data.filter(s => s.match_status === 'matched');
     else if (matchFilter === 'unmatched') data = data.filter(s => s.match_status !== 'matched');
     
-    // Sort ASC by date
-    data.sort((a, b) => (parseThaiDate(a.date) || 0) - (parseThaiDate(b.date) || 0));
+    // Filter by date range
+    if (dateFrom || dateTo) {
+      data = data.filter(s => {
+        const d = toISODate(s.date || s.trans_date);
+        if (!d) return true;
+        if (dateFrom && d < dateFrom) return false;
+        if (dateTo && d > dateTo) return false;
+        return true;
+      });
+    }
     
-    // PERF: truncate for render
-    const _t = truncateForRender(data);
-    const visibleData = _t.visible;
+    // Sort DESC by date (ใหม่สุดก่อน — เห็นรายการล่าสุดทันที)
+    data.sort((a, b) => (parseThaiDate(b.date) || 0) - (parseThaiDate(a.date) || 0));
+    
+    // Truncate for render (หลัง filter แล้ว — ไม่ตัดข้อมูลที่ต้องการ)
+    const MAX_ROWS = 1000;
+    const visibleData = data.length > MAX_ROWS ? data.slice(0, MAX_ROWS) : data;
+    const isTruncated = data.length > MAX_ROWS;
 
     // Bank counts
     const bankCounts = {
@@ -8409,10 +8421,16 @@ async function renderMatching(el) {
         <button class="pill ${matchFilter==='ALL'?'active':''}" data-mf="ALL">ทั้งหมด (${allStmts.length})</button>
         <button class="pill ${matchFilter==='unmatched'?'active':''}" data-mf="unmatched" style="--pill-color:var(--danger)">✗ ยังไม่ Match (${totalUnmatched})</button>
         <button class="pill ${matchFilter==='matched'?'active':''}" data-mf="matched" style="--pill-color:var(--success)">✓ Matched (${totalMatched})</button>
+        <span style="margin-left:16px" class="text-xs text-dim">ช่วงวันที่:</span>
+        <input type="date" class="input" id="match-date-from" value="${dateFrom}" style="width:145px;padding:3px 6px;font-size:.78rem" title="จาก">
+        <span class="text-xs">→</span>
+        <input type="date" class="input" id="match-date-to" value="${dateTo}" style="width:145px;padding:3px 6px;font-size:.78rem" title="ถึง">
+        ${dateFrom||dateTo?'<button class="btn btn-ghost btn-sm" id="match-date-clear" style="color:var(--danger);padding:2px 6px">✕</button>':''}
       </div>
       <div class="flex gap-3 flex-wrap mb-3 stagger">
         ${statCard('Matched', totalMatched, '', 'var(--success)', ICONS.check)}
         ${statCard('ยังไม่ Match', totalUnmatched, '', 'var(--danger)', ICONS.alert)}
+        ${statCard('แสดง', data.length, isTruncated?'(จำกัด '+MAX_ROWS+')':'', 'var(--info)', ICONS.file)}
       </div>
       <div class="card-flat">
         <div class="table-wrap" style="max-height:500px;overflow-y:auto">
@@ -8440,9 +8458,12 @@ async function renderMatching(el) {
                     : `<span class="badge badge-danger">✗ ไม่พบ</span> <button class="btn btn-primary btn-sm btn-manual-match" data-stmt-idx="${i}">${ICONS.search} Match เอง</button>`
                   }</td>
                 </tr>
-              `}).join('') : '<tr><td colspan="9" style="text-align:center;padding:30px;color:var(--text3)">ไม่มีข้อมูล Statement ในวันที่เลือก</td></tr>'}
+              `}).join('') : '<tr><td colspan="9" style="text-align:center;padding:30px;color:var(--text3)">ไม่มีข้อมูล Statement — กรองวันที่หรือเลือกธนาคาร</td></tr>'}
             </tbody>
           </table>
+        </div>
+        <div class="flex justify-between items-center" style="padding:8px 16px;border-top:1px solid var(--border)">
+          <span class="text-sm text-dim">แสดง ${visibleData.length} / ${data.length} รายการ ${isTruncated?'<span style="color:var(--warn)">⚠️ จำกัด '+MAX_ROWS+' — ใช้ช่วงวันที่กรอง</span>':''}</span>
         </div>
       </div>
     `;
@@ -8453,6 +8474,9 @@ async function renderMatching(el) {
     el.querySelectorAll('.pill[data-mf]').forEach(btn => {
       btn.addEventListener('click', () => { matchFilter = btn.dataset.mf; render(); });
     });
+    document.getElementById('match-date-from')?.addEventListener('change', e => { dateFrom = e.target.value; render(); });
+    document.getElementById('match-date-to')?.addEventListener('change', e => { dateTo = e.target.value; render(); });
+    document.getElementById('match-date-clear')?.addEventListener('click', () => { dateFrom = ''; dateTo = ''; render(); });
     document.getElementById('btn-stmt-upload')?.addEventListener('click', () => {
       triggerFileUpload('file-stmt', (result, name) => { handleStmtUpload(result, name); render(); });
     });
