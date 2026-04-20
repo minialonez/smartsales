@@ -1790,45 +1790,77 @@ async function renderMain(el) {
 
   // ── Sum check: เงินเข้า vs เงินออก ──
   // Formula ตาม Excel template (row 12):
-  //   diff = SUM(C7:C11) - SUM(C3:C6)
-  //        = (drawer + transfer + card + cheque + refund) - (cashIn + sales + cashOut + returns)
-  //        = outflow - inflow
+  //
+  //   Front1-4:   diff = SUM(Cx7:Cx11) - SUM(Cx3:Cx6)  (per station)
+  //               = outflow - inflow ของ station นั้น
+  //
+  //   Invoice:    diff = SUM(G7, G8:I11) - SUM(G4:I4)
+  //               = รวม outflow ของ Invoice+Order+Payment (G+H+I cols, row 7-11)
+  //                 - รวม sales ของ Invoice+Order+Payment (G+H+I cols, row 4)
+  //               ← รวม 3 stations เพราะเงินไหลถึงกัน (Order + Payment = child ของ Invoice)
+  //
+  //   Invoice Credit, Order Credit: diff = SUM(J5:J11) - J4
+  //                                 = outflow - sales ของ credit นั้น
   //
   // Rule:
-  //   1) ถ้า station ไม่มีข้อมูลเลย (ไม่ใช้งาน) → return empty (แสดง "-")
-  //   2) ถ้ามีบางอย่าง → คำนวณตาม Excel
-  //   3) Front1-4 + Invoice ใช้สูตรเต็ม · Credit/Order/Payment ใช้ sales vs outflow
+  //   1) ถ้า station ไม่มีข้อมูลเลย → แสดง "-"
+  //   2) ถ้า balance (|diff| < 1) → "OK"
+  //   3) อื่นๆ → แสดง diff +/−
   function calcSumCheck(station) {
-    const drawer = calcCashFromBills(station);
-    const transfer = calcAutoValue('Transfer', station);
-    const card = calcAutoValue('Card', station);
-    const cheque = calcAutoValue('Cheque', station);
-    const refund = calcAutoValue('Refund', station);
-    const cashIn = Number(mainSummary['cashIn_' + station]) || 0;
-    const cashOut = Number(mainSummary['cashOut_' + station]) || 0;
-    const returns = Number(mainSummary['returns_' + station]) || 0;
-    const salesSummary = Number(mainSummary['sales_' + station]) || 0;
+    // Helper: ดึงค่าของ row/station
+    const get = (field, st) => Number(mainSummary[field + '_' + st]) || 0;
+    const outflowOf = (st) => calcCashFromBills(st) + calcAutoValue('Transfer', st) + 
+                               calcAutoValue('Card', st) + calcAutoValue('Cheque', st) + 
+                               calcAutoValue('Refund', st);
     
-    const outflow = drawer + transfer + card + cheque + refund;
-    
-    // ── Rule 1: ไม่มีข้อมูลเลย → แสดง "-" ──
-    // (station ที่ user ไม่ได้ใช้งานในวันนั้น เช่น Front1 ของ 02/01/2026)
-    const hasAnyData = outflow !== 0 || cashIn !== 0 || cashOut !== 0 || returns !== 0 || salesSummary !== 0;
-    if (!hasAnyData) {
-      return { diff: 0, isOk: null, empty: true };  // empty = ไม่แสดง
+    if (['Front1', 'Front2', 'Front3', 'Front4'].includes(station)) {
+      // สูตรเต็ม per station
+      const cashIn = get('cashIn', station);
+      const sales = get('sales', station);
+      const cashOut = get('cashOut', station);
+      const returns = get('returns', station);
+      const outflow = outflowOf(station);
+      
+      const hasAny = outflow || cashIn || cashOut || returns || sales;
+      if (!hasAny) return { diff: 0, isOk: null, empty: true };
+      
+      const inflow = cashIn + sales + cashOut + returns;
+      const diff = outflow - inflow;
+      return { diff, isOk: Math.abs(diff) < 1.0, empty: false };
     }
     
-    let inflow;
-    if (['Front1', 'Front2', 'Front3', 'Front4', 'Invoice'].includes(station)) {
-      // สูตรเต็มตาม Excel: sales จาก summary (user กรอก) หรือ 0
-      inflow = cashIn + salesSummary + cashOut + returns;
-    } else {
-      // Order, Order Credit, Invoice Credit, Payment → ใช้ sales อย่างเดียว
-      inflow = calcSales(station);
+    if (station === 'Invoice') {
+      // รวม 3 stations: Invoice + Order + Payment
+      const stations3 = ['Invoice', 'Order', 'Payment'];
+      const outflowSum = stations3.reduce((s, st) => s + outflowOf(st), 0);
+      const salesSum = stations3.reduce((s, st) => {
+        // ใช้ calcSales เพื่อ Invoice/Order/Payment จะ sum bills
+        return s + calcSales(st);
+      }, 0);
+      
+      // Fallback: ถ้า calcSales เป็น 0 → ลอง mainSummary
+      const salesSumFallback = stations3.reduce((s, st) => s + get('sales', st), 0);
+      const salesFinal = salesSum || salesSumFallback;
+      
+      if (!outflowSum && !salesFinal) return { diff: 0, isOk: null, empty: true };
+      
+      const diff = outflowSum - salesFinal;
+      return { diff, isOk: Math.abs(diff) < 1.0, empty: false };
     }
     
-    const diff = outflow - inflow;
-    return { diff, isOk: Math.abs(diff) < 1.0, empty: false };
+    if (station === 'Invoice Credit' || station === 'Order Credit') {
+      // diff = outflow - sales
+      const outflow = outflowOf(station);
+      const sales = calcSales(station) || get('sales', station);
+      
+      if (!outflow && !sales) return { diff: 0, isOk: null, empty: true };
+      
+      const diff = outflow - sales;
+      return { diff, isOk: Math.abs(diff) < 1.0, empty: false };
+    }
+    
+    // Order, Payment → ไม่มี Sum check (รวมใน Invoice แล้ว)
+    return { diff: 0, isOk: null, empty: true };
   }
 
   function render() {
