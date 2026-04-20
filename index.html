@@ -534,31 +534,104 @@ function handleStmtUpload(result, fileName) {
     return result;
   }
 
+  // ── Thai date parser: "17 เม.ย. 2569 17:13" → { date: "2026-04-17", time: "17:13" } ──
+  const thMonths = {'ม.ค.':'01','ก.พ.':'02','มี.ค.':'03','เม.ย.':'04','พ.ค.':'05','มิ.ย.':'06','ก.ค.':'07','ส.ค.':'08','ก.ย.':'09','ต.ค.':'10','พ.ย.':'11','ธ.ค.':'12'};
+  function parseThaiDateFull(val) {
+    if (!val) return { date: '', time: '' };
+    const s = String(val).trim();
+    const m = s.match(/^(\d{1,2})\s+(\S+)\s+(\d{4})(?:\s+(\d{1,2}:\d{2}))?/);
+    if (m) {
+      const mo = thMonths[m[2]] || '01';
+      let y = Number(m[3]); if (y > 2400) { y -= 543; buddhistCount++; }
+      return { date: `${y}-${mo}-${String(m[1]).padStart(2,'0')}`, time: m[4] || '' };
+    }
+    return { date: convertDate(s), time: extractTimeStr(s) };
+  }
+
   // Parse ตาม format ธนาคาร
   if (bank === 'KTB') {
+    // KTB .xls: header row มี "Date", data เริ่มหลัง header
+    // format: Date | Teller Id | Transaction Code | Description | Cheque No. | Amount | Tax | Balance | Init Br.
     const sheet = firstSheet;
-    // หา header row (Date)
-    let hRow = 10;
+    let hRow = -1;
     for (let i = 0; i < Math.min(15, sheet.length); i++) {
-      if (sheet[i] && sheet[i].some(c => String(c).includes('Date'))) { hRow = i; break; }
+      if (sheet[i] && sheet[i].some(c => String(c) === 'Date' || String(c).includes('Date'))) { hRow = i; break; }
     }
+    if (hRow < 0) hRow = 10;
     for (let i = hRow + 1; i < sheet.length; i++) {
       const r = sheet[i];
-      if (!r[0] || !r[5]) continue;
-      rows.push({ bank, date: convertDate(r[0]), time: extractTimeStr(r[0]), ref_no: String(r[3]||''), description: String(r[3]||''), amount: Number(r[5])||0, match_status: 'unmatched', match_station: '', match_bill: '' });
+      if (!r || !r[0]) continue;
+      const dateStr = String(r[0] || '');
+      // ข้าม header/junk rows: ต้องมีวันที่จริง (dd/mm/yyyy หรือ yyyy)
+      if (!dateStr.match(/\d{2}\/\d{2}\/\d{4}|\d{4}-\d{2}-\d{2}/)) continue;
+      const amt = Number(r[5]) || 0;
+      if (!amt) continue; // ข้ามยอด 0
+      rows.push({ 
+        bank, 
+        date: convertDate(dateStr), 
+        time: extractTimeStr(dateStr), 
+        ref_no: String(r[3] || '').substring(0, 30),
+        description: String(r[3] || ''), 
+        amount: amt, 
+        match_status: 'unmatched' 
+      });
     }
   } else if (bank === 'KBANK') {
     const sheet = firstSheet;
-    let hRow = 10;
+    let hRow = -1;
     for (let i = 0; i < Math.min(15, sheet.length); i++) {
-      if (sheet[i] && sheet[i].some(c => String(c).includes('วันที่'))) { hRow = i; break; }
+      if (sheet[i] && sheet[i].some(c => String(c).includes('วันที่') || String(c).includes('Date'))) { hRow = i; break; }
     }
+    if (hRow < 0) hRow = 10;
     for (let i = hRow + 1; i < sheet.length; i++) {
       const r = sheet[i];
       const dateVal = r[0] || r[1];
+      if (!dateVal) continue;
       const deposit = Number(r[6]) || Number(r[5]) || 0;
-      if (!dateVal || !deposit) continue;
-      rows.push({ bank, date: convertDate(dateVal), time: String(r[1]||r[2]||''), ref_no: String(r[12]||r[11]||''), description: String(r[3]||r[2]||''), amount: deposit, match_status: 'unmatched', match_station: '', match_bill: '' });
+      const withdraw = Number(r[7]) || Number(r[4]) || 0;
+      if (!deposit && !withdraw) continue;
+      rows.push({ 
+        bank, 
+        date: convertDate(dateVal), 
+        time: String(r[1] || r[2] || ''), 
+        ref_no: String(r[12] || r[11] || ''), 
+        description: String(r[3] || r[2] || ''), 
+        amount: deposit || -withdraw, 
+        match_status: 'unmatched' 
+      });
+    }
+  } else if (bank === 'BBL NW') {
+    // BBL NW: MyDownLoad*.csv
+    // Row 0: ชื่อย่อบัญชี, ...
+    // Row 1: เลขที่บัญชี, "266-4-414113", ...
+    // Row 3: (empty), วันที่, รายละเอียด, หักบัญชี, เข้าบัญชี, ยอดคงเหลือ, ช่องทาง
+    // Row 4+: data — col[1]=date(Thai), col[2]=desc, col[3]=debit, col[4]=credit
+    const sheet = firstSheet;
+    let hRow = -1;
+    for (let i = 0; i < Math.min(10, sheet.length); i++) {
+      const joined = (sheet[i] || []).join('|');
+      if (joined.includes('วันที่') && joined.includes('หักบัญชี')) { hRow = i; break; }
+    }
+    if (hRow < 0) hRow = 3;
+    for (let i = hRow + 1; i < sheet.length; i++) {
+      const r = sheet[i];
+      if (!r) continue;
+      const dateRaw = String(r[1] || r[0] || '').trim();
+      if (!dateRaw || dateRaw.length < 5) continue;
+      const parsed = parseThaiDateFull(dateRaw);
+      if (!parsed.date) continue;
+      const debit = Number(String(r[3] || '').replace(/,/g, '')) || 0;
+      const credit = Number(String(r[4] || '').replace(/,/g, '')) || 0;
+      if (!credit && !debit) continue;
+      rows.push({
+        bank,
+        date: parsed.date,
+        time: parsed.time,
+        ref_no: String(r[6] || ''),
+        description: String(r[2] || ''),
+        amount: credit || -debit,
+        match_status: 'unmatched'
+      });
     }
   } else if (bank === 'BBL') {
     const sheet = firstSheet;
@@ -8844,7 +8917,8 @@ async function renderMatching(el) {
       pendingStmts.forEach(stmt => {
         const sa = Number(stmt.amount || 0);
         const sd = toISODate(stmt.date || stmt.trans_date);
-        if (!sa || !sd) return;
+        if (!sd) return;
+        if (sa <= 0) { noAmt++; return; } // ข้ามเงินออก (ยอดลบ)
         
         const k = sd + '|' + Math.round(sa);
         const cs = billIdx[k] || [];
@@ -8853,8 +8927,10 @@ async function renderMatching(el) {
         
         if (found) {
           used.add(found.i);
-          // Mark bill
+          // Mark bill + ใส่ confirmation (ธนาคาร) + pay_date
           found.b.match_status = 'matched';
+          found.b.confirmation = stmt.bank || '';
+          found.b.pay_date = found.b.date;
           found.b.matched_stmt_ref = stmt.ref_no || '';
           found.b.matched_at = new Date().toISOString();
           // Mark statement
