@@ -2027,17 +2027,32 @@ async function renderMain(el) {
               <tr data-sum-row="1" style="border-top:2px solid var(--border);background:var(--surface2)">
                 <td></td>
                 <td style="font-weight:800;color:var(--text)">📊 Sum</td>
-                ${SUMMARY_STATIONS.map(s=>{
-                  // Sum check เฉพาะ Front1-4 และ Invoice/Invoice Credit/Order Credit
-                  if (!['Front1','Front2','Front3','Front4','Invoice','Invoice Credit','Order Credit'].includes(s)) {
-                    return `<td data-sum-station="${s}"></td>`;
-                  }
-                  const {diff, isOk, empty} = calcSumCheck(s);
-                  if (empty) {
-                    return `<td data-sum-station="${s}" style="text-align:center;color:var(--text3)">-</td>`;
-                  }
-                  return `<td data-sum-station="${s}" style="text-align:center;font-weight:700;color:${isOk?'var(--success)':'var(--danger)'}">${isOk?'✓ OK':fmtNum(diff)}</td>`;
-                }).join('')}
+                ${(() => {
+                  // ── Build cells; merge Invoice+Order+Payment into one centered cell ──
+                  const cells = [];
+                  SUMMARY_STATIONS.forEach(s => {
+                    if (s === 'Order' || s === 'Payment') return; // handled by Invoice's colspan
+                    if (s === 'Invoice') {
+                      // รวม 3 stations (Invoice+Order+Payment) เป็น cell เดียว colspan=3
+                      const {diff, isOk, empty} = calcSumCheck('Invoice');
+                      const content = empty ? '-' : (isOk ? '✓ OK' : fmtNum(diff));
+                      const color = empty ? 'var(--text3)' : (isOk ? 'var(--success)' : 'var(--danger)');
+                      cells.push(`<td colspan="3" data-sum-station="Invoice" style="text-align:center;font-weight:700;color:${color};border-left:1px dashed var(--border);border-right:1px dashed var(--border);background:rgba(91,124,250,.08)" title="รวม Invoice + Order + Payment">${content}</td>`);
+                      return;
+                    }
+                    if (!['Front1','Front2','Front3','Front4','Invoice Credit','Order Credit'].includes(s)) {
+                      cells.push(`<td data-sum-station="${s}"></td>`);
+                      return;
+                    }
+                    const {diff, isOk, empty} = calcSumCheck(s);
+                    if (empty) {
+                      cells.push(`<td data-sum-station="${s}" style="text-align:center;color:var(--text3)">-</td>`);
+                      return;
+                    }
+                    cells.push(`<td data-sum-station="${s}" style="text-align:center;font-weight:700;color:${isOk?'var(--success)':'var(--danger)'}">${isOk?'✓ OK':fmtNum(diff)}</td>`);
+                  });
+                  return cells.join('');
+                })()}
               </tr>
             </tbody>
           </table>
