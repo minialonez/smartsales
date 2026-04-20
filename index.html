@@ -2728,7 +2728,7 @@ async function renderMain(el) {
             });
           }
           
-          ['KTB', 'KBANK', 'BBL NW'].forEach(bankKey => {
+          ['KTB', 'KBANK', 'BBL NW', 'BBL'].forEach(bankKey => {
             const incoming = data.statementsByBank[bankKey] || [];
             const existing = statementsByBank[bankKey] || [];
             const dupSet = skipStmtDup ? new Set(existing.map(s => `${s.ref_no||''}|${s.date}|${s.amount}`)) : null;
@@ -2746,7 +2746,8 @@ async function renderMain(el) {
             statementsByBank[bankKey] = existing;
           });
           
-          // Persist
+          // Persist + refresh uploadedStatements (ให้ Matching page เห็นข้อมูล)
+          uploadedStatements = getAllStatements();
           try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(e) {}
           persistMainState();
           
