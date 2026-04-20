@@ -794,13 +794,12 @@ let statementsByBank = { KTB: [], KBANK: [], 'BBL NW': [], BBL: [], UNKNOWN: [] 
 function addStatementRows(bank, rows) {
   if (!statementsByBank[bank]) statementsByBank[bank] = [];
   
-  // Dedup key = bank + date + amount + ref_no + description
-  // ถ้าซ้ำกัน → skip ของใหม่ คงของเก่าไว้ (ซึ่งอาจ matched แล้ว)
-  const existingKeys = new Set(statementsByBank[bank].map(r => `${r.date}|${r.amount}|${r.ref_no}|${r.description}`));
-  const uniqueRows = rows.filter(r => {
-    const key = `${r.date}|${r.amount}|${r.ref_no}|${r.description}`;
-    return !existingKeys.has(key);
-  });
+  // Dedup key = date + time + amount + ref_no (ตรงเป๊ะ ไม่พึ่ง description)
+  function makeKey(r) {
+    return `${r.date||''}|${r.time||''}|${Math.round(Number(r.amount)||0)}|${r.ref_no||''}`;
+  }
+  const existingKeys = new Set(statementsByBank[bank].map(makeKey));
+  const uniqueRows = rows.filter(r => !existingKeys.has(makeKey(r)));
   
   statementsByBank[bank] = statementsByBank[bank].concat(uniqueRows);
   
@@ -812,6 +811,35 @@ function addStatementRows(bank, rows) {
   });
   
   return { added: uniqueRows.length, skipped: rows.length - uniqueRows.length };
+}
+
+// ── ลบ statement ซ้ำใน statementsByBank ทั้งหมด (ใช้ตอนโหลด) ──
+function dedupAllStatements() {
+  let totalRemoved = 0;
+  Object.keys(statementsByBank).forEach(bank => {
+    const arr = statementsByBank[bank] || [];
+    if (arr.length === 0) return;
+    const seen = new Map();
+    const unique = [];
+    arr.forEach(r => {
+      const key = `${r.date||''}|${r.time||''}|${Math.round(Number(r.amount)||0)}|${r.ref_no||''}`;
+      if (seen.has(key)) {
+        // ถ้าซ้ำ — เก็บตัวที่ matched ไว้ (ถ้ามี)
+        const existing = seen.get(key);
+        if (r.match_status === 'matched' && existing.match_status !== 'matched') {
+          const i = unique.indexOf(existing);
+          if (i >= 0) unique[i] = r;
+          seen.set(key, r);
+        }
+        totalRemoved++;
+      } else {
+        seen.set(key, r);
+        unique.push(r);
+      }
+    });
+    statementsByBank[bank] = unique;
+  });
+  return totalRemoved;
 }
 
 function parseThaiDate(s) {
@@ -1324,6 +1352,23 @@ async function restoreMainState() {
       }
     });
     if (cleaned > 0) console.log(`Cleaned bank field from ${cleaned} SP/SC/JS/JR bills`);
+  }
+  
+  // ── Auto dedup: ลบ statement ซ้ำ (date+time+amount+ref_no ตรงเป๊ะ) ──
+  if (Object.keys(statementsByBank).some(k => (statementsByBank[k]||[]).length > 0)) {
+    const removed = dedupAllStatements();
+    if (removed > 0) {
+      console.log(`Auto-deduped ${removed} duplicate statements`);
+      uploadedStatements = getAllStatements();
+      // save back
+      try {
+        const req = indexedDB.open('SmartFinanceDB', 1);
+        req.onsuccess = (e) => {
+          const tx = e.target.result.transaction('data', 'readwrite');
+          tx.objectStore('data').put(JSON.stringify(statementsByBank), 'sf_statementsByBank');
+        };
+      } catch(e) {}
+    }
   }
   
   // ── Auto-sync: บิล matched ที่ขาด confirmation → เติมจาก statement ที่ match ──
@@ -2565,6 +2610,8 @@ async function renderMain(el) {
                 <th>Station</th>
                 <th>Type</th>
                 <th style="text-align:right">Baht</th>
+                <th style="text-align:right" title="รวม WHT+ค่าโอน+ค่าธรรมเนียมบัตร">หัก</th>
+                <th style="text-align:right">สุทธิ</th>
                 <th>Confirmation</th>
                 <th>Pay Date</th>
                 <th>Remarks1</th>
@@ -2574,7 +2621,7 @@ async function renderMain(el) {
               </tr>
             </thead>
             <tbody>
-              ${data.length === 0 ? '<tr><td colspan="13" style="text-align:center;padding:40px;color:var(--text3)">ยังไม่มีข้อมูล — กด "Generate จาก Smart" เพื่อเริ่มต้น</td></tr>' :
+              ${data.length === 0 ? '<tr><td colspan="14" style="text-align:center;padding:40px;color:var(--text3)">ยังไม่มีข้อมูล — กด "Generate จาก Smart" เพื่อเริ่มต้น</td></tr>' :
                 (() => {
                   // หาบิลที่ซ้ำจริง (composite key: bill_no + type + amount)
                   // ไม่จับ split payment ว่าซ้ำ
@@ -2597,7 +2644,10 @@ async function renderMain(el) {
                   // ── Row status (สีไฮไลต์ตามสถานะ) ──
                   const isVoid = b.match_status === 'void';
                   const isPaid = !isVoid && (b.match_status === 'paid' || b.match_status === 'matched');
-                  const isAwaitingClear = !isVoid && (b.match_status === 'awaiting_clear' || (b.type === 'Cheque' && b.match_status !== 'matched' && b.match_status !== 'bounced'));
+                  const isAwaitingClear = !isVoid && !isPaid && (
+                    b.match_status === 'awaiting_clear' || 
+                    (b.type === 'Cheque' && b.match_status !== 'matched' && b.match_status !== 'bounced' && !b.confirmation)
+                  );
                   const isBounced = b.match_status === 'bounced';
                   const billPrefix = (b.bill_no||'').substring(0,2).toUpperCase();
                   const isCreditNote = !isVoid && !isPaid && ['SC','PC','JS','JR','BR','BS'].includes(billPrefix);
@@ -2664,6 +2714,27 @@ async function renderMain(el) {
                       </select>
                     </td>
                     <td style="text-align:right;font-weight:600;color:${b.amount<0?'var(--danger)':'var(--success)'}">฿${fmtNum(b.amount||0)}</td>
+                    <td style="text-align:right;font-size:.78rem">${(() => {
+                      const wht = Number(b.wht_amount)||0;
+                      const tf = Number(b.transfer_fee)||0;
+                      const cf = Number(b.card_fee)||0;
+                      const total = wht + tf + cf;
+                      if (total === 0) return '<span style="color:var(--text3)">-</span>';
+                      const parts = [];
+                      if (wht) parts.push(`WHT ฿${fmtNum(wht)}`);
+                      if (tf) parts.push(`ค่าโอน ฿${fmtNum(tf)}`);
+                      if (cf) parts.push(`Card fee ฿${fmtNum(cf)}`);
+                      return `<span style="color:var(--warn);font-weight:600" title="${parts.join(' + ')}">฿${fmtNum(total)}</span>`;
+                    })()}</td>
+                    <td style="text-align:right;font-weight:600;font-size:.82rem">${(() => {
+                      const wht = Number(b.wht_amount)||0;
+                      const tf = Number(b.transfer_fee)||0;
+                      const cf = Number(b.card_fee)||0;
+                      const total = wht + tf + cf;
+                      if (total === 0) return '<span style="color:var(--text3)">-</span>';
+                      const net = (Number(b.amount)||0) - total;
+                      return `<span style="color:var(--success)">฿${fmtNum(net)}</span>`;
+                    })()}</td>
                     <td><input type="text" class="input bl-cell" data-field="confirmation" value="${b.confirmation||''}" style="padding:3px 6px;font-size:.78rem;width:120px"></td>
                     <td style="white-space:nowrap">
                       <input type="date" class="input bl-cell" data-field="pay_date" value="${toISODate(b.pay_date)}" style="padding:3px 6px;font-size:.78rem;width:130px">
@@ -3051,7 +3122,7 @@ async function renderMain(el) {
           <div class="flex gap-2">
             <div class="input-group flex-1">
               <label>Bill Number</label>
-              <input class="input" id="ab-bill" placeholder="เช่น SS00126-xxx หรือ MANUAL-001">
+              <input class="input" id="ab-bill" placeholder="เช่น SS00126-xxx (ปล่อยว่างได้)">
             </div>
             <div class="input-group flex-1">
               <label>Bill Date</label>
@@ -3071,17 +3142,54 @@ async function renderMain(el) {
                 ${TYPE_OPTIONS.map(o=>`<option value="${o}">${o||'(เลือก)'}</option>`).join('')}
               </select>
             </div>
-            <div class="input-group flex-1">
-              <label>Baht</label>
-              <input type="number" class="input" id="ab-amount" placeholder="0.00" step="0.01">
+          </div>
+          <div class="input-group">
+            <label>ยอดเต็ม (รวม VAT)</label>
+            <input type="number" class="input" id="ab-amount" placeholder="0.00" step="0.01" style="font-size:1.1rem;font-weight:600">
+          </div>
+          
+          <!-- Fee/WHT Section -->
+          <div id="ab-fee-box" style="background:rgba(79,156,249,.05);border:1px solid rgba(79,156,249,.2);border-radius:6px;padding:10px;display:none">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+              <div style="font-size:.85rem;color:var(--info);font-weight:600">⚡ การหัก</div>
+              <label style="display:flex;align-items:center;gap:6px;font-size:.8rem;cursor:pointer" id="ab-wht-label">
+                <input type="checkbox" id="ab-wht-enabled" style="accent-color:var(--info)">
+                <span>หัก ณ ที่จ่าย 1%</span>
+              </label>
+            </div>
+            <div class="flex gap-2" id="ab-fee-transfer" style="display:none">
+              <div class="input-group flex-1">
+                <label>ฐานก่อน VAT</label>
+                <input type="number" class="input" id="ab-base" readonly style="background:rgba(255,255,255,.02)">
+              </div>
+              <div class="input-group flex-1">
+                <label>WHT 1%</label>
+                <input type="number" class="input" id="ab-wht" readonly style="background:rgba(255,255,255,.02);color:var(--purple)">
+              </div>
+              <div class="input-group flex-1">
+                <label>ค่าโอน</label>
+                <input type="number" class="input" id="ab-transfer-fee" value="12" step="0.01" style="color:var(--warn)">
+              </div>
+            </div>
+            <div class="flex gap-2" id="ab-fee-card" style="display:none">
+              <div class="input-group flex-1">
+                <label>ค่าธรรมเนียมบัตร</label>
+                <input type="number" class="input" id="ab-card-fee" value="0" step="0.01" style="color:var(--warn)">
+              </div>
+            </div>
+            <div id="ab-summary" style="margin-top:10px;padding:10px;background:rgba(0,0,0,.2);border-radius:5px;font-size:.9rem;display:none">
+              <div style="display:flex;justify-content:space-between;padding:3px 0"><span>ยอดเต็ม</span><span id="ab-sum-full">฿0.00</span></div>
+              <div id="ab-sum-wht-row" style="display:none;justify-content:space-between;padding:3px 0;color:var(--purple)"><span>− หัก ณ ที่จ่าย 1%</span><span id="ab-sum-wht">฿0.00</span></div>
+              <div id="ab-sum-tf-row" style="display:none;justify-content:space-between;padding:3px 0;color:var(--warn)"><span>− ค่าโอน</span><span id="ab-sum-tf">฿0.00</span></div>
+              <div id="ab-sum-cf-row" style="display:none;justify-content:space-between;padding:3px 0;color:var(--warn)"><span>− ค่าธรรมเนียมบัตร</span><span id="ab-sum-cf">฿0.00</span></div>
+              <div style="display:flex;justify-content:space-between;padding:8px 0 0;border-top:1px solid var(--border);margin-top:4px;font-weight:600;color:var(--success);font-size:1.05rem"><span>สุทธิเข้าบัญชี</span><span id="ab-sum-net">฿0.00</span></div>
             </div>
           </div>
+          
           <div class="flex gap-2">
             <div class="input-group flex-1">
-              <label>Bank</label>
-              <select class="select" id="ab-bank">
-                ${['','KTB','KBANK','BBL','SCB','BAY','TMB','Other'].map(o=>`<option value="${o}">${o||'-'}</option>`).join('')}
-              </select>
+              <label>Confirmation (ธนาคารที่รับ)</label>
+              <input class="input" id="ab-confirmation" placeholder="KTB / KBANK / BBL / BBL NW">
             </div>
             <div class="input-group flex-1">
               <label>Due Date</label>
@@ -3098,27 +3206,149 @@ async function renderMain(el) {
           </div>
         </div>
       `);
+      
+      // ── Fee calculation logic ──
+      const $type = document.getElementById('ab-type');
+      const $station = document.getElementById('ab-station');
+      const $amount = document.getElementById('ab-amount');
+      const $bill = document.getElementById('ab-bill');
+      const $wht = document.getElementById('ab-wht-enabled');
+      const $whtOut = document.getElementById('ab-wht');
+      const $base = document.getElementById('ab-base');
+      const $tf = document.getElementById('ab-transfer-fee');
+      const $cf = document.getElementById('ab-card-fee');
+      const $feeBox = document.getElementById('ab-fee-box');
+      const $feeTransfer = document.getElementById('ab-fee-transfer');
+      const $feeCard = document.getElementById('ab-fee-card');
+      const $summary = document.getElementById('ab-summary');
+      
+      function feeApplies() {
+        // เฉพาะ FRONT/SS/SR เท่านั้นที่หักได้
+        const prefix = $bill.value.substring(0,2).toUpperCase();
+        const station = $station.value || '';
+        const type = $type.value || '';
+        const isFront = station.startsWith('Front');
+        const isSSSR = prefix === 'SS' || prefix === 'SR';
+        const isCardOrTransfer = type === 'Transfer' || type === 'Card';
+        return (isFront || isSSSR) && isCardOrTransfer;
+      }
+      
+      function updateFeeUI() {
+        const type = $type.value || '';
+        const applies = feeApplies();
+        
+        if (!applies) {
+          $feeBox.style.display = 'none';
+          return;
+        }
+        $feeBox.style.display = 'block';
+        
+        if (type === 'Card') {
+          $feeTransfer.style.display = 'none';
+          $feeCard.style.display = 'flex';
+          $wht.checked = false;
+          $wht.disabled = true;
+          document.getElementById('ab-wht-label').style.opacity = '.4';
+        } else if (type === 'Transfer') {
+          $feeTransfer.style.display = 'flex';
+          $feeCard.style.display = 'none';
+          $wht.disabled = false;
+          document.getElementById('ab-wht-label').style.opacity = '1';
+        } else {
+          $feeBox.style.display = 'none';
+        }
+        updateSummary();
+      }
+      
+      function updateSummary() {
+        const amount = Number($amount.value) || 0;
+        const type = $type.value || '';
+        const applies = feeApplies();
+        
+        let wht = 0, tf = 0, cf = 0;
+        
+        if (applies && type === 'Transfer') {
+          const base = amount / 1.07;
+          $base.value = base.toFixed(2);
+          if ($wht.checked) {
+            wht = Math.round(base * 0.01 * 100) / 100;
+            $whtOut.value = wht.toFixed(2);
+          } else {
+            $whtOut.value = '0.00';
+          }
+          tf = Number($tf.value) || 0;
+        } else if (applies && type === 'Card') {
+          cf = Number($cf.value) || 0;
+        }
+        
+        const net = Math.round((amount - wht - tf - cf) * 100) / 100;
+        
+        if (applies && (type === 'Transfer' || type === 'Card')) {
+          $summary.style.display = 'block';
+          document.getElementById('ab-sum-full').textContent = '฿' + amount.toFixed(2);
+          document.getElementById('ab-sum-wht-row').style.display = wht > 0 ? 'flex' : 'none';
+          document.getElementById('ab-sum-wht').textContent = '−฿' + wht.toFixed(2);
+          document.getElementById('ab-sum-tf-row').style.display = tf > 0 ? 'flex' : 'none';
+          document.getElementById('ab-sum-tf').textContent = '−฿' + tf.toFixed(2);
+          document.getElementById('ab-sum-cf-row').style.display = cf > 0 ? 'flex' : 'none';
+          document.getElementById('ab-sum-cf').textContent = '−฿' + cf.toFixed(2);
+          document.getElementById('ab-sum-net').textContent = '฿' + net.toFixed(2);
+        } else {
+          $summary.style.display = 'none';
+        }
+      }
+      
+      [$type, $station, $bill, $amount, $wht, $tf, $cf].forEach(el => {
+        if (el) {
+          el.addEventListener('input', updateFeeUI);
+          el.addEventListener('change', updateFeeUI);
+        }
+      });
 
       document.getElementById('ab-confirm')?.addEventListener('click', () => {
+        const amount = Number(document.getElementById('ab-amount').value) || 0;
+        const type = document.getElementById('ab-type').value;
+        const applies = feeApplies();
+        const whtEnabled = $wht.checked;
+        
+        let whtAmount = 0, transferFee = 0, cardFee = 0;
+        if (applies && type === 'Transfer') {
+          if (whtEnabled) whtAmount = Math.round((amount / 1.07 * 0.01) * 100) / 100;
+          transferFee = Number($tf.value) || 0;
+        } else if (applies && type === 'Card') {
+          cardFee = Number($cf.value) || 0;
+        }
+        
+        const confirmation = document.getElementById('ab-confirmation').value.trim();
+        
         const newBill = {
           bill_no: document.getElementById('ab-bill').value.trim() || 'MANUAL-' + Date.now(),
           date: document.getElementById('ab-date').value,
           station: document.getElementById('ab-station').value,
-          type: document.getElementById('ab-type').value,
-          amount: Number(document.getElementById('ab-amount').value) || 0,
-          confirmation: '',
-          pay_date: '',
+          type: type,
+          amount: amount,
+          // Fee fields
+          wht_enabled: whtEnabled,
+          wht_amount: whtAmount,
+          transfer_fee: transferFee,
+          card_fee: cardFee,
+          // Confirmation & status
+          confirmation: confirmation,
+          pay_date: confirmation ? document.getElementById('ab-date').value : '',
           remarks1: document.getElementById('ab-remarks').value,
           remarks2: '',
-          bank: document.getElementById('ab-bank').value,
+          bank: '', // ช่อง manual ปล่อยว่าง
           due_date: document.getElementById('ab-due').value,
-          match_status: 'pending',
+          match_status: confirmation ? 'matched' : 'pending',
           source: 'manual',
         };
         billList.push(newBill);
         persistMainState();
         closeModal();
-        toast('เพิ่มบิลสำเร็จ', 'success');
+        const netNote = (whtAmount || transferFee || cardFee) 
+          ? ` (สุทธิ ฿${(amount - whtAmount - transferFee - cardFee).toFixed(2)})` 
+          : '';
+        toast(`เพิ่มบิล฿${amount.toFixed(2)}${netNote}`, 'success');
         render();
       });
     });
@@ -3479,8 +3709,32 @@ async function renderMain(el) {
         const idx = Number(tr.dataset.idx);
         const field = inp.dataset.field;
         billList[idx][field] = inp.value;
+        
+        // ── Auto status change เมื่อกรอก confirmation ──
+        if (field === 'confirmation') {
+          const b = billList[idx];
+          if (b.confirmation && b.confirmation.trim()) {
+            // มีค่า → mark matched
+            if (b.match_status !== 'matched' && b.match_status !== 'paid' && b.match_status !== 'void') {
+              b.match_status = 'matched';
+              if (!b.pay_date) b.pay_date = b.date;
+              toast(`✓ บันทึกเป็นชำระแล้ว — ${b.bill_no||'(ไม่มีเลข)'}`, 'success');
+            }
+          } else {
+            // ล้างค่า → กลับเป็น pending (ถ้าเคย matched)
+            if (b.match_status === 'matched' && !b.paid_by_sp) {
+              b.match_status = 'pending';
+              delete b.pay_date;
+              delete b.matched_stmt_ref;
+              delete b.matched_at;
+              toast(`↩ ยกเลิก matched — ${b.bill_no||'(ไม่มีเลข)'}`, 'info');
+            }
+          }
+          render(); // re-render เพื่อเห็น badge เปลี่ยน
+          return;
+        }
+        
         persistMainState();
-        // ถ้าแก้ station/type → re-render เพื่ออัปเดต summary
         if (field === 'station' || field === 'type') render();
       });
     });
@@ -9088,9 +9342,18 @@ async function renderMatching(el) {
       toast(`กำลัง Auto Match: ${dateFrom} → ${dateTo}...`, 'info');
 
       const BAD_PREFIX = ['SR','OR','SC','JS','JR','PR','PS','MR','MS','PC','BR','BS'];
-      const GOOD_TYPE = ['Transfer','Card'];
+      const GOOD_TYPE = ['Transfer']; // Card ไม่ต้อง auto match (user manual เท่านั้น)
       
-      // Index บิลเฉพาะที่อยู่ในช่วงวันที่
+      // ── Helper: คำนวณยอดสุทธิ (หลังหัก WHT + ค่าโอน + Card fee) ──
+      function netAmount(b) {
+        const amt = Number(b.amount || 0);
+        const wht = Number(b.wht_amount || 0);
+        const tf = Number(b.transfer_fee || 0);
+        const cf = Number(b.card_fee || 0);
+        return Math.round((amt - wht - tf - cf) * 100) / 100;
+      }
+      
+      // Index บิลเฉพาะที่อยู่ในช่วงวันที่ — ใช้ยอด "สุทธิ" เป็น key
       const idx = {};
       const used = new Set();
       let billsInRange = 0;
@@ -9100,17 +9363,18 @@ async function renderMatching(el) {
         if (b.match_status === 'matched' || b.match_status === 'paid' || b.match_status === 'void') continue;
         
         const d = toISODate(b.date);
-        if (!d || d < dateFrom || d > dateTo) continue; // ช่วงวันที่
+        if (!d || d < dateFrom || d > dateTo) continue;
         
         const prefix = (b.bill_no || '').substring(0, 2).toUpperCase();
         if (prefix && BAD_PREFIX.indexOf(prefix) >= 0) continue;
         if (prefix && prefix !== 'SS' && prefix !== 'OS' && prefix !== 'SP') continue;
         if (GOOD_TYPE.indexOf(b.type) < 0) continue;
         
-        const amt = Math.round(Number(b.amount || 0));
-        if (!amt) continue;
+        // ใช้ยอดสุทธิ (เงินที่จะเข้าบัญชีจริง) เป็น key
+        const netAmt = Math.round(netAmount(b));
+        if (!netAmt) continue;
         
-        const k = d + '|' + amt;
+        const k = d + '|' + netAmt;
         if (!idx[k]) idx[k] = [];
         idx[k].push({ bi });
         billsInRange++;
@@ -9123,7 +9387,7 @@ async function renderMatching(el) {
         
         const sd = toISODate(stmt.date || stmt.trans_date);
         if (!sd) return;
-        if (sd < dateFrom || sd > dateTo) { skippedRange++; return; } // นอกช่วง
+        if (sd < dateFrom || sd > dateTo) { skippedRange++; return; }
         
         stmtsInRange++;
         
@@ -9137,7 +9401,8 @@ async function renderMatching(el) {
         for (let c = 0; c < candidates.length; c++) {
           const bi = candidates[c].bi;
           if (used.has(bi)) continue;
-          if (Math.round(Number(billList[bi].amount)) === Math.round(sa)) {
+          // เทียบ statement.amount กับ bill net (ยอดสุทธิหลังหัก)
+          if (Math.round(netAmount(billList[bi])) === Math.round(sa)) {
             foundIdx = bi;
             break;
           }
@@ -9165,6 +9430,79 @@ async function renderMatching(el) {
         }
       });
 
+      // ══════════════════════════════════════════════════════════
+      // PASS 2: Match เงินออก กับบิลเจ้าหนี้ (PP/PS)
+      //   - PP = เลขตัดชำระเจ้าหนี้
+      //   - PS = ใบกำกับ VAT เจ้าหนี้ สด
+      //   - Type = Transfer เท่านั้น
+      // ══════════════════════════════════════════════════════════
+      const expIdx = {};
+      const expUsed = new Set();
+      let expBillsInRange = 0;
+      
+      for (let bi = 0; bi < billList.length; bi++) {
+        const b = billList[bi];
+        if (b.match_status === 'matched' || b.match_status === 'paid' || b.match_status === 'void') continue;
+        
+        const d = toISODate(b.date);
+        if (!d || d < dateFrom || d > dateTo) continue;
+        
+        const prefix = (b.bill_no || '').substring(0, 2).toUpperCase();
+        if (prefix !== 'PP' && prefix !== 'PS') continue;
+        if (b.type !== 'Transfer') continue;
+        
+        const amt = Math.round(Math.abs(Number(b.amount || 0)));
+        if (!amt) continue;
+        
+        const k = d + '|' + amt;
+        if (!expIdx[k]) expIdx[k] = [];
+        expIdx[k].push({ bi });
+        expBillsInRange++;
+      }
+      
+      let matchedExp = 0;
+      uploadedStatements.forEach(stmt => {
+        if (stmt.match_status === 'matched') return;
+        const sa = Number(stmt.amount || 0);
+        if (sa >= 0) return; // เฉพาะเงินออก
+        
+        const sd = toISODate(stmt.date || stmt.trans_date);
+        if (!sd || sd < dateFrom || sd > dateTo) return;
+        
+        const absSa = Math.round(Math.abs(sa));
+        const k = sd + '|' + absSa;
+        const cands = expIdx[k] || [];
+        
+        let foundIdx = -1;
+        for (let c = 0; c < cands.length; c++) {
+          const bi = cands[c].bi;
+          if (expUsed.has(bi)) continue;
+          if (Math.round(Math.abs(Number(billList[bi].amount))) === absSa) {
+            foundIdx = bi;
+            break;
+          }
+        }
+        
+        if (foundIdx >= 0) {
+          expUsed.add(foundIdx);
+          const bill = billList[foundIdx];
+          
+          bill.match_status = 'matched';
+          bill.confirmation = stmt.bank || '';
+          bill.pay_date = bill.date;
+          bill.matched_stmt_ref = stmt.ref_no || '';
+          bill.matched_at = new Date().toISOString();
+          
+          stmt.match_status = 'matched';
+          stmt.match_station = bill.station || '';
+          stmt.match_bill = bill.bill_no || `${bill.station}|${bill.type}|฿${bill.amount}`;
+          stmt.matched_at = new Date().toISOString();
+          stmt.match_method = 'auto_expense';
+          
+          matchedExp++;
+        }
+      });
+
       // Save to IndexedDB
       const req = indexedDB.open('SmartFinanceDB', 1);
       req.onsuccess = (e) => {
@@ -9174,10 +9512,10 @@ async function renderMatching(el) {
         store.put(JSON.stringify(statementsByBank), 'sf_statementsByBank');
         tx.oncomplete = () => {
           let msg = `✅ Auto Match ${dateFrom} → ${dateTo}\n\n`;
-          msg += `✓ Match ได้: ${matched}\n`;
-          msg += `✗ ไม่เจอคู่: ${noMatch}\n`;
-          msg += `⊘ เงินออก (ข้าม): ${skippedNeg}\n\n`;
-          msg += `(Stmt ในช่วง: ${stmtsInRange} · Bills ในช่วง: ${billsInRange})`;
+          msg += `💰 เงินเข้า (SS/OS/SP): ${matched}\n`;
+          msg += `💸 เงินออก (PP/PS): ${matchedExp}\n`;
+          msg += `✗ ไม่เจอคู่: ${noMatch}\n\n`;
+          msg += `(Stmt ในช่วง: ${stmtsInRange} · Bills ในช่วง: ${billsInRange} รับ + ${expBillsInRange} จ่าย)`;
           alert(msg);
           uploadedStatements = getAllStatements();
           render();
