@@ -1763,13 +1763,23 @@ async function renderMain(el) {
     }).reduce((s, b) => s + (Number(b.amount) || 0), 0);
   }
 
-  // คำนวณ ยอดขาย (Sales) row — Invoice/Order/Payment = SUMIFS, Front1-4 = กรอกเอง
+  // คำนวณ ยอดขาย (Sales) row
+  // Invoice/Order/Payment/Credit → SUMIFS จาก bills เสมอ
+  // Front1-4 → 
+  //   1) ใช้ mainSummary['sales_Front*'] ถ้า user กรอก หรือ import มาได้
+  //   2) Fallback: รวมจาก bills ที่ station=Front* (ยกเว้นบิล type=Transfer ที่เป็น Invoice cross-station)
+  //      เพราะ mainSummary อาจ import มาไม่ครบทุกวัน
   function calcSales(station) {
     if (['Invoice', 'Invoice Credit', 'Order', 'Order Credit', 'Payment'].includes(station)) {
       return getBillsForSelectedDate().filter(b => (b.station || '').trim() === station)
         .reduce((s, b) => s + (Number(b.amount) || 0), 0);
     }
-    return Number(mainSummary['sales_' + station]) || 0;
+    // Front1-4: ใช้ mainSummary ถ้ามี → ไม่งั้น sum จาก bills
+    var fromSummary = Number(mainSummary['sales_' + station]) || 0;
+    if (fromSummary !== 0) return fromSummary;
+    // Fallback: sum bills ของ station นี้
+    return getBillsForSelectedDate().filter(b => (b.station || '').trim() === station)
+      .reduce((s, b) => s + (Number(b.amount) || 0), 0);
   }
 
   // คำนวณยอดรวมธนบัตรใน Cash Drawer
@@ -1779,33 +1789,46 @@ async function renderMain(el) {
   }
 
   // ── Sum check: เงินเข้า vs เงินออก ──
-  // Front1-4 (POS stations): inflow = cashIn + sales + cashOut + returns, outflow = drawer + transfer + card + cheque + refund
-  // Invoice/Invoice Credit/Order Credit (ไม่มีลิ้นชัก POS): inflow = sales เท่านั้น (cashIn/cashOut/returns ไม่นับ)
-  // Formula ตาม Excel template: diff = outflow - inflow → balance → "OK"
+  // Formula ตาม Excel template (row 12):
+  //   diff = SUM(C7:C11) - SUM(C3:C6)
+  //        = (drawer + transfer + card + cheque + refund) - (cashIn + sales + cashOut + returns)
+  //        = outflow - inflow
+  //
+  // Rule:
+  //   1) ถ้า station ไม่มีข้อมูลเลย (ไม่ใช้งาน) → return empty (แสดง "-")
+  //   2) ถ้ามีบางอย่าง → คำนวณตาม Excel
+  //   3) Front1-4 + Invoice ใช้สูตรเต็ม · Credit/Order/Payment ใช้ sales vs outflow
   function calcSumCheck(station) {
-    const sales = calcSales(station);
     const drawer = calcCashFromBills(station);
     const transfer = calcAutoValue('Transfer', station);
     const card = calcAutoValue('Card', station);
     const cheque = calcAutoValue('Cheque', station);
     const refund = calcAutoValue('Refund', station);
+    const cashIn = Number(mainSummary['cashIn_' + station]) || 0;
+    const cashOut = Number(mainSummary['cashOut_' + station]) || 0;
+    const returns = Number(mainSummary['returns_' + station]) || 0;
+    const salesSummary = Number(mainSummary['sales_' + station]) || 0;
+    
     const outflow = drawer + transfer + card + cheque + refund;
-
-    // Front1-4 → รวม cashIn/cashOut/returns
-    // Invoice/Credit → ดูแค่ sales
-    let inflow;
-    if (['Front1', 'Front2', 'Front3', 'Front4'].includes(station)) {
-      const cashIn = Number(mainSummary['cashIn_' + station]) || 0;
-      const cashOut = Number(mainSummary['cashOut_' + station]) || 0;
-      const returns = Number(mainSummary['returns_' + station]) || 0;
-      inflow = cashIn + sales + cashOut + returns;
-    } else {
-      // Invoice, Invoice Credit, Order Credit
-      inflow = sales;
+    
+    // ── Rule 1: ไม่มีข้อมูลเลย → แสดง "-" ──
+    // (station ที่ user ไม่ได้ใช้งานในวันนั้น เช่น Front1 ของ 02/01/2026)
+    const hasAnyData = outflow !== 0 || cashIn !== 0 || cashOut !== 0 || returns !== 0 || salesSummary !== 0;
+    if (!hasAnyData) {
+      return { diff: 0, isOk: null, empty: true };  // empty = ไม่แสดง
     }
-
-    const diff = outflow - inflow;  // ตาม Excel: SUM(7,8:11) - SUM(3:6)
-    return { diff, isOk: Math.abs(diff) < 0.01 };
+    
+    let inflow;
+    if (['Front1', 'Front2', 'Front3', 'Front4', 'Invoice'].includes(station)) {
+      // สูตรเต็มตาม Excel: sales จาก summary (user กรอก) หรือ 0
+      inflow = cashIn + salesSummary + cashOut + returns;
+    } else {
+      // Order, Order Credit, Invoice Credit, Payment → ใช้ sales อย่างเดียว
+      inflow = calcSales(station);
+    }
+    
+    const diff = outflow - inflow;
+    return { diff, isOk: Math.abs(diff) < 1.0, empty: false };
   }
 
   function render() {
@@ -1839,6 +1862,21 @@ async function renderMain(el) {
 
     const totalAmount = data.reduce((s, b) => b.match_status === 'void' ? s : s + (Number(b.amount) || 0), 0);
     const paidCount = billList.filter(b => b.match_status === 'paid').length;
+    
+    // ── Sort bill list: station canonical order → bill_no (ascending) ──
+    // ตามลำดับไฟล์ต้นฉบับ: Front1 → Front2 → ... → SS → SR → OS → OR → SP
+    const BILL_STATION_ORDER = ['Front1','Front2','Front3','Front4','Invoice','Invoice Credit','Order','Order Credit','Payment','Cancel',''];
+    const stationRank = (st) => {
+      const i = BILL_STATION_ORDER.indexOf(st || '');
+      return i === -1 ? 999 : i;
+    };
+    data = [...data].sort((a, b) => {
+      const sa = stationRank(a.station);
+      const sb = stationRank(b.station);
+      if (sa !== sb) return sa - sb;
+      // ภายใน station เดียวกัน → เรียงตาม bill_no
+      return String(a.bill_no || '').localeCompare(String(b.bill_no || ''));
+    });
     
     // ── PERF: Cap table rendering to first 500 rows to prevent lag on massive datasets ──
     const MAX_VISIBLE_ROWS = 500;
@@ -1950,7 +1988,10 @@ async function renderMain(el) {
                   if (!['Front1','Front2','Front3','Front4','Invoice','Invoice Credit','Order Credit'].includes(s)) {
                     return `<td></td>`;
                   }
-                  const {diff, isOk} = calcSumCheck(s);
+                  const {diff, isOk, empty} = calcSumCheck(s);
+                  if (empty) {
+                    return `<td style="text-align:center;color:var(--text3)">-</td>`;
+                  }
                   return `<td style="text-align:center;font-weight:700;color:${isOk?'var(--success)':'var(--danger)'}">${isOk?'✓ OK':fmtNum(diff)}</td>`;
                 }).join('')}
               </tr>
