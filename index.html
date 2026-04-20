@@ -4267,18 +4267,41 @@ async function renderMain(el) {
         const field = inp.dataset.field;
         billList[idx][field] = inp.value;
         
+        // Helper: render() แบบเก็บ scroll position
+        const renderKeepScroll = () => {
+          const mainScroll = el.scrollTop || document.getElementById('main')?.scrollTop || 0;
+          const tableWrap = el.querySelector('.table-wrap');
+          const tableScroll = tableWrap?.scrollTop || 0;
+          const focusedField = document.activeElement?.dataset?.field;
+          const focusedIdx = document.activeElement?.closest?.('tr')?.dataset?.idx;
+          
+          render();
+          
+          // Restore after DOM update
+          requestAnimationFrame(() => {
+            const main = document.getElementById('main');
+            if (main) main.scrollTop = mainScroll;
+            const newTableWrap = el.querySelector('.table-wrap');
+            if (newTableWrap) newTableWrap.scrollTop = tableScroll;
+            // Re-focus the input that was being edited (if still exists)
+            if (focusedField && focusedIdx != null) {
+              const selector = `tr[data-idx="${focusedIdx}"] [data-field="${focusedField}"]`;
+              const newInp = el.querySelector(selector);
+              if (newInp) newInp.focus();
+            }
+          });
+        };
+        
         // ── Auto status change เมื่อกรอก confirmation ──
         if (field === 'confirmation') {
           const b = billList[idx];
           if (b.confirmation && b.confirmation.trim()) {
-            // มีค่า → mark matched
             if (b.match_status !== 'matched' && b.match_status !== 'paid' && b.match_status !== 'void') {
               b.match_status = 'matched';
               if (!b.pay_date) b.pay_date = b.date;
               toast(`✓ บันทึกเป็นชำระแล้ว — ${b.bill_no||'(ไม่มีเลข)'}`, 'success');
             }
           } else {
-            // ล้างค่า → กลับเป็น pending (ถ้าเคย matched และไม่ใช่ Cash)
             if (b.match_status === 'matched' && !b.paid_by_sp && b.type !== 'Cash') {
               b.match_status = 'pending';
               delete b.pay_date;
@@ -4288,33 +4311,31 @@ async function renderMain(el) {
             }
           }
           persistMainState();
-          render();
+          renderKeepScroll();
           return;
         }
         
-        // ── Auto-match Type=Cash (เงินสดเข้าลิ้นชัก ไม่ต้องมี confirmation) ──
+        // ── Auto-match Type=Cash ──
         if (field === 'type') {
           const b = billList[idx];
           if (b.type === 'Cash') {
-            // Cash → auto matched (ไม่ต้องใส่ confirmation)
             if (b.match_status !== 'matched' && b.match_status !== 'paid' && b.match_status !== 'void') {
               b.match_status = 'matched';
               if (!b.pay_date) b.pay_date = b.date;
               toast(`✓ Cash → auto matched`, 'success');
             }
           } else if (b.type !== 'Cash' && b.match_status === 'matched' && !b.confirmation && !b.paid_by_sp) {
-            // เปลี่ยนจาก Cash → type อื่น และไม่มี confirmation → pending
             b.match_status = 'pending';
             delete b.pay_date;
             toast(`↩ เปลี่ยน type → ต้องใส่ confirmation`, 'info');
           }
           persistMainState();
-          render();
+          renderKeepScroll();
           return;
         }
         
         persistMainState();
-        if (field === 'station') render();
+        if (field === 'station') renderKeepScroll();
       });
     });
 
