@@ -1327,38 +1327,71 @@ async function restoreMainState() {
   }
   
   // ── Auto-sync: บิล matched ที่ขาด confirmation → เติมจาก statement ที่ match ──
+  // ── ALSO: บิลที่ statement บอกว่า matched แต่ bill ยัง pending → sync ให้ ──
   if (billList.length > 0 && uploadedStatements.length > 0) {
-    let synced = 0;
-    // สร้าง index: match_bill → statement
-    const stmtByBill = {};
+    let confSynced = 0;
+    let statusSynced = 0;
+    
+    // สร้าง index statements ที่ matched → lookup ด้วย bill_no และ station+type+amount+date
+    const stmtByBillNo = {};
+    const stmtByKey = {};
     uploadedStatements.forEach(s => {
-      if (s.match_status === 'matched' && s.match_bill) {
-        stmtByBill[s.match_bill] = s;
+      if (s.match_status !== 'matched' || !s.match_bill) return;
+      const mb = s.match_bill;
+      // index 1: bill_no
+      if (!mb.includes('|')) {
+        stmtByBillNo[mb] = s;
+      } else {
+        // index 2: generated key → parse เป็น components
+        const parts = mb.split('|');
+        const station = parts[0];
+        const type = parts[1];
+        const amtRaw = String(parts[2] || '').replace('฿', '').replace(/,/g, '');
+        const amt = Math.round(Number(amtRaw));
+        const sDate = toISODate(s.date || s.trans_date);
+        if (station && type && amt && sDate) {
+          const k = `${sDate}|${station}|${type}|${amt}`;
+          stmtByKey[k] = s;
+        }
       }
     });
     
     billList.forEach(b => {
-      if (b.match_status !== 'matched') return;
-      if (b.confirmation) return; // มีแล้ว ไม่แทน
-      
       // หา statement คู่
       let stmt = null;
-      if (b.bill_no && stmtByBill[b.bill_no]) {
-        stmt = stmtByBill[b.bill_no];
+      if (b.bill_no && stmtByBillNo[b.bill_no]) {
+        stmt = stmtByBillNo[b.bill_no];
       } else {
-        // หาจาก generated key: station|type|amount (ตรงวันด้วย)
-        const key1 = `${b.station}|${b.type}|฿${b.amount}`;
-        const key2 = `${b.station}|${b.type}|${b.amount}`;
-        stmt = stmtByBill[key1] || stmtByBill[key2];
+        // ใช้ station+type+amount+date หา
+        const bDate = toISODate(b.date);
+        const amt = Math.round(Number(b.amount || 0));
+        if (bDate && b.station && b.type && amt) {
+          const k = `${bDate}|${b.station}|${b.type}|${amt}`;
+          stmt = stmtByKey[k];
+        }
       }
       
-      if (stmt && stmt.bank) {
+      if (!stmt) return;
+      
+      // ถ้าบิลยัง pending แต่ statement บอก matched → sync
+      if (b.match_status !== 'matched' && b.match_status !== 'paid' && b.match_status !== 'void') {
+        b.match_status = 'matched';
+        b.confirmation = stmt.bank || '';
+        b.pay_date = b.date;
+        b.matched_stmt_ref = stmt.ref_no || '';
+        statusSynced++;
+      }
+      // ถ้าบิล matched อยู่แล้วแต่ขาด confirmation → เติม
+      else if (b.match_status === 'matched' && !b.confirmation && stmt.bank) {
         b.confirmation = stmt.bank;
         if (!b.pay_date) b.pay_date = b.date;
-        synced++;
+        confSynced++;
       }
     });
-    if (synced > 0) console.log(`Auto-synced confirmation for ${synced} matched bills`);
+    
+    if (confSynced > 0 || statusSynced > 0) {
+      console.log(`Auto-sync: status=${statusSynced} confirmation=${confSynced} bills`);
+    }
   }
 }
 
