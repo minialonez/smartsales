@@ -8276,26 +8276,28 @@ async function renderSales(el) {
 
 // ── Matching ────────────────────────────────────────────────
 async function renderMatching(el) {
-  let bankFilter = 'ALL', matchDate = todayISO();
+  let bankFilter = 'ALL', matchFilter = 'ALL';
   const bankColors = { KTB:'#00a4e4', KBANK:'#138f2d', 'BBL NW':'#ff7b00', BBL:'#1e3a7b' };
 
-  async function render() {
-    const res = await api('getStatements', { date: formatDateKey(matchDate), bank: bankFilter });
-    let data = res.data?.data || [];
-
-    // รวม uploaded statements (ถ้ามี)
-    if (uploadedStatements.length > 0) {
-      data = [...data, ...uploadedStatements.filter(s => bankFilter === 'ALL' || s.bank === bankFilter)];
-    }
+  function render() {
+    // ── ใช้ข้อมูลจาก localStorage เท่านั้น (ไม่ call API — เร็วมาก) ──
+    let data = uploadedStatements.length > 0 ? [...uploadedStatements] : [];
     
-    // Sort ASC by date (รองรับ descending format จาก BBL)
+    // Filter by bank
+    if (bankFilter !== 'ALL') data = data.filter(s => s.bank === bankFilter);
+    
+    // Filter by match status
+    if (matchFilter === 'matched') data = data.filter(s => s.match_status === 'matched');
+    else if (matchFilter === 'unmatched') data = data.filter(s => s.match_status !== 'matched');
+    
+    // Sort ASC by date
     data.sort((a, b) => (parseThaiDate(a.date) || 0) - (parseThaiDate(b.date) || 0));
     
     // PERF: truncate for render
     const _t = truncateForRender(data);
     const visibleData = _t.visible;
 
-    // Bank counts (แสดงจำนวนแต่ละธนาคารที่นำเข้าแล้ว)
+    // Bank counts
     const bankCounts = {
       KTB: (statementsByBank.KTB || []).length,
       KBANK: (statementsByBank.KBANK || []).length,
@@ -8303,14 +8305,16 @@ async function renderMatching(el) {
       BBL: (statementsByBank.BBL || []).length,
     };
 
-    const matched = data.filter(s=>s.match_status==='matched').length;
-    const unmatched = data.length - matched;
+    const allStmts = uploadedStatements;
+    const totalMatched = allStmts.filter(s=>s.match_status==='matched').length;
+    const totalUnmatched = allStmts.length - totalMatched;
+    const filteredMatched = data.filter(s=>s.match_status==='matched').length;
+    const filteredUnmatched = data.length - filteredMatched;
 
     el.innerHTML = `
       <div class="flex justify-between items-center mb-3">
         <div class="page-title">Statement Matching</div>
         <div class="flex gap-2 items-center">
-          <input type="date" class="input" value="${matchDate}" style="width:155px" id="match-date">
           <button class="btn btn-outline btn-sm" id="btn-stmt-upload">${ICONS.file} วาง Statement</button>
           <button class="btn btn-primary btn-sm" id="btn-auto-match">${ICONS.pulse} Auto Match</button>
         </div>
@@ -8323,14 +8327,19 @@ async function renderMatching(el) {
           }).join('')}
           ${(bankCounts.KTB+bankCounts.KBANK+(bankCounts['BBL NW']||0)+bankCounts.BBL) > 0 ? '<button class="btn btn-ghost btn-sm" id="btn-clear-stmts" style="color:var(--danger)">✕ ล้าง Statement</button>' : ''}
         </div>
-        <button class="btn btn-ghost btn-sm">${ICONS.file} ดู Match Log</button>
+      </div>
+      <div class="flex gap-2 mb-3 items-center">
+        <span class="text-xs text-dim">สถานะ:</span>
+        <button class="pill ${matchFilter==='ALL'?'active':''}" data-mf="ALL">ทั้งหมด (${allStmts.length})</button>
+        <button class="pill ${matchFilter==='unmatched'?'active':''}" data-mf="unmatched" style="--pill-color:var(--danger)">✗ ยังไม่ Match (${totalUnmatched})</button>
+        <button class="pill ${matchFilter==='matched'?'active':''}" data-mf="matched" style="--pill-color:var(--success)">✓ Matched (${totalMatched})</button>
       </div>
       <div class="flex gap-3 flex-wrap mb-3 stagger">
-        ${statCard('Matched', matched, '', 'var(--success)', ICONS.check)}
-        ${statCard('ยังไม่ Match', unmatched, '', 'var(--danger)', ICONS.alert)}
+        ${statCard('Matched', totalMatched, '', 'var(--success)', ICONS.check)}
+        ${statCard('ยังไม่ Match', totalUnmatched, '', 'var(--danger)', ICONS.alert)}
       </div>
       <div class="card-flat">
-        <div class="table-wrap" style="max-height:420px;overflow-y:auto">
+        <div class="table-wrap" style="max-height:500px;overflow-y:auto">
           <table>
             <thead><tr><th>ธนาคาร</th><th>วันที่</th><th>เวลา</th><th>Ref.</th><th style="text-align:right">จำนวนเงิน</th><th>รายละเอียด</th><th>Station</th><th>Bill</th><th>สถานะ</th></tr></thead>
             <tbody>
@@ -8365,7 +8374,9 @@ async function renderMatching(el) {
     el.querySelectorAll('.pill[data-bank]').forEach(btn => {
       btn.addEventListener('click', () => { bankFilter = btn.dataset.bank; render(); });
     });
-    document.getElementById('match-date')?.addEventListener('change', e => { matchDate = e.target.value; render(); });
+    el.querySelectorAll('.pill[data-mf]').forEach(btn => {
+      btn.addEventListener('click', () => { matchFilter = btn.dataset.mf; render(); });
+    });
     document.getElementById('btn-stmt-upload')?.addEventListener('click', () => {
       triggerFileUpload('file-stmt', (result, name) => { handleStmtUpload(result, name); render(); });
     });
@@ -8474,6 +8485,14 @@ async function renderMatching(el) {
             
             <div id="mm-bill-list" style="max-height:300px;overflow-y:auto;border:1px solid var(--border);border-radius:8px"></div>
             
+            <div style="padding:10px;background:var(--surface2);border-radius:8px;margin-top:8px">
+              <div class="text-xs font-semi" style="margin-bottom:6px">✏️ หรือกรอกเลขบิลเอง (กรณีบิลยังไม่อยู่ในระบบ)</div>
+              <div class="flex gap-2">
+                <input class="input" id="mm-manual-bill" placeholder="เลขบิล เช่น SS00126-001234" style="flex:1">
+                <input class="input" id="mm-manual-station" placeholder="Station" value="Invoice" style="width:100px">
+              </div>
+            </div>
+            
             <div class="input-group">
               <label>หมายเหตุ (ทำไมถึง match ด้วยตัวเอง)</label>
               <input class="input" id="mm-reason" placeholder="เช่น ลูกค้าโอนผิดยอด, รวมยอด 2 บิล">
@@ -8558,48 +8577,77 @@ async function renderMatching(el) {
         renderBillList('');
         document.getElementById('mm-search')?.addEventListener('input', debounce(e => renderBillList(e.target.value), 200));
         
+        // ── Enable confirm เมื่อกรอกเลขบิลเอง ──
+        document.getElementById('mm-manual-bill')?.addEventListener('input', (e) => {
+          if (e.target.value.trim()) {
+            // ยกเลิก selection จาก list (ถ้ามี)
+            selectedIdx = null;
+            const bc = document.getElementById('mm-bill-list');
+            if (bc) bc.querySelectorAll('.mm-item').forEach(i => i.style.background = '');
+            document.getElementById('mm-confirm').disabled = false;
+          } else if (selectedIdx === null) {
+            document.getElementById('mm-confirm').disabled = true;
+          }
+        });
+        
         document.getElementById('mm-confirm')?.addEventListener('click', () => {
-          if (selectedIdx === null) return;
-          const match = displayList[selectedIdx];
-          if (!match) return;
+          const manualBill = (document.getElementById('mm-manual-bill')?.value || '').trim();
+          const manualStation = (document.getElementById('mm-manual-station')?.value || 'Invoice').trim();
           const reason = document.getElementById('mm-reason').value || '';
+          
+          // ── กรณี 1: เลือกบิลจาก list ──
+          // ── กรณี 2: กรอกเลขบิลเอง ──
+          let matchBillNo = '';
+          let matchStation = '';
+          let targetLabel = '';
+          
+          if (selectedIdx !== null && displayList[selectedIdx]) {
+            // เลือกจาก list
+            const match = displayList[selectedIdx];
+            matchBillNo = match.bill_no || '';
+            matchStation = match.station || '';
+            
+            // อัปเดต Bill / Cashflow / Supplier Payment
+            if (match._supplierPayment) {
+              const sp = match._supplierPayment;
+              sp.match_status = 'matched';
+              sp.match_stmt_ref = stmt.ref_no || '';
+              sp.matched_at = new Date().toISOString();
+              if (sp.payment_method === 'เช็ค') {
+                sp.cheque_cleared_date = toISODate(stmt.date);
+                sp.cleared_statement_ref = stmt.ref_no || '';
+                targetLabel = `📝 เช็ค ${sp.cheque_no} (${sp.supplier_name})`;
+              } else {
+                targetLabel = `🏭 SP ${sp.pp_no||sp.id} (${sp.supplier_name})`;
+              }
+            } else if (match._cashflow) {
+              match._cashflow.match_status = 'matched';
+              match._cashflow.match_stmt_ref = stmt.ref_no || '';
+              targetLabel = `💰 CF ${match.bill_no}`;
+            } else {
+              match.match_status = 'matched';
+              match.matched_stmt_ref = stmt.ref_no || '';
+              match.matched_at = new Date().toISOString();
+              targetLabel = `📄 ${match.bill_no}`;
+            }
+          } else if (manualBill) {
+            // กรอกเลขบิลเอง (ไม่มีบิลในระบบ — แค่บันทึกการ match)
+            matchBillNo = manualBill;
+            matchStation = manualStation;
+            targetLabel = `✏️ ${manualBill} (กรอกเอง)`;
+          } else {
+            toast('กรุณาเลือกบิลหรือกรอกเลขบิล', 'warn');
+            return;
+          }
           
           // อัปเดต Statement
           stmt.match_status = 'matched';
           stmt.match_method = 'manual';
-          stmt.match_station = match.station || '';
-          stmt.match_bill = match.bill_no || '';
+          stmt.match_station = matchStation;
+          stmt.match_bill = matchBillNo;
           stmt.matched_at = new Date().toISOString();
           stmt.matched_by = currentUser?.display_name || 'Admin';
-          stmt.match_reason = reason;
-          
-          let targetLabel = '';
-          
-          // อัปเดต Bill / Cashflow / Supplier Payment
-          if (match._supplierPayment) {
-            const sp = match._supplierPayment;
-            sp.match_status = 'matched';
-            sp.match_stmt_ref = stmt.ref_no || '';
-            sp.matched_at = new Date().toISOString();
-            // เช็คขึ้นเงินแล้ว
-            if (sp.payment_method === 'เช็ค') {
-              sp.cheque_cleared_date = toISODate(stmt.date);
-              sp.cleared_statement_ref = stmt.ref_no || '';
-              targetLabel = `📝 เช็ค ${sp.cheque_no} (${sp.supplier_name})`;
-            } else {
-              targetLabel = `🏭 SP ${sp.pp_no||sp.id} (${sp.supplier_name})`;
-            }
-          } else if (match._cashflow) {
-            match._cashflow.match_status = 'matched';
-            match._cashflow.match_stmt_ref = stmt.ref_no || '';
-            targetLabel = `💰 CF ${match.bill_no}`;
-          } else {
-            // Regular bill
-            match.match_status = 'matched';
-            match.matched_stmt_ref = stmt.ref_no || '';
-            match.matched_at = new Date().toISOString();
-            targetLabel = `📄 ${match.bill_no}`;
-          }
+          stmt.match_reason = reason || (manualBill ? 'กรอกเลขบิลเอง' : '');
           
           // Persist
           try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(e) {}
@@ -8648,7 +8696,7 @@ async function renderMatching(el) {
       toast('กำลัง Auto Match...', 'info');
 
       // ── ลอง Backend ก่อน ──
-      const res = await api('autoMatch', { date: formatDateKey(matchDate), action_by: currentUser?.display_name || 'Admin' });
+      const res = await api('autoMatch', { date: formatDateKey(todayISO()), action_by: currentUser?.display_name || 'Admin' });
 
       if (res.success && res.data && res.data.matched > 0) {
         toast(`Auto Match (Server) สำเร็จ — จับคู่ได้ ${res.data.matched} รายการ`, 'success');
