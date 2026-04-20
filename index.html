@@ -2361,6 +2361,11 @@ async function renderMain(el) {
   // รวมบิลที่ (station ตรง, type=Cash, bill_no เริ่มด้วย SS/OS/SP/SC/JS หรือไม่มี bill_no)
   // fallback → mainSummary['cashDrawer_*'] (กรณีข้อมูล import ที่ไม่มีบิล Cash แยก)
   function calcCashFromBills(station) {
+    // Priority 1: user นับธนบัตรแล้ว → ใช้ยอดนั้น (เป็น ground truth)
+    const countedCash = calcCashDrawer(station);
+    if (countedCash > 0) return countedCash;
+    
+    // Priority 2: รวมจากบิล Cash
     var fromBills = getBillsForSelectedDate().filter(b => {
       const st = (b.station || '').trim();
       const ty = (b.type || '').trim();
@@ -2370,7 +2375,7 @@ async function renderMain(el) {
     
     if (fromBills !== 0) return fromBills;
     
-    // ไม่มีบิล Cash — อาจเป็นข้อมูลนำเข้าจาก JSON summary → ใช้ fallback
+    // Priority 3: mainSummary fallback (import จาก JSON)
     return Number(mainSummary['cashDrawer_' + station]) || 0;
   }
   function calcAutoValue(type, station) {
@@ -3179,11 +3184,11 @@ async function renderMain(el) {
     const vals = SUMMARY_STATIONS.map(s => calcCashFromBills(s));
     const allSum = vals.reduce((a,b)=>a+b,0);
     return `<tr>
-      <td style="text-align:right;font-weight:700">${allSum?fmtNum(allSum):'-'}</td>
+      <td style="text-align:right;font-weight:700" data-drawer-total>${allSum?fmtNum(allSum):'-'}</td>
       <td style="font-weight:600;color:var(--purple)">🗃️ Cash Drawer</td>
       ${SUMMARY_STATIONS.map((s,i)=>{
         if (['Invoice Credit', 'Order Credit'].includes(s)) return `<td></td>`;
-        return `<td style="text-align:right;color:${vals[i]?'var(--purple)':'var(--text3)'};font-weight:${vals[i]?'600':'400'}">${vals[i]?fmtNum(vals[i]):'-'}</td>`;
+        return `<td data-drawer-station="${s}" style="text-align:right;color:${vals[i]?'var(--purple)':'var(--text3)'};font-weight:${vals[i]?'600':'400'}">${vals[i]?fmtNum(vals[i]):'-'}</td>`;
       }).join('')}
     </tr>`;
   }
@@ -4242,7 +4247,7 @@ async function renderMain(el) {
         const k = inp.dataset.denom + '_' + inp.dataset.station;
         dayCash[k] = parseInt(inp.value) || 0;
         persistMainState();
-        // Update totals
+        // Update totals ในตารางธนบัตรด้านล่าง
         const denom = Number(inp.dataset.denom);
         const rowTotal = ['Front1','Front2','Front3','Front4','Invoice']
           .reduce((s, st) => s + denom * (Number(dayCash[denom+'_'+st]) || 0), 0);
@@ -4256,6 +4261,27 @@ async function renderMain(el) {
         const grand = ['Front1','Front2','Front3','Front4','Invoice'].reduce((s,st)=>s+calcCashDrawer(st),0);
         const gEl = document.getElementById('grand-total');
         if (gEl) gEl.textContent = '฿' + fmtNum(grand);
+        
+        // ── Update Cash Drawer row + Sum row ในสรุปด้านบน ──
+        SUMMARY_STATIONS.forEach(s => {
+          if (['Invoice Credit', 'Order Credit'].includes(s)) return;
+          const v = calcCashFromBills(s);  // now includes cash count priority
+          const cell = el.querySelector(`[data-drawer-station="${s}"]`);
+          if (cell) {
+            cell.textContent = v ? fmtNum(v) : '-';
+            cell.style.color = v ? 'var(--purple)' : 'var(--text3)';
+            cell.style.fontWeight = v ? '600' : '400';
+          }
+        });
+        // Drawer total column
+        const drawerTotalEl = el.querySelector('[data-drawer-total]');
+        if (drawerTotalEl) {
+          const total = SUMMARY_STATIONS.reduce((s,st) => s + calcCashFromBills(st), 0);
+          drawerTotalEl.textContent = total ? fmtNum(total) : '-';
+        }
+        
+        // Recalc Sum row (✓OK / ตัวเลขต่าง)
+        updateSumCheckRow();
       }, 200));
     });
 
@@ -9725,17 +9751,43 @@ async function renderMatching(el) {
         
         // ยอดตรง ±5% หรือ ±1 บาท (ใช้ absolute รองรับเงินเข้า/ออก)
         const absStmt = Math.abs(stmtAmt);
+        
+        // ── Filter ตาม direction ──
+        //   เงินออก (stmtAmt < 0) → PP / PS / PR / MS / MR / PX (ฝั่งเจ้าหนี้)
+        //   เงินเข้า (stmtAmt > 0) → SS / OS / SP / SR / OR / JR / JS / Front (ฝั่งลูกหนี้)
+        const EXPENSE_PREFIXES = ['PP','PS','PR','MS','MR','PX'];
+        const INCOME_PREFIXES = ['SS','OS','SP','SR','OR','JR','JS','SC'];
+        const matchesDirection = (b) => {
+          const prefix = String(b.bill_no||'').substring(0,2).toUpperCase();
+          const isFrontStation = String(b.station||'').startsWith('Front');
+          if (stmtAmt < 0) {
+            // เงินออก → เจ้าหนี้ (PP/PS/PR/MS/MR/PX)
+            return EXPENSE_PREFIXES.includes(prefix);
+          } else {
+            // เงินเข้า → ลูกหนี้ (SS/OS/SP/SR/OR) หรือ Front station (ทุก prefix)
+            return INCOME_PREFIXES.includes(prefix) || isFrontStation;
+          }
+        };
+        
         const candidates = [
           ...billList.filter(b => {
             if (b.match_status === 'matched' || b.match_status === 'paid') return false;
+            if (!matchesDirection(b)) return false;
             const amtDiff = Math.abs(Math.abs(Number(b.amount)) - absStmt);
             return amtDiff < 1 || amtDiff < absStmt * 0.05;
           }),
+          // Cashflow: deposit/supplier/transfer - filter by direction
           ...cashflowCandidates.filter(c => {
+            // เงินออก → supplier/transfer out · เงินเข้า → deposit
+            const cfDir = c._cashflow?.type;
+            if (stmtAmt < 0 && !['supplier','transfer','misc'].includes(cfDir)) return false;
+            if (stmtAmt > 0 && !['deposit','transfer','misc'].includes(cfDir)) return false;
             const amtDiff = Math.abs(Math.abs(Number(c.amount)) - absStmt);
             return amtDiff < 1 || amtDiff < absStmt * 0.05;
           }),
+          // Supplier Payments → always expense (out)
           ...spCandidates.filter(sp => {
+            if (stmtAmt > 0) return false; // SP = เงินออก only
             const amtDiff = Math.abs(Math.abs(Number(sp.amount)) - absStmt);
             return amtDiff < 1 || amtDiff < absStmt * 0.05;
           }),
