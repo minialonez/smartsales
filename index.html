@@ -2502,8 +2502,9 @@ async function renderMain(el) {
                   const isAwaitingClear = !isVoid && (b.match_status === 'awaiting_clear' || (b.type === 'Cheque' && b.match_status !== 'matched' && b.match_status !== 'bounced'));
                   const isBounced = b.match_status === 'bounced';
                   const billPrefix = (b.bill_no||'').substring(0,2).toUpperCase();
-                  const isCreditNote = !isVoid && !isPaid && ['SR','OR','SC','JS','JR'].includes(billPrefix);
-                  const isPendingMatch = !isVoid && !isPaid && !isAwaitingClear && !isBounced && !isCreditNote &&
+                  const isCreditNote = !isVoid && !isPaid && ['SC','PC','JS','JR','BR','BS'].includes(billPrefix);
+                  const isCreditSale = !isVoid && !isPaid && ['SR','OR'].includes(billPrefix);
+                  const isPendingMatch = !isVoid && !isPaid && !isAwaitingClear && !isBounced && !isCreditNote && !isCreditSale &&
                     (b.type === 'Transfer' || b.type === 'Card') &&
                     b.station !== 'Invoice Credit' && b.station !== 'Order Credit';
                   const billKey = b.bill_no ? `${b.bill_no}|${(b.type||'').trim()}|${Number(b.amount)||0}` : '';
@@ -2534,6 +2535,9 @@ async function renderMain(el) {
                   } else if (isCreditNote) {
                     rowStyle = 'background:rgba(160,100,255,.08);border-left:3px solid rgba(160,100,255,.6)';
                     statusBadge = `<br><span class="badge" style="background:rgba(160,100,255,.15);color:#a064ff;margin-top:2px">📋 ใบลดหนี้</span>`;
+                  } else if (isCreditSale) {
+                    rowStyle = 'background:rgba(91,124,250,.08);border-left:3px solid rgba(91,124,250,.6)';
+                    statusBadge = `<br><span class="badge" style="background:rgba(91,124,250,.15);color:#5b7cfa;margin-top:2px">💳 บิลเครดิต</span>`;
                   } else if (isPendingMatch) {
                     rowStyle = 'background:rgba(239,87,87,.08);border-left:3px solid var(--danger)';
                     statusBadge = `<br><span class="badge badge-danger" style="margin-top:2px">⚠ ยัง Match ไม่เจอ</span>`;
@@ -8906,103 +8910,144 @@ async function renderMatching(el) {
       });
     });
     document.getElementById('btn-auto-match')?.addEventListener('click', async () => {
-      toast('กำลัง Auto Match (วันเดียวกัน + ยอดตรง)...', 'info');
+      toast('กำลัง Auto Match...', 'info');
 
       // ══════════════════════════════════════════════════════════
-      // Auto Match v4 — กฎ:
-      //   1. วันเดียวกันเท่านั้น
-      //   2. ยอดตรง ±1 บาท
+      // Auto Match v5 — กฎ:
+      //   1. วันเดียวกันเท่านั้น (ไม่ match ข้ามวัน)
+      //   2. ยอดตรง 100% (ไม่มี tolerance)
       //   3. 1 Statement = 1 Bill (1:1)
-      //   4. ใช้ temp Set (ไม่แก้ bill object ระหว่าง match)
-      //   5. Mark ทุกบิลที่ matched (รวมบิลไม่มี bill_no)
-      //   6. Save ลง IndexedDB ทันที
+      //   4. เฉพาะ SS, OS, SP, บิลไม่มีเลข (Front) 
+      //      + Type = Transfer หรือ Card เท่านั้น
+      //   5. ห้าม match กับ SR, OR, SC, JS, JR (ใบลดหนี้/เครดิต)
+      //   6. ข้ามเงินออก (amount ≤ 0)
+      //   7. Mark ทั้ง bill + statement (ใช้ billList[index] ตรง)
+      //   8. ใส่ confirmation = bank, pay_date = bill.date
+      //   9. Save ลง IndexedDB ทันที
       // ══════════════════════════════════════════════════════════
       
-      // ล้าง flag เก่า (ถ้ามี)
-      billList.forEach(b => { delete b._autoMatched; delete b._clientMatched; delete b._used; });
+      const BAD_PREFIX = ['SR','OR','SC','JS','JR','PR','PS','MR','MS','PC','BR','BS'];
+      const GOOD_TYPE = ['Transfer','Card'];
       
-      const pendingBills = billList.filter(b => 
-        b.match_status !== 'matched' && b.match_status !== 'paid' && b.match_status !== 'void'
-      );
-      const pendingStmts = uploadedStatements.filter(s => s.match_status !== 'matched');
+      // ── สร้าง index: key = "ISO_DATE|AMOUNT" → [billList index] ──
+      const idx = {};    // key → [{ bi: billList index }]
+      const used = new Set(); // billList indexes ที่ใช้แล้ว
       
-      if (pendingStmts.length === 0) { toast('ไม่มี Statement ที่ยังไม่ matched', 'warn'); return; }
-      if (pendingBills.length === 0) { toast('ไม่มีบิลให้จับคู่', 'warn'); return; }
-      
-      // ── Index bills by (date + amount) ──
-      // เฉพาะ SS/OS/SP + บิลไม่มีเลข (Front) | Type = Transfer หรือ Card
-      const _goodPrefix = ['SS','OS','SP',''];
-      const _goodType = ['Transfer','Card'];
-      const billIdx = {};
-      pendingBills.forEach(b => {
-        const prefix = (b.bill_no||'').substring(0,2).toUpperCase();
-        const type = b.type || '';
-        if (_goodPrefix.indexOf(prefix) < 0) return;
-        if (_goodType.indexOf(type) < 0) return;
-        const i = billList.indexOf(b);
+      for (let bi = 0; bi < billList.length; bi++) {
+        const b = billList[bi];
+        if (b.match_status === 'matched' || b.match_status === 'paid' || b.match_status === 'void') continue;
+        
+        // Filter: เฉพาะ SS/OS/SP/ว่าง + Transfer/Card
+        const prefix = (b.bill_no || '').substring(0, 2).toUpperCase();
+        if (prefix && BAD_PREFIX.indexOf(prefix) >= 0) continue;
+        if (prefix && prefix !== 'SS' && prefix !== 'OS' && prefix !== 'SP') continue;
+        if (GOOD_TYPE.indexOf(b.type) < 0) continue;
+        
         const d = toISODate(b.date);
         const amt = Math.round(Number(b.amount || 0));
-        if (!d || !amt) return;
-        for (let a = amt - 1; a <= amt + 1; a++) {
-          const k = d + '|' + a;
-          if (!billIdx[k]) billIdx[k] = [];
-          billIdx[k].push({ i, b });
-        }
-      });
+        if (!d || !amt) continue;
+        
+        const k = d + '|' + amt;
+        if (!idx[k]) idx[k] = [];
+        idx[k].push({ bi });
+      }
       
-      const used = new Set(); // bill indexes ที่ใช้แล้วในรอบนี้
-      let matched = 0, noAmt = 0, noDate = 0;
+      // ── Match: แต่ละ statement หาบิลคู่ ──
+      let matched = 0, skippedNeg = 0, skippedNoKey = 0, noMatch = 0;
       
-      pendingStmts.forEach(stmt => {
+      // วน uploadedStatements ซึ่ง = reference ตรงจาก statementsByBank
+      uploadedStatements.forEach(stmt => {
+        if (stmt.match_status === 'matched') return;
+        
         const sa = Number(stmt.amount || 0);
+        if (sa <= 0) { skippedNeg++; return; }
+        
         const sd = toISODate(stmt.date || stmt.trans_date);
-        if (!sd) return;
-        if (sa <= 0) { noAmt++; return; } // ข้ามเงินออก (ยอดลบ)
+        if (!sd) { skippedNoKey++; return; }
         
         const k = sd + '|' + Math.round(sa);
-        const cs = billIdx[k] || [];
+        const candidates = idx[k] || [];
         
-        const found = cs.find(c => !used.has(c.i) && Math.abs(Number(c.b.amount) - sa) <= 1.0);
+        // หาบิลที่ยังไม่ถูกใช้ + ยอดตรง 100%
+        let foundIdx = -1;
+        for (let c = 0; c < candidates.length; c++) {
+          const bi = candidates[c].bi;
+          if (used.has(bi)) continue;
+          const bill = billList[bi];
+          if (Math.round(Number(bill.amount)) === Math.round(sa)) {
+            foundIdx = bi;
+            break;
+          }
+        }
         
-        if (found) {
-          used.add(found.i);
-          // Mark bill + ใส่ confirmation (ธนาคาร) + pay_date
-          found.b.match_status = 'matched';
-          found.b.confirmation = stmt.bank || '';
-          found.b.pay_date = found.b.date;
-          found.b.matched_stmt_ref = stmt.ref_no || '';
-          found.b.matched_at = new Date().toISOString();
-          // Mark statement
+        if (foundIdx >= 0) {
+          used.add(foundIdx);
+          const bill = billList[foundIdx]; // ใช้ billList[index] ตรง ไม่ผ่าน reference
+          
+          // ═══ Mark BILL ═══
+          bill.match_status = 'matched';
+          bill.confirmation = stmt.bank || '';
+          bill.pay_date = bill.date;
+          bill.matched_stmt_ref = stmt.ref_no || '';
+          bill.matched_at = new Date().toISOString();
+          
+          // ═══ Mark STATEMENT ═══
           stmt.match_status = 'matched';
-          stmt.match_station = found.b.station || '';
-          stmt.match_bill = found.b.bill_no || `${found.b.station}|${found.b.type}|฿${found.b.amount}`;
+          stmt.match_station = bill.station || '';
+          stmt.match_bill = bill.bill_no || `${bill.station}|${bill.type}|฿${bill.amount}`;
           stmt.matched_at = new Date().toISOString();
           stmt.match_method = 'auto_sameday';
+          
           matched++;
         } else {
-          if (!pendingBills.some(b => toISODate(b.date) === sd)) noDate++;
-          else noAmt++;
+          noMatch++;
         }
       });
 
-      // Save to IndexedDB
-      try {
-        const req = indexedDB.open('SmartFinanceDB', 1);
-        req.onsuccess = (e) => {
-          const tx = e.target.result.transaction('data', 'readwrite');
-          const store = tx.objectStore('data');
-          store.put(JSON.stringify(billList), 'sf_billList');
-          store.put(JSON.stringify(statementsByBank), 'sf_statementsByBank');
-          tx.oncomplete = () => {
-            const totalMatched = uploadedStatements.filter(s => s.match_status === 'matched').length;
-            toast(`✅ Auto Match — จับคู่ ${matched} · รวม matched ${totalMatched} · ไม่มีบิลวันนั้น ${noDate} · ยอดไม่ตรง ${noAmt}`, 'success', 8000);
-            uploadedStatements = getAllStatements();
-            render();
-          };
+      // ═══ VERIFY: ตรวจว่า bill + statement sync กัน ═══
+      let verified = 0, fixNeeded = 0;
+      uploadedStatements.forEach(stmt => {
+        if (stmt.match_status !== 'matched' || stmt.match_method !== 'auto_sameday') return;
+        const mb = stmt.match_bill || '';
+        // หาบิลคู่
+        let found = false;
+        if (mb && !mb.includes('|')) {
+          // มี bill_no
+          found = billList.some(b => b.bill_no === mb && b.match_status === 'matched');
+        } else if (mb.includes('|')) {
+          // generated key: station|type|฿amount
+          const parts = mb.split('|');
+          const station = parts[0], type = parts[1];
+          const amt = Number(String(parts[2] || '').replace('฿', ''));
+          const sd = toISODate(stmt.date || stmt.trans_date);
+          found = billList.some(b => 
+            b.match_status === 'matched' && b.station === station && b.type === type &&
+            Math.round(Number(b.amount)) === Math.round(amt) && toISODate(b.date) === sd
+          );
+        }
+        if (found) verified++;
+        else fixNeeded++;
+      });
+
+      // ═══ SAVE IndexedDB ═══
+      const req = indexedDB.open('SmartFinanceDB', 1);
+      req.onsuccess = (e) => {
+        const tx = e.target.result.transaction('data', 'readwrite');
+        const store = tx.objectStore('data');
+        store.put(JSON.stringify(billList), 'sf_billList');
+        store.put(JSON.stringify(statementsByBank), 'sf_statementsByBank');
+        tx.oncomplete = () => {
+          const totalMatched = uploadedStatements.filter(s => s.match_status === 'matched').length;
+          const totalBillMatched = billList.filter(b => b.match_status === 'matched').length;
+          let msg = `✅ Auto Match — จับคู่ ${matched}`;
+          msg += ` · รวม: stmt ${totalMatched} / bill ${totalBillMatched}`;
+          msg += ` · เงินออก ${skippedNeg} · ไม่เจอ ${noMatch}`;
+          if (fixNeeded > 0) msg += ` · ⚠️ sync ผิด ${fixNeeded}`;
+          toast(msg, matched > 0 ? 'success' : 'warn', 10000);
+          uploadedStatements = getAllStatements();
+          render();
         };
-      } catch(e) {
-        toast(`Match ${matched} แต่ save ล้มเหลว: ${e.message}`, 'error');
-      }
+      };
     });
   }
   render();
