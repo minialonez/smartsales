@@ -550,28 +550,51 @@ function handleStmtUpload(result, fileName) {
 
   // Parse ตาม format ธนาคาร
   if (bank === 'KTB') {
-    // KTB .xls: header row มี "Date", data เริ่มหลัง header
-    // format: Date | Teller Id | Transaction Code | Description | Cheque No. | Amount | Tax | Balance | Init Br.
+    // KTB มี 2 formats:
+    // A) ปัจจุบัน (20260418...xls): Date | Teller Id | Trans Code | Description | Cheque | Amount | Tax | Balance
+    // B) ย้อนหลัง (Statement_KTB...xls): Date/Time | Trans Code | Description | Cheque | W/D Amount | Tax | Balance | Channel
     const sheet = firstSheet;
     let hRow = -1;
+    let isHistorical = false;
     for (let i = 0; i < Math.min(15, sheet.length); i++) {
-      if (sheet[i] && sheet[i].some(c => String(c) === 'Date' || String(c).includes('Date'))) { hRow = i; break; }
+      const joined = (sheet[i]||[]).join('|');
+      if (joined.includes('Date')) { 
+        hRow = i; 
+        // ตรวจว่าเป็น format ไหน
+        if (joined.includes('Withdrawal') || joined.includes('Channel') || joined.includes('Date/ Time')) {
+          isHistorical = true;
+        }
+        break; 
+      }
     }
     if (hRow < 0) hRow = 10;
+    
     for (let i = hRow + 1; i < sheet.length; i++) {
       const r = sheet[i];
       if (!r || !r[0]) continue;
       const dateStr = String(r[0] || '');
-      // ข้าม header/junk rows: ต้องมีวันที่จริง (dd/mm/yyyy หรือ yyyy)
-      if (!dateStr.match(/\d{2}\/\d{2}\/\d{4}|\d{4}-\d{2}-\d{2}/)) continue;
-      const amt = Number(r[5]) || 0;
-      if (!amt) continue; // ข้ามยอด 0
+      if (!dateStr.match(/\d{2}\/\d{2}\/\d{4}/)) continue; // ข้าม BEGINNING BALANCE / junk
+      
+      let amt, desc, ref;
+      if (isHistorical) {
+        // Format B: col 2=Description, col 4=Amount (text "1,638.00")
+        amt = Number(String(r[4]||'').replace(/,/g,'')) || 0;
+        desc = String(r[2] || '');
+        ref = String(r[2] || '').substring(0, 30);
+      } else {
+        // Format A: col 3=Description, col 5=Amount (number)
+        amt = Number(String(r[5]||'').replace(/,/g,'')) || 0;
+        desc = String(r[3] || '');
+        ref = String(r[3] || '').substring(0, 30);
+      }
+      
+      if (!amt) continue;
       rows.push({ 
         bank, 
         date: convertDate(dateStr), 
         time: extractTimeStr(dateStr), 
-        ref_no: String(r[3] || '').substring(0, 30),
-        description: String(r[3] || ''), 
+        ref_no: ref,
+        description: desc, 
         amount: amt, 
         match_status: 'unmatched' 
       });
