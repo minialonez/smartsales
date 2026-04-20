@@ -408,6 +408,42 @@ function truncationFooter(totalCount, origTotal) {
   return `<span style="color:var(--warn);margin-left:8px">⚠️ แสดง ${PERF_MAX_VISIBLE_ROWS} จาก ${totalCount} — กรองเพื่อเห็นเฉพาะที่ต้องการ</span>`;
 }
 
+// ══════════════════════════════════════════════════════════
+// Global Sort Order System
+//   - Default: ASC (เก่า → ใหม่)
+//   - ใช้กับทุกหน้าที่มี list — toggle ได้ด้วยปุ่ม
+// ══════════════════════════════════════════════════════════
+const sortOrders = (() => {
+  try { return JSON.parse(localStorage.getItem('sf_sortOrders') || '{}'); }
+  catch (e) { return {}; }
+})();
+
+function getSortOrder(pageKey) {
+  return sortOrders[pageKey] || 'asc'; // default ASC
+}
+
+function toggleSortOrder(pageKey) {
+  sortOrders[pageKey] = getSortOrder(pageKey) === 'asc' ? 'desc' : 'asc';
+  try { localStorage.setItem('sf_sortOrders', JSON.stringify(sortOrders)); } catch(e) {}
+  return sortOrders[pageKey];
+}
+
+// Reusable toggle button HTML
+function sortToggleBtn(pageKey) {
+  const isAsc = getSortOrder(pageKey) === 'asc';
+  return `<button class="btn btn-outline btn-sm sort-toggle" data-page-key="${pageKey}" title="${isAsc?'เก่า → ใหม่ (กดเพื่อกลับ)':'ใหม่ → เก่า (กดเพื่อกลับ)'}" style="padding:4px 10px;font-size:.78rem">
+    ${isAsc ? '↑ เก่า→ใหม่' : '↓ ใหม่→เก่า'}
+  </button>`;
+}
+
+// Generic date sorter (ASC)
+function sortByDateAsc(arr, getDate) {
+  return arr.sort((a, b) => (parseThaiDate(getDate(a)) || 0) - (parseThaiDate(getDate(b)) || 0));
+}
+function sortByDateDesc(arr, getDate) {
+  return arr.sort((a, b) => (parseThaiDate(getDate(b)) || 0) - (parseThaiDate(getDate(a)) || 0));
+}
+
 
 // ── Excel / CSV File Parser ──
 function parseExcelFile(file) {
@@ -1354,22 +1390,9 @@ async function restoreMainState() {
     if (cleaned > 0) console.log(`Cleaned bank field from ${cleaned} SP/SC/JS/JR bills`);
   }
   
-  // ── Auto dedup: ลบ statement ซ้ำ (date+time+amount+ref_no ตรงเป๊ะ) ──
-  if (Object.keys(statementsByBank).some(k => (statementsByBank[k]||[]).length > 0)) {
-    const removed = dedupAllStatements();
-    if (removed > 0) {
-      console.log(`Auto-deduped ${removed} duplicate statements`);
-      uploadedStatements = getAllStatements();
-      // save back
-      try {
-        const req = indexedDB.open('SmartFinanceDB', 1);
-        req.onsuccess = (e) => {
-          const tx = e.target.result.transaction('data', 'readwrite');
-          tx.objectStore('data').put(JSON.stringify(statementsByBank), 'sf_statementsByBank');
-        };
-      } catch(e) {}
-    }
-  }
+  // ── Auto dedup: ⚠️ DISABLED - เสี่ยงลบข้อมูลจริง ──
+  // ใช้ manual dedup เท่านั้น (ใน addStatementRows ตอน import จะ dedup อัตโนมัติ)
+  // ถ้าจำเป็นต้อง dedup ทั้งหมด → เรียก dedupAllStatements() เอง
   
   // ── Auto-sync: บิล matched ที่ขาด confirmation → เติมจาก statement ที่ match ──
   // ── ALSO: บิลที่ statement บอกว่า matched แต่ bill ยัง pending → sync ให้ ──
@@ -3893,6 +3916,14 @@ async function renderPayments(el) {
       );
     }
     
+    // Sort by date (default ASC, toggle-able)
+    const _spOrder = getSortOrder('payment');
+    data = [...data].sort((a, b) => {
+      const da = parseThaiDate(a.date) || 0;
+      const db = parseThaiDate(b.date) || 0;
+      return _spOrder === 'asc' ? da - db : db - da;
+    });
+    
     // PERF: truncate rendering
     const _t = truncateForRender(data);
     const visibleData = _t.visible;
@@ -3925,10 +3956,12 @@ async function renderPayments(el) {
       </div>
 
       <!-- Filter pills -->
-      <div class="flex gap-2 mb-3">
+      <div class="flex gap-2 mb-3 items-center">
         <button class="pill ${filterStatus==='ALL'?'active':''}" data-fs="ALL">ทั้งหมด (${paymentList.length})</button>
         <button class="pill ${filterStatus==='pending'?'active':''}" data-fs="pending">รอ Match (${pendingCount})</button>
         <button class="pill ${filterStatus==='matched'?'active':''}" data-fs="matched">Matched (${matchedCount})</button>
+        <span style="margin-left:auto"></span>
+        ${sortToggleBtn('payment')}
       </div>
 
       <div class="card-flat">
@@ -4148,6 +4181,12 @@ async function renderPayments(el) {
     el.querySelectorAll('.pill[data-fs]').forEach(btn => {
       btn.addEventListener('click', () => { filterStatus = btn.dataset.fs; render(); });
     });
+    el.querySelectorAll('.sort-toggle').forEach(btn => {
+      btn.addEventListener('click', () => {
+        toggleSortOrder(btn.dataset.pageKey);
+        render();
+      });
+    });
     el.querySelectorAll('.sp-row').forEach(row => {
       row.addEventListener('click', (e) => {
         // ถ้าคลิกปุ่ม rename → ไม่ toggle
@@ -4247,8 +4286,13 @@ async function renderCashflow(el) {
         return true;
       });
     }
-    // Sort: วันใหม่ก่อน
-    data.sort((a,b) => (parseThaiDate(b.date)||0) - (parseThaiDate(a.date)||0));
+    // Sort by date (default ASC, toggle-able)
+    const _cfOrder = getSortOrder('cashflow');
+    data.sort((a, b) => {
+      const da = parseThaiDate(a.date) || 0;
+      const db = parseThaiDate(b.date) || 0;
+      return _cfOrder === 'asc' ? da - db : db - da;
+    });
     
     // PERF: truncate
     const _t = truncateForRender(data);
@@ -4310,6 +4354,7 @@ async function renderCashflow(el) {
         <span style="flex:1"></span>
         <input type="date" class="input" id="cf-date-from" value="${filterDateFrom}" style="width:140px;font-size:.8rem" placeholder="จาก">
         <input type="date" class="input" id="cf-date-to" value="${filterDateTo}" style="width:140px;font-size:.8rem" placeholder="ถึง">
+        ${sortToggleBtn('cashflow')}
       </div>
 
       <!-- Table -->
@@ -4401,6 +4446,12 @@ async function renderCashflow(el) {
     });
     document.getElementById('cf-date-from')?.addEventListener('change', e => { filterDateFrom = e.target.value; render(); });
     document.getElementById('cf-date-to')?.addEventListener('change', e => { filterDateTo = e.target.value; render(); });
+    el.querySelectorAll('.sort-toggle').forEach(btn => {
+      btn.addEventListener('click', () => {
+        toggleSortOrder(btn.dataset.pageKey);
+        render();
+      });
+    });
 
     // Add buttons
     document.getElementById('btn-add-deposit')?.addEventListener('click', () => openCashflowModal('deposit'));
@@ -6547,7 +6598,12 @@ async function renderTransferLog(el) {
     }
     
     // Sort: newest first
-    data.sort((a,b) => (toISODate(b.transfer_date)||'').localeCompare(toISODate(a.transfer_date)||''));
+    const _tlOrder = getSortOrder('transferlog');
+    data.sort((a, b) => {
+      const da = toISODate(a.transfer_date) || '';
+      const db = toISODate(b.transfer_date) || '';
+      return _tlOrder === 'asc' ? da.localeCompare(db) : db.localeCompare(da);
+    });
     
     // PERF: truncate
     const _t = truncateForRender(data);
@@ -6617,6 +6673,8 @@ async function renderTransferLog(el) {
         <span class="text-xs text-dim">ช่วงวัน:</span>
         <input type="date" class="input" id="tl-from" value="${dateFrom}" style="width:140px;font-size:.8rem">
         <input type="date" class="input" id="tl-to" value="${dateTo}" style="width:140px;font-size:.8rem">
+        <span style="margin-left:auto"></span>
+        ${sortToggleBtn('transferlog')}
       </div>
 
       <!-- Table -->
@@ -6687,6 +6745,12 @@ async function renderTransferLog(el) {
     document.getElementById('tl-cat')?.addEventListener('change', e => { filterCategory = e.target.value; render(); });
     document.getElementById('tl-from')?.addEventListener('change', e => { dateFrom = e.target.value; render(); });
     document.getElementById('tl-to')?.addEventListener('change', e => { dateTo = e.target.value; render(); });
+    el.querySelectorAll('.sort-toggle').forEach(btn => {
+      btn.addEventListener('click', () => {
+        toggleSortOrder(btn.dataset.pageKey);
+        render();
+      });
+    });
     el.querySelectorAll('.pill[data-fv]').forEach(btn => {
       btn.addEventListener('click', () => { filterVat = btn.dataset.fv; render(); });
     });
@@ -8847,8 +8911,13 @@ async function renderMatching(el) {
       });
     }
     
-    // Sort DESC by date (ใหม่สุดก่อน — เห็นรายการล่าสุดทันที)
-    data.sort((a, b) => (parseThaiDate(b.date) || 0) - (parseThaiDate(a.date) || 0));
+    // Sort by date (default ASC, toggle-able via button)
+    const _order = getSortOrder('statement');
+    data.sort((a, b) => {
+      const da = parseThaiDate(a.date) || 0;
+      const db = parseThaiDate(b.date) || 0;
+      return _order === 'asc' ? da - db : db - da;
+    });
     
     // Truncate for render (หลัง filter แล้ว — ไม่ตัดข้อมูลที่ต้องการ)
     const MAX_ROWS = 1000;
@@ -8896,6 +8965,8 @@ async function renderMatching(el) {
         <span class="text-xs">→</span>
         <input type="date" class="input" id="match-date-to" value="${dateTo}" style="width:145px;padding:3px 6px;font-size:.78rem" title="ถึง">
         ${dateFrom||dateTo?'<button class="btn btn-ghost btn-sm" id="match-date-clear" style="color:var(--danger);padding:2px 6px">✕</button>':''}
+        <span style="margin-left:auto"></span>
+        ${sortToggleBtn('statement')}
       </div>
       <div class="flex gap-3 flex-wrap mb-3 stagger">
         ${statCard('Matched', totalMatched, '', 'var(--success)', ICONS.check)}
@@ -8947,6 +9018,13 @@ async function renderMatching(el) {
     document.getElementById('match-date-from')?.addEventListener('change', e => { dateFrom = e.target.value; render(); });
     document.getElementById('match-date-to')?.addEventListener('change', e => { dateTo = e.target.value; render(); });
     document.getElementById('match-date-clear')?.addEventListener('click', () => { dateFrom = ''; dateTo = ''; render(); });
+    // Sort toggle button (reusable — ใช้ใน el scope)
+    el.querySelectorAll('.sort-toggle').forEach(btn => {
+      btn.addEventListener('click', () => {
+        toggleSortOrder(btn.dataset.pageKey);
+        render();
+      });
+    });
     document.getElementById('btn-stmt-upload')?.addEventListener('click', () => {
       triggerFileUpload('file-stmt', (result, name) => { handleStmtUpload(result, name); render(); });
     });
