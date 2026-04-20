@@ -9723,26 +9723,27 @@ async function renderMatching(el) {
             };
           });
         
-        // ยอดตรง ±5% หรือ ±1 บาท
+        // ยอดตรง ±5% หรือ ±1 บาท (ใช้ absolute รองรับเงินเข้า/ออก)
+        const absStmt = Math.abs(stmtAmt);
         const candidates = [
           ...billList.filter(b => {
             if (b.match_status === 'matched' || b.match_status === 'paid') return false;
-            const amtDiff = Math.abs(Number(b.amount) - stmtAmt);
-            return amtDiff < 1 || amtDiff < stmtAmt * 0.05;
+            const amtDiff = Math.abs(Math.abs(Number(b.amount)) - absStmt);
+            return amtDiff < 1 || amtDiff < absStmt * 0.05;
           }),
           ...cashflowCandidates.filter(c => {
-            const amtDiff = Math.abs(Number(c.amount) - stmtAmt);
-            return amtDiff < 1 || amtDiff < Math.abs(stmtAmt) * 0.05;
+            const amtDiff = Math.abs(Math.abs(Number(c.amount)) - absStmt);
+            return amtDiff < 1 || amtDiff < absStmt * 0.05;
           }),
           ...spCandidates.filter(sp => {
-            const amtDiff = Math.abs(Math.abs(Number(sp.amount)) - Math.abs(stmtAmt));
-            return amtDiff < 1 || amtDiff < Math.abs(stmtAmt) * 0.05;
+            const amtDiff = Math.abs(Math.abs(Number(sp.amount)) - absStmt);
+            return amtDiff < 1 || amtDiff < absStmt * 0.05;
           }),
         ];
         // Sort: ยอดตรง + วันที่ใกล้ที่สุด
         candidates.sort((a, b) => {
-          const aExact = Math.abs(Number(a.amount) - stmtAmt) < 0.01 ? 0 : 1;
-          const bExact = Math.abs(Number(b.amount) - stmtAmt) < 0.01 ? 0 : 1;
+          const aExact = Math.abs(Math.abs(Number(a.amount)) - absStmt) < 0.01 ? 0 : 1;
+          const bExact = Math.abs(Math.abs(Number(b.amount)) - absStmt) < 0.01 ? 0 : 1;
           if (aExact !== bExact) return aExact - bExact;
           const aDate = toISODate(a.date), bDate = toISODate(b.date);
           return Math.abs(new Date(aDate) - new Date(stmtDate)) - Math.abs(new Date(bDate) - new Date(stmtDate));
