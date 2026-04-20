@@ -9014,71 +9014,130 @@ async function renderMatching(el) {
       });
     });
     document.getElementById('btn-auto-match')?.addEventListener('click', async () => {
-      toast('กำลัง Auto Match...', 'info');
-
-      // ══════════════════════════════════════════════════════════
-      // Auto Match v5 — กฎ:
-      //   1. วันเดียวกันเท่านั้น (ไม่ match ข้ามวัน)
-      //   2. ยอดตรง 100% (ไม่มี tolerance)
-      //   3. 1 Statement = 1 Bill (1:1)
-      //   4. เฉพาะ SS, OS, SP, บิลไม่มีเลข (Front) 
-      //      + Type = Transfer หรือ Card เท่านั้น
-      //   5. ห้าม match กับ SR, OR, SC, JS, JR (ใบลดหนี้/เครดิต)
-      //   6. ข้ามเงินออก (amount ≤ 0)
-      //   7. Mark ทั้ง bill + statement (ใช้ billList[index] ตรง)
-      //   8. ใส่ confirmation = bank, pay_date = bill.date
-      //   9. Save ลง IndexedDB ทันที
-      // ══════════════════════════════════════════════════════════
+      // ── เปิด modal เลือกช่วงวันที่ ──
+      const today = new Date().toISOString().substring(0, 10);
+      const stmtDates = [];
+      uploadedStatements.forEach(s => {
+        const d = toISODate(s.date || s.trans_date);
+        if (d) stmtDates.push(d);
+      });
+      stmtDates.sort();
+      const minDate = stmtDates[0] || today;
+      const maxDate = stmtDates[stmtDates.length - 1] || today;
       
+      openModal('🔍 Auto Match — เลือกช่วงวันที่', `
+        <div class="flex-col gap-3">
+          <div style="padding:10px;background:rgba(79,156,249,.08);border-radius:6px" class="text-xs">
+            <strong>📅 Statement ในระบบ:</strong> ${minDate} → ${maxDate} (${stmtDates.length} รายการ)
+          </div>
+          <div class="input-group">
+            <label>จากวันที่</label>
+            <input type="date" id="am-from" class="input" value="${minDate}" min="${minDate}" max="${maxDate}">
+          </div>
+          <div class="input-group">
+            <label>ถึงวันที่</label>
+            <input type="date" id="am-to" class="input" value="${maxDate}" min="${minDate}" max="${maxDate}">
+          </div>
+          <div class="flex gap-2">
+            <button class="btn btn-outline btn-sm" id="am-today">วันนี้</button>
+            <button class="btn btn-outline btn-sm" id="am-week">7 วันล่าสุด</button>
+            <button class="btn btn-outline btn-sm" id="am-month">30 วันล่าสุด</button>
+            <button class="btn btn-outline btn-sm" id="am-all">ทั้งหมด</button>
+          </div>
+          <div class="flex gap-2 mt-2">
+            <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ยกเลิก</button>
+            <button class="btn btn-primary btn-sm flex-1" id="am-start">${ICONS.pulse} เริ่ม Auto Match</button>
+          </div>
+        </div>
+      `);
+      
+      // Quick presets
+      document.getElementById('am-today')?.addEventListener('click', () => {
+        document.getElementById('am-from').value = today;
+        document.getElementById('am-to').value = today;
+      });
+      document.getElementById('am-week')?.addEventListener('click', () => {
+        const d = new Date(); d.setDate(d.getDate() - 7);
+        document.getElementById('am-from').value = d.toISOString().substring(0, 10);
+        document.getElementById('am-to').value = today;
+      });
+      document.getElementById('am-month')?.addEventListener('click', () => {
+        const d = new Date(); d.setDate(d.getDate() - 30);
+        document.getElementById('am-from').value = d.toISOString().substring(0, 10);
+        document.getElementById('am-to').value = today;
+      });
+      document.getElementById('am-all')?.addEventListener('click', () => {
+        document.getElementById('am-from').value = minDate;
+        document.getElementById('am-to').value = maxDate;
+      });
+      
+      document.getElementById('am-start')?.addEventListener('click', () => {
+        const dateFrom = document.getElementById('am-from').value;
+        const dateTo = document.getElementById('am-to').value;
+        if (!dateFrom || !dateTo) { toast('กรุณาเลือกวันที่', 'warn'); return; }
+        if (dateFrom > dateTo) { toast('วันเริ่มต้นต้องน้อยกว่าวันสุดท้าย', 'warn'); return; }
+        closeModal();
+        runAutoMatchRange(dateFrom, dateTo);
+      });
+    });
+    
+    // ══════════════════════════════════════════════════════════
+    // Auto Match — ช่วงวันที่ที่ระบุ
+    // ══════════════════════════════════════════════════════════
+    async function runAutoMatchRange(dateFrom, dateTo) {
+      toast(`กำลัง Auto Match: ${dateFrom} → ${dateTo}...`, 'info');
+
       const BAD_PREFIX = ['SR','OR','SC','JS','JR','PR','PS','MR','MS','PC','BR','BS'];
       const GOOD_TYPE = ['Transfer','Card'];
       
-      // ── สร้าง index: key = "ISO_DATE|AMOUNT" → [billList index] ──
-      const idx = {};    // key → [{ bi: billList index }]
-      const used = new Set(); // billList indexes ที่ใช้แล้ว
+      // Index บิลเฉพาะที่อยู่ในช่วงวันที่
+      const idx = {};
+      const used = new Set();
+      let billsInRange = 0;
       
       for (let bi = 0; bi < billList.length; bi++) {
         const b = billList[bi];
         if (b.match_status === 'matched' || b.match_status === 'paid' || b.match_status === 'void') continue;
         
-        // Filter: เฉพาะ SS/OS/SP/ว่าง + Transfer/Card
+        const d = toISODate(b.date);
+        if (!d || d < dateFrom || d > dateTo) continue; // ช่วงวันที่
+        
         const prefix = (b.bill_no || '').substring(0, 2).toUpperCase();
         if (prefix && BAD_PREFIX.indexOf(prefix) >= 0) continue;
         if (prefix && prefix !== 'SS' && prefix !== 'OS' && prefix !== 'SP') continue;
         if (GOOD_TYPE.indexOf(b.type) < 0) continue;
         
-        const d = toISODate(b.date);
         const amt = Math.round(Number(b.amount || 0));
-        if (!d || !amt) continue;
+        if (!amt) continue;
         
         const k = d + '|' + amt;
         if (!idx[k]) idx[k] = [];
         idx[k].push({ bi });
+        billsInRange++;
       }
       
-      // ── Match: แต่ละ statement หาบิลคู่ ──
-      let matched = 0, skippedNeg = 0, skippedNoKey = 0, noMatch = 0;
+      let matched = 0, skippedNeg = 0, skippedRange = 0, noMatch = 0, stmtsInRange = 0;
       
-      // วน uploadedStatements ซึ่ง = reference ตรงจาก statementsByBank
       uploadedStatements.forEach(stmt => {
         if (stmt.match_status === 'matched') return;
+        
+        const sd = toISODate(stmt.date || stmt.trans_date);
+        if (!sd) return;
+        if (sd < dateFrom || sd > dateTo) { skippedRange++; return; } // นอกช่วง
+        
+        stmtsInRange++;
         
         const sa = Number(stmt.amount || 0);
         if (sa <= 0) { skippedNeg++; return; }
         
-        const sd = toISODate(stmt.date || stmt.trans_date);
-        if (!sd) { skippedNoKey++; return; }
-        
         const k = sd + '|' + Math.round(sa);
         const candidates = idx[k] || [];
         
-        // หาบิลที่ยังไม่ถูกใช้ + ยอดตรง 100%
         let foundIdx = -1;
         for (let c = 0; c < candidates.length; c++) {
           const bi = candidates[c].bi;
           if (used.has(bi)) continue;
-          const bill = billList[bi];
-          if (Math.round(Number(bill.amount)) === Math.round(sa)) {
+          if (Math.round(Number(billList[bi].amount)) === Math.round(sa)) {
             foundIdx = bi;
             break;
           }
@@ -9086,16 +9145,14 @@ async function renderMatching(el) {
         
         if (foundIdx >= 0) {
           used.add(foundIdx);
-          const bill = billList[foundIdx]; // ใช้ billList[index] ตรง ไม่ผ่าน reference
+          const bill = billList[foundIdx];
           
-          // ═══ Mark BILL ═══
           bill.match_status = 'matched';
           bill.confirmation = stmt.bank || '';
           bill.pay_date = bill.date;
           bill.matched_stmt_ref = stmt.ref_no || '';
           bill.matched_at = new Date().toISOString();
           
-          // ═══ Mark STATEMENT ═══
           stmt.match_status = 'matched';
           stmt.match_station = bill.station || '';
           stmt.match_bill = bill.bill_no || `${bill.station}|${bill.type}|฿${bill.amount}`;
@@ -9108,32 +9165,7 @@ async function renderMatching(el) {
         }
       });
 
-      // ═══ VERIFY: ตรวจว่า bill + statement sync กัน ═══
-      let verified = 0, fixNeeded = 0;
-      uploadedStatements.forEach(stmt => {
-        if (stmt.match_status !== 'matched' || stmt.match_method !== 'auto_sameday') return;
-        const mb = stmt.match_bill || '';
-        // หาบิลคู่
-        let found = false;
-        if (mb && !mb.includes('|')) {
-          // มี bill_no
-          found = billList.some(b => b.bill_no === mb && b.match_status === 'matched');
-        } else if (mb.includes('|')) {
-          // generated key: station|type|฿amount
-          const parts = mb.split('|');
-          const station = parts[0], type = parts[1];
-          const amt = Number(String(parts[2] || '').replace('฿', ''));
-          const sd = toISODate(stmt.date || stmt.trans_date);
-          found = billList.some(b => 
-            b.match_status === 'matched' && b.station === station && b.type === type &&
-            Math.round(Number(b.amount)) === Math.round(amt) && toISODate(b.date) === sd
-          );
-        }
-        if (found) verified++;
-        else fixNeeded++;
-      });
-
-      // ═══ SAVE IndexedDB ═══
+      // Save to IndexedDB
       const req = indexedDB.open('SmartFinanceDB', 1);
       req.onsuccess = (e) => {
         const tx = e.target.result.transaction('data', 'readwrite');
@@ -9141,18 +9173,17 @@ async function renderMatching(el) {
         store.put(JSON.stringify(billList), 'sf_billList');
         store.put(JSON.stringify(statementsByBank), 'sf_statementsByBank');
         tx.oncomplete = () => {
-          const totalMatched = uploadedStatements.filter(s => s.match_status === 'matched').length;
-          const totalBillMatched = billList.filter(b => b.match_status === 'matched').length;
-          let msg = `✅ Auto Match — จับคู่ ${matched}`;
-          msg += ` · รวม: stmt ${totalMatched} / bill ${totalBillMatched}`;
-          msg += ` · เงินออก ${skippedNeg} · ไม่เจอ ${noMatch}`;
-          if (fixNeeded > 0) msg += ` · ⚠️ sync ผิด ${fixNeeded}`;
-          toast(msg, matched > 0 ? 'success' : 'warn', 10000);
+          let msg = `✅ Auto Match ${dateFrom} → ${dateTo}\n\n`;
+          msg += `✓ Match ได้: ${matched}\n`;
+          msg += `✗ ไม่เจอคู่: ${noMatch}\n`;
+          msg += `⊘ เงินออก (ข้าม): ${skippedNeg}\n\n`;
+          msg += `(Stmt ในช่วง: ${stmtsInRange} · Bills ในช่วง: ${billsInRange})`;
+          alert(msg);
           uploadedStatements = getAllStatements();
           render();
         };
       };
-    });
+    }
   }
   render();
 }
