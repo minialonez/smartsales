@@ -351,6 +351,13 @@ function fmtDate(d) {
   return str.split(' ')[0];
 }
 function fmtNum(n) { return new Intl.NumberFormat('th-TH',{minimumFractionDigits:2,maximumFractionDigits:2}).format(n); }
+// Sum diff formatter: +1, -18, +0.50 (sign prefix + integer when whole)
+function fmtDiff(n) {
+  const abs = Math.abs(n);
+  const isWhole = abs === Math.floor(abs);
+  const formatted = isWhole ? abs.toLocaleString('th-TH') : new Intl.NumberFormat('th-TH',{minimumFractionDigits:2,maximumFractionDigits:2}).format(abs);
+  return (n >= 0 ? '+' : '-') + formatted;
+}
 function fmtInt(n) { return new Intl.NumberFormat('th-TH').format(n); }
 
 function extractTimeStr(val) {
@@ -803,13 +810,19 @@ function validateBill(b, idx, allBills) {
     }
   }
   if (b.type === 'Transfer' && !b.bank) {
-    issues.push({ level:'warn', billIdx:idx, field:'bank', msg:`${billNo}: Type=Transfer แต่ยังไม่ได้เลือก Bank` });
+    // ข้ามสำหรับบิลที่ import มา (JSON/Smart/Summary ไม่มี bank field — ปกติ)
+    if (b.source === 'manual') {
+      issues.push({ level:'warn', billIdx:idx, field:'bank', msg:`${billNo}: Type=Transfer แต่ยังไม่ได้เลือก Bank` });
+    }
   }
   if (b.type === 'Cheque' && !b.expected_clear_date && b.match_status !== 'matched' && b.match_status !== 'bounced') {
     issues.push({ level:'warn', billIdx:idx, field:'expected_clear_date', msg:`${billNo}: Type=Cheque แต่ไม่มีวันที่คาดว่าเช็คเข้า` });
   }
   if ((b.station === 'Invoice Credit' || b.station === 'Order Credit') && !b.due_date) {
-    issues.push({ level:'warn', billIdx:idx, field:'due_date', msg:`${billNo}: บิลเครดิตแต่ยังไม่มี Due Date` });
+    // ข้ามสำหรับบิลที่ import มา (ไม่มี due_date — กรอกทีหลังได้)
+    if (b.source === 'manual') {
+      issues.push({ level:'warn', billIdx:idx, field:'due_date', msg:`${billNo}: บิลเครดิตแต่ยังไม่มี Due Date` });
+    }
   }
   
   return issues;
@@ -1929,20 +1942,25 @@ async function renderMain(el) {
       return { diff, isOk: Math.abs(diff) < 1.0, empty: false };
     }
     
-    // ── Invoice Credit / Order Credit: summary-only outflow ──
+    // ── Invoice Credit / Order Credit ──
+    // Business rule: Credit stations เก็บยอดลดหนี้/คืน → Refund = ยอดขาย → Sum = OK
+    // Invoice Credit: Excel มี Refund = ยอดขาย (จากสูตร SUMIFS)
+    // Order Credit: Excel ไม่มี Refund → auto-fill = ยอดขาย เพื่อให้ Sum = OK เหมือนกัน
     if (station === 'Invoice Credit' || station === 'Order Credit') {
+      const salesSummaryVal = summaryRow('ยอดขาย', station);
+      const sales = salesSummaryVal !== null ? salesSummaryVal : calcSales(station);
+      
       const cashOut = summaryOrZero('นำเงินออก', station);
       const returns = summaryOrZero('ยอดคืนสินค้า', station);
       const drawer = summaryOrZero('Cash Drawer', station);
       const transfer = summaryOrZero('Transfer', station);
       const card = summaryOrZero('Card', station);
       const cheque = summaryOrZero('Cheque', station);
-      const refund = summaryOrZero('Refund', station);
+      // Refund: ถ้า summary มี → ใช้ · ถ้าไม่มี → auto = sales (ทำให้ balance)
+      const refundRaw = summaryOrZero('Refund', station);
+      const refund = refundRaw || sales;
       
       const outflow = cashOut + returns + drawer + transfer + card + cheque + refund;
-      // Sales: summary ก่อน → bills (ถ้า summary = 0 ใช้ 0 จริง)
-      const salesSummaryVal = summaryRow('ยอดขาย', station);
-      const sales = salesSummaryVal !== null ? salesSummaryVal : calcSales(station);
       
       if (!outflow && !sales) return { diff: 0, isOk: null, empty: true };
       
@@ -2125,7 +2143,7 @@ async function renderMain(el) {
                     if (s === 'Invoice') {
                       // รวม 3 stations (Invoice+Order+Payment) เป็น cell เดียว colspan=3
                       const {diff, isOk, empty} = calcSumCheck('Invoice');
-                      const content = empty ? '-' : (isOk ? '✓ OK' : fmtNum(diff));
+                      const content = empty ? '-' : (isOk ? '✓ OK' : fmtDiff(diff));
                       const color = empty ? 'var(--text3)' : (isOk ? 'var(--success)' : 'var(--danger)');
                       cells.push(`<td colspan="3" data-sum-station="Invoice" style="text-align:center;font-weight:700;color:${color};border-left:1px dashed var(--border);border-right:1px dashed var(--border);background:rgba(91,124,250,.08)" title="รวม Invoice + Order + Payment">${content}</td>`);
                       return;
@@ -2139,7 +2157,7 @@ async function renderMain(el) {
                       cells.push(`<td data-sum-station="${s}" style="text-align:center;color:var(--text3)">-</td>`);
                       return;
                     }
-                    cells.push(`<td data-sum-station="${s}" style="text-align:center;font-weight:700;color:${isOk?'var(--success)':'var(--danger)'}">${isOk?'✓ OK':fmtNum(diff)}</td>`);
+                    cells.push(`<td data-sum-station="${s}" style="text-align:center;font-weight:700;color:${isOk?'var(--success)':'var(--danger)'}">${isOk?'✓ OK':fmtDiff(diff)}</td>`);
                   });
                   return cells.join('');
                 })()}
@@ -2408,7 +2426,7 @@ async function renderMain(el) {
     // cashIn: Front1-4 + Invoice (Merged with Order/Payment), cashOut: Front1 + Invoice (Merged), returns: Front1-3 + Invoice (Merged)
     const allowedStations = {
       cashIn: ['Front1','Front2','Front3','Front4','Invoice','Order','Payment'],
-      cashOut: ['Front1','Invoice','Order','Payment'],
+      cashOut: ['Front1','Front2','Front3','Front4','Invoice','Order','Payment'],
       returns: ['Front1','Front2','Front3','Front4','Invoice','Order','Payment'],
     };
     const allowed = allowedStations[key] || [];
@@ -2575,6 +2593,9 @@ async function renderMain(el) {
               return;
             }
             // Normalize bill format ให้ตรงกับระบบ
+            // SP/SC/JS/JR ไม่ auto-fill bank จาก confirmation
+            const _bp = String(b.bill_no || '').toUpperCase();
+            const _noBank = _bp.startsWith('SP') || _bp.startsWith('SC') || _bp.startsWith('JS') || _bp.startsWith('JR');
             const newBill = {
               bill_no: b.bill_no || '',
               date: b.date_th || b.date || '',
@@ -2585,7 +2606,7 @@ async function renderMain(el) {
               pay_date: b.pay_date || '',
               remarks1: b.remarks1 || '',
               remarks2: b.remarks2 || '',
-              bank: b.confirmation || '', // bank ที่ confirmation คือ KTB/BBL NW ฯลฯ
+              bank: _noBank ? '' : (b.confirmation || ''),
               match_status: 'pending',
               source: 'daily_import',
               source_file: b.source_file || '',
@@ -3298,7 +3319,7 @@ async function renderMain(el) {
         cell.textContent = '✓ OK';
         cell.style.color = 'var(--success)';
       } else {
-        cell.textContent = fmtNum(diff);
+        cell.textContent = fmtDiff(diff);
         cell.style.color = 'var(--danger)';
       }
     });
