@@ -2501,7 +2501,9 @@ async function renderMain(el) {
                   const isPaid = !isVoid && (b.match_status === 'paid' || b.match_status === 'matched');
                   const isAwaitingClear = !isVoid && (b.match_status === 'awaiting_clear' || (b.type === 'Cheque' && b.match_status !== 'matched' && b.match_status !== 'bounced'));
                   const isBounced = b.match_status === 'bounced';
-                  const isPendingMatch = !isVoid && !isPaid && !isAwaitingClear && !isBounced && 
+                  const billPrefix = (b.bill_no||'').substring(0,2).toUpperCase();
+                  const isCreditNote = !isVoid && !isPaid && ['SR','OR','SC','JS','JR'].includes(billPrefix);
+                  const isPendingMatch = !isVoid && !isPaid && !isAwaitingClear && !isBounced && !isCreditNote &&
                     (b.type === 'Transfer' || b.type === 'Card') &&
                     b.station !== 'Invoice Credit' && b.station !== 'Order Credit';
                   const billKey = b.bill_no ? `${b.bill_no}|${(b.type||'').trim()}|${Number(b.amount)||0}` : '';
@@ -2529,9 +2531,12 @@ async function renderMain(el) {
                   } else if (isAwaitingClear) {
                     rowStyle = 'background:rgba(245,166,35,.10);border-left:3px solid var(--warn)';
                     statusBadge = `<br><span class="badge badge-warn" style="margin-top:2px" title="เช็ครอเคลียร์">⏳ รอเช็คเข้า</span>`;
+                  } else if (isCreditNote) {
+                    rowStyle = 'background:rgba(160,100,255,.08);border-left:3px solid rgba(160,100,255,.6)';
+                    statusBadge = `<br><span class="badge" style="background:rgba(160,100,255,.15);color:#a064ff;margin-top:2px">📋 ใบลดหนี้</span>`;
                   } else if (isPendingMatch) {
-                    rowStyle = 'background:rgba(245,166,35,.05);border-left:3px solid rgba(245,166,35,.5)';
-                    statusBadge = `<br><span class="badge badge-warn" style="margin-top:2px;opacity:.8">⏳ รอ Match</span>`;
+                    rowStyle = 'background:rgba(239,87,87,.08);border-left:3px solid var(--danger)';
+                    statusBadge = `<br><span class="badge badge-danger" style="margin-top:2px">⚠ ยัง Match ไม่เจอ</span>`;
                   }
                   
                   return `<tr data-idx="${realIdx}" style="${rowStyle}">
@@ -8925,9 +8930,15 @@ async function renderMatching(el) {
       if (pendingBills.length === 0) { toast('ไม่มีบิลให้จับคู่', 'warn'); return; }
       
       // ── Index bills by (date + amount) ──
-      // ใช้ billList index เป็น unique ID
+      // เฉพาะ SS/OS/SP + บิลไม่มีเลข (Front) | Type = Transfer หรือ Card
+      const _goodPrefix = ['SS','OS','SP',''];
+      const _goodType = ['Transfer','Card'];
       const billIdx = {};
       pendingBills.forEach(b => {
+        const prefix = (b.bill_no||'').substring(0,2).toUpperCase();
+        const type = b.type || '';
+        if (_goodPrefix.indexOf(prefix) < 0) return;
+        if (_goodType.indexOf(type) < 0) return;
         const i = billList.indexOf(b);
         const d = toISODate(b.date);
         const amt = Math.round(Number(b.amount || 0));
