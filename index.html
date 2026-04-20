@@ -2607,7 +2607,7 @@ async function renderMain(el) {
           <button class="btn btn-primary btn-sm" id="btn-add-bill">${ICONS.plus} เพิ่มบิล</button>
           <button class="btn btn-outline btn-sm" id="btn-bulk-date">📅 Bulk</button>
           <button class="btn btn-outline btn-sm" id="btn-auto-duedate">⚡ Auto Due</button>
-          <button class="btn btn-outline btn-sm" id="btn-delete-by-date" style="color:var(--danger);border-color:var(--danger)">🗑 ลบตามวันที่</button>
+          <button class="btn btn-sm" id="btn-delete-selected" style="background:var(--danger);color:#fff;display:none">🗑 ลบที่เลือก (<span id="del-count">0</span>)</button>
           <button class="btn btn-outline btn-sm" id="btn-clear-bl">ล้าง</button>
         </div>
       </div>
@@ -2628,6 +2628,7 @@ async function renderMain(el) {
           <table>
             <thead>
               <tr>
+                <th style="width:30px"><input type="checkbox" id="chk-all-bills" title="เลือกทั้งหมด"></th>
                 <th>#</th>
                 <th>Bill Number</th>
                 <th>Bill Date</th>
@@ -2645,7 +2646,7 @@ async function renderMain(el) {
               </tr>
             </thead>
             <tbody>
-              ${data.length === 0 ? '<tr><td colspan="14" style="text-align:center;padding:40px;color:var(--text3)">ยังไม่มีข้อมูล — กด "Generate จาก Smart" เพื่อเริ่มต้น</td></tr>' :
+              ${data.length === 0 ? '<tr><td colspan="15" style="text-align:center;padding:40px;color:var(--text3)">ยังไม่มีข้อมูล — กด "Generate จาก Smart" เพื่อเริ่มต้น</td></tr>' :
                 (() => {
                   // หาบิลที่ซ้ำจริง (composite key: bill_no + type + amount)
                   // ไม่จับ split payment ว่าซ้ำ
@@ -2717,6 +2718,7 @@ async function renderMain(el) {
                   }
                   
                   return `<tr data-idx="${realIdx}" style="${rowStyle}">
+                    <td style="text-align:center"><input type="checkbox" class="chk-bill" data-idx="${realIdx}"></td>
                     <td class="text-xs text-muted">${idx+1} <span class="badge ${badgeCls}" style="margin-left:4px">${badgeText}</span>${statusBadge}</td>
                     <td style="font-weight:600;color:var(--text)">${b.bill_no||'-'}${isPaid&&b.paid_by_sp?`<br><span class="text-xs" style="color:var(--success)">← ${b.paid_by_sp}</span>`:''}</td>
                     <td style="position:relative"><input type="date" class="input bl-cell" data-field="date" value="${toISODate(b.date)}" style="padding:3px 6px;font-size:.78rem;width:130px">
@@ -3103,122 +3105,50 @@ async function renderMain(el) {
     document.getElementById('btn-toggle-change')?.addEventListener('click', () => {
       showChange = !showChange; render();
     });
-    // ── ลบบิลตามวันที่ (ช่วงวันหรือวันเดียว) ──
-    document.getElementById('btn-delete-by-date')?.addEventListener('click', () => {
-      openModal('🗑 ลบบิลตามวันที่', `
-        <div class="flex-col gap-3">
-          <p class="text-sm" style="color:var(--danger)">⚠️ ลบบิลภายในช่วงวันที่ที่เลือก — ไม่สามารถกู้คืนได้</p>
-          <div class="flex gap-2">
-            <div class="input-group flex-1">
-              <label>จากวันที่</label>
-              <input type="date" class="input" id="del-from" value="${todayISO()}">
-            </div>
-            <div class="input-group flex-1">
-              <label>ถึงวันที่</label>
-              <input type="date" class="input" id="del-to" value="${todayISO()}">
-            </div>
-          </div>
-          <div class="flex gap-2 flex-wrap">
-            <button class="btn btn-outline btn-sm" id="del-preset-today">วันนี้</button>
-            <button class="btn btn-outline btn-sm" id="del-preset-selected">วันที่เลือก (${fmtDate(selectedDate)})</button>
-          </div>
-          <div id="del-preview" style="padding:10px;background:rgba(239,87,87,.08);border-radius:6px;font-size:.85rem;min-height:40px;color:var(--text)">
-            เลือกวันที่เพื่อดูจำนวนบิลที่จะถูกลบ
-          </div>
-          <div class="flex gap-2 mt-2">
-            <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ยกเลิก</button>
-            <button class="btn btn-sm flex-1" id="del-confirm" style="background:var(--danger);color:#fff" disabled>🗑 ลบบิล</button>
-          </div>
-        </div>
-      `);
-      
-      const $from = document.getElementById('del-from');
-      const $to = document.getElementById('del-to');
-      const $preview = document.getElementById('del-preview');
-      const $confirm = document.getElementById('del-confirm');
-      
-      function updatePreview() {
-        const from = $from.value;
-        const to = $to.value;
-        if (!from || !to || from > to) {
-          $preview.innerHTML = '⚠️ วันที่ไม่ถูกต้อง';
-          $confirm.disabled = true;
-          return;
-        }
-        const toDelete = billList.filter(b => {
-          const d = toISODate(b.date);
-          return d && d >= from && d <= to;
-        });
-        if (toDelete.length === 0) {
-          $preview.innerHTML = 'ไม่พบบิลในช่วงวันที่นี้';
-          $confirm.disabled = true;
-          return;
-        }
-        // breakdown by station
-        const byStation = {};
-        toDelete.forEach(b => { byStation[b.station||'(ว่าง)'] = (byStation[b.station||'(ว่าง)']||0) + 1; });
-        const stationStr = Object.keys(byStation).sort().map(s => `${s}: ${byStation[s]}`).join(' · ');
-        $preview.innerHTML = `<strong style="color:var(--danger)">จะลบ ${toDelete.length} บิล</strong><br><span class="text-xs">${stationStr}</span>`;
-        $confirm.disabled = false;
+    
+    // ── Checkbox selection + Delete Selected ──
+    function updateDeleteButton() {
+      const checked = el.querySelectorAll('.chk-bill:checked');
+      const btn = document.getElementById('btn-delete-selected');
+      const countEl = document.getElementById('del-count');
+      if (!btn) return;
+      if (checked.length > 0) {
+        btn.style.display = 'inline-block';
+        if (countEl) countEl.textContent = checked.length;
+      } else {
+        btn.style.display = 'none';
       }
+    }
+    
+    el.querySelectorAll('.chk-bill').forEach(chk => {
+      chk.addEventListener('change', updateDeleteButton);
+    });
+    
+    document.getElementById('chk-all-bills')?.addEventListener('change', (e) => {
+      const checked = e.target.checked;
+      el.querySelectorAll('.chk-bill').forEach(chk => { chk.checked = checked; });
+      updateDeleteButton();
+    });
+    
+    document.getElementById('btn-delete-selected')?.addEventListener('click', () => {
+      const checked = el.querySelectorAll('.chk-bill:checked');
+      if (checked.length === 0) return;
       
-      $from.addEventListener('change', updatePreview);
-      $to.addEventListener('change', updatePreview);
+      const indexes = Array.from(checked).map(c => Number(c.dataset.idx));
+      const toDelete = indexes.map(i => billList[i]).filter(Boolean);
       
-      document.getElementById('del-preset-today')?.addEventListener('click', () => {
-        const t = todayISO();
-        $from.value = t; $to.value = t;
-        updatePreview();
-      });
-      document.getElementById('del-preset-selected')?.addEventListener('click', () => {
-        $from.value = selectedDate; $to.value = selectedDate;
-        updatePreview();
-      });
+      const byStation = {};
+      toDelete.forEach(b => { byStation[b.station||'(ว่าง)'] = (byStation[b.station||'(ว่าง)']||0) + 1; });
+      const stationStr = Object.keys(byStation).sort().map(s => `${s}: ${byStation[s]}`).join(', ');
       
-      $confirm.addEventListener('click', () => {
-        const from = $from.value;
-        const to = $to.value;
-        const toDelete = billList.filter(b => {
-          const d = toISODate(b.date);
-          return d && d >= from && d <= to;
-        });
-        if (toDelete.length === 0) return;
-        
-        if (!confirm(`ยืนยันลบ ${toDelete.length} บิล (${from} ถึง ${to})?\n\nการลบไม่สามารถกู้คืนได้`)) return;
-        
-        const before = billList.length;
-        billList = billList.filter(b => {
-          const d = toISODate(b.date);
-          return !d || d < from || d > to;
-        });
-        const deleted = before - billList.length;
-        
-        // ล้าง summary ใน __byDate สำหรับวันที่ในช่วง
-        if (mainSummary.__byDate) {
-          Object.keys(mainSummary.__byDate).forEach(d => {
-            const iso = toISODate(d) || d;
-            if (iso >= from && iso <= to) {
-              delete mainSummary.__byDate[d];
-            }
-          });
-        }
-        if (cashCount.__byDate) {
-          Object.keys(cashCount.__byDate).forEach(d => {
-            const iso = toISODate(d) || d;
-            if (iso >= from && iso <= to) {
-              delete cashCount.__byDate[d];
-            }
-          });
-        }
-        
-        persistMainState();
-        closeModal();
-        toast(`ลบ ${deleted} บิลสำเร็จ (${from} ถึง ${to})`, 'success');
-        render();
-      });
+      if (!confirm(`ยืนยันลบ ${toDelete.length} บิล?\n\n${stationStr}\n\n⚠️ ลบแล้วกู้คืนไม่ได้`)) return;
       
-      // Initial preview for today
-      updatePreview();
+      const toDeleteSet = new Set(toDelete);
+      billList = billList.filter(b => !toDeleteSet.has(b));
+      
+      persistMainState();
+      toast(`ลบ ${toDelete.length} บิลสำเร็จ`, 'success');
+      render();
     });
     
     document.getElementById('btn-clear-bl')?.addEventListener('click', () => {
