@@ -1583,18 +1583,8 @@ async function restoreMainState() {
     }
   } catch (e) { console.warn('Could not restore state:', e); }
   
-  // ── Cleanup: SP/SC/JS/JR bills ไม่ควรมี bank ──
-  if (billList.length > 0) {
-    let cleaned = 0;
-    billList.forEach(b => {
-      const prefix = String(b.bill_no || '').toUpperCase();
-      if ((prefix.startsWith('SP') || prefix.startsWith('SC') || prefix.startsWith('JS') || prefix.startsWith('JR')) && b.bank) {
-        b.bank = '';
-        cleaned++;
-      }
-    });
-    if (cleaned > 0) console.log(`Cleaned bank field from ${cleaned} SP/SC/JS/JR bills`);
-  }
+  // ── Bank field = USER MANUAL ENTRY ──
+  // ไม่แตะข้อมูล user อัตโนมัติ (เคย clear สำหรับ SP/SC/JS/JR แต่ทำให้ข้อมูลหาย)
   
   // ── Auto dedup: ⚠️ DISABLED - เสี่ยงลบข้อมูลจริง ──
   // ใช้ manual dedup เท่านั้น (ใน addStatementRows ตอน import จะ dedup อัตโนมัติ)
