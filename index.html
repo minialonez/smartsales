@@ -8769,86 +8769,94 @@ async function renderMatching(el) {
       });
     });
     document.getElementById('btn-auto-match')?.addEventListener('click', async () => {
-      toast('กำลัง Auto Match (วันเดียวกันเท่านั้น)...', 'info');
+      toast('กำลัง Auto Match (วันเดียวกัน + ยอดตรง)...', 'info');
 
       // ══════════════════════════════════════════════════════════
-      // Auto Match — กฎ: วันเดียวกันเท่านั้น + ยอดตรง (±1 บาท)
-      // ไม่ match ข้ามวัน → ป้องกันจับคู่ผิด
+      // Auto Match v4 — กฎ:
+      //   1. วันเดียวกันเท่านั้น
+      //   2. ยอดตรง ±1 บาท
+      //   3. 1 Statement = 1 Bill (1:1)
+      //   4. ใช้ temp Set (ไม่แก้ bill object ระหว่าง match)
+      //   5. Mark ทุกบิลที่ matched (รวมบิลไม่มี bill_no)
+      //   6. Save ลง IndexedDB ทันที
       // ══════════════════════════════════════════════════════════
       
-      const allBills = (billList||[]).filter(s => 
-        s.match_status !== 'matched' && s.match_status !== 'paid' && s.match_status !== 'void'
-      );
-      const allStmts = uploadedStatements.filter(s => s.match_status !== 'matched');
+      // ล้าง flag เก่า (ถ้ามี)
+      billList.forEach(b => { delete b._autoMatched; delete b._clientMatched; delete b._used; });
       
-      if (allStmts.length === 0) { toast('ไม่มี Statement ที่ยังไม่ matched', 'warn'); return; }
-      if (allBills.length === 0) { toast('ไม่มีบิลให้จับคู่', 'warn'); return; }
-      
-      // ── Group bills by date + amount (index เร็ว) ──
-      const alreadyUsed = new Set(
-        uploadedStatements.filter(s => s.match_status === 'matched' && s.match_bill).map(s => s.match_bill)
+      const pendingBills = billList.filter(b => 
+        b.match_status !== 'matched' && b.match_status !== 'paid' && b.match_status !== 'void'
       );
-      const billIndex = {}; // key = "YYYY-MM-DD|roundedAmt"
-      allBills.forEach(b => {
-        if (b.bill_no && alreadyUsed.has(b.bill_no)) return;
+      const pendingStmts = uploadedStatements.filter(s => s.match_status !== 'matched');
+      
+      if (pendingStmts.length === 0) { toast('ไม่มี Statement ที่ยังไม่ matched', 'warn'); return; }
+      if (pendingBills.length === 0) { toast('ไม่มีบิลให้จับคู่', 'warn'); return; }
+      
+      // ── Index bills by (date + amount) ──
+      // ใช้ billList index เป็น unique ID
+      const billIdx = {};
+      pendingBills.forEach(b => {
+        const i = billList.indexOf(b);
         const d = toISODate(b.date);
         const amt = Math.round(Number(b.amount || 0));
         if (!d || !amt) return;
-        // index ±1 baht
         for (let a = amt - 1; a <= amt + 1; a++) {
-          const key = d + '|' + a;
-          if (!billIndex[key]) billIndex[key] = [];
-          billIndex[key].push(b);
+          const k = d + '|' + a;
+          if (!billIdx[k]) billIdx[k] = [];
+          billIdx[k].push({ i, b });
         }
       });
       
+      const used = new Set(); // bill indexes ที่ใช้แล้วในรอบนี้
       let matched = 0, noAmt = 0, noDate = 0;
       
-      allStmts.forEach(stmt => {
-        const stmtAmt = Number(stmt.amount || 0);
-        const stmtDate = toISODate(stmt.date || stmt.trans_date);
-        if (!stmtAmt || !stmtDate) return;
+      pendingStmts.forEach(stmt => {
+        const sa = Number(stmt.amount || 0);
+        const sd = toISODate(stmt.date || stmt.trans_date);
+        if (!sa || !sd) return;
         
-        // ── หาบิล: วันเดียวกัน + ยอดตรง (±1 บาท) ──
-        const key = stmtDate + '|' + Math.round(stmtAmt);
-        const candidates = billIndex[key] || [];
+        const k = sd + '|' + Math.round(sa);
+        const cs = billIdx[k] || [];
         
-        const bill = candidates.find(b => {
-          if (b._autoMatched) return false;
-          return Math.abs(Number(b.amount) - stmtAmt) <= 1.0;
-        });
+        const found = cs.find(c => !used.has(c.i) && Math.abs(Number(c.b.amount) - sa) <= 1.0);
         
-        if (bill) {
-          bill._autoMatched = true;
+        if (found) {
+          used.add(found.i);
+          // Mark bill
+          found.b.match_status = 'matched';
+          found.b.matched_stmt_ref = stmt.ref_no || '';
+          found.b.matched_at = new Date().toISOString();
+          // Mark statement
           stmt.match_status = 'matched';
-          stmt.match_station = bill.station || '';
-          stmt.match_bill = bill.bill_no || `${bill.station}|${bill.type}|฿${bill.amount}`;
+          stmt.match_station = found.b.station || '';
+          stmt.match_bill = found.b.bill_no || `${found.b.station}|${found.b.type}|฿${found.b.amount}`;
           stmt.matched_at = new Date().toISOString();
           stmt.match_method = 'auto_sameday';
-          if (bill.bill_no) {
-            bill.match_status = 'matched';
-            bill.matched_stmt_ref = stmt.ref_no || '';
-          }
           matched++;
         } else {
-          // วิเคราะห์สาเหตุ: มีบิลวันนี้ไหม?
-          const anyBillToday = allBills.some(b => toISODate(b.date) === stmtDate);
-          if (!anyBillToday) noDate++;
+          if (!pendingBills.some(b => toISODate(b.date) === sd)) noDate++;
           else noAmt++;
         }
       });
 
-      // Persist
-      try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(e) {}
-      if (matched > 0) persistMainState();
-
-      const total = allStmts.length;
-      if (matched > 0) {
-        toast(`✅ Auto Match — จับคู่ ${matched}/${total} · ไม่มีบิลวันนั้น ${noDate} · ยอดไม่ตรง ${noAmt}`, 'success', 8000);
-      } else {
-        toast(`⚠️ ไม่เจอคู่ — ไม่มีบิลวันนั้น ${noDate} · ยอดไม่ตรง ${noAmt} (stmt ${total} · bills ${allBills.length})`, 'warn', 8000);
+      // Save to IndexedDB
+      try {
+        const req = indexedDB.open('SmartFinanceDB', 1);
+        req.onsuccess = (e) => {
+          const tx = e.target.result.transaction('data', 'readwrite');
+          const store = tx.objectStore('data');
+          store.put(JSON.stringify(billList), 'sf_billList');
+          store.put(JSON.stringify(statementsByBank), 'sf_statementsByBank');
+          tx.oncomplete = () => {
+            const totalMatched = uploadedStatements.filter(s => s.match_status === 'matched').length;
+            toast(`✅ Auto Match — จับคู่ ${matched} · รวม matched ${totalMatched} · ไม่มีบิลวันนั้น ${noDate} · ยอดไม่ตรง ${noAmt}`, 'success', 8000);
+            uploadedStatements = getAllStatements();
+            render();
+          };
+        };
+      } catch(e) {
+        toast(`Match ${matched} แต่ save ล้มเหลว: ${e.message}`, 'error');
       }
-      render();
     });
   }
   render();
