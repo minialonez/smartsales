@@ -8693,208 +8693,86 @@ async function renderMatching(el) {
       });
     });
     document.getElementById('btn-auto-match')?.addEventListener('click', async () => {
-      toast('กำลัง Auto Match...', 'info');
+      toast('กำลัง Auto Match (วันเดียวกันเท่านั้น)...', 'info');
 
-      // ── ลอง Backend ก่อน ──
-      const res = await api('autoMatch', { date: formatDateKey(todayISO()), action_by: currentUser?.display_name || 'Admin' });
-
-      if (res.success && res.data && res.data.matched > 0) {
-        toast(`Auto Match (Server) สำเร็จ — จับคู่ได้ ${res.data.matched} รายการ`, 'success');
-        render();
-        return;
-      }
-
-      // ── Fallback: Client-side match จากข้อมูลที่โหลดมาแล้ว ──
-      // จับคู่โดย: ยอดตรง (±1 บาท) + วันที่ตรง/ใกล้เคียง (±2 วัน)
-      const cashflowAsSales = (cashflowList||[]).map(c => ({
-        bill_no: c.id,
-        amount: c.type === 'supplier' ? -Math.abs(c.amount) : c.amount,
-        date: c.date,
-        station: 'Cashflow',
-        type: 'Transfer',
-        _cashflow: c,
-      }));
-      const supplierAsSales = (supplierPayments||[])
-        .filter(p => p.status === 'paid' && p.match_status !== 'matched')
-        .map(p => ({
-          bill_no: p.pp_no || p.id,
-          amount: -Math.abs(p.amount),
-          date: p.transfer_date,
-          station: 'Supplier Payment',
-          type: 'Transfer',
-          _supplierPayment: p,
-        }));
-      // ── รวมทุก bill type (ไม่ใช่แค่ Transfer) เพราะ statement อาจตรงกับ Cash/Card ด้วย ──
-      const allSales = [...(billList||[]), ...(uploadedSales||[]), ...cashflowAsSales, ...supplierAsSales]
-        .filter(s => {
-          // ข้ามบิลที่ matched แล้ว
-          if (s.match_status === 'matched' || s.match_status === 'paid') return false;
-          // ข้ามบิลที่ยกเลิก
-          if (s.match_status === 'void') return false;
-          return true;
-        });
+      // ══════════════════════════════════════════════════════════
+      // Auto Match — กฎ: วันเดียวกันเท่านั้น + ยอดตรง (±1 บาท)
+      // ไม่ match ข้ามวัน → ป้องกันจับคู่ผิด
+      // ══════════════════════════════════════════════════════════
       
-      if (data.length > 0 && allSales.length > 0) {
-        let clientMatched = 0;
-        let skippedAlreadyMatched = 0;
+      const allBills = (billList||[]).filter(s => 
+        s.match_status !== 'matched' && s.match_status !== 'paid' && s.match_status !== 'void'
+      );
+      const allStmts = uploadedStatements.filter(s => s.match_status !== 'matched');
+      
+      if (allStmts.length === 0) { toast('ไม่มี Statement ที่ยังไม่ matched', 'warn'); return; }
+      if (allBills.length === 0) { toast('ไม่มีบิลให้จับคู่', 'warn'); return; }
+      
+      // ── Group bills by date + amount (index เร็ว) ──
+      const alreadyUsed = new Set(
+        uploadedStatements.filter(s => s.match_status === 'matched' && s.match_bill).map(s => s.match_bill)
+      );
+      const billIndex = {}; // key = "YYYY-MM-DD|roundedAmt"
+      allBills.forEach(b => {
+        if (b.bill_no && alreadyUsed.has(b.bill_no)) return;
+        const d = toISODate(b.date);
+        const amt = Math.round(Number(b.amount || 0));
+        if (!d || !amt) return;
+        // index ±1 baht
+        for (let a = amt - 1; a <= amt + 1; a++) {
+          const key = d + '|' + a;
+          if (!billIndex[key]) billIndex[key] = [];
+          billIndex[key].push(b);
+        }
+      });
+      
+      let matched = 0, noAmt = 0, noDate = 0;
+      
+      allStmts.forEach(stmt => {
+        const stmtAmt = Number(stmt.amount || 0);
+        const stmtDate = toISODate(stmt.date || stmt.trans_date);
+        if (!stmtAmt || !stmtDate) return;
         
-        const alreadyMatchedBillNos = new Set(
-          data.filter(s => s.match_status === 'matched' && s.match_bill)
-              .map(s => s.match_bill)
-        );
+        // ── หาบิล: วันเดียวกัน + ยอดตรง (±1 บาท) ──
+        const key = stmtDate + '|' + Math.round(stmtAmt);
+        const candidates = billIndex[key] || [];
         
-        // ── Index bills by rounded amount สำหรับ lookup เร็ว ──
-        const billsByAmt = {};
-        allSales.forEach(s => {
-          const billNo = s.bill_no || '';
-          if (billNo && alreadyMatchedBillNos.has(billNo)) return;
-          const amt = Math.round(Number(s.amount || 0));
-          if (!amt) return;
-          // index ±1
-          for (let a = amt - 1; a <= amt + 1; a++) {
-            if (!billsByAmt[a]) billsByAmt[a] = [];
-            billsByAmt[a].push(s);
-          }
-        });
-
-        data.forEach(stmt => {
-          if (stmt.match_status === 'matched') {
-            skippedAlreadyMatched++;
-            return;
-          }
-          const stmtAmt = Number(stmt.amount || 0);
-          const stmtDate = toISODate(stmt.date || stmt.trans_date);
-          if (!stmtAmt) return;
-
-          // หาบิลที่ยอดตรง (±1 บาท) จาก index
-          const candidates = billsByAmt[Math.round(stmtAmt)] || [];
-          const match = candidates.find(sale => {
-            if (sale._clientMatched) return false;
-            const saleAmt = Number(sale.amount || 0);
-            if (Math.abs(saleAmt - stmtAmt) > 1.0) return false;
-            // วันที่: ±2 วัน
-            const saleDate = toISODate(sale.date || sale.source_date);
-            if (saleDate && stmtDate) {
-              const diffMs = Math.abs(new Date(saleDate) - new Date(stmtDate));
-              const diffDays = diffMs / (1000 * 60 * 60 * 24);
-              if (diffDays > 2) return false;
-            }
-            return true;
-          });
-
-          if (match) {
-            match._clientMatched = true;
-            stmt.match_status = 'matched';
-            stmt.match_station = match.station || match.Station || '';
-            stmt.match_bill = match.bill_no || match['Bill Number'] || '';
-            stmt.matched_at = new Date().toISOString();
-            // ถ้า match กับ cashflow → mark cashflow ด้วย
-            if (match._cashflow) {
-              match._cashflow.match_status = 'matched';
-              match._cashflow.match_stmt_ref = stmt.ref_no || '';
-            }
-            // ถ้า match กับ supplier payment → mark ด้วย
-            if (match._supplierPayment) {
-              match._supplierPayment.match_status = 'matched';
-              match._supplierPayment.match_stmt_ref = stmt.ref_no || '';
-            }
-            clientMatched++;
-          }
+        const bill = candidates.find(b => {
+          if (b._autoMatched) return false;
+          return Math.abs(Number(b.amount) - stmtAmt) <= 1.0;
         });
         
-        // ══════════════════════════════════════════════════════════════
-        // Cheque Auto-Match — เช็คจ่ายเจ้าหนี้ → เงินออก KTB
-        // ══════════════════════════════════════════════════════════════
-        let chequeMatched = 0;
-        const pendingCheques = (supplierPayments||[])
-          .filter(p => p.status === 'paid' 
-                    && p.payment_method === 'เช็ค' 
-                    && !p.cheque_cleared_date
-                    && p.match_status !== 'matched');
-        
-        if (pendingCheques.length > 0) {
-          // KTB withdrawals (เงินออก) ที่ยังไม่ match
-          const ktbWithdrawals = data.filter(stmt => {
-            if (stmt.match_status === 'matched') return false;
-            if (stmt.bank !== 'KTB') return false;
-            const amt = Number(stmt.amount || 0);
-            // เงินออก: amount < 0 หรือ direction=debit/withdraw/out
-            const dir = (stmt.direction || stmt.dr_cr || '').toLowerCase();
-            const isOut = amt < 0 || dir === 'debit' || dir === 'withdraw' || dir === 'dr' || dir === 'out';
-            return isOut;
-          });
-          
-          ktbWithdrawals.forEach(stmt => {
-            if (stmt.match_status === 'matched') return;
-            const stmtAmt = Math.abs(Number(stmt.amount || 0));
-            const stmtDate = toISODate(stmt.date || stmt.trans_date);
-            if (!stmtAmt) return;
-            
-            // Match: ยอดตรง + cheque_date ภายใน 30 วันก่อน statement date
-            const match = pendingCheques.find(chq => {
-              if (chq._matched) return false;
-              const chqAmt = Math.abs(Number(chq.amount) || 0);
-              if (Math.abs(chqAmt - stmtAmt) > 0.01) return false;
-              const chqDate = toISODate(chq.cheque_date || chq.transfer_date);
-              if (!chqDate || !stmtDate) return true; // ยอดตรงก็พอ (ถ้าไม่มีวัน)
-              const diffDays = (new Date(stmtDate) - new Date(chqDate)) / (1000 * 60 * 60 * 24);
-              // เช็คขึ้นเงินหลังเขียน 0-60 วัน
-              return diffDays >= -1 && diffDays <= 60;
-            });
-            
-            if (match) {
-              match._matched = true;
-              match.match_status = 'matched';
-              match.match_stmt_ref = stmt.ref_no || '';
-              match.cheque_cleared_date = stmtDate;
-              match.cleared_statement_ref = stmt.ref_no || '';
-              match.cleared_at = new Date().toISOString();
-              
-              stmt.match_status = 'matched';
-              stmt.match_method = 'cheque_auto';
-              stmt.match_station = '📝 เช็ค';
-              stmt.match_bill = match.cheque_no || match.pp_no || match.id;
-              stmt.matched_at = new Date().toISOString();
-              
-              chequeMatched++;
-            }
-          });
-          
-          if (chequeMatched > 0) {
-            persistMainState();
+        if (bill) {
+          bill._autoMatched = true;
+          stmt.match_status = 'matched';
+          stmt.match_station = bill.station || '';
+          stmt.match_bill = bill.bill_no || `${bill.station}|${bill.type}|฿${bill.amount}`;
+          stmt.matched_at = new Date().toISOString();
+          stmt.match_method = 'auto_sameday';
+          if (bill.bill_no) {
+            bill.match_status = 'matched';
+            bill.matched_stmt_ref = stmt.ref_no || '';
           }
+          matched++;
+        } else {
+          // วิเคราะห์สาเหตุ: มีบิลวันนี้ไหม?
+          const anyBillToday = allBills.some(b => toISODate(b.date) === stmtDate);
+          if (!anyBillToday) noDate++;
+          else noAmt++;
         }
+      });
 
-        // Persist updated statements (เก็บสถานะ matched ไว้)
-        if (clientMatched > 0 || chequeMatched > 0) {
-          try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(e) {}
-          const skipMsg = skippedAlreadyMatched > 0 ? ` · ข้าม ${skippedAlreadyMatched} ที่ match แล้ว (ไม่ทับ)` : '';
-          const chqMsg = chequeMatched > 0 ? ` · 📝 เช็คขึ้นเงิน ${chequeMatched}` : '';
-          toast(`Auto Match สำเร็จ — จับคู่เพิ่ม ${clientMatched} รายการ${chqMsg}${skipMsg}`, 'success');
-          render();
-          return;
-        } else if (skippedAlreadyMatched > 0) {
-          toast(`ไม่มีรายการใหม่ให้ match — มีอยู่แล้ว ${skippedAlreadyMatched} รายการ`, 'info');
-          return;
-        }
+      // Persist
+      try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(e) {}
+      if (matched > 0) persistMainState();
+
+      const total = allStmts.length;
+      if (matched > 0) {
+        toast(`✅ Auto Match — จับคู่ ${matched}/${total} · ไม่มีบิลวันนั้น ${noDate} · ยอดไม่ตรง ${noAmt}`, 'success', 8000);
+      } else {
+        toast(`⚠️ ไม่เจอคู่ — ไม่มีบิลวันนั้น ${noDate} · ยอดไม่ตรง ${noAmt} (stmt ${total} · bills ${allBills.length})`, 'warn', 8000);
       }
-
-      // ── ไม่เจอเลย ──
-      const errMsg = res.error || 'ไม่พบรายการที่จับคู่ได้';
-      toast(errMsg, 'error');
-
-      // แนะนำสิ่งที่ต้องทำ
-      openModal('Auto Match ไม่พบคู่', `
-        <div class="flex-col gap-3">
-          <p class="text-sm">ตรวจสอบว่า:</p>
-          <div style="padding:12px;background:var(--surface2);border-radius:8px" class="text-sm">
-            <p>1. <strong>นำเข้าข้อมูลยอดขาย</strong> ก่อน (หน้ายอดขาย → "นำเข้า Excel")</p>
-            <p class="mt-2">2. <strong>วาง Statement</strong> ของธนาคาร (หน้า Matching → "วาง Statement")</p>
-            <p class="mt-2">3. ยอดขายที่ Type = <strong>Transfer</strong> จะถูกจับคู่กับ Statement ที่ยอดตรงกัน</p>
-          </div>
-          ${res.error ? '<p class="text-xs text-dim mt-2">Server: '+res.error+'</p>' : ''}
-        </div>
-      `);
+      render();
     });
   }
   render();
