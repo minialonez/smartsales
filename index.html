@@ -271,6 +271,25 @@ async function api(action, params = {}) {
 
     const url = API_URL + '?' + qs.toString();
     let res;
+    
+    // ── DEBUG: Log request สำหรับ action สำคัญ ──
+    const DEBUG_ACTIONS = ['saveDailySales', 'saveDailyMeta', 'savePayments'];
+    const shouldLog = DEBUG_ACTIONS.includes(action) || window.__apiDebug;
+    if (shouldLog) {
+      console.group(`📤 API: ${action}`);
+      console.log('Params:', Object.keys(params).reduce((acc, k) => {
+        const v = params[k];
+        acc[k] = Array.isArray(v) ? `[Array ${v.length} items]` : v;
+        return acc;
+      }, {}));
+      if (params.rows && Array.isArray(params.rows)) {
+        console.log('First row sample:', params.rows[0]);
+        console.log('Last row sample:', params.rows[params.rows.length - 1]);
+      }
+      console.log('URL length:', url.length);
+      console.log('Method:', url.length < 4000 ? 'GET' : 'POST');
+      console.groupEnd();
+    }
 
     // URL < 4000 chars → GET (Apps Script limit ~8KB, ใช้ 4K เพื่อความปลอดภัย)
     // URL ≥ 4000 chars → POST with text/plain (ไม่เกิด CORS preflight)
@@ -286,6 +305,14 @@ async function api(action, params = {}) {
     }
 
     const text = await res.text();
+    
+    if (shouldLog) {
+      console.group(`📥 Response: ${action}`);
+      console.log('Status:', res.status);
+      console.log('Text (first 500):', text.substring(0, 500));
+      console.groupEnd();
+    }
+    
     try {
       return JSON.parse(text);
     } catch {
@@ -556,6 +583,125 @@ function triggerFileUpload(inputId, callback) {
 // ── Statement Upload Handler ──
 let uploadedStatements = [];
 
+// ══════════════════════════════════════════════════════════
+// รหัสธนาคารไทย (Thailand Bank Codes) — ใช้ parse ผู้โอน
+// ══════════════════════════════════════════════════════════
+const THAI_BANK_CODES = {
+  '002': { code: 'BBL', name: 'กรุงเทพ' },
+  '004': { code: 'KBANK', name: 'กสิกรไทย' },
+  '006': { code: 'KTB', name: 'กรุงไทย' },
+  '008': { code: 'JPM', name: 'เจพีมอร์แกน' },
+  '009': { code: 'OCBC', name: 'OCBC' },
+  '011': { code: 'TTB', name: 'ทหารไทยธนชาต' },
+  '014': { code: 'SCB', name: 'ไทยพาณิชย์' },
+  '017': { code: 'CITI', name: 'ซิตี้แบงก์' },
+  '018': { code: 'SMBC', name: 'ซูมิโตโม' },
+  '020': { code: 'SCBT', name: 'สแตนดาร์ดชาร์เตอร์ด' },
+  '022': { code: 'CIMBT', name: 'ซีไอเอ็มบี' },
+  '024': { code: 'UOB', name: 'ยูโอบี' },
+  '025': { code: 'BAY', name: 'กรุงศรีอยุธยา' },
+  '026': { code: 'MEGA', name: 'เมกะ' },
+  '030': { code: 'GSB', name: 'ออมสิน' },
+  '031': { code: 'HSBC', name: 'HSBC' },
+  '032': { code: 'DB', name: 'ดอยซ์แบงก์' },
+  '033': { code: 'GHB', name: 'อาคารสงเคราะห์' },
+  '034': { code: 'BAAC', name: 'ธ.ก.ส.' },
+  '035': { code: 'EXIM', name: 'EXIM' },
+  '039': { code: 'Mizuho', name: 'มิซูโฮ' },
+  '066': { code: 'ISBT', name: 'อิสลาม' },
+  '067': { code: 'TISCO', name: 'ทิสโก้' },
+  '069': { code: 'KKP', name: 'เกียรตินาคิน' },
+  '070': { code: 'ICBCT', name: 'ไอซีบีซี' },
+  '071': { code: 'TCR', name: 'ไทยเครดิต' },
+  '073': { code: 'LHBANK', name: 'แลนด์แอนด์เฮ้าส์' },
+  '098': { code: 'SME', name: 'SME' },
+};
+
+// Parse ข้อมูลผู้โอน/ผู้รับจาก description ของ statement
+// Returns: { bank_code, bank_name, account_no, sender_name, direction } หรือ null
+function parseStatementSender(bank, description, action) {
+  if (!description) return null;
+  const desc = String(description).trim();
+  
+  if (bank === 'KTB') {
+    // Pattern 1: "002-4800371025" (3-digit bank code + account)
+    let m = desc.match(/^(\d{3})-(\d{6,15})/);
+    if (m) {
+      const info = THAI_BANK_CODES[m[1]];
+      return {
+        bank_code: m[1],
+        bank_name: info ? info.code : ('?'+m[1]),
+        bank_full: info ? info.name : '',
+        account_no: m[2],
+        sender_name: '',
+        direction: 'in',
+      };
+    }
+    // Pattern 2: "TR fr 9091964758" (same-bank KTB transfer in)
+    m = desc.match(/^TR\s+fr\s+(\d{6,15})/i);
+    if (m) {
+      return {
+        bank_code: '006',
+        bank_name: 'KTB',
+        bank_full: 'กรุงไทย',
+        account_no: m[1],
+        sender_name: '',
+        direction: 'in',
+      };
+    }
+    // Pattern 3: "TR to ..." (outgoing transfer)
+    m = desc.match(/^TR\s+to\s+(\d{6,15})?/i);
+    if (m) {
+      return {
+        bank_code: '006',
+        bank_name: 'KTB',
+        bank_full: 'กรุงไทย',
+        account_no: m[1] || '',
+        sender_name: '',
+        direction: 'out',
+      };
+    }
+    // Pattern 4: QR/PromptPay — ไม่มีข้อมูลผู้โอน
+    if (/^010753/.test(desc) || desc.includes('-EB')) {
+      return { bank_code: '', bank_name: 'QR', bank_full: 'QR/PromptPay', account_no: '', sender_name: '', direction: 'in' };
+    }
+    return null;
+  }
+  
+  if (bank === 'KBANK') {
+    // Pattern: "โอนไป BBL X0892 บจ.ซี-ทีแอล คอร์ปอ++"
+    //      or "โอนไป X0204 บจก กรีนครอสเซฟตี้++"
+    let m = desc.match(/โอนไป\s+([A-Z]+)?\s*X(\d{4,6})\s+(.+?)(\+\+|$)/);
+    if (m) {
+      return {
+        bank_code: '',
+        bank_name: m[1] || 'KBANK', // if no bank name → same bank KBANK
+        bank_full: '',
+        account_no: 'X' + m[2],
+        sender_name: m[3].trim(),
+        direction: 'out',
+      };
+    }
+    // Pattern: "Internet/Mobile KTB" — โอนเข้าจาก KTB (ไม่ระบุ account)
+    m = desc.match(/Internet\/Mobile\s+(\w+)/);
+    if (m) {
+      const bankKey = m[1].toUpperCase();
+      return {
+        bank_code: '',
+        bank_name: bankKey,
+        bank_full: '',
+        account_no: '',
+        sender_name: '',
+        direction: 'in',
+      };
+    }
+    return null;
+  }
+  
+  // BBL / BBL NW — ไม่มีข้อมูลผู้โอนใน description
+  return null;
+}
+
 function handleStmtUpload(result, fileName) {
   const rows = [];
   const nameLC = fileName.toLowerCase();
@@ -666,6 +812,7 @@ function handleStmtUpload(result, fileName) {
       }
       
       if (!amt) continue;
+      const senderInfo = parseStatementSender('KTB', desc);
       rows.push({ 
         bank, 
         date: convertDate(dateStr), 
@@ -673,7 +820,11 @@ function handleStmtUpload(result, fileName) {
         ref_no: ref,
         description: desc, 
         amount: amt, 
-        match_status: 'unmatched' 
+        match_status: 'unmatched',
+        sender_bank_code: senderInfo?.bank_code || '',
+        sender_bank_name: senderInfo?.bank_name || '',
+        sender_account: senderInfo?.account_no || '',
+        sender_name: senderInfo?.sender_name || '',
       });
     }
   } else if (bank === 'KBANK') {
@@ -718,14 +869,20 @@ function handleStmtUpload(result, fileName) {
       const withdraw = parseAmt(r[4]); // col 4 = ถอนเงิน
       if (!deposit && !withdraw) continue;
       
+      const kbDesc = String(r[3] || '').trim() + (r[12] ? ' · ' + String(r[12]).trim() : '');
+      const kbSender = parseStatementSender('KBANK', kbDesc);
       rows.push({ 
         bank, 
         date: convertDate(dateStr),
-        time: String(r[2] || '').trim(), // col 2 = เวลา
-        ref_no: String(r[12] || '').trim(), // col 12 = รายละเอียด
-        description: String(r[3] || '').trim() + (r[12] ? ' · ' + String(r[12]).trim() : ''),
+        time: String(r[2] || '').trim(),
+        ref_no: String(r[12] || '').trim(),
+        description: kbDesc,
         amount: deposit || -withdraw, 
-        match_status: 'unmatched' 
+        match_status: 'unmatched',
+        sender_bank_code: kbSender?.bank_code || '',
+        sender_bank_name: kbSender?.bank_name || '',
+        sender_account: kbSender?.account_no || '',
+        sender_name: kbSender?.sender_name || '',
       });
     }
   } else if (bank === 'BBL NW') {
@@ -1509,6 +1666,39 @@ async function restoreMainState() {
     if (confSynced > 0 || statusSynced > 0) {
       console.log(`Auto-sync: status=${statusSynced} confirmation=${confSynced} bills`);
     }
+  }
+  
+  // ── Auto-mark Cash bills as matched (เงินสด = เข้าลิ้นชักแล้ว) ──
+  let cashSynced = 0;
+  billList.forEach(b => {
+    if (b.type === 'Cash' && 
+        b.match_status !== 'matched' && 
+        b.match_status !== 'paid' && 
+        b.match_status !== 'void') {
+      b.match_status = 'matched';
+      if (!b.pay_date) b.pay_date = b.date;
+      cashSynced++;
+    }
+  });
+  if (cashSynced > 0) {
+    console.log(`Cash auto-matched: ${cashSynced} bills`);
+  }
+  
+  // ── Auto-mark: confirmation มีค่าแล้ว → matched ──
+  // (รองรับข้อมูลเก่าที่ user กรอก confirmation ก่อนหน้ามี auto-match feature)
+  let confMatched = 0;
+  billList.forEach(b => {
+    if (b.confirmation && String(b.confirmation).trim() &&
+        b.match_status !== 'matched' && 
+        b.match_status !== 'paid' && 
+        b.match_status !== 'void') {
+      b.match_status = 'matched';
+      if (!b.pay_date) b.pay_date = b.date;
+      confMatched++;
+    }
+  });
+  if (confMatched > 0) {
+    console.log(`Confirmation-filled auto-matched: ${confMatched} bills`);
   }
 }
 
@@ -2375,6 +2565,33 @@ async function renderMain(el) {
   }
 
   function render() {
+    // ── FIX: Sync summary flat keys กับ selectedDate ก่อนเสมอ ──
+    // ไม่งั้น flat keys จากวันเก่าจะค้างแสดง
+    (function syncSummaryToSelectedDate() {
+      // 1. Clear all flat keys (เก็บแค่ __byDate)
+      Object.keys(mainSummary).forEach(k => {
+        if (k === '__byDate') return;
+        if (k.includes('_')) delete mainSummary[k];
+      });
+      // 2. Load from __byDate[selectedDate] ถ้ามี
+      if (mainSummary.__byDate && mainSummary.__byDate[selectedDate]) {
+        const LABEL_MAP = {
+          'นำเงินเข้า': 'cashIn', 'ยอดขาย': 'sales', 'นำเงินออก': 'cashOut',
+          'ยอดคืนสินค้า': 'returns', 'Cash Drawer': 'cashDrawer',
+          'Transfer': 'transfer', 'Card': 'card', 'Cheque': 'cheque', 'Refund': 'refund',
+        };
+        const sum = mainSummary.__byDate[selectedDate];
+        Object.entries(sum).forEach(([thLabel, stations]) => {
+          const prefix = LABEL_MAP[thLabel];
+          if (!prefix || !stations || typeof stations !== 'object') return;
+          ['Front1', 'Front2', 'Front3', 'Front4', 'Invoice', 'Order', 'Payment', 'Invoice Credit', 'Order Credit'].forEach(st => {
+            const val = stations[st];
+            if (val != null && val !== 0) mainSummary[prefix + '_' + st] = val;
+          });
+        });
+      }
+    })();
+    
     // ── Filter bill list ──
     let data = billList;
     
@@ -2839,7 +3056,15 @@ async function renderMain(el) {
             ${truncated ? `<span style="color:var(--warn);margin-left:8px">⚠️ แสดงเฉพาะ ${MAX_VISIBLE_ROWS} แถวแรก — กรองเพื่อเห็นทั้งหมด</span>` : ''}
             ${billList.length > 200 && !filterDateFrom && !filterDateTo ? `<span style="color:var(--info);margin-left:8px">📅 กรองเฉพาะวันที่ ${fmtDate(selectedDate)}</span>` : ''}
           </span>
-          <span class="font-bold">รวม: ฿${fmtNum(totalAmount)}</span>
+          <span class="font-bold" title="${(() => {
+            const byType = {};
+            data.forEach(b => {
+              if (b.match_status === 'void') return;
+              const t = b.type || '(ว่าง)';
+              byType[t] = (byType[t] || 0) + (Number(b.amount) || 0);
+            });
+            return Object.entries(byType).map(([t,v]) => `${t}: ฿${fmtNum(v)}`).join(' · ');
+          })()}">รวม (${data.length} บิล): ฿${fmtNum(totalAmount)}</span>
         </div>
       </div>
     `;
@@ -3792,7 +4017,30 @@ async function renderMain(el) {
     // Summary cells (cashIn/cashOut/returns/sales/drawer)
     el.querySelectorAll('.sum-cell').forEach(inp => {
       inp.addEventListener('input', debounce(() => {
-        mainSummary[inp.dataset.k] = parseFloat(inp.value) || 0;
+        const key = inp.dataset.k;
+        const value = parseFloat(inp.value) || 0;
+        mainSummary[key] = value;
+        
+        // Sync to __byDate[selectedDate] ด้วย (ป้องกันข้อมูลหายเมื่อเปลี่ยนวัน)
+        const [field, station] = key.split('_').reduce((acc, part, i, arr) => {
+          if (i === 0) return [part, ''];
+          return [acc[0], acc[1] ? acc[1] + '_' + part : part];
+        }, ['', '']);
+        if (field && station) {
+          const LABEL_MAP = {
+            cashIn: 'นำเงินเข้า', sales: 'ยอดขาย', cashOut: 'นำเงินออก',
+            returns: 'ยอดคืนสินค้า', cashDrawer: 'Cash Drawer',
+            transfer: 'Transfer', card: 'Card', cheque: 'Cheque', refund: 'Refund',
+          };
+          const thLabel = LABEL_MAP[field];
+          if (thLabel) {
+            if (!mainSummary.__byDate) mainSummary.__byDate = {};
+            if (!mainSummary.__byDate[selectedDate]) mainSummary.__byDate[selectedDate] = {};
+            if (!mainSummary.__byDate[selectedDate][thLabel]) mainSummary.__byDate[selectedDate][thLabel] = {};
+            mainSummary.__byDate[selectedDate][thLabel][station] = value;
+          }
+        }
+        
         persistMainState();
         updateSumCheckRow();
         updateAllStationColumn();
@@ -3842,8 +4090,8 @@ async function renderMain(el) {
               toast(`✓ บันทึกเป็นชำระแล้ว — ${b.bill_no||'(ไม่มีเลข)'}`, 'success');
             }
           } else {
-            // ล้างค่า → กลับเป็น pending (ถ้าเคย matched)
-            if (b.match_status === 'matched' && !b.paid_by_sp) {
+            // ล้างค่า → กลับเป็น pending (ถ้าเคย matched และไม่ใช่ Cash)
+            if (b.match_status === 'matched' && !b.paid_by_sp && b.type !== 'Cash') {
               b.match_status = 'pending';
               delete b.pay_date;
               delete b.matched_stmt_ref;
@@ -3851,12 +4099,34 @@ async function renderMain(el) {
               toast(`↩ ยกเลิก matched — ${b.bill_no||'(ไม่มีเลข)'}`, 'info');
             }
           }
-          render(); // re-render เพื่อเห็น badge เปลี่ยน
+          persistMainState();
+          render();
+          return;
+        }
+        
+        // ── Auto-match Type=Cash (เงินสดเข้าลิ้นชัก ไม่ต้องมี confirmation) ──
+        if (field === 'type') {
+          const b = billList[idx];
+          if (b.type === 'Cash') {
+            // Cash → auto matched (ไม่ต้องใส่ confirmation)
+            if (b.match_status !== 'matched' && b.match_status !== 'paid' && b.match_status !== 'void') {
+              b.match_status = 'matched';
+              if (!b.pay_date) b.pay_date = b.date;
+              toast(`✓ Cash → auto matched`, 'success');
+            }
+          } else if (b.type !== 'Cash' && b.match_status === 'matched' && !b.confirmation && !b.paid_by_sp) {
+            // เปลี่ยนจาก Cash → type อื่น และไม่มี confirmation → pending
+            b.match_status = 'pending';
+            delete b.pay_date;
+            toast(`↩ เปลี่ยน type → ต้องใส่ confirmation`, 'info');
+          }
+          persistMainState();
+          render();
           return;
         }
         
         persistMainState();
-        if (field === 'station' || field === 'type') render();
+        if (field === 'station') render();
       });
     });
 
@@ -9092,7 +9362,14 @@ async function renderMatching(el) {
                   <td>${s.time}</td>
                   <td class="text-xs" style="font-family:var(--mono)">${s.ref_no}</td>
                   <td style="text-align:right;font-weight:600;color:var(--success)">฿${fmtNum(s.amount)}</td>
-                  <td class="truncate" style="max-width:170px;color:var(--text)">${s.description}</td>
+                  <td class="truncate" style="max-width:170px;color:var(--text)">
+                    ${s.description}
+                    ${(s.sender_bank_name || s.sender_account || s.sender_name) ? `<br><span class="text-xs" style="color:var(--info);font-family:var(--mono)">
+                      ${s.sender_bank_name ? `🏦 ${s.sender_bank_name}` : ''}
+                      ${s.sender_account ? ` · ${s.sender_account}` : ''}
+                      ${s.sender_name ? ` · 👤 ${s.sender_name}` : ''}
+                    </span>` : ''}
+                  </td>
                   <td>${s.match_station?`<span class="badge badge-info">${s.match_station}</span>`:'-'}</td>
                   <td class="text-xs">${s.match_bill||'-'}</td>
                   <td>${isMatched
