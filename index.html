@@ -8704,8 +8704,8 @@ async function renderMatching(el) {
         return;
       }
 
-      // ── Fallback: Client-side match จากข้อมูลที่โหลดมาแล้ว (จับคู่โดย วันที่ + ยอด) ──
-      // รวมทั้ง billList (Main), uploadedSales, cashflowList, และ supplierPayments ที่โอนแล้ว
+      // ── Fallback: Client-side match จากข้อมูลที่โหลดมาแล้ว ──
+      // จับคู่โดย: ยอดตรง (±1 บาท) + วันที่ตรง/ใกล้เคียง (±2 วัน)
       const cashflowAsSales = (cashflowList||[]).map(c => ({
         bill_no: c.id,
         amount: c.type === 'supplier' ? -Math.abs(c.amount) : c.amount,
@@ -8714,7 +8714,6 @@ async function renderMatching(el) {
         type: 'Transfer',
         _cashflow: c,
       }));
-      // Supplier Payments ที่โอนแล้ว → จ่ายออก (ลบ)
       const supplierAsSales = (supplierPayments||[])
         .filter(p => p.status === 'paid' && p.match_status !== 'matched')
         .map(p => ({
@@ -8725,47 +8724,60 @@ async function renderMatching(el) {
           type: 'Transfer',
           _supplierPayment: p,
         }));
-      const allSales = [...(billList||[]), ...(uploadedSales||[]), ...cashflowAsSales, ...supplierAsSales];
+      // ── รวมทุก bill type (ไม่ใช่แค่ Transfer) เพราะ statement อาจตรงกับ Cash/Card ด้วย ──
+      const allSales = [...(billList||[]), ...(uploadedSales||[]), ...cashflowAsSales, ...supplierAsSales]
+        .filter(s => {
+          // ข้ามบิลที่ matched แล้ว
+          if (s.match_status === 'matched' || s.match_status === 'paid') return false;
+          // ข้ามบิลที่ยกเลิก
+          if (s.match_status === 'void') return false;
+          return true;
+        });
+      
       if (data.length > 0 && allSales.length > 0) {
         let clientMatched = 0;
         let skippedAlreadyMatched = 0;
         
-        // ── สร้าง Set ของบิลที่ถูก match ไปแล้ว (จาก Statement ที่ matched) ──
-        // ป้องกันการหยิบบิลเดียวกันไปใช้ซ้ำ
         const alreadyMatchedBillNos = new Set(
           data.filter(s => s.match_status === 'matched' && s.match_bill)
               .map(s => s.match_bill)
         );
         
-        const transferSales = allSales.filter(s => {
-          const type = (s.type || s.pay_method || s.Type || '').toLowerCase();
-          if (type !== 'transfer') return false;
-          // ข้ามบิลที่เคย matched ไปแล้ว
-          const billNo = s.bill_no || s['Bill Number'] || '';
-          if (billNo && alreadyMatchedBillNos.has(billNo)) return false;
-          return true;
+        // ── Index bills by rounded amount สำหรับ lookup เร็ว ──
+        const billsByAmt = {};
+        allSales.forEach(s => {
+          const billNo = s.bill_no || '';
+          if (billNo && alreadyMatchedBillNos.has(billNo)) return;
+          const amt = Math.round(Number(s.amount || 0));
+          if (!amt) return;
+          // index ±1
+          for (let a = amt - 1; a <= amt + 1; a++) {
+            if (!billsByAmt[a]) billsByAmt[a] = [];
+            billsByAmt[a].push(s);
+          }
         });
 
         data.forEach(stmt => {
-          // ── ไม่แตะรายการที่ matched แล้ว ──
           if (stmt.match_status === 'matched') {
             skippedAlreadyMatched++;
             return;
           }
           const stmtAmt = Number(stmt.amount || 0);
           const stmtDate = toISODate(stmt.date || stmt.trans_date);
-          if (!stmtAmt || stmtAmt <= 0) return;
+          if (!stmtAmt) return;
 
-          const match = transferSales.find(sale => {
+          // หาบิลที่ยอดตรง (±1 บาท) จาก index
+          const candidates = billsByAmt[Math.round(stmtAmt)] || [];
+          const match = candidates.find(sale => {
             if (sale._clientMatched) return false;
-            const saleAmt = Number(sale.amount || sale.Baht || 0);
+            const saleAmt = Number(sale.amount || 0);
+            if (Math.abs(saleAmt - stmtAmt) > 1.0) return false;
+            // วันที่: ±2 วัน
             const saleDate = toISODate(sale.date || sale.source_date);
-            // ต้อง: ยอดตรง + วันที่ตรง (หรือต่างกันไม่เกิน 1 วัน)
-            if (Math.abs(saleAmt - stmtAmt) > 0.01) return false;
             if (saleDate && stmtDate) {
               const diffMs = Math.abs(new Date(saleDate) - new Date(stmtDate));
               const diffDays = diffMs / (1000 * 60 * 60 * 24);
-              if (diffDays > 1) return false;
+              if (diffDays > 2) return false;
             }
             return true;
           });
