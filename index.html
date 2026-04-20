@@ -794,7 +794,8 @@ window.addEventListener('beforeunload', flushPersistState);
 // ══════════════════════════════════════════════════════════════
 function validateBill(b, idx, allBills) {
   const issues = [];
-  const billNo = b.bill_no || `(แถว ${idx+1})`;
+  const dateTag = b.date ? `[${fmtDate(b.date)}] ` : '';
+  const billNo = dateTag + (b.bill_no || `(แถว ${idx+1})`);
   
   // ── Voided bills: ไม่ต้อง validate ──
   if (b.match_status === 'void') return issues;
@@ -819,9 +820,6 @@ function validateBill(b, idx, allBills) {
     if (b.source === 'manual') {
       issues.push({ level:'warn', billIdx:idx, field:'bank', msg:`${billNo}: Type=Transfer แต่ยังไม่ได้เลือก Bank` });
     }
-  }
-  if (b.type === 'Cheque' && !b.expected_clear_date && b.match_status !== 'matched' && b.match_status !== 'bounced') {
-    issues.push({ level:'warn', billIdx:idx, field:'expected_clear_date', msg:`${billNo}: Type=Cheque แต่ไม่มีวันที่คาดว่าเช็คเข้า` });
   }
   if ((b.station === 'Invoice Credit' || b.station === 'Order Credit') && !b.due_date) {
     // ข้ามสำหรับบิลที่ import มา (ไม่มี due_date — กรอกทีหลังได้)
@@ -912,10 +910,12 @@ function validateAll() {
   // ── บิลซ้ำ ──
   const dupes = findDuplicateBills();
   dupes.forEach(d => {
+    const firstBill = billList[d.indices[0]];
+    const dateTag = firstBill?.date ? `[${fmtDate(firstBill.date)}] ` : '';
     errors.push({
       level: 'error',
       category: 'duplicate',
-      msg: `เลขบิลซ้ำ: ${d.bill_no} (${d.count} รายการ ที่แถว ${d.indices.map(i=>i+1).join(', ')})`,
+      msg: `${dateTag}เลขบิลซ้ำ: ${d.bill_no} (${d.count} รายการ)`,
       billIdx: d.indices[0],
     });
   });
@@ -923,10 +923,12 @@ function validateAll() {
   // ── บิลน่าสงสัย (วัน+ยอด+station ตรง) ──
   const similar = findSimilarBills();
   similar.forEach(s => {
+    const firstBill = billList[s.indices[0]];
+    const dateTag = firstBill?.date ? `[${fmtDate(firstBill.date)}] ` : '';
     warnings.push({
       level: 'warn',
       category: 'similar',
-      msg: `น่าสงสัย — ${s.bills.length} บิล วันเดียวกัน ยอดเดียวกัน station เดียวกัน: ${s.bills.map(b=>b.bill_no||'(ว่าง)').join(', ')}`,
+      msg: `${dateTag}น่าสงสัย — ${s.bills.length} บิล ยอดเดียวกัน station เดียวกัน: ${s.bills.map(b=>b.bill_no||'(ว่าง)').join(', ')}`,
       billIdx: s.indices[0],
     });
   });
@@ -954,17 +956,53 @@ function validateAll() {
     }
   });
   
-  // ── เช็คเลยวันที่คาด ──
+  // ── แจ้งเตือน Due Date / เช็ครอเคลียร์ ──
+  // เตือนวัน due date เลย (today >= due_date) สำหรับ:
+  // 1. บิลเช็ค (Type=Cheque) ที่มี expected_clear_date หรือ due_date
+  // 2. ทุกบิลที่มี due_date (เช่น SR/OR เครดิต)
   const today = todayISO();
+  
+  // 1) เช็ครอเคลียร์: expected_clear_date ถึงหรือเลยแล้ว
   const chequesOverdue = billList.filter(b => 
-    b.type === 'Cheque' && b.expected_clear_date && toISODate(b.expected_clear_date) < today &&
-    b.match_status !== 'matched' && b.match_status !== 'bounced'
+    b.type === 'Cheque' && b.expected_clear_date && toISODate(b.expected_clear_date) <= today &&
+    b.match_status !== 'matched' && b.match_status !== 'bounced' && b.match_status !== 'paid'
   );
-  if (chequesOverdue.length > 0) {
+  chequesOverdue.forEach(b => {
+    const dateTag = b.date ? `[${fmtDate(b.date)}] ` : '';
+    const clearDate = fmtDate(b.expected_clear_date);
+    const isPast = toISODate(b.expected_clear_date) < today;
     warnings.push({
       level: 'warn',
-      category: 'cheque_overdue',
-      msg: `มีเช็ค ${chequesOverdue.length} ฉบับเลยวันที่คาดว่าเข้าแล้ว — ตรวจสอบว่าเข้าหรือเด้ง`,
+      category: 'cheque_due',
+      msg: `${dateTag}${b.bill_no||'เช็ค'}: ${isPast ? '⏰ เลยกำหนดเคลียร์' : '📅 ถึงกำหนดเคลียร์วันนี้'} (${clearDate}) ยอด ฿${fmtNum(b.amount)} — ตรวจสอบว่าเข้าหรือเด้ง`,
+      billIdx: billList.indexOf(b),
+    });
+  });
+  
+  // 2) บิลที่มี due_date ถึงหรือเลยแล้ว (SR/OR เครดิต ฯลฯ)
+  const dueDateBills = billList.filter(b => 
+    b.due_date && toISODate(b.due_date) <= today &&
+    b.type !== 'Cheque' && // เช็คจัดการข้างบนแล้ว
+    b.match_status !== 'matched' && b.match_status !== 'paid' && b.match_status !== 'void'
+  );
+  if (dueDateBills.length > 0) {
+    // Group ตามวัน due_date เพื่อไม่ให้เตือนทีละบิล (เยอะเกินไป)
+    const byDueDate = {};
+    dueDateBills.forEach(b => {
+      const dd = toISODate(b.due_date);
+      if (!byDueDate[dd]) byDueDate[dd] = [];
+      byDueDate[dd].push(b);
+    });
+    Object.keys(byDueDate).sort().forEach(dd => {
+      const bills = byDueDate[dd];
+      const totalAmt = bills.reduce((s, b) => s + (Number(b.amount) || 0), 0);
+      const isPast = dd < today;
+      const sample = bills.slice(0, 3).map(b => b.bill_no || '(ไม่มีเลข)').join(', ');
+      warnings.push({
+        level: 'warn',
+        category: 'due_date',
+        msg: `${isPast ? '⏰ เลยกำหนด' : '📅 ครบกำหนดวันนี้'} ${fmtDate(dd)}: ${bills.length} บิล รวม ฿${fmtNum(totalAmt)} (${sample}${bills.length > 3 ? '...' : ''})`,
+      });
     });
   }
   
@@ -2303,7 +2341,6 @@ async function renderMain(el) {
                 <th>Remarks2</th>
                 <th>Bank</th>
                 <th>Due Date</th>
-                <th>เช็ครอเคลียร์</th>
               </tr>
             </thead>
             <tbody>
@@ -2395,26 +2432,13 @@ async function renderMain(el) {
                     <td><input type="text" class="input bl-cell" data-field="remarks1" value="${b.remarks1||''}" style="padding:3px 6px;font-size:.78rem;min-width:160px"></td>
                     <td><input type="text" class="input bl-cell" data-field="remarks2" value="${b.remarks2||''}" style="padding:3px 6px;font-size:.78rem;width:140px"></td>
                     <td style="white-space:nowrap">
-                      <select class="select bl-cell" data-field="bank" style="padding:3px 8px;font-size:.8rem;min-width:80px">
-                        ${['','KTB','KBANK','BBL','SCB','BAY','TMB','Other'].map(o=>`<option value="${o}" ${b.bank===o?'selected':''}>${o||'-'}</option>`).join('')}
-                      </select>
+                      <input type="text" class="input bl-cell" data-field="bank" value="${b.bank||''}" placeholder="-" style="padding:3px 6px;font-size:.78rem;width:80px">
                       <button class="btn-copy-down" data-idx="${realIdx}" data-field="bank" title="คัดลอกลงทุกแถว" style="background:none;border:1px solid var(--border);color:var(--text2);padding:0 4px;margin-left:2px;border-radius:4px;cursor:pointer;font-size:.75rem">⬇️</button>
                     </td>
                     <td style="white-space:nowrap">
                       <input type="date" class="input bl-cell" data-field="due_date" value="${toISODate(b.due_date)}" style="padding:3px 6px;font-size:.78rem;width:130px">
                       <button class="btn-copy-down" data-idx="${realIdx}" data-field="due_date" title="คัดลอกลงทุกแถว" style="background:none;border:1px solid var(--border);color:var(--text2);padding:0 4px;margin-left:2px;border-radius:4px;cursor:pointer;font-size:.75rem">⬇️</button>
                     </td>
-                    ${b.type === 'Cheque' ? `
-                      <td style="white-space:nowrap">
-                        <input type="date" class="input bl-cell" data-field="expected_clear_date" value="${toISODate(b.expected_clear_date)}" title="วันที่เช็คคาดว่าจะเข้า" style="padding:3px 6px;font-size:.78rem;width:130px">
-                        ${!isPaid && !isBounced ? `<button class="btn btn-ghost btn-sm btn-bounce-cheque" data-idx="${realIdx}" title="เช็คเด้ง" style="margin-left:2px;color:var(--danger);font-size:.75rem">🚫</button>` : ''}
-                        ${!isVoid && !isPaid ? `<button class="btn btn-ghost btn-sm btn-void-bill" data-idx="${realIdx}" title="ยกเลิกบิล" style="margin-left:2px;color:var(--text2);font-size:.75rem">❌</button>` : ''}
-                        ${isVoid ? `<button class="btn btn-ghost btn-sm btn-unvoid-bill" data-idx="${realIdx}" title="ยกเลิกการยกเลิก" style="margin-left:2px;color:var(--info);font-size:.75rem">↩️</button>` : ''}
-                      </td>
-                    ` : `<td style="white-space:nowrap">
-                        ${!isVoid && !isPaid ? `<button class="btn btn-ghost btn-sm btn-void-bill" data-idx="${realIdx}" title="ยกเลิกบิล" style="color:var(--text2);font-size:.75rem">❌</button>` : ''}
-                        ${isVoid ? `<button class="btn btn-ghost btn-sm btn-unvoid-bill" data-idx="${realIdx}" title="ยกเลิกการยกเลิก" style="color:var(--info);font-size:.75rem">↩️</button>` : ''}
-                      </td>`}
                   </tr>`;
                 }).join('')
                 })()
