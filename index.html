@@ -1131,14 +1131,34 @@ function showValidationModal(validation, onContinue) {
   }
 }
 
-function restoreMainState() {
+async function restoreMainState() {
   try {
-    const savedBills = safeStorage.get('sf_billList');
-    if (savedBills) billList = JSON.parse(savedBills);
-    const savedSummary = safeStorage.get('sf_mainSummary');
-    if (savedSummary) Object.assign(mainSummary, JSON.parse(savedSummary));
-    const savedCash = safeStorage.get('sf_cashCount');
-    if (savedCash) Object.assign(cashCount, JSON.parse(savedCash));
+    // ── ข้อมูลใหญ่: ลอง IndexedDB ก่อน → fallback localStorage ──
+    for (const key of IDB_LARGE_KEYS) {
+      const idbVal = await idbGet(key);
+      if (idbVal) {
+        const parsed = JSON.parse(idbVal);
+        if (key === 'sf_billList') billList = parsed;
+        else if (key === 'sf_mainSummary') Object.assign(mainSummary, parsed);
+        else if (key === 'sf_cashCount') Object.assign(cashCount, parsed);
+        else if (key === 'sf_statementsByBank') { statementsByBank = parsed; uploadedStatements = getAllStatements(); }
+      } else {
+        // Fallback: localStorage (ข้อมูลเก่าก่อนย้าย IndexedDB)
+        const lsVal = safeStorage.get(key);
+        if (lsVal) {
+          const parsed = JSON.parse(lsVal);
+          if (key === 'sf_billList') billList = parsed;
+          else if (key === 'sf_mainSummary') Object.assign(mainSummary, parsed);
+          else if (key === 'sf_cashCount') Object.assign(cashCount, parsed);
+          else if (key === 'sf_statementsByBank') { statementsByBank = parsed; uploadedStatements = getAllStatements(); }
+          // Migrate ไป IndexedDB + ลบจาก localStorage
+          idbSet(key, lsVal);
+          try { localStorage.removeItem(key); } catch(e) {}
+        }
+      }
+    }
+    
+    // ── ข้อมูลเล็ก: localStorage เหมือนเดิม ──
     const savedPay = safeStorage.get('sf_paymentList');
     if (savedPay) paymentList = JSON.parse(savedPay);
     const savedCashflow = safeStorage.get('sf_cashflowList');
@@ -1151,14 +1171,18 @@ function restoreMainState() {
     if (savedPPRpt) ppReport = JSON.parse(savedPPRpt);
     const savedTransferLog = safeStorage.get('sf_transferLog');
     if (savedTransferLog) transferLog = JSON.parse(savedTransferLog);
-    const savedStmts = safeStorage.get('sf_statementsByBank');
-    if (savedStmts) {
-      statementsByBank = JSON.parse(savedStmts);
-      uploadedStatements = getAllStatements();
+    
+    // Statements จาก localStorage (ถ้า IndexedDB ไม่มี)
+    if (uploadedStatements.length === 0) {
+      const savedStmts = safeStorage.get('sf_statementsByBank');
+      if (savedStmts) {
+        statementsByBank = JSON.parse(savedStmts);
+        uploadedStatements = getAllStatements();
+      }
     }
   } catch (e) { console.warn('Could not restore state:', e); }
   
-  // ── Cleanup: SP/SC/JS/JR bills ไม่ควรมี bank (เป็นเลขตัดชำระ/ใบลดหนี้ ไม่ใช่ธุรกรรมธนาคาร) ──
+  // ── Cleanup: SP/SC/JS/JR bills ไม่ควรมี bank ──
   if (billList.length > 0) {
     let cleaned = 0;
     billList.forEach(b => {
@@ -6865,11 +6889,63 @@ function openModal(title, html) {
 }
 function closeModal() { document.getElementById('modal-overlay').classList.remove('open'); }
 
-// ── Safe Storage (fallback เมื่อ localStorage ไม่พร้อมใช้) ──
+// ── Storage: IndexedDB สำหรับข้อมูลใหญ่ (ไม่มี 5MB limit) ──
 const _mem = {};
+const IDB_NAME = 'SmartFinanceDB';
+const IDB_STORE = 'data';
+const IDB_LARGE_KEYS = ['sf_billList','sf_statementsByBank','sf_mainSummary','sf_cashCount'];
+
+let _idb = null;
+function openIDB() {
+  return new Promise(function(resolve) {
+    if (_idb) { resolve(_idb); return; }
+    try {
+      var req = indexedDB.open(IDB_NAME, 1);
+      req.onupgradeneeded = function(e) { e.target.result.createObjectStore(IDB_STORE); };
+      req.onsuccess = function(e) { _idb = e.target.result; resolve(_idb); };
+      req.onerror = function() { resolve(null); };
+    } catch(e) { resolve(null); }
+  });
+}
+function idbGet(key) {
+  return new Promise(function(resolve) {
+    openIDB().then(function(db) {
+      if (!db) { resolve(null); return; }
+      try {
+        var tx = db.transaction(IDB_STORE, 'readonly');
+        var req = tx.objectStore(IDB_STORE).get(key);
+        req.onsuccess = function() { resolve(req.result || null); };
+        req.onerror = function() { resolve(null); };
+      } catch(e) { resolve(null); }
+    });
+  });
+}
+function idbSet(key, value) {
+  return new Promise(function(resolve) {
+    openIDB().then(function(db) {
+      if (!db) { resolve(false); return; }
+      try {
+        var tx = db.transaction(IDB_STORE, 'readwrite');
+        tx.objectStore(IDB_STORE).put(value, key);
+        tx.oncomplete = function() { resolve(true); };
+        tx.onerror = function() { resolve(false); };
+      } catch(e) { resolve(false); }
+    });
+  });
+}
+
 const safeStorage = {
   get(k) { try { return localStorage.getItem(k); } catch { return _mem[k] || null; } },
-  set(k,v) { try { localStorage.setItem(k,v); } catch { _mem[k] = v; } },
+  set(k,v) { 
+    if (IDB_LARGE_KEYS.includes(k)) {
+      // เก็บใน IndexedDB (async — fire and forget)
+      idbSet(k, v);
+      // ลบจาก localStorage (ถ้ามี) เพื่อเพิ่มพื้นที่
+      try { localStorage.removeItem(k); } catch(e) {}
+      return;
+    }
+    try { localStorage.setItem(k,v); } catch { _mem[k] = v; } 
+  },
   del(k) { try { localStorage.removeItem(k); } catch { delete _mem[k]; } },
 };
 
@@ -9948,8 +10024,10 @@ async function renderUsers(el) {
 }
 
 // ── Initialize after all declarations are ready ──
-restoreMainState();
-checkSavedLogin();
+(async function() {
+  await restoreMainState();
+  checkSavedLogin();
+})();
 </script>
 </body>
 </html>
