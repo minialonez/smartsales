@@ -813,23 +813,32 @@ function validateBill(b, idx, allBills) {
 }
 
 function findDuplicateBills() {
-  // หาบิลที่เลขบิลซ้ำกัน (ยกเว้นเลขว่าง และบิลที่ยกเลิก)
-  const byBillNo = {};
+  // หาบิลที่ซ้ำกันจริงๆ (ไม่ใช่ split payment)
+  // Composite key: bill_no + type + amount (ตรงกับ dedup logic ตอน import)
+  // เหตุผล: บิลเดียวกันอาจชำระหลายวิธี เช่น
+  //   SS00126-000002 | Cash     | 3      ← ✓ เก็บได้
+  //   SS00126-000002 | Transfer | 5515   ← ✓ เก็บได้ (ไม่ถือว่าซ้ำ)
+  // แต่ถ้า bill_no + type + amount ตรงกัน = ซ้ำจริง
+  const byKey = {};
   billList.forEach((b, i) => {
     if (b.match_status === 'void') return;
     const no = (b.bill_no || '').trim();
     if (!no || no.startsWith('MANUAL-')) return;
-    if (!byBillNo[no]) byBillNo[no] = [];
-    byBillNo[no].push(i);
+    // Composite key
+    const key = `${no}|${(b.type || '').trim()}|${Number(b.amount) || 0}`;
+    if (!byKey[key]) byKey[key] = [];
+    byKey[key].push(i);
   });
   
   const dupes = [];
-  Object.keys(byBillNo).forEach(no => {
-    if (byBillNo[no].length > 1) {
+  Object.keys(byKey).forEach(key => {
+    if (byKey[key].length > 1) {
+      // แยก bill_no กลับ (เพื่อแสดงข้อความ)
+      const firstIdx = byKey[key][0];
       dupes.push({
-        bill_no: no,
-        indices: byBillNo[no],
-        count: byBillNo[no].length,
+        bill_no: billList[firstIdx].bill_no,
+        indices: byKey[key],
+        count: byKey[key].length,
       });
     }
   });
@@ -2156,15 +2165,18 @@ async function renderMain(el) {
             <tbody>
               ${data.length === 0 ? '<tr><td colspan="13" style="text-align:center;padding:40px;color:var(--text3)">ยังไม่มีข้อมูล — กด "Generate จาก Smart" เพื่อเริ่มต้น</td></tr>' :
                 (() => {
-                  // หา bill_no ที่ซ้ำ (limit for perf)
-                  const billNoCounts = {};
+                  // หาบิลที่ซ้ำจริง (composite key: bill_no + type + amount)
+                  // ไม่จับ split payment ว่าซ้ำ
+                  const billKeyCounts = {};
                   const billIndexMap = new Map(); // bill → index (O(1) lookup)
                   billList.forEach((b, i) => {
                     billIndexMap.set(b, i);
                     const no = (b.bill_no||'').trim();
-                    if (no && !no.startsWith('MANUAL-')) billNoCounts[no] = (billNoCounts[no]||0) + 1;
+                    if (!no || no.startsWith('MANUAL-')) return;
+                    const key = `${no}|${(b.type||'').trim()}|${Number(b.amount)||0}`;
+                    billKeyCounts[key] = (billKeyCounts[key]||0) + 1;
                   });
-                  const dupeBillNos = new Set(Object.keys(billNoCounts).filter(n => billNoCounts[n] > 1));
+                  const dupeKeys = new Set(Object.keys(billKeyCounts).filter(k => billKeyCounts[k] > 1));
                   
                   return visibleData.map((b, idx) => {
                   const realIdx = billIndexMap.get(b) ?? idx;
@@ -2179,7 +2191,8 @@ async function renderMain(el) {
                   const isPendingMatch = !isVoid && !isPaid && !isAwaitingClear && !isBounced && 
                     (b.type === 'Transfer' || b.type === 'Card') &&
                     b.station !== 'Invoice Credit' && b.station !== 'Order Credit';
-                  const isDuplicate = !isVoid && b.bill_no && dupeBillNos.has(b.bill_no);
+                  const billKey = b.bill_no ? `${b.bill_no}|${(b.type||'').trim()}|${Number(b.amount)||0}` : '';
+                  const isDuplicate = !isVoid && billKey && dupeKeys.has(billKey);
                   const isMissingAmount = !isVoid && (!b.amount || Number(b.amount) === 0);
                   
                   let rowStyle = '';
