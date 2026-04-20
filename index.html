@@ -1814,23 +1814,34 @@ async function renderMain(el) {
   //   Invoice Credit, Order Credit: diff = SUM(J5:J11) - J4
   //                                 = outflow - sales ของ credit นั้น
   //
-  // Rule:
-  //   1) ถ้า station ไม่มีข้อมูลเลย → แสดง "-"
-  //   2) ถ้า balance (|diff| < 1) → "OK"
-  //   3) อื่นๆ → แสดง diff +/−
+  // ── อ่านข้อมูล summary จาก __byDate ก่อน → flat key → 0 ──
+  function _getSummaryValue(field, station) {
+    // field: 'cashIn' | 'sales' | 'cashOut' | 'returns' | ...
+    // station: 'Front1' | ...
+    // 1) ลอง flat key ก่อน (ถูก set ตอน date change)
+    const flat = Number(mainSummary[field + '_' + station]);
+    if (!isNaN(flat) && flat !== 0) return flat;
+    // 2) Fallback: __byDate[selectedDate][thLabel][station]
+    const labelMap = { cashIn: 'นำเงินเข้า', sales: 'ยอดขาย', cashOut: 'นำเงินออก', 
+                       returns: 'ยอดคืนสินค้า', cashDrawer: 'Cash Drawer' };
+    const thLabel = labelMap[field];
+    if (thLabel && mainSummary.__byDate && mainSummary.__byDate[selectedDate]) {
+      const dayData = mainSummary.__byDate[selectedDate][thLabel];
+      if (dayData && dayData[station] != null) return Number(dayData[station]) || 0;
+    }
+    return 0;
+  }
+  
   function calcSumCheck(station) {
-    // Helper: ดึงค่าของ row/station
-    const get = (field, st) => Number(mainSummary[field + '_' + st]) || 0;
     const outflowOf = (st) => calcCashFromBills(st) + calcAutoValue('Transfer', st) + 
                                calcAutoValue('Card', st) + calcAutoValue('Cheque', st) + 
                                calcAutoValue('Refund', st);
     
     if (['Front1', 'Front2', 'Front3', 'Front4'].includes(station)) {
-      // สูตรเต็ม per station
-      const cashIn = get('cashIn', station);
-      const sales = get('sales', station);
-      const cashOut = get('cashOut', station);
-      const returns = get('returns', station);
+      const cashIn = _getSummaryValue('cashIn', station);
+      const sales = _getSummaryValue('sales', station);
+      const cashOut = _getSummaryValue('cashOut', station);
+      const returns = _getSummaryValue('returns', station);
       const outflow = outflowOf(station);
       
       const hasAny = outflow || cashIn || cashOut || returns || sales;
@@ -1847,23 +1858,22 @@ async function renderMain(el) {
       const outflowSum = stations3.reduce((s, st) => s + outflowOf(st), 0);
       const salesSum = stations3.reduce((s, st) => {
         // ใช้ calcSales เพื่อ Invoice/Order/Payment จะ sum bills
-        return s + calcSales(st);
+        const bs = calcSales(st);
+        if (bs) return s + bs;
+        // fallback → summary
+        return s + _getSummaryValue('sales', st);
       }, 0);
       
-      // Fallback: ถ้า calcSales เป็น 0 → ลอง mainSummary
-      const salesSumFallback = stations3.reduce((s, st) => s + get('sales', st), 0);
-      const salesFinal = salesSum || salesSumFallback;
+      if (!outflowSum && !salesSum) return { diff: 0, isOk: null, empty: true };
       
-      if (!outflowSum && !salesFinal) return { diff: 0, isOk: null, empty: true };
-      
-      const diff = outflowSum - salesFinal;
+      const diff = outflowSum - salesSum;
       return { diff, isOk: Math.abs(diff) < 1.0, empty: false };
     }
     
     if (station === 'Invoice Credit' || station === 'Order Credit') {
       // diff = outflow - sales
       const outflow = outflowOf(station);
-      const sales = calcSales(station) || get('sales', station);
+      const sales = calcSales(station) || _getSummaryValue('sales', station);
       
       if (!outflow && !sales) return { diff: 0, isOk: null, empty: true };
       
@@ -1871,7 +1881,6 @@ async function renderMain(el) {
       return { diff, isOk: Math.abs(diff) < 1.0, empty: false };
     }
     
-    // Order, Payment → ไม่มี Sum check (รวมใน Invoice แล้ว)
     return { diff: 0, isOk: null, empty: true };
   }
 
@@ -2315,20 +2324,41 @@ async function renderMain(el) {
   function buildSumRow(key, label, color, editable) {
     const vals = SUMMARY_STATIONS.map(s => Number(mainSummary[key+'_'+s]) || 0);
     const allSum = vals.reduce((a,b)=>a+b,0);
+    // cashIn: Front1-4 + Invoice (Merged with Order/Payment), cashOut: Front1 + Invoice (Merged), returns: Front1-3 + Invoice (Merged)
+    const allowedStations = {
+      cashIn: ['Front1','Front2','Front3','Front4','Invoice','Order','Payment'],
+      cashOut: ['Front1','Invoice','Order','Payment'],
+      returns: ['Front1','Front2','Front3','Front4','Invoice','Order','Payment'],
+    };
+    const allowed = allowedStations[key] || [];
+    
+    const cellParts = [];
+    SUMMARY_STATIONS.forEach((s, i) => {
+      // Skip Order/Payment — merged into Invoice cell
+      if (s === 'Order' || s === 'Payment') return;
+      if (s === 'Invoice') {
+        // รวม 3 stations (Invoice+Order+Payment) เป็น cell เดียว colspan=3 
+        // เฉพาะถ้า Invoice allowed
+        if (allowed.includes('Invoice')) {
+          // Editable input โผล่ที่ Invoice (ใช้ key 'Invoice')
+          cellParts.push(`<td colspan="3" style="background:rgba(91,124,250,.04);border-left:1px dashed var(--border);border-right:1px dashed var(--border)"><input class="input sum-cell" data-k="${key}_Invoice" type="number" value="${mainSummary[key+'_Invoice']||''}" step="0.01" placeholder="0" style="width:95%;padding:3px 6px;font-size:.78rem;text-align:center;border-color:${color}" title="รวม Invoice + Order + Payment"></td>`);
+        } else {
+          cellParts.push(`<td colspan="3"></td>`);
+        }
+        return;
+      }
+      // Other stations
+      if (!allowed.includes(s)) {
+        cellParts.push(`<td></td>`);
+        return;
+      }
+      cellParts.push(`<td><input class="input sum-cell" data-k="${key}_${s}" type="number" value="${mainSummary[key+'_'+s]||''}" step="0.01" placeholder="0" style="width:95%;padding:3px 6px;font-size:.78rem;text-align:right;border-color:${color}"></td>`);
+    });
+    
     return `<tr>
       <td style="text-align:right;font-weight:700">${allSum?fmtNum(allSum):'-'}</td>
       <td style="font-weight:600;color:${color}">${label}</td>
-      ${SUMMARY_STATIONS.map((s,i)=>{
-        // cashIn: Front1-4 + Invoice, cashOut: Front1 + Invoice, returns: Front1-3 + Invoice
-        const allowedStations = {
-          cashIn: ['Front1','Front2','Front3','Front4','Invoice'],
-          cashOut: ['Front1','Invoice'],
-          returns: ['Front1','Front2','Front3','Front4','Invoice'],
-        };
-        const allowed = (allowedStations[key] || []).includes(s);
-        if (!allowed) return `<td></td>`;
-        return `<td><input class="input sum-cell" data-k="${key}_${s}" type="number" value="${mainSummary[key+'_'+s]||''}" step="0.01" placeholder="0" style="width:95%;padding:3px 6px;font-size:.78rem;text-align:right;border-color:${color}"></td>`;
-      }).join('')}
+      ${cellParts.join('')}
     </tr>`;
   }
 
@@ -8431,7 +8461,7 @@ async function renderMatching(el) {
           persistMainState();
           
           closeModal();
-          toast(`Match สำเร็จ: ${stmt.bank} ↔ ${bill.bill_no}`, 'success');
+          toast(`Match สำเร็จ: ${stmt.bank} ↔ ${targetLabel}`, 'success');
           render();
         });
       });
