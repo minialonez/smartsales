@@ -577,25 +577,53 @@ function handleStmtUpload(result, fileName) {
       });
     }
   } else if (bank === 'KBANK') {
+    // KBANK CSV: resultFile_*.csv
+    // Header row 11: ,วันที่,เวลา,รายการ,ถอนเงิน,,ฝากเงิน,,ยอดคงเหลือ,,ช่องทาง,,รายละเอียด
+    // Data: ,01-04-26,10:56,รับโอนเงิน,,,"19,029.00",,...
+    // Date format: DD-MM-YY (2-digit year!)
     const sheet = firstSheet;
     let hRow = -1;
     for (let i = 0; i < Math.min(15, sheet.length); i++) {
-      if (sheet[i] && sheet[i].some(c => String(c).includes('วันที่') || String(c).includes('Date'))) { hRow = i; break; }
+      if (sheet[i] && sheet[i].some(c => String(c).includes('วันที่'))) { hRow = i; break; }
     }
-    if (hRow < 0) hRow = 10;
+    if (hRow < 0) hRow = 11;
+    
+    function parseKbankDate(val) {
+      if (!val) return '';
+      const s = String(val).trim();
+      // DD-MM-YY format (e.g. "01-04-26")
+      const m = s.match(/^(\d{1,2})-(\d{1,2})-(\d{2,4})$/);
+      if (m) {
+        let y = Number(m[3]);
+        if (y < 100) y += 2000; // 26 → 2026
+        if (y > 2400) y -= 543; // พ.ศ.
+        return `${String(m[1]).padStart(2,'0')}/${String(m[2]).padStart(2,'0')}/${y}`;
+      }
+      return s;
+    }
+    function parseAmt(val) {
+      if (!val && val !== 0) return 0;
+      return Number(String(val).replace(/,/g, '')) || 0;
+    }
+    
     for (let i = hRow + 1; i < sheet.length; i++) {
       const r = sheet[i];
-      const dateVal = r[0] || r[1];
-      if (!dateVal) continue;
-      const deposit = Number(r[6]) || Number(r[5]) || 0;
-      const withdraw = Number(r[7]) || Number(r[4]) || 0;
+      if (!r) continue;
+      const dateRaw = r[1] || r[0]; // col 1 = วันที่
+      if (!dateRaw) continue;
+      const dateStr = parseKbankDate(dateRaw);
+      if (!dateStr || dateStr.includes('ยอดยกมา') || dateStr.includes('ยอดยกไป')) continue;
+      
+      const deposit = parseAmt(r[6]); // col 6 = ฝากเงิน
+      const withdraw = parseAmt(r[4]); // col 4 = ถอนเงิน
       if (!deposit && !withdraw) continue;
+      
       rows.push({ 
         bank, 
-        date: convertDate(dateVal), 
-        time: String(r[1] || r[2] || ''), 
-        ref_no: String(r[12] || r[11] || ''), 
-        description: String(r[3] || r[2] || ''), 
+        date: convertDate(dateStr),
+        time: String(r[2] || '').trim(), // col 2 = เวลา
+        ref_no: String(r[12] || '').trim(), // col 12 = รายละเอียด
+        description: String(r[3] || '').trim() + (r[12] ? ' · ' + String(r[12]).trim() : ''),
         amount: deposit || -withdraw, 
         match_status: 'unmatched' 
       });
