@@ -1647,6 +1647,11 @@ async function restoreMainState() {
       
       if (!stmt) return;
       
+      // ⚠️ Skip Cash/Refund — ไม่ auto เติม confirmation
+      //   - Cash: ไม่ผ่านธนาคาร (เข้าลิ้นชัก)
+      //   - Refund: user ต้องกรอกเองเพื่อบอกวิธีคืน (Cash/KTB/KBANK/etc.)
+      if (b.type === 'Cash' || b.type === 'Refund') return;
+      
       // ถ้าบิลยัง pending แต่ statement บอก matched → sync
       if (b.match_status !== 'matched' && b.match_status !== 'paid' && b.match_status !== 'void') {
         b.match_status = 'matched';
@@ -1670,18 +1675,29 @@ async function restoreMainState() {
   
   // ── Auto-mark Cash bills as matched (เงินสด = เข้าลิ้นชักแล้ว) ──
   let cashSynced = 0;
+  let cashConfCleared = 0;
   billList.forEach(b => {
-    if (b.type === 'Cash' && 
-        b.match_status !== 'matched' && 
-        b.match_status !== 'paid' && 
-        b.match_status !== 'void') {
-      b.match_status = 'matched';
-      if (!b.pay_date) b.pay_date = b.date;
-      cashSynced++;
+    if (b.type === 'Cash') {
+      // Cash: auto matched + ล้าง confirmation ที่ auto เติมผิด
+      if (b.match_status !== 'matched' && 
+          b.match_status !== 'paid' && 
+          b.match_status !== 'void') {
+        b.match_status = 'matched';
+        if (!b.pay_date) b.pay_date = b.date;
+        cashSynced++;
+      }
+      // ล้าง confirmation ถ้ามีค่าจาก auto-sync เก่าที่ผิด
+      if (b.confirmation) {
+        delete b.confirmation;
+        cashConfCleared++;
+      }
     }
   });
   if (cashSynced > 0) {
     console.log(`Cash auto-matched: ${cashSynced} bills`);
+  }
+  if (cashConfCleared > 0) {
+    console.log(`Cleared wrong confirmation on Cash bills: ${cashConfCleared}`);
   }
   
   // ── Auto-mark: confirmation มีค่าแล้ว → matched ──
@@ -2300,6 +2316,7 @@ function getCashForDate(dateISO) {
 async function renderMain(el) {
   let filterStation = 'ALL';
   let filterType = 'ALL';
+  let filterMatch = 'ALL';  // ALL | unmatched | matched | pending
   let filterDateFrom = '';
   let filterDateTo = '';
   let hidePaid = false;
@@ -2605,6 +2622,23 @@ async function renderMain(el) {
     if (filterType !== 'ALL') data = data.filter(b => b.type === filterType);
     if (hidePaid) data = data.filter(b => b.match_status !== 'paid');
     
+    // ── Filter by match status ──
+    if (filterMatch === 'unmatched') {
+      // ยังไม่ match = ไม่ใช่ matched/paid/void + ไม่ใช่ credit bill (SR/OR - รอรับเงิน)
+      data = data.filter(b => {
+        const prefix = (b.bill_no||'').substring(0,2).toUpperCase();
+        const isCredit = ['SR','OR'].includes(prefix);
+        const isCreditNote = ['SC','PC','JS','JR','BR','BS'].includes(prefix);
+        const isMatched = b.match_status === 'matched' || b.match_status === 'paid';
+        const isVoid = b.match_status === 'void';
+        return !isMatched && !isVoid && !isCredit && !isCreditNote;
+      });
+    } else if (filterMatch === 'matched') {
+      data = data.filter(b => b.match_status === 'matched' || b.match_status === 'paid');
+    } else if (filterMatch === 'pending') {
+      data = data.filter(b => !b.match_status || b.match_status === 'pending');
+    }
+    
     // Filter by date range (overrides default filter)
     if (filterDateFrom || filterDateTo) {
       data = billList;
@@ -2623,19 +2657,41 @@ async function renderMain(el) {
     const totalAmount = data.reduce((s, b) => b.match_status === 'void' ? s : s + (Number(b.amount) || 0), 0);
     const paidCount = billList.filter(b => b.match_status === 'paid').length;
     
-    // ── Sort bill list: station canonical order → bill_no (ascending) ──
-    // ตามลำดับไฟล์ต้นฉบับ: Front1 → Front2 → ... → SS → SR → OS → OR → SP
+    // นับบิลที่ยังไม่ match — ใน range ปัจจุบัน
+    const unmatchedCount = (billList.length > 200 && !filterDateFrom && !filterDateTo 
+      ? getBillsForSelectedDate() 
+      : billList).filter(b => {
+      const prefix = (b.bill_no||'').substring(0,2).toUpperCase();
+      const isCredit = ['SR','OR'].includes(prefix);
+      const isCreditNote = ['SC','PC','JS','JR','BR','BS'].includes(prefix);
+      const isMatched = b.match_status === 'matched' || b.match_status === 'paid';
+      const isVoid = b.match_status === 'void';
+      return !isMatched && !isVoid && !isCredit && !isCreditNote;
+    }).length;
+    
+    // ── Sort bill list ──
+    // Default: วันที่ ASC → Station canonical → Bill No
+    // Toggle DESC: วันที่ DESC → Station canonical → Bill No (DESC)
     const BILL_STATION_ORDER = ['Front1','Front2','Front3','Front4','Invoice','Invoice Credit','Order','Order Credit','Payment','Cancel',''];
     const stationRank = (st) => {
       const i = BILL_STATION_ORDER.indexOf(st || '');
       return i === -1 ? 999 : i;
     };
+    const _billOrder = getSortOrder('billList');
     data = [...data].sort((a, b) => {
+      // 1) วันที่ก่อน (ASC หรือ DESC)
+      const da = parseThaiDate(a.date) || 0;
+      const db = parseThaiDate(b.date) || 0;
+      if (da !== db) {
+        return _billOrder === 'asc' ? da - db : db - da;
+      }
+      // 2) วันเดียวกัน → Station canonical order (คงที่ไม่ว่า asc/desc)
       const sa = stationRank(a.station);
       const sb = stationRank(b.station);
       if (sa !== sb) return sa - sb;
-      // ภายใน station เดียวกัน → เรียงตาม bill_no
-      return String(a.bill_no || '').localeCompare(String(b.bill_no || ''));
+      // 3) station เดียวกัน → เรียงตาม bill_no
+      const cmp = String(a.bill_no || '').localeCompare(String(b.bill_no || ''));
+      return _billOrder === 'asc' ? cmp : -cmp;
     });
     
     // ── PERF: Cap table rendering to first 500 rows to prevent lag on massive datasets ──
@@ -2888,6 +2944,16 @@ async function renderMain(el) {
         <button class="pill ${filterType==='ALL'?'active':''}" data-ft="ALL">ALL</button>
         ${types.map(t=>`<button class="pill ${filterType===t?'active':''}" data-ft="${t}">${t||'(ว่าง)'}</button>`).join('')}
       </div>
+      <div class="flex gap-2 mb-3 flex-wrap items-center">
+        <span class="text-xs text-dim">สถานะ:</span>
+        <button class="pill ${filterMatch==='ALL'?'active':''}" data-fm="ALL">ทั้งหมด</button>
+        <button class="pill ${filterMatch==='unmatched'?'active':''}" data-fm="unmatched" style="--pill-color:var(--danger)">✗ ยังไม่ match (${unmatchedCount})</button>
+        <button class="pill ${filterMatch==='matched'?'active':''}" data-fm="matched" style="--pill-color:var(--success)">✓ matched</button>
+        <button class="pill ${filterMatch==='pending'?'active':''}" data-fm="pending" style="--pill-color:var(--warn)">⏳ pending</button>
+        <span style="margin-left:auto"></span>
+        <span class="text-xs text-dim">เรียง:</span>
+        ${sortToggleBtn('billList')}
+      </div>
 
       <div class="card-flat">
         <div class="table-wrap" style="max-height:420px;overflow-y:auto">
@@ -2909,10 +2975,11 @@ async function renderMain(el) {
                 <th>Remarks2</th>
                 <th>Bank</th>
                 <th>Due Date</th>
+                <th style="width:80px">แก้ไข</th>
               </tr>
             </thead>
             <tbody>
-              ${data.length === 0 ? '<tr><td colspan="15" style="text-align:center;padding:40px;color:var(--text3)">ยังไม่มีข้อมูล — กด "Generate จาก Smart" เพื่อเริ่มต้น</td></tr>' :
+              ${data.length === 0 ? '<tr><td colspan="16" style="text-align:center;padding:40px;color:var(--text3)">ยังไม่มีข้อมูล — กด "Generate จาก Smart" เพื่อเริ่มต้น</td></tr>' :
                 (() => {
                   // หาบิลที่ซ้ำจริง (composite key: bill_no + type + amount)
                   // ไม่จับ split payment ว่าซ้ำ
@@ -3041,6 +3108,9 @@ async function renderMain(el) {
                     <td style="white-space:nowrap">
                       <input type="date" class="input bl-cell" data-field="due_date" value="${toISODate(b.due_date)}" style="padding:3px 6px;font-size:.78rem;width:130px">
                       <button class="btn-copy-down" data-idx="${realIdx}" data-field="due_date" title="คัดลอกลงทุกแถว" style="background:none;border:1px solid var(--border);color:var(--text2);padding:0 4px;margin-left:2px;border-radius:4px;cursor:pointer;font-size:.75rem">⬇️</button>
+                    </td>
+                    <td style="white-space:nowrap;text-align:center">
+                      <button class="btn-edit-bill" data-idx="${realIdx}" title="แก้ไขบิล" style="background:var(--info-bg);border:1px solid var(--info);color:var(--info);padding:3px 10px;border-radius:4px;cursor:pointer;font-size:.8rem">✏️ แก้ไข</button>
                     </td>
                   </tr>`;
                 }).join('')
@@ -4012,6 +4082,134 @@ async function renderMain(el) {
     });
     el.querySelectorAll('.pill[data-ft]').forEach(btn => {
       btn.addEventListener('click', () => { filterType = btn.dataset.ft; render(); });
+    });
+    el.querySelectorAll('.pill[data-fm]').forEach(btn => {
+      btn.addEventListener('click', () => { filterMatch = btn.dataset.fm; render(); });
+    });
+    
+    // Sort toggle button
+    el.querySelectorAll('.sort-toggle').forEach(btn => {
+      btn.addEventListener('click', () => {
+        toggleSortOrder(btn.dataset.pageKey);
+        render();
+      });
+    });
+    
+    // ── ปุ่มแก้ไขบิล (✏️) — เปิด modal ──
+    el.querySelectorAll('.btn-edit-bill').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const idx = Number(btn.dataset.idx);
+        const b = billList[idx];
+        if (!b) return;
+        
+        openModal(`✏️ แก้ไขบิล — ${b.bill_no || '(ไม่มีเลข)'}`, `
+          <div class="flex-col gap-3">
+            <div class="flex gap-2">
+              <div class="input-group flex-1">
+                <label>Bill Number</label>
+                <input class="input" id="eb-bill" value="${b.bill_no || ''}">
+              </div>
+              <div class="input-group flex-1">
+                <label>Bill Date</label>
+                <input type="date" class="input" id="eb-date" value="${toISODate(b.date)}">
+              </div>
+            </div>
+            <div class="flex gap-2">
+              <div class="input-group flex-1">
+                <label>Station</label>
+                <select class="select" id="eb-station">
+                  ${STATION_OPTIONS.map(o=>`<option value="${o}" ${b.station===o?'selected':''}>${o||'(ว่าง)'}</option>`).join('')}
+                </select>
+              </div>
+              <div class="input-group flex-1">
+                <label>Type</label>
+                <select class="select" id="eb-type">
+                  ${TYPE_OPTIONS.map(o=>`<option value="${o}" ${b.type===o?'selected':''}>${o||'(ว่าง)'}</option>`).join('')}
+                </select>
+              </div>
+              <div class="input-group flex-1">
+                <label>Baht</label>
+                <input type="number" class="input" id="eb-amount" value="${b.amount||0}" step="0.01">
+              </div>
+            </div>
+            <div class="flex gap-2">
+              <div class="input-group flex-1">
+                <label>Confirmation (ธนาคาร/Cash)</label>
+                <input class="input" id="eb-confirmation" value="${b.confirmation||''}" placeholder="KTB / KBANK / BBL / BBL NW / Cash">
+              </div>
+              <div class="input-group flex-1">
+                <label>Pay Date</label>
+                <input type="date" class="input" id="eb-pay-date" value="${toISODate(b.pay_date)}">
+              </div>
+            </div>
+            <div class="flex gap-2">
+              <div class="input-group flex-1">
+                <label>Bank (user manual)</label>
+                <input class="input" id="eb-bank" value="${b.bank||''}">
+              </div>
+              <div class="input-group flex-1">
+                <label>Due Date</label>
+                <input type="date" class="input" id="eb-due-date" value="${toISODate(b.due_date)}">
+              </div>
+            </div>
+            <div class="input-group">
+              <label>Remarks 1</label>
+              <input class="input" id="eb-remarks1" value="${b.remarks1||''}">
+            </div>
+            <div class="input-group">
+              <label>Remarks 2</label>
+              <input class="input" id="eb-remarks2" value="${b.remarks2||''}">
+            </div>
+            <div class="input-group">
+              <label>Match Status</label>
+              <select class="select" id="eb-status">
+                ${['pending','matched','paid','void','awaiting_clear','bounced'].map(s=>`<option value="${s}" ${b.match_status===s?'selected':''}>${s}</option>`).join('')}
+              </select>
+            </div>
+            <div class="flex gap-2 mt-3">
+              <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ยกเลิก</button>
+              <button class="btn btn-sm" id="eb-delete" style="background:var(--danger);color:#fff;padding:6px 14px">🗑 ลบ</button>
+              <button class="btn btn-primary btn-sm flex-1" id="eb-save">✓ บันทึก</button>
+            </div>
+          </div>
+        `);
+        
+        document.getElementById('eb-save')?.addEventListener('click', () => {
+          b.bill_no = document.getElementById('eb-bill').value.trim();
+          b.date = document.getElementById('eb-date').value;
+          b.station = document.getElementById('eb-station').value;
+          b.type = document.getElementById('eb-type').value;
+          b.amount = Number(document.getElementById('eb-amount').value) || 0;
+          b.confirmation = document.getElementById('eb-confirmation').value.trim();
+          b.pay_date = document.getElementById('eb-pay-date').value;
+          b.bank = document.getElementById('eb-bank').value.trim();
+          b.due_date = document.getElementById('eb-due-date').value;
+          b.remarks1 = document.getElementById('eb-remarks1').value;
+          b.remarks2 = document.getElementById('eb-remarks2').value;
+          b.match_status = document.getElementById('eb-status').value;
+          
+          // Auto-matched rule: Cash type without confirmation → still matched
+          if (b.type === 'Cash' && b.match_status === 'pending') {
+            b.match_status = 'matched';
+            if (!b.pay_date) b.pay_date = b.date;
+          }
+          
+          persistMainState();
+          closeModal();
+          toast(`✓ บันทึกแล้ว — ${b.bill_no||'(ไม่มีเลข)'}`, 'success');
+          render();
+        });
+        
+        document.getElementById('eb-delete')?.addEventListener('click', () => {
+          if (!confirm(`ลบบิล ${b.bill_no||'(ไม่มีเลข)'}?\n${b.type} · ฿${fmtNum(b.amount)} · ${fmtDate(b.date)}\n\nลบแล้วกู้คืนไม่ได้`)) return;
+          billList.splice(idx, 1);
+          persistMainState();
+          closeModal();
+          toast('ลบบิลแล้ว', 'success');
+          render();
+        });
+      });
     });
 
     // Summary cells (cashIn/cashOut/returns/sales/drawer)
