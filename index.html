@@ -2060,10 +2060,17 @@ async function renderMain(el) {
     
     const summaryOrBills = (label, billType, st) => {
       const s = summaryRow(label, st);
-      if (s !== null) return s;
-      // fallback: bills
-      if (billType === 'Cash') return calcCashFromBills(st);
-      return calcAutoValue(billType, st);
+      if (s !== null && s !== 0) return s; // summary มีค่า (ไม่ใช่ 0) → ใช้เลย
+      // summary = 0 หรือ null → ลอง bills ก่อน
+      if (billType === 'Cash') {
+        const bv = calcCashFromBills(st);
+        if (bv) return bv;
+      } else {
+        const bv = calcAutoValue(billType, st);
+        if (bv) return bv;
+      }
+      // bills ก็ไม่มี → ใช้ summary (0) หรือ 0
+      return s !== null ? s : 0;
     };
     
     const summaryOrZero = (label, st) => {
@@ -2537,7 +2544,8 @@ async function renderMain(el) {
                     statusBadge = `<br><span class="badge" style="background:rgba(160,100,255,.15);color:#a064ff;margin-top:2px">📋 ใบลดหนี้</span>`;
                   } else if (isCreditSale) {
                     rowStyle = 'background:rgba(91,124,250,.08);border-left:3px solid rgba(91,124,250,.6)';
-                    statusBadge = `<br><span class="badge" style="background:rgba(91,124,250,.15);color:#5b7cfa;margin-top:2px">💳 บิลเครดิต</span>`;
+                    const csLabel = billPrefix === 'SR' ? '🧾 ใบกำกับภาษี' : '📦 ใบส่งของ';
+                    statusBadge = `<br><span class="badge" style="background:rgba(91,124,250,.15);color:#5b7cfa;margin-top:2px">${csLabel}</span>`;
                   } else if (isPendingMatch) {
                     rowStyle = 'background:rgba(239,87,87,.08);border-left:3px solid var(--danger)';
                     statusBadge = `<br><span class="badge badge-danger" style="margin-top:2px">⚠ ยัง Match ไม่เจอ</span>`;
