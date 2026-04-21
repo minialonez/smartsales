@@ -3144,10 +3144,17 @@ async function renderMain(el) {
   //   เพราะเงินสดรวมกันทั้ง 3 station
   //   ★ แสดงค่า adjusted = raw − นำเงินเข้า  (เพื่อให้ตรงสูตร Sum)
   function buildCashDrawerRow() {
-    // Helper: ค่า cashIn สำหรับ station
+    // Helper: ค่า cashIn สำหรับ station (inline — ไม่พึ่ง summaryRow ที่อยู่ใน scope อื่น)
     const cashInOf = (st) => {
-      const summaryVal = summaryRow('นำเงินเข้า', st);
-      return summaryVal !== null ? summaryVal : (Number(mainSummary['cashIn_' + st]) || 0);
+      // ลอง __byDate ก่อน
+      if (mainSummary && mainSummary.__byDate && mainSummary.__byDate[selectedDate]) {
+        const dayData = mainSummary.__byDate[selectedDate];
+        if (dayData['นำเงินเข้า'] && dayData['นำเงินเข้า'][st] !== undefined) {
+          return Number(dayData['นำเงินเข้า'][st]) || 0;
+        }
+      }
+      // Fallback: flat key
+      return Number(mainSummary['cashIn_' + st]) || 0;
     };
     
     // Merged total ของ Invoice + Order + Payment (adjusted)
