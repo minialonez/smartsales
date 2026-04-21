@@ -2488,60 +2488,68 @@ async function renderMain(el) {
       return s !== null ? s : 0;
     };
     
-    // ── Front1-4: ใช้สูตรเดียวกับ Invoice merged ──
-    // (Cash Drawer − นำเงินเข้า) + Transfer + Card + Cheque + Refund − ยอดขาย
-    //   diff > 0  → ได้รับเงินเกิน
-    //   diff < 0  → ได้รับเงินไม่ครบ (ติดลบ)
+    // ── Front1-4: สูตร xlsm (C12) ──
+    //   LHS = drawer + transfer + card + cheque + refund  (row 7 + row 8:11)
+    //   RHS = cashIn + sales + cashOut + returns         (row 3:6)
+    //   diff = LHS - RHS
+    //   diff > 0 → ได้รับเงินเกิน
+    //   diff < 0 → ได้รับเงินไม่ครบ
     if (['Front1', 'Front2', 'Front3', 'Front4'].includes(station)) {
       const cashIn = _getSummaryValue('cashIn', station);
       const sales = _getSummaryValue('sales', station);
+      const cashOut = _getSummaryValue('cashOut', station);
+      const returns = _getSummaryValue('returns', station);
       const drawer = summaryOrBills('Cash Drawer', 'Cash', station);
       const transfer = summaryOrBills('Transfer', 'Transfer', station);
       const card = summaryOrBills('Card', 'Card', station);
       const cheque = summaryOrBills('Cheque', 'Cheque', station);
       const refund = summaryOrBills('Refund', 'Refund', station);
       
-      // (Cash Drawer - นำเงินเข้า) + Transfer + Card + Cheque + Refund
-      const effectiveInflow = (drawer - cashIn) + transfer + card + cheque + refund;
+      const LHS = drawer + transfer + card + cheque + refund;
+      const RHS = cashIn + sales + cashOut + returns;
       
-      if (!effectiveInflow && !sales) return { diff: 0, isOk: null, empty: true };
+      if (!LHS && !RHS) return { diff: 0, isOk: null, empty: true };
       
-      const diff = effectiveInflow - sales;
+      const diff = LHS - RHS;
       return { diff, isOk: Math.abs(diff) < 1.0, empty: false };
     }
     
     // ── Invoice merged (Invoice + Order + Payment) ──
-    // สูตร: (Cash Drawer − นำเงินเข้า) + Transfer + Card + Cheque + Refund − ยอดขาย
-    //   diff > 0  → ได้รับเงินเกิน
-    //   diff < 0  → ได้รับเงินไม่ครบ (ติดลบ)
+    // สูตร xlsm G12: SUM(G7, G8:I11) = SUM(G4:I4)
+    //   LHS = drawer_Invoice_only + (transfer+card+cheque+refund for 3 stations)
+    //   RHS = sum of sales for 3 stations
+    //   diff = LHS - RHS
+    //   (ไม่รวม cashIn, cashOut, returns เพราะ xlsm ไม่รวมในสมการนี้)
+    //   NOTE: ถ้า drawer มาจาก user นับธนบัตรจริง (raw count) จะรวม cashIn อยู่
+    //   → ต้องลบ cashIn+cashOut ออกก่อน (xlsm: G7 = O10 - G3 - G5)
     if (station === 'Invoice') {
       const stations3 = ['Invoice', 'Order', 'Payment'];
       
-      // Cash Drawer (รวม 3 stations)
+      // Cash Drawer (only Invoice station has drawer - ถือว่าเป็นลิ้นชักรวม 3 stations)
       const drawerSummary = summaryOrZero('Cash Drawer', 'Invoice');
-      const drawerBills = stations3.reduce((s, st) => s + calcCashFromBills(st), 0);
-      const drawer = drawerSummary || drawerBills;
+      const countedCash = calcCashDrawer('Invoice'); // user นับธนบัตร
+      let drawer;
+      if (countedCash > 0) {
+        // User นับธนบัตรจริง → raw count รวม cashIn อยู่
+        // ต้องลบ cashIn+cashOut ออก (ตรงตามสูตร G7 = O10 - G3 - G5)
+        const cashIn_Invoice = _getSummaryValue('cashIn', 'Invoice');
+        const cashOut_Invoice = _getSummaryValue('cashOut', 'Invoice');
+        drawer = countedCash - cashIn_Invoice - cashOut_Invoice;
+      } else {
+        // Summary value (already adjusted - xlsm convention)
+        drawer = drawerSummary || stations3.reduce((s, st) => s + calcCashFromBills(st), 0);
+      }
       
-      // นำเงินเข้า (รวม 3 stations) — ต้องลบออกจาก cash drawer
-      //   เพราะ cash drawer มีทั้งเงินทอนที่ user ใส่เข้าไปและเงินขายจริง
-      let cashInSum = 0;
+      // Transfer/Card/Cheque/Refund: summary ก่อน → bills (รวม 3 stations)
+      let otherSum = 0;
       stations3.forEach(st => {
-        cashInSum += _getSummaryValue('cashIn', st);
+        otherSum += summaryOrBills('Transfer', 'Transfer', st);
+        otherSum += summaryOrBills('Card', 'Card', st);
+        otherSum += summaryOrBills('Cheque', 'Cheque', st);
+        otherSum += summaryOrBills('Refund', 'Refund', st);
       });
       
-      // Transfer/Card/Cheque/Refund: summary ก่อน → bills
-      let otherOutflow = 0;
-      stations3.forEach(st => {
-        otherOutflow += summaryOrBills('Transfer', 'Transfer', st);
-        otherOutflow += summaryOrBills('Card', 'Card', st);
-        otherOutflow += summaryOrBills('Cheque', 'Cheque', st);
-        otherOutflow += summaryOrBills('Refund', 'Refund', st);
-      });
-      
-      // (Cash Drawer - นำเงินเข้า) + อื่นๆ
-      const effectiveInflow = (drawer - cashInSum) + otherOutflow;
-      
-      // ยอดขาย
+      // ยอดขาย (รวม 3 stations)
       let salesSum = 0;
       stations3.forEach(st => {
         const summaryVal = summaryRow('ยอดขาย', st);
@@ -2549,12 +2557,12 @@ async function renderMain(el) {
         else salesSum += calcSales(st);
       });
       
-      if (!effectiveInflow && !salesSum) return { diff: 0, isOk: null, empty: true };
+      const LHS = drawer + otherSum;
+      const RHS = salesSum;
       
-      // diff = effective inflow − sales
-      //   บวก (effective > sales)  → ได้รับเงินเกิน
-      //   ลบ (effective < sales)   → ได้รับเงินไม่ครบ
-      const diff = effectiveInflow - salesSum;
+      if (!LHS && !RHS) return { diff: 0, isOk: null, empty: true };
+      
+      const diff = LHS - RHS;
       return { diff, isOk: Math.abs(diff) < 1.0, empty: false };
     }
     
@@ -2770,26 +2778,19 @@ async function renderMain(el) {
               <!-- Row 3: นำเงินเข้า -->
               ${buildSumRow('cashIn', 'นำเงินเข้า', 'var(--success)', true)}
 
-              <!-- Row 4: ยอดขาย (Sales) — เหมือน Sum row: Front1-4 กรอกเอง, Invoice+Order+Payment รวมเป็น cell เดียว -->
+              <!-- Row 4: ยอดขาย (Sales) — แยก Invoice/Order/Payment ออกเป็น 3 ช่อง (ตรงตาม xlsm) -->
               ${(function(){
                 const vals = SUMMARY_STATIONS.map(s => calcSales(s) || _getSummaryValue('sales', s));
                 const allSum = vals.reduce((a,b)=>a+b,0);
                 const cellParts = [];
                 SUMMARY_STATIONS.forEach((s, i) => {
-                  if (s === 'Order' || s === 'Payment') return;
-                  if (s === 'Invoice') {
-                    // รวม Invoice+Order+Payment 3 stations เป็น cell เดียว (read-only)
-                    const invoiceIdx = SUMMARY_STATIONS.indexOf('Invoice');
-                    const orderIdx = SUMMARY_STATIONS.indexOf('Order');
-                    const paymentIdx = SUMMARY_STATIONS.indexOf('Payment');
-                    const merged = vals[invoiceIdx] + vals[orderIdx] + vals[paymentIdx];
-                    cellParts.push(`<td colspan="3" style="background:rgba(91,124,250,.08);border-left:1px dashed var(--border);border-right:1px dashed var(--border);text-align:center;font-weight:600;color:var(--info)" title="รวม Invoice + Order + Payment (คำนวณจากบิล)">${merged ? fmtNum(merged) : '-'}</td>`);
-                    return;
-                  }
                   const isManual = ['Front1','Front2','Front3','Front4'].includes(s);
-                  cellParts.push(isManual
-                    ? `<td><input class="input sum-cell" data-k="sales_${s}" type="number" value="${mainSummary['sales_'+s]||''}" step="0.01" placeholder="0" style="width:95%;padding:3px 6px;font-size:.78rem;text-align:right;border-color:var(--primary)"></td>`
-                    : `<td style="text-align:right;font-weight:600;color:var(--info)">${vals[i]?fmtNum(vals[i]):'-'}</td>`);
+                  if (isManual) {
+                    cellParts.push(`<td><input class="input sum-cell" data-k="sales_${s}" type="number" value="${mainSummary['sales_'+s]||''}" step="0.01" placeholder="0" style="width:95%;padding:3px 6px;font-size:.78rem;text-align:right;border-color:var(--primary)"></td>`);
+                  } else {
+                    // Invoice / Order / Payment / Invoice Credit / Order Credit — read-only per station
+                    cellParts.push(`<td style="text-align:right;font-weight:600;color:var(--info)">${vals[i]?fmtNum(vals[i]):'-'}</td>`);
+                  }
                 });
                 return `<tr style="background:rgba(91,124,250,.06)">
                   <td style="text-align:right;font-weight:700">${fmtNum(allSum)}</td>
