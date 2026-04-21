@@ -2637,16 +2637,18 @@ async function renderMain(el) {
     if (hidePaid) data = data.filter(b => b.match_status !== 'paid');
     
     // ── Filter by match status ──
+    //   "ยังไม่ match" = Type ใน [Transfer, Card, Cheque] หรือ Type ว่าง
+    //   (Type=Cash, Refund ไม่ต้อง match — ไม่แสดงในกลุ่มนี้)
+    const MATCHABLE_TYPES_FILTER = ['Transfer', 'Card', 'Cheque', '', null, undefined];
+    const isUnmatchedCandidate = (b) => {
+      const isMatched = b.match_status === 'matched' || b.match_status === 'paid';
+      const isVoid = b.match_status === 'void';
+      if (isMatched || isVoid) return false;
+      return MATCHABLE_TYPES_FILTER.includes(b.type || '');
+    };
+    
     if (filterMatch === 'unmatched') {
-      // ยังไม่ match = ไม่ใช่ matched/paid/void + ไม่ใช่ credit bill (SR/OR - รอรับเงิน)
-      data = data.filter(b => {
-        const prefix = (b.bill_no||'').substring(0,2).toUpperCase();
-        const isCredit = ['SR','OR'].includes(prefix);
-        const isCreditNote = ['SC','PC','JS','JR','BR','BS'].includes(prefix);
-        const isMatched = b.match_status === 'matched' || b.match_status === 'paid';
-        const isVoid = b.match_status === 'void';
-        return !isMatched && !isVoid && !isCredit && !isCreditNote;
-      });
+      data = data.filter(isUnmatchedCandidate);
     } else if (filterMatch === 'matched') {
       data = data.filter(b => b.match_status === 'matched' || b.match_status === 'paid');
     } else if (filterMatch === 'pending') {
@@ -2671,17 +2673,10 @@ async function renderMain(el) {
     const totalAmount = data.reduce((s, b) => b.match_status === 'void' ? s : s + (Number(b.amount) || 0), 0);
     const paidCount = billList.filter(b => b.match_status === 'paid').length;
     
-    // นับบิลที่ยังไม่ match — ใน range ปัจจุบัน
+    // นับบิลที่ยังไม่ match — ใช้กฎเดียวกับ filter
     const unmatchedCount = (billList.length > 200 && !filterDateFrom && !filterDateTo 
       ? getBillsForSelectedDate() 
-      : billList).filter(b => {
-      const prefix = (b.bill_no||'').substring(0,2).toUpperCase();
-      const isCredit = ['SR','OR'].includes(prefix);
-      const isCreditNote = ['SC','PC','JS','JR','BR','BS'].includes(prefix);
-      const isMatched = b.match_status === 'matched' || b.match_status === 'paid';
-      const isVoid = b.match_status === 'void';
-      return !isMatched && !isVoid && !isCredit && !isCreditNote;
-    }).length;
+      : billList).filter(isUnmatchedCandidate).length;
     
     // ── Sort bill list ──
     // Default: วันที่ ASC → Station canonical → Bill No
@@ -4356,16 +4351,32 @@ async function renderMain(el) {
           });
         };
         
+        // กฎ matched ใหม่:
+        //   Type = Cash                     → auto matched (ไม่ต้องใส่ confirmation)
+        //   Type = Transfer/Card/Cheque     → matched ก็ต่อเมื่อมี confirmation
+        //   Type = Refund / Unknown / ว่าง  → pending เสมอ
+        const MATCHABLE_TYPES_INLINE = ['Transfer', 'Card', 'Cheque'];
+        
         // ── Auto status change เมื่อกรอก confirmation ──
         if (field === 'confirmation') {
           const b = billList[idx];
-          if (b.confirmation && b.confirmation.trim()) {
+          const hasConf = b.confirmation && b.confirmation.trim();
+          const canMatchByType = MATCHABLE_TYPES_INLINE.includes(b.type || '');
+          
+          if (hasConf && canMatchByType) {
+            // Type = Transfer/Card/Cheque + มี confirmation → matched
             if (b.match_status !== 'matched' && b.match_status !== 'paid' && b.match_status !== 'void') {
               b.match_status = 'matched';
               if (!b.pay_date) b.pay_date = b.date;
               toast(`✓ บันทึกเป็นชำระแล้ว — ${b.bill_no||'(ไม่มีเลข)'}`, 'success');
             }
-          } else {
+          } else if (hasConf && !canMatchByType) {
+            // มี confirmation แต่ Type ไม่ match → แจ้งเตือน ไม่เปลี่ยนสถานะ
+            if (b.type && b.type !== 'Cash') {
+              toast(`⚠️ Type = "${b.type}" ไม่ match กับ statement (ใช้ได้เฉพาะ Transfer/Card/Cheque)`, 'warn');
+            }
+          } else if (!hasConf) {
+            // ล้าง confirmation → กลับเป็น pending (ถ้าไม่ใช่ Cash/paid_by_sp/void)
             if (b.match_status === 'matched' && !b.paid_by_sp && b.type !== 'Cash') {
               b.match_status = 'pending';
               delete b.pay_date;
@@ -4379,19 +4390,38 @@ async function renderMain(el) {
           return;
         }
         
-        // ── Auto-match Type=Cash ──
+        // ── Auto-match Type=Cash / revert when Type changes ──
         if (field === 'type') {
           const b = billList[idx];
+          const hasConf = b.confirmation && b.confirmation.trim();
+          
           if (b.type === 'Cash') {
+            // Cash → auto matched
             if (b.match_status !== 'matched' && b.match_status !== 'paid' && b.match_status !== 'void') {
               b.match_status = 'matched';
               if (!b.pay_date) b.pay_date = b.date;
               toast(`✓ Cash → auto matched`, 'success');
             }
-          } else if (b.type !== 'Cash' && b.match_status === 'matched' && !b.confirmation && !b.paid_by_sp) {
-            b.match_status = 'pending';
-            delete b.pay_date;
-            toast(`↩ เปลี่ยน type → ต้องใส่ confirmation`, 'info');
+          } else if (MATCHABLE_TYPES_INLINE.includes(b.type)) {
+            // Transfer/Card/Cheque → matched ต่อเมื่อมี confirmation
+            if (hasConf && b.match_status !== 'matched' && b.match_status !== 'paid' && b.match_status !== 'void') {
+              b.match_status = 'matched';
+              if (!b.pay_date) b.pay_date = b.date;
+              toast(`✓ มี confirmation อยู่แล้ว → matched`, 'success');
+            } else if (!hasConf && b.match_status === 'matched' && !b.paid_by_sp) {
+              b.match_status = 'pending';
+              delete b.pay_date;
+              delete b.matched_stmt_ref;
+              toast(`↩ ต้องใส่ confirmation ก่อนจึงจะ matched`, 'info');
+            }
+          } else {
+            // Type = Refund / Unknown / ว่าง → pending (ถ้าไม่ได้ถูก paid_by_sp)
+            if (b.match_status === 'matched' && !b.paid_by_sp) {
+              b.match_status = 'pending';
+              delete b.pay_date;
+              delete b.matched_stmt_ref;
+              toast(`↩ Type "${b.type||'(ว่าง)'}" ไม่ต้อง match → pending`, 'info');
+            }
           }
           persistMainState();
           renderKeepScroll();
@@ -9591,6 +9621,7 @@ async function renderMatching(el) {
         <div class="flex gap-2 items-center">
           <button class="btn btn-outline btn-sm" id="btn-stmt-upload">${ICONS.file} วาง Statement</button>
           <button class="btn btn-outline btn-sm" id="btn-dedup-stmts" title="ลบ statement ซ้ำ (date+time HH:MM+amount+ref)">🧹 ลบซ้ำ</button>
+          <button class="btn btn-ghost btn-sm" id="btn-unmatch-all" style="color:var(--warn);border:1px solid var(--warn)" title="ยกเลิก match ทั้งหมด (ไม่ลบข้อมูล)">↩ Unmatch ทั้งหมด</button>
           <button class="btn btn-primary btn-sm" id="btn-auto-match">${ICONS.pulse} Auto Match</button>
         </div>
       </div>
@@ -9794,19 +9825,22 @@ async function renderMatching(el) {
         // ยอดตรง ±5% หรือ ±1 บาท (ใช้ absolute รองรับเงินเข้า/ออก)
         const absStmt = Math.abs(stmtAmt);
         
-        // ── Filter ตาม direction ──
-        //   เงินออก (stmtAmt < 0) → PP / PS / PR / MS / MR / PX (ฝั่งเจ้าหนี้)
-        //   เงินเข้า (stmtAmt > 0) → SS / OS / SP / SR / OR / JR / JS / Front (ฝั่งลูกหนี้)
+        // ── Filter กฎใหม่ (ง่ายกว่าเดิม): ──
+        //   Match เฉพาะ Type = Transfer, Card, Cheque
+        //   + ทิศทาง (เงินเข้า/ออก) ตาม prefix และ station
+        const MATCHABLE_TYPES = ['Transfer', 'Card', 'Cheque'];
         const EXPENSE_PREFIXES = ['PP','PS','PR','MS','MR','PX'];
         const INCOME_PREFIXES = ['SS','OS','SP','SR','OR','JR','JS','SC'];
-        const matchesDirection = (b) => {
+        
+        const canMatchBill = (b) => {
+          if (!MATCHABLE_TYPES.includes(b.type || '')) return false;
           const prefix = String(b.bill_no||'').substring(0,2).toUpperCase();
           const isFrontStation = String(b.station||'').startsWith('Front');
           if (stmtAmt < 0) {
-            // เงินออก → เจ้าหนี้ (PP/PS/PR/MS/MR/PX)
+            // เงินออก → เจ้าหนี้
             return EXPENSE_PREFIXES.includes(prefix);
           } else {
-            // เงินเข้า → ลูกหนี้ (SS/OS/SP/SR/OR) หรือ Front station (ทุก prefix)
+            // เงินเข้า → ลูกหนี้ หรือ Front
             return INCOME_PREFIXES.includes(prefix) || isFrontStation;
           }
         };
@@ -9814,13 +9848,12 @@ async function renderMatching(el) {
         const candidates = [
           ...billList.filter(b => {
             if (b.match_status === 'matched' || b.match_status === 'paid') return false;
-            if (!matchesDirection(b)) return false;
+            if (!canMatchBill(b)) return false;
             const amtDiff = Math.abs(Math.abs(Number(b.amount)) - absStmt);
             return amtDiff < 1 || amtDiff < absStmt * 0.05;
           }),
           // Cashflow: deposit/supplier/transfer - filter by direction
           ...cashflowCandidates.filter(c => {
-            // เงินออก → supplier/transfer out · เงินเข้า → deposit
             const cfDir = c._cashflow?.type;
             if (stmtAmt < 0 && !['supplier','transfer','misc'].includes(cfDir)) return false;
             if (stmtAmt > 0 && !['deposit','transfer','misc'].includes(cfDir)) return false;
@@ -9829,7 +9862,7 @@ async function renderMatching(el) {
           }),
           // Supplier Payments → always expense (out)
           ...spCandidates.filter(sp => {
-            if (stmtAmt > 0) return false; // SP = เงินออก only
+            if (stmtAmt > 0) return false;
             const amtDiff = Math.abs(Math.abs(Number(sp.amount)) - absStmt);
             return amtDiff < 1 || amtDiff < absStmt * 0.05;
           }),
@@ -10078,6 +10111,68 @@ async function renderMatching(el) {
         render();
       });
     });
+    document.getElementById('btn-unmatch-all')?.addEventListener('click', async () => {
+      // นับเพื่อ preview
+      const matchedBills = billList.filter(b => 
+        b.match_status === 'matched' && b.match_status !== 'void' && b.match_status !== 'paid'
+      );
+      const matchedStmts = uploadedStatements.filter(s => s.match_status === 'matched');
+      
+      if (matchedBills.length === 0 && matchedStmts.length === 0) {
+        toast('ไม่มีรายการที่ match อยู่', 'info');
+        return;
+      }
+      
+      const msg = `ยกเลิก match ทั้งหมด?\n\n` +
+                  `• บิล matched: ${matchedBills.length} รายการ\n` +
+                  `• Statement matched: ${matchedStmts.length} รายการ\n\n` +
+                  `การดำเนินการนี้จะ:\n` +
+                  `✓ เปลี่ยน match_status → pending\n` +
+                  `✓ ล้าง confirmation, pay_date, matched_stmt_ref\n` +
+                  `✗ ไม่ลบข้อมูลบิล/statement\n` +
+                  `✗ ไม่แตะ Type, Station, Amount, Bank (manual input)\n\n` +
+                  `(บิลที่เป็น Cash/Refund + Matched จาก Cash rule จะคงสภาพ matched)`;
+      
+      if (!confirm(msg)) return;
+      
+      let unmatched = 0, stmtsCleared = 0;
+      billList.forEach(b => {
+        // Skip Cash-auto-matched bills (ไม่ต้องการ unmatch เพราะ Cash ไม่ได้ match กับ stmt)
+        if (b.type === 'Cash') return;
+        // Skip void/paid (manually set status)
+        if (b.match_status === 'void' || b.match_status === 'paid') return;
+        
+        if (b.match_status === 'matched') {
+          b.match_status = 'pending';
+          delete b.confirmation;
+          delete b.pay_date;
+          delete b.matched_stmt_ref;
+          delete b.matched_at;
+          unmatched++;
+        }
+      });
+      
+      Object.values(statementsByBank).forEach(arr => {
+        if (!Array.isArray(arr)) return;
+        arr.forEach(s => {
+          if (s.match_status === 'matched') {
+            s.match_status = 'pending';
+            delete s.match_station;
+            delete s.match_bill;
+            delete s.matched_at;
+            delete s.match_method;
+            stmtsCleared++;
+          }
+        });
+      });
+      uploadedStatements = getAllStatements();
+      
+      try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(e) {}
+      persistMainState();
+      toast(`↩ Unmatch สำเร็จ — บิล: ${unmatched} · Stmt: ${stmtsCleared}`, 'success', 6000);
+      render();
+    });
+    
     document.getElementById('btn-auto-match')?.addEventListener('click', async () => {
       // ── เปิด modal เลือกช่วงวันที่ ──
       const today = new Date().toISOString().substring(0, 10);
@@ -10152,34 +10247,57 @@ async function renderMatching(el) {
     async function runAutoMatchRange(dateFrom, dateTo) {
       toast(`กำลัง Auto Match: ${fmtDate(dateFrom)} → ${fmtDate(dateTo)}...`, 'info');
 
-      const BAD_PREFIX = ['SR','OR','SC','JS','JR','PR','PS','MR','MS','PC','BR','BS'];
-      const GOOD_TYPE = ['Transfer']; // Card ไม่ต้อง auto match (user manual เท่านั้น)
-      
       // ── Helper: คำนวณยอดสุทธิ (หลังหัก WHT + ค่าโอน + Card fee) ──
       function netAmount(b) {
-        const amt = Number(b.amount || 0);
+        const amt = Math.abs(Number(b.amount || 0));
         const wht = Number(b.wht_amount || 0);
         const tf = Number(b.transfer_fee || 0);
         const cf = Number(b.card_fee || 0);
         return Math.round((amt - wht - tf - cf) * 100) / 100;
       }
       
-      // Index บิลเฉพาะที่อยู่ในช่วงวันที่ — ใช้ยอด "สุทธิ" เป็น key
+      // ── กฎ match ใหม่ (ง่ายกว่าเดิม): ── 
+      //   Match เฉพาะ Type = Transfer, Card, Cheque (ไม่สนใจ prefix)
+      //   เงินเข้า (stmt > 0) → บิลทิศทางรับ (Front* station + prefix SS/OS/SP)
+      //   เงินออก (stmt < 0) → บิลทิศทางจ่าย (prefix PP/PS + supplier cashflow)
+      //   Type=Cash, Refund, Unknown → ไม่ match
+      const MATCHABLE_TYPES = ['Transfer', 'Card', 'Cheque'];
+      
+      function canMatch(b) {
+        if (!MATCHABLE_TYPES.includes(b.type || '')) return false;
+        if (b.match_status === 'matched' || b.match_status === 'paid' || b.match_status === 'void') return false;
+        return true;
+      }
+      
+      function isIncomeBill(b) {
+        if (!canMatch(b)) return false;
+        // เงินเข้า = Front station หรือ prefix ฝั่งลูกหนี้ (SS/OS/SP)
+        const prefix = String(b.bill_no || '').substring(0, 2).toUpperCase();
+        const isFrontStation = String(b.station || '').startsWith('Front');
+        const isIncomePrefix = ['SS','OS','SP','SR','OR'].includes(prefix);
+        return isFrontStation || isIncomePrefix;
+      }
+      
+      function isExpenseBill(b) {
+        if (!canMatch(b)) return false;
+        // เงินออก = prefix ฝั่งเจ้าหนี้ (PP/PS/PR/MS/MR)
+        const prefix = String(b.bill_no || '').substring(0, 2).toUpperCase();
+        return ['PP','PS','PR','MS','MR'].includes(prefix);
+      }
+      
+      // ══════════════════════════════════════════════════════════
+      // PASS 1: Match เงินเข้า (stmt amount > 0)
+      // ══════════════════════════════════════════════════════════
       const idx = {};
       const used = new Set();
       let billsInRange = 0;
       
       for (let bi = 0; bi < billList.length; bi++) {
         const b = billList[bi];
-        if (b.match_status === 'matched' || b.match_status === 'paid' || b.match_status === 'void') continue;
+        if (!isIncomeBill(b)) continue;
         
         const d = toISODate(b.date);
         if (!d || d < dateFrom || d > dateTo) continue;
-        
-        const prefix = (b.bill_no || '').substring(0, 2).toUpperCase();
-        if (prefix && BAD_PREFIX.indexOf(prefix) >= 0) continue;
-        if (prefix && prefix !== 'SS' && prefix !== 'OS' && prefix !== 'SP') continue;
-        if (GOOD_TYPE.indexOf(b.type) < 0) continue;
         
         // ใช้ยอดสุทธิ (เงินที่จะเข้าบัญชีจริง) เป็น key
         const netAmt = Math.round(netAmount(b));
@@ -10212,7 +10330,6 @@ async function renderMatching(el) {
         for (let c = 0; c < candidates.length; c++) {
           const bi = candidates[c].bi;
           if (used.has(bi)) continue;
-          // เทียบ statement.amount กับ bill net (ยอดสุทธิหลังหัก)
           if (Math.round(netAmount(billList[bi])) === Math.round(sa)) {
             foundIdx = bi;
             break;
@@ -10242,10 +10359,7 @@ async function renderMatching(el) {
       });
 
       // ══════════════════════════════════════════════════════════
-      // PASS 2: Match เงินออก กับบิลเจ้าหนี้ (PP/PS)
-      //   - PP = เลขตัดชำระเจ้าหนี้
-      //   - PS = ใบกำกับ VAT เจ้าหนี้ สด
-      //   - Type = Transfer เท่านั้น
+      // PASS 2: Match เงินออก (stmt amount < 0)
       // ══════════════════════════════════════════════════════════
       const expIdx = {};
       const expUsed = new Set();
@@ -10253,14 +10367,10 @@ async function renderMatching(el) {
       
       for (let bi = 0; bi < billList.length; bi++) {
         const b = billList[bi];
-        if (b.match_status === 'matched' || b.match_status === 'paid' || b.match_status === 'void') continue;
+        if (!isExpenseBill(b)) continue;
         
         const d = toISODate(b.date);
         if (!d || d < dateFrom || d > dateTo) continue;
-        
-        const prefix = (b.bill_no || '').substring(0, 2).toUpperCase();
-        if (prefix !== 'PP' && prefix !== 'PS') continue;
-        if (b.type !== 'Transfer') continue;
         
         const amt = Math.round(Math.abs(Number(b.amount || 0)));
         if (!amt) continue;
