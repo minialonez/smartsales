@@ -2307,6 +2307,7 @@ async function renderMain(el) {
   let filterStation = 'ALL';
   let filterType = 'ALL';
   let filterMatch = 'ALL';  // ALL | unmatched | matched | pending
+  let filterBillSearch = ''; // ค้นหาเลขบิล/confirmation/remarks
   let filterDateFrom = '';
   let filterDateTo = '';
   let hidePaid = false;
@@ -2596,7 +2597,8 @@ async function renderMain(el) {
     
     // ── PERF: If > 200 bills and no explicit date range → default to selectedDate only ──
     // ป้องกันค้างเมื่อมีข้อมูลย้อนหลังหลายพันบิล
-    if (billList.length > 200 && !filterDateFrom && !filterDateTo) {
+    // (เมื่อค้นหา → ค้นทั้ง billList ไม่จำกัดเฉพาะวันที่เลือก)
+    if (billList.length > 200 && !filterDateFrom && !filterDateTo && !filterBillSearch) {
       data = getBillsForSelectedDate();
     }
     
@@ -2635,6 +2637,27 @@ async function renderMain(el) {
         if (filterDateFrom && bd < filterDateFrom) return false;
         if (filterDateTo && bd > filterDateTo) return false;
         return true;
+      });
+    }
+    
+    // ── Filter by bill search (ค้นหาเลขบิล/confirmation/remarks/amount) ──
+    // ค้นได้ทั้งบิลทั้งหมด ไม่จำกัดวันที่ (ถ้า user ไม่ได้ set date range)
+    if (filterBillSearch) {
+      // ถ้าไม่มี date range → ใช้ billList ทั้งหมดเป็น source (ไม่จำกัด selectedDate)
+      if (!filterDateFrom && !filterDateTo) {
+        data = billList;
+        if (filterStation !== 'ALL') data = data.filter(b => b.station === filterStation);
+        if (filterType !== 'ALL') data = data.filter(b => b.type === filterType);
+        if (hidePaid) data = data.filter(b => b.match_status !== 'paid');
+        // Match status filter
+        if (filterMatch === 'unmatched') data = data.filter(isUnmatchedCandidate);
+        else if (filterMatch === 'matched') data = data.filter(b => b.match_status === 'matched' || b.match_status === 'paid');
+        else if (filterMatch === 'pending') data = data.filter(b => !b.match_status || b.match_status === 'pending');
+      }
+      const q = filterBillSearch.toLowerCase().trim();
+      data = data.filter(b => {
+        const fields = [b.bill_no, b.confirmation, b.remarks1, b.remarks2, b.amount];
+        return fields.some(f => String(f||'').toLowerCase().includes(q));
       });
     }
 
@@ -2695,7 +2718,11 @@ async function renderMain(el) {
       <div class="flex justify-between items-center mb-3">
         <div class="page-title">Main — สรุปยอดรายวัน</div>
         <div class="flex gap-2 items-center flex-wrap">
-          <input type="date" class="input" value="${selectedDate}" id="main-date" style="width:160px">
+          <div class="flex items-center" style="gap:4px">
+            <button class="btn btn-outline btn-sm" id="main-date-prev" title="วันก่อนหน้า" style="padding:4px 10px;font-weight:700">◀</button>
+            <input type="date" class="input" value="${selectedDate}" id="main-date" style="width:160px">
+            <button class="btn btn-outline btn-sm" id="main-date-next" title="วันถัดไป" style="padding:4px 10px;font-weight:700">▶</button>
+          </div>
           <button class="btn btn-primary btn-sm" id="btn-gen-smart">${ICONS.download} Smart (SS/OS/OR/SR)</button>
           <button class="btn btn-info btn-sm" id="btn-import-pos" style="background:var(--info);color:#fff">${ICONS.download} Front POS</button>
           <label class="btn btn-outline btn-sm" style="cursor:pointer" title="Import Daily JSON ที่ convert ไว้แล้ว (หลายวันรวด)">
@@ -2880,8 +2907,12 @@ async function renderMain(el) {
 
       <!-- ═══════ SECTION 3: Bill List Transactions (ส่วนล่าง) ═══════ -->
       <div class="flex justify-between items-center mb-2">
-        <div class="font-semi">📋 Bill List (${billList.length} รายการ${paidCount?` · <span style="color:var(--success)">จ่ายแล้ว ${paidCount}</span>`:''}${filterDateFrom||filterDateTo?` · กรอง ${filterDateFrom||'…'} → ${filterDateTo||'…'}`:''})</div>
+        <div class="font-semi">📋 Bill List (${billList.length} รายการ${paidCount?` · <span style="color:var(--success)">จ่ายแล้ว ${paidCount}</span>`:''}${filterDateFrom||filterDateTo?` · กรอง ${filterDateFrom||'…'} → ${filterDateTo||'…'}`:''}${filterBillSearch?` · <span style="color:var(--info)">🔍 ค้น "${filterBillSearch}" = ${data.length}</span>`:''})</div>
         <div class="flex gap-2 flex-wrap">
+          <div style="position:relative">
+            <input type="text" class="input" id="filter-bill-search" value="${filterBillSearch.replace(/"/g,'&quot;')}" placeholder="🔍 ค้นเลขบิล / confirmation / remarks / ยอด..." style="width:280px;font-size:.8rem;padding-right:28px">
+            ${filterBillSearch?`<button id="btn-clear-bill-search" title="ล้างค้นหา" style="position:absolute;right:6px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--danger);cursor:pointer;font-size:1.1rem;line-height:1">✕</button>`:''}
+          </div>
           <input type="date" class="input" id="filter-date-from" value="${filterDateFrom}" placeholder="จาก" title="วันที่เริ่ม" style="width:140px;font-size:.8rem">
           <input type="date" class="input" id="filter-date-to" value="${filterDateTo}" placeholder="ถึง" title="วันที่สิ้นสุด" style="width:140px;font-size:.8rem">
           ${filterDateFrom||filterDateTo?'<button class="btn btn-ghost btn-sm" id="btn-clear-date">✕ ล้างวันที่</button>':''}
@@ -3519,6 +3550,44 @@ async function renderMain(el) {
     document.getElementById('filter-date-to')?.addEventListener('change', e => { filterDateTo = e.target.value; render(); });
     document.getElementById('btn-clear-date')?.addEventListener('click', () => { filterDateFrom = ''; filterDateTo = ''; render(); });
     document.getElementById('btn-hide-paid')?.addEventListener('click', () => { hidePaid = !hidePaid; render(); });
+    
+    // ── Bill search (ค้นเลขบิล/confirmation/remarks/ยอด) ──
+    // ใช้ debounce 200ms กัน re-render ทุกตัวอักษร
+    const billSearchInput = document.getElementById('filter-bill-search');
+    if (billSearchInput) {
+      let _searchTimer = null;
+      billSearchInput.addEventListener('input', e => {
+        const val = e.target.value;
+        clearTimeout(_searchTimer);
+        _searchTimer = setTimeout(() => {
+          filterBillSearch = val;
+          render();
+          // คืน focus + คงตำแหน่ง cursor หลัง render
+          const fresh = document.getElementById('filter-bill-search');
+          if (fresh) {
+            fresh.focus();
+            const pos = fresh.value.length;
+            try { fresh.setSelectionRange(pos, pos); } catch(e) {}
+          }
+        }, 200);
+      });
+      // Enter = apply ทันที (ข้าม debounce)
+      billSearchInput.addEventListener('keydown', e => {
+        if (e.key === 'Enter') {
+          clearTimeout(_searchTimer);
+          filterBillSearch = e.target.value;
+          render();
+        } else if (e.key === 'Escape') {
+          clearTimeout(_searchTimer);
+          filterBillSearch = '';
+          render();
+        }
+      });
+    }
+    document.getElementById('btn-clear-bill-search')?.addEventListener('click', () => {
+      filterBillSearch = '';
+      render();
+    });
 
     // ── เพิ่มบิลเอง ──
     document.getElementById('btn-add-bill')?.addEventListener('click', () => {
@@ -4033,11 +4102,14 @@ async function renderMain(el) {
         toast('บันทึกล้มเหลว: ' + err.message, 'error');
       }
     }
-    document.getElementById('main-date')?.addEventListener('change', e => { 
-      selectedDate = e.target.value; 
-      invalidateBillsCache();  // ← clear cache when date changes
+    // ── Helper: เปลี่ยนวันที่ + reload summary + render ──
+    // ใช้ทั้งจาก date input change และปุ่ม ◀ ▶
+    function _changeDateTo(newISO) {
+      if (!newISO || newISO === selectedDate) return;
+      selectedDate = newISO;
+      invalidateBillsCache();
       
-      // ── Clear summary keys เสมอก่อน (ไม่งั้นค่าจากวันก่อนหน้าจะค้าง) ──
+      // Clear flat summary keys (ค่าจากวันก่อนจะค้างถ้าไม่ล้าง)
       Object.keys(mainSummary).forEach(k => {
         if (k === '__byDate') return;
         if (k.includes('_')) delete mainSummary[k];
@@ -4050,7 +4122,6 @@ async function renderMain(el) {
           'ยอดคืนสินค้า': 'returns', 'Cash Drawer': 'cashDrawer',
           'Transfer': 'transfer', 'Card': 'card', 'Cheque': 'cheque', 'Refund': 'refund',
         };
-        // Set new (cleared already above)
         const sum = mainSummary.__byDate[selectedDate];
         Object.entries(sum).forEach(([thLabel, stations]) => {
           const prefix = LABEL_MAP[thLabel];
@@ -4061,9 +4132,25 @@ async function renderMain(el) {
           });
         });
       }
-      // Render เสมอ (ทั้งกรณีมีและไม่มีข้อมูล — ให้ UI update แสดง "-" ถ้าว่าง)
       render();
+    }
+    
+    // Shift selectedDate by ±N days
+    function _shiftDate(days) {
+      const d = new Date(selectedDate + 'T00:00:00');
+      if (isNaN(d)) return;
+      d.setDate(d.getDate() + days);
+      const iso = d.getFullYear() + '-'
+                + String(d.getMonth()+1).padStart(2,'0') + '-'
+                + String(d.getDate()).padStart(2,'0');
+      _changeDateTo(iso);
+    }
+    
+    document.getElementById('main-date')?.addEventListener('change', e => { 
+      _changeDateTo(e.target.value);
     });
+    document.getElementById('main-date-prev')?.addEventListener('click', () => _shiftDate(-1));
+    document.getElementById('main-date-next')?.addEventListener('click', () => _shiftDate(+1));
 
     // Filter pills
     el.querySelectorAll('.pill[data-fs]').forEach(btn => {
