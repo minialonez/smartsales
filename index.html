@@ -2488,25 +2488,25 @@ async function renderMain(el) {
       return s !== null ? s : 0;
     };
     
-    // ── Front1-4: สูตรเต็ม per station ──
+    // ── Front1-4: ใช้สูตรเดียวกับ Invoice merged ──
+    // (Cash Drawer − นำเงินเข้า) + Transfer + Card + Cheque + Refund − ยอดขาย
+    //   diff > 0  → ได้รับเงินเกิน
+    //   diff < 0  → ได้รับเงินไม่ครบ (ติดลบ)
     if (['Front1', 'Front2', 'Front3', 'Front4'].includes(station)) {
       const cashIn = _getSummaryValue('cashIn', station);
       const sales = _getSummaryValue('sales', station);
-      const cashOut = _getSummaryValue('cashOut', station);
-      const returns = _getSummaryValue('returns', station);
       const drawer = summaryOrBills('Cash Drawer', 'Cash', station);
       const transfer = summaryOrBills('Transfer', 'Transfer', station);
       const card = summaryOrBills('Card', 'Card', station);
       const cheque = summaryOrBills('Cheque', 'Cheque', station);
       const refund = summaryOrBills('Refund', 'Refund', station);
       
-      const outflow = drawer + transfer + card + cheque + refund;
-      const inflow = cashIn + sales + cashOut + returns;
+      // (Cash Drawer - นำเงินเข้า) + Transfer + Card + Cheque + Refund
+      const effectiveInflow = (drawer - cashIn) + transfer + card + cheque + refund;
       
-      const hasAny = outflow || inflow;
-      if (!hasAny) return { diff: 0, isOk: null, empty: true };
+      if (!effectiveInflow && !sales) return { diff: 0, isOk: null, empty: true };
       
-      const diff = outflow - inflow;
+      const diff = effectiveInflow - sales;
       return { diff, isOk: Math.abs(diff) < 1.0, empty: false };
     }
     
@@ -2855,17 +2855,17 @@ async function renderMain(el) {
         <div style="padding:10px 14px;background:var(--surface2);border-bottom:1px solid var(--border)" class="flex justify-between items-center">
           <div>
             <div class="font-semi">🪙 นับธนบัตร/เหรียญ — วันที่ <span style="color:var(--primary)">${fmtDate(selectedDate)}</span></div>
-            <div class="text-xs text-dim" style="margin-top:2px">ใส่จำนวนธนบัตร/เหรียญจริง → เปรียบเทียบกับ Cash Drawer (คำนวณจากบิล Cash) · ข้อมูลแยกตามวันที่</div>
+            <div class="text-xs text-dim" style="margin-top:2px">ใส่จำนวนธนบัตร/เหรียญจริงของลิ้นชัก Invoice+Order+Payment (รวมเป็น Invoice) → เปรียบเทียบกับ Cash Drawer (คำนวณจากบิล Cash) · ข้อมูลแยกตามวันที่</div>
           </div>
           <div class="text-xs" style="color:var(--warn)">💡 เปลี่ยนวันด้านบน → เปลี่ยน cash count ตามวัน</div>
         </div>
         <div class="table-wrap" style="overflow-x:auto">
-          <table style="font-size:.82rem;min-width:700px">
+          <table style="font-size:.9rem;max-width:500px;margin:0 auto">
             <thead>
               <tr>
-                <th style="min-width:80px;text-align:center;background:var(--surface3)">ธนบัตร/เหรียญ</th>
-                ${['Front1','Front2','Front3','Front4','Invoice'].map(s=>`<th style="min-width:95px;text-align:center;background:var(--surface3)">${s}</th>`).join('')}
-                <th style="min-width:95px;text-align:center;background:var(--surface3)">รวม (บาท)</th>
+                <th style="min-width:120px;text-align:center;background:var(--surface3)">ธนบัตร/เหรียญ</th>
+                <th style="min-width:160px;text-align:center;background:var(--surface3)">จำนวนใบ</th>
+                <th style="min-width:140px;text-align:center;background:var(--surface3)">มูลค่า (บาท)</th>
               </tr>
             </thead>
             <tbody>
@@ -2874,49 +2874,39 @@ async function renderMain(el) {
                 return DENOMINATIONS.map(d => `
                   <tr>
                     <td style="font-weight:700;color:var(--primary);text-align:center">฿${fmtInt(d)}</td>
-                    ${['Front1','Front2','Front3','Front4','Invoice'].map(s => `
-                      <td><input type="number" class="input cash-cell" data-denom="${d}" data-station="${s}" value="${dayCash[d+'_'+s]||''}" min="0" step="1" placeholder="0" style="width:95%;padding:3px 6px;font-size:.78rem;text-align:right"></td>
-                    `).join('')}
+                    <td><input type="number" class="input cash-cell" data-denom="${d}" data-station="Invoice" value="${dayCash[d+'_Invoice']||''}" min="0" step="1" placeholder="0" style="width:95%;padding:4px 8px;font-size:.9rem;text-align:right"></td>
                     <td style="text-align:right;font-weight:600;color:var(--success)" data-denom-total="${d}">
-                      ${fmtNum(['Front1','Front2','Front3','Front4','Invoice'].reduce((s,st)=>s+(d*(Number(dayCash[d+'_'+st])||0)),0))}
+                      ${fmtNum(d * (Number(dayCash[d+'_Invoice'])||0))}
                     </td>
                   </tr>
                 `).join('');
               })()}
               <tr style="border-top:2px solid var(--border);background:var(--surface2)">
                 <td style="font-weight:800">นับได้ (จริง)</td>
-                ${['Front1','Front2','Front3','Front4','Invoice'].map(s => `
-                  <td style="text-align:right;font-weight:800;color:var(--success)" data-station-total="${s}">
-                    ฿${fmtNum(calcCashDrawer(s))}
-                  </td>
-                `).join('')}
-                <td style="text-align:right;font-weight:800;color:var(--success);font-size:1rem" id="grand-total">
-                  ฿${fmtNum(['Front1','Front2','Front3','Front4','Invoice'].reduce((s,st)=>s+calcCashDrawer(st),0))}
+                <td></td>
+                <td style="text-align:right;font-weight:800;color:var(--success);font-size:1rem" data-station-total="Invoice" id="grand-total">
+                  ฿${fmtNum(calcCashDrawer('Invoice'))}
                 </td>
               </tr>
               <tr style="background:var(--surface2)">
-                <td style="font-weight:800">ระบบคำนวณ</td>
-                ${['Front1','Front2','Front3','Front4','Invoice'].map(s => `
-                  <td style="text-align:right;font-weight:600;color:var(--purple)">
-                    ฿${fmtNum(calcCashFromBills(s))}
-                  </td>
-                `).join('')}
-                <td style="text-align:right;font-weight:800;color:var(--purple)">
-                  ฿${fmtNum(['Front1','Front2','Front3','Front4','Invoice'].reduce((s,st)=>s+calcCashFromBills(st),0))}
+                <td style="font-weight:800">ระบบคำนวณ (จากบิล Cash)</td>
+                <td></td>
+                <td style="text-align:right;font-weight:600;color:var(--purple)">
+                  ฿${fmtNum(['Invoice','Order','Payment'].reduce((s,st)=>s+calcCashFromBills(st),0))}
                 </td>
               </tr>
               <tr style="background:var(--surface2);border-top:1px solid var(--border)">
                 <td style="font-weight:800">ส่วนต่าง</td>
-                ${['Front1','Front2','Front3','Front4','Invoice'].map(s => {
-                  const counted = calcCashDrawer(s);
-                  const system = calcCashFromBills(s);
+                <td></td>
+                ${(() => {
+                  const counted = calcCashDrawer('Invoice');
+                  const system = ['Invoice','Order','Payment'].reduce((s,st)=>s+calcCashFromBills(st),0);
                   const diff = counted - system;
                   const isOk = Math.abs(diff) < 0.01 && (counted > 0 || system > 0);
-                  return `<td style="text-align:right;font-weight:800;color:${isOk?'var(--success)':diff===0?'var(--text3)':'var(--danger)'}">
-                    ${counted === 0 && system === 0 ? '-' : (isOk ? '✓ ตรง' : fmtNum(diff))}
-                  </td>`;
-                }).join('')}
-                <td></td>
+                  const content = (counted === 0 && system === 0) ? '-' : (isOk ? '✓ ตรง' : fmtNum(diff));
+                  const color = isOk ? 'var(--success)' : (counted === 0 && system === 0 ? 'var(--text3)' : 'var(--danger)');
+                  return `<td style="text-align:right;font-weight:800;color:${color}">${content}</td>`;
+                })()}
               </tr>
             </tbody>
           </table>
@@ -3191,16 +3181,41 @@ async function renderMain(el) {
   }
 
   // ── Helper: Cash Drawer row (คำนวณอัตโนมัติจากบิล Type=Cash) ──
+  //   Invoice + Order + Payment = merge เป็น cell เดียว (colspan=3)
+  //   เพราะเงินสดรวมกันทั้ง 3 station
   function buildCashDrawerRow() {
-    const vals = SUMMARY_STATIONS.map(s => calcCashFromBills(s));
-    const allSum = vals.reduce((a,b)=>a+b,0);
+    // Merged total ของ Invoice + Order + Payment
+    const mergedInvoiceTotal = ['Invoice','Order','Payment']
+      .reduce((s, st) => s + calcCashFromBills(st), 0);
+    
+    // Per-station values (เฉพาะ Front1-4)
+    const frontVals = ['Front1','Front2','Front3','Front4'].map(s => calcCashFromBills(s));
+    const frontTotal = frontVals.reduce((a,b)=>a+b, 0);
+    const allSum = frontTotal + mergedInvoiceTotal;
+    
+    const cells = [];
+    SUMMARY_STATIONS.forEach(s => {
+      if (s === 'Order' || s === 'Payment') return; // skip - handled by Invoice colspan
+      if (s === 'Invoice') {
+        // Merged cell colspan=3
+        const v = mergedInvoiceTotal;
+        cells.push(`<td colspan="3" data-drawer-station="Invoice" style="text-align:center;color:${v?'var(--purple)':'var(--text3)'};font-weight:${v?'700':'400'};border-left:1px dashed var(--border);border-right:1px dashed var(--border);background:rgba(91,124,250,.04)" title="รวม Invoice + Order + Payment (เงินสดรวมลิ้นชัก)">${v?fmtNum(v):'-'}</td>`);
+        return;
+      }
+      if (['Invoice Credit','Order Credit'].includes(s)) {
+        cells.push('<td></td>');
+        return;
+      }
+      // Front1-4
+      const idx = ['Front1','Front2','Front3','Front4'].indexOf(s);
+      const v = idx >= 0 ? frontVals[idx] : 0;
+      cells.push(`<td data-drawer-station="${s}" style="text-align:right;color:${v?'var(--purple)':'var(--text3)'};font-weight:${v?'600':'400'}">${v?fmtNum(v):'-'}</td>`);
+    });
+    
     return `<tr>
       <td style="text-align:right;font-weight:700" data-drawer-total>${allSum?fmtNum(allSum):'-'}</td>
       <td style="font-weight:600;color:var(--purple)">🗃️ Cash Drawer</td>
-      ${SUMMARY_STATIONS.map((s,i)=>{
-        if (['Invoice Credit', 'Order Credit'].includes(s)) return `<td></td>`;
-        return `<td data-drawer-station="${s}" style="text-align:right;color:${vals[i]?'var(--purple)':'var(--text3)'};font-weight:${vals[i]?'600':'400'}">${vals[i]?fmtNum(vals[i]):'-'}</td>`;
-      }).join('')}
+      ${cells.join('')}
     </tr>`;
   }
 
@@ -4273,10 +4288,10 @@ async function renderMain(el) {
         const gEl = document.getElementById('grand-total');
         if (gEl) gEl.textContent = '฿' + fmtNum(grand);
         
-        // ── Update Cash Drawer row + Sum row ในสรุปด้านบน ──
-        SUMMARY_STATIONS.forEach(s => {
-          if (['Invoice Credit', 'Order Credit'].includes(s)) return;
-          const v = calcCashFromBills(s);  // now includes cash count priority
+        // ── Update Cash Drawer row ในสรุปด้านบน ──
+        // Front1-4: คำนวณแยกต่อ station
+        ['Front1','Front2','Front3','Front4'].forEach(s => {
+          const v = calcCashFromBills(s);
           const cell = el.querySelector(`[data-drawer-station="${s}"]`);
           if (cell) {
             cell.textContent = v ? fmtNum(v) : '-';
@@ -4284,10 +4299,21 @@ async function renderMain(el) {
             cell.style.fontWeight = v ? '600' : '400';
           }
         });
-        // Drawer total column
+        // Invoice merged = รวม 3 stations
+        const mergedInvoice = ['Invoice','Order','Payment']
+          .reduce((s,st) => s + calcCashFromBills(st), 0);
+        const mergedCell = el.querySelector('[data-drawer-station="Invoice"]');
+        if (mergedCell) {
+          mergedCell.textContent = mergedInvoice ? fmtNum(mergedInvoice) : '-';
+          mergedCell.style.color = mergedInvoice ? 'var(--purple)' : 'var(--text3)';
+          mergedCell.style.fontWeight = mergedInvoice ? '700' : '400';
+        }
+        // Drawer total column (ซ้ายสุด)
         const drawerTotalEl = el.querySelector('[data-drawer-total]');
         if (drawerTotalEl) {
-          const total = SUMMARY_STATIONS.reduce((s,st) => s + calcCashFromBills(st), 0);
+          const frontSum = ['Front1','Front2','Front3','Front4']
+            .reduce((s,st) => s + calcCashFromBills(st), 0);
+          const total = frontSum + mergedInvoice;
           drawerTotalEl.textContent = total ? fmtNum(total) : '-';
         }
         
