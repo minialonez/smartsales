@@ -2379,10 +2379,15 @@ async function renderMain(el) {
     return Number(mainSummary['cashDrawer_' + station]) || 0;
   }
   function calcAutoValue(type, station) {
+    // Transfer/Card/Cheque/Refund row: รวมเฉพาะบิลที่ matched แล้ว
+    // → Sum row จะโชว์ diff ทันทีถ้ามีบิลยังไม่ match
     return getBillsForSelectedDate().filter(b => {
       const st = (b.station || '').trim();
       const ty = (b.type || '').trim();
-      return st === station && ty === type;
+      if (st !== station || ty !== type) return false;
+      // Filter: เฉพาะบิลที่ match แล้ว (matched, paid, paid_by_sp)
+      const isMatched = b.match_status === 'matched' || b.match_status === 'paid' || b.paid_by_sp;
+      return isMatched;
     }).reduce((s, b) => s + (Number(b.amount) || 0), 0);
   }
 
@@ -10484,6 +10489,27 @@ function renderData(el) {
         ${statCard('Statement', totalStmts, '', 'var(--purple)', ICONS.file)}
       </div>
       
+      <!-- Daily Import Section -->
+      <div class="card mb-3" style="border:1.5px solid var(--primary);background:rgba(91,124,250,.04)">
+        <div class="flex justify-between items-center mb-3">
+          <div>
+            <div class="font-semi" style="color:var(--primary)">🗓️ Import Daily xlsm (หลายไฟล์)</div>
+            <div class="text-xs text-muted mt-1">อ่านวันที่จาก B2 → นำเข้า bills + summary + cash count · <strong>ข้าม Confirmation + Pay Date</strong> (ให้ไป match ที่หน้า Matching เอง)</div>
+          </div>
+          <div class="flex gap-2">
+            <button class="btn btn-ghost btn-sm" id="btn-clear-daily-all" style="color:var(--danger);border:1px solid var(--danger)">🗑 ล้าง Daily ทั้งหมด</button>
+            <label class="btn btn-primary btn-sm" style="cursor:pointer">
+              📥 เลือกไฟล์ xlsm
+              <input type="file" id="file-import-daily" accept=".xlsm,.xlsx,.xls" multiple style="display:none">
+            </label>
+          </div>
+        </div>
+        <p class="text-xs text-dim" style="padding:10px;background:rgba(245,166,35,.08);border-radius:6px;border-left:3px solid var(--warn)">
+          ⚠️ <strong>"ล้าง Daily ทั้งหมด"</strong> จะลบ: billList + mainSummary + cashCount <strong>ทั้งหมด</strong><br>
+          ✅ ไม่แตะ: Statement, Cashflow, Supplier Payments, SP/PP Recon
+        </p>
+      </div>
+      
       <!-- Backup Section -->
       <div class="card mb-3">
         <div class="flex justify-between items-center mb-3">
@@ -10539,6 +10565,95 @@ function renderData(el) {
     `;
     
     // ── Backup JSON ──
+    // ── Clear Daily ทั้งหมด ──
+    document.getElementById('btn-clear-daily-all')?.addEventListener('click', async () => {
+      const msg = `🗑 ล้าง Daily ทั้งหมด?\n\n` +
+                  `จะลบ:\n` +
+                  `  • Bill List ทั้งหมด (${billList.length} รายการ)\n` +
+                  `  • mainSummary (cashIn/sales/drawer/transfer/card/cheque/refund ทุกวัน)\n` +
+                  `  • Cash count (นับธนบัตร)\n\n` +
+                  `ไม่แตะ:\n` +
+                  `  ✅ Statement\n` +
+                  `  ✅ Cashflow\n` +
+                  `  ✅ Supplier Payments\n` +
+                  `  ✅ SP/PP Reconciliation\n\n` +
+                  `แน่ใจไหม? (ไม่สามารถย้อนกลับได้)`;
+      if (!confirm(msg)) return;
+      
+      billList = [];
+      mainSummary = {};
+      cashCount = {};
+      
+      try {
+        const db = await new Promise((res, rej) => {
+          const r = indexedDB.open('SmartFinanceDB', 1);
+          r.onsuccess = () => res(r.result);
+          r.onerror = () => rej(r.error);
+        });
+        const tx = db.transaction('data', 'readwrite');
+        tx.objectStore('data').put(JSON.stringify(billList), 'sf_billList');
+        tx.objectStore('data').put(JSON.stringify(mainSummary), 'sf_mainSummary');
+        tx.objectStore('data').put(JSON.stringify(cashCount), 'sf_cashCount');
+        tx.oncomplete = () => {
+          toast('🗑 ล้าง Daily ทั้งหมดเรียบร้อย', 'success');
+          render();
+        };
+      } catch(e) { console.error(e); toast('เกิดข้อผิดพลาด: ' + e.message, 'error'); }
+    });
+    
+    // ── Import Daily xlsm (หลายไฟล์) ──
+    document.getElementById('file-import-daily')?.addEventListener('change', async (e) => {
+      const files = Array.from(e.target.files);
+      if (files.length === 0) return;
+      
+      if (!confirm(`📥 Import ${files.length} ไฟล์ xlsm?\n\nแต่ละไฟล์จะอ่าน:\n  • วันที่จาก B2\n  • Summary (rows 3-11)\n  • Bill List (rows 15+) — ข้าม Confirmation + Pay Date\n  • Cash count (M2:O11)\n\n*ไม่ลบข้อมูลเดิม → ถ้ามีวันซ้ำจะเขียนทับ`)) {
+        e.target.value = '';
+        return;
+      }
+      
+      toast(`กำลัง parse ${files.length} ไฟล์...`, 'info');
+      
+      let totalBills = 0, totalDays = 0, failed = 0;
+      const errors = [];
+      
+      for (const file of files) {
+        try {
+          const result = await importDailyXlsm(file);
+          totalBills += result.billsImported;
+          totalDays++;
+        } catch(err) {
+          failed++;
+          errors.push(`${file.name}: ${err.message}`);
+          console.error(`Import failed for ${file.name}:`, err);
+        }
+      }
+      
+      // Save
+      try {
+        const db = await new Promise((res, rej) => {
+          const r = indexedDB.open('SmartFinanceDB', 1);
+          r.onsuccess = () => res(r.result);
+          r.onerror = () => rej(r.error);
+        });
+        const tx = db.transaction('data', 'readwrite');
+        tx.objectStore('data').put(JSON.stringify(billList), 'sf_billList');
+        tx.objectStore('data').put(JSON.stringify(mainSummary), 'sf_mainSummary');
+        tx.objectStore('data').put(JSON.stringify(cashCount), 'sf_cashCount');
+      } catch(err) { console.error(err); }
+      
+      e.target.value = '';
+      
+      let resultMsg = `✅ Import สำเร็จ ${totalDays}/${files.length} วัน\n` +
+                      `📋 บิลรวม ${totalBills} รายการ`;
+      if (failed > 0) {
+        resultMsg += `\n\n❌ Error ${failed} ไฟล์:\n` + errors.slice(0, 5).join('\n');
+        alert(resultMsg);
+      } else {
+        toast(resultMsg, 'success', 8000);
+      }
+      render();
+    });
+    
     document.getElementById('btn-backup-json')?.addEventListener('click', () => {
       const backup = {
         version: 'SmartFinance-v1',
@@ -11943,6 +12058,165 @@ async function parseReconFiles(files, kind) {
 // ════════════════════════════════════════════════════════════════
 // Render: SP Reconciliation (ลูกหนี้)
 // ════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
+// Import Daily xlsm
+//   Structure:
+//     B2 = date (datetime)
+//     Row 3-11: Summary (label in B, values in C-K)
+//       3=นำเงินเข้า 4=ยอดขาย 5=นำเงินออก 6=ยอดคืนสินค้า
+//       7=Cash Drawer 8=Transfer 9=Card 10=Cheque 11=Refund
+//     Col C-K = station: Front1/2/3/4/Invoice/Order/Payment/InvoiceCredit/OrderCredit
+//     Row 15+: bills (A=no, B=date, C=station, D=type, E=amount, F=conf*, G=payDate*, H=r1, I=r2, J=bank)
+//       * SKIP F and G per user request
+//     M2:O11 = change counting (M=denom, N=count, O=total)
+// ════════════════════════════════════════════════════════════════
+
+async function importDailyXlsm(file) {
+  const parsed = await parseExcelFile(file);
+  const sheets = parsed.sheets || {};
+  const mainSheet = sheets['Main'] || sheets[Object.keys(sheets)[0]];
+  if (!mainSheet) throw new Error('ไม่พบ Sheet "Main"');
+  
+  // ── 1. อ่านวันที่จาก B2 (row 2, col 2) ──
+  const b2 = mainSheet[1]?.[1]; // 0-indexed
+  const dateISO = toDailyISO(b2);
+  if (!dateISO) throw new Error(`B2 ไม่ใช่วันที่ที่ถูกต้อง: ${b2}`);
+  
+  // ── 2. อ่าน Summary (rows 3-11, cols C-K) ──
+  const LABELS = {
+    2: 'นำเงินเข้า',    // row 3 (0-indexed: 2)
+    3: 'ยอดขาย',        // row 4
+    4: 'นำเงินออก',    // row 5
+    5: 'ยอดคืนสินค้า',   // row 6
+    6: 'Cash Drawer',   // row 7
+    7: 'Transfer',      // row 8
+    8: 'Card',          // row 9
+    9: 'Cheque',        // row 10
+    10: 'Refund',       // row 11
+  };
+  const STATIONS = ['Front1', 'Front2', 'Front3', 'Front4', 'Invoice', 'Order', 'Payment', 'Invoice Credit', 'Order Credit'];
+  
+  if (!mainSummary.__byDate) mainSummary.__byDate = {};
+  mainSummary.__byDate[dateISO] = mainSummary.__byDate[dateISO] || {};
+  
+  const LABEL_TO_KEY = {
+    'นำเงินเข้า': 'cashIn', 'ยอดขาย': 'sales', 'นำเงินออก': 'cashOut',
+    'ยอดคืนสินค้า': 'returns', 'Cash Drawer': 'cashDrawer',
+    'Transfer': 'transfer', 'Card': 'card', 'Cheque': 'cheque', 'Refund': 'refund',
+  };
+  
+  for (const [rIdx, label] of Object.entries(LABELS)) {
+    const row = mainSheet[Number(rIdx)];
+    if (!row) continue;
+    if (!mainSummary.__byDate[dateISO][label]) mainSummary.__byDate[dateISO][label] = {};
+    
+    STATIONS.forEach((st, sIdx) => {
+      const colIdx = 2 + sIdx; // C=2, D=3, ..., K=10
+      const val = Number(row[colIdx]);
+      if (val && !isNaN(val)) {
+        mainSummary.__byDate[dateISO][label][st] = val;
+        // Also write flat key (backwards compat)
+        const keyName = LABEL_TO_KEY[label];
+        if (keyName) mainSummary[keyName + '_' + st] = val;
+      }
+    });
+  }
+  
+  // ── 3. อ่าน Cash counting (M2:O11) ──
+  // M2 is row 2 col 13 (0-indexed: row 1 col 12)
+  if (!cashCount.__byDate) cashCount.__byDate = {};
+  cashCount.__byDate[dateISO] = cashCount.__byDate[dateISO] || {};
+  const dayCash = cashCount.__byDate[dateISO];
+  
+  for (let r = 1; r < 11; r++) {
+    const row = mainSheet[r];
+    if (!row) continue;
+    const denom = Number(row[12]); // M
+    const count = Number(row[13]); // N
+    if (denom && count) {
+      // สมมติ Invoice station (ลิ้นชักรวม)
+      dayCash[denom + '_Invoice'] = count;
+    }
+  }
+  
+  // ── 4. ลบบิลเดิมของวันที่นี้ (ป้องกันซ้ำ) ──
+  const beforeCount = billList.length;
+  billList = billList.filter(b => toISODate(b.date) !== dateISO);
+  const deleted = beforeCount - billList.length;
+  
+  // ── 5. อ่านบิล (rows 15+) ──
+  let billsImported = 0;
+  for (let r = 14; r < mainSheet.length; r++) { // row 15 = index 14
+    const row = mainSheet[r];
+    if (!row) continue;
+    
+    const billNo = String(row[0] || '').trim();
+    const billDate = row[1];
+    const station = String(row[2] || '').trim();
+    const type = String(row[3] || '').trim();
+    const amount = Number(row[4]);
+    // SKIP col 5 (F = Confirmation) และ col 6 (G = Pay Date)
+    const remarks1 = String(row[7] || '').trim();
+    const remarks2 = String(row[8] || '').trim();
+    const bank = String(row[9] || '').trim();
+    
+    // ข้ามแถวที่ไม่มีข้อมูลบิล
+    if (!station && !type && !amount) continue;
+    if (isNaN(amount) || amount === 0) continue;
+    
+    const billDateISO = toDailyISO(billDate) || dateISO;
+    
+    billList.push({
+      bill_no: billNo || '',
+      date: billDateISO,
+      station: station,
+      type: type,
+      amount: amount,
+      // SKIP: confirmation, pay_date (user จะ match เอง)
+      confirmation: '',
+      remarks1: remarks1,
+      remarks2: remarks2,
+      bank: bank,
+      match_status: type === 'Cash' ? 'matched' : 'pending',
+      pay_date: type === 'Cash' ? billDateISO : undefined,
+      _imported_from: file.name,
+      _imported_at: new Date().toISOString(),
+    });
+    billsImported++;
+  }
+  
+  return { dateISO, billsImported, summaryRows: 9, deleted };
+}
+
+// Helper: convert value to YYYY-MM-DD
+function toDailyISO(v) {
+  if (!v) return '';
+  if (v instanceof Date) {
+    return v.getFullYear() + '-' +
+      String(v.getMonth()+1).padStart(2,'0') + '-' +
+      String(v.getDate()).padStart(2,'0');
+  }
+  if (typeof v === 'number' && v > 10000) {
+    // Excel serial
+    const epoch = new Date(1899, 11, 30);
+    const d = new Date(epoch.getTime() + v * 86400000);
+    return d.getFullYear() + '-' +
+      String(d.getMonth()+1).padStart(2,'0') + '-' +
+      String(d.getDate()).padStart(2,'0');
+  }
+  const s = String(v);
+  // dd/mm/yyyy (with optional BE year)
+  let m = s.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+  if (m) {
+    let y = Number(m[3]); if (y > 2400) y -= 543;
+    return y + '-' + m[2].padStart(2,'0') + '-' + m[1].padStart(2,'0');
+  }
+  // yyyy-mm-dd
+  m = s.match(/(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (m) return m[1] + '-' + m[2].padStart(2,'0') + '-' + m[3].padStart(2,'0');
+  return '';
+}
+
 async function renderSpRecon(el) {
   if (!spReconData) spReconData = await loadReconData('sp');
   renderReconPage(el, 'sp', spReconData);
