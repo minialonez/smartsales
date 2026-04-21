@@ -2554,7 +2554,16 @@ async function renderMain(el) {
     
     if (!incomeSide && !accountedSide && !drawerRaw && !sales) return { diff: 0, isOk: null, empty: true };
     
-    const diff = incomeSide - accountedSide;
+    let diff = incomeSide - accountedSide;
+    
+    // Credit stations: flip sign (outflow direction)
+    //   Invoice Credit = SC bills = เราต้องจ่ายเงินคืน → ติดลบจนกว่าจะจ่ายครบ
+    //   Order Credit = OR bills = ลูกค้าต้องจ่าย → ติดลบจนกว่าจะรับเงิน
+    //   เมื่อ matched ครบ → diff = 0 (OK)
+    if (station === 'Invoice Credit' || station === 'Order Credit') {
+      diff = -diff;
+    }
+    
     return { diff, isOk: Math.abs(diff) < 1.0, empty: false };
   }
 
@@ -3139,35 +3148,20 @@ async function renderMain(el) {
     </tr>`;
   }
 
-  // ── Helper: Cash Drawer row (คำนวณอัตโนมัติจากบิล Type=Cash) ──
-  //   Invoice + Order + Payment = merge เป็น cell เดียว (colspan=3)
-  //   เพราะเงินสดรวมกันทั้ง 3 station
-  //   ★ แสดงค่า adjusted = raw − นำเงินเข้า  (เพื่อให้ตรงสูตร Sum)
+  // ── Helper: Cash Drawer row ──
+  //   Front1-4: EDITABLE input (แสดงค่า raw — ไม่หัก cashIn)
+  //   Invoice + Order + Payment = merge cell เดียว (colspan=3, raw จากการนับธนบัตร)
+  //   Invoice Credit / Order Credit: empty
+  //   สูตร Sum จะหัก cashIn ภายในเอง (ไม่ยุ่งกับ display)
   function buildCashDrawerRow() {
-    // Helper: ค่า cashIn สำหรับ station (inline — ไม่พึ่ง summaryRow ที่อยู่ใน scope อื่น)
-    const cashInOf = (st) => {
-      // ลอง __byDate ก่อน
-      if (mainSummary && mainSummary.__byDate && mainSummary.__byDate[selectedDate]) {
-        const dayData = mainSummary.__byDate[selectedDate];
-        if (dayData['นำเงินเข้า'] && dayData['นำเงินเข้า'][st] !== undefined) {
-          return Number(dayData['นำเงินเข้า'][st]) || 0;
-        }
-      }
-      // Fallback: flat key
-      return Number(mainSummary['cashIn_' + st]) || 0;
-    };
+    // Invoice merged: ถ้า user นับธนบัตร = ยอดรวม 3 stations, ไม่งั้น sum จาก bills
+    const invoiceCountedCash = calcCashDrawer('Invoice');
+    const mergedInvoiceTotal = invoiceCountedCash > 0 
+      ? invoiceCountedCash 
+      : ['Invoice','Order','Payment'].reduce((s, st) => s + calcCashFromBills(st), 0);
     
-    // Merged total ของ Invoice + Order + Payment (adjusted)
-    const mergedInvoiceRaw = ['Invoice','Order','Payment']
-      .reduce((s, st) => s + calcCashFromBills(st), 0);
-    const mergedCashIn = ['Invoice','Order','Payment'].reduce((s,st) => s + cashInOf(st), 0);
-    const mergedInvoiceTotal = mergedInvoiceRaw - mergedCashIn;
-    
-    // Per-station values (เฉพาะ Front1-4) — adjusted
-    const frontVals = ['Front1','Front2','Front3','Front4'].map(s => {
-      const raw = calcCashFromBills(s);
-      return raw - cashInOf(s);
-    });
+    // Per-station values (Front1-4) — raw
+    const frontVals = ['Front1','Front2','Front3','Front4'].map(s => calcCashFromBills(s));
     const frontTotal = frontVals.reduce((a,b)=>a+b, 0);
     const allSum = frontTotal + mergedInvoiceTotal;
     
@@ -3175,21 +3169,19 @@ async function renderMain(el) {
     SUMMARY_STATIONS.forEach(s => {
       if (s === 'Order' || s === 'Payment') return; // skip - handled by Invoice colspan
       if (s === 'Invoice') {
-        // Merged cell colspan=3
+        // Merged cell colspan=3 (read-only — จากการนับธนบัตร)
         const v = mergedInvoiceTotal;
-        cells.push(`<td colspan="3" data-drawer-station="Invoice" style="text-align:center;color:${v?'var(--purple)':'var(--text3)'};font-weight:${v?'700':'400'};border-left:1px dashed var(--border);border-right:1px dashed var(--border);background:rgba(91,124,250,.04)" title="Cash Drawer Raw (${fmtNum(mergedInvoiceRaw)}) − นำเงินเข้า (${fmtNum(mergedCashIn)}) = ${fmtNum(v)}">${v?fmtNum(v):'-'}</td>`);
+        cells.push(`<td colspan="3" data-drawer-station="Invoice" style="text-align:center;color:${v?'var(--purple)':'var(--text3)'};font-weight:${v?'700':'400'};border-left:1px dashed var(--border);border-right:1px dashed var(--border);background:rgba(91,124,250,.04)" title="รวม Invoice + Order + Payment (จากการนับธนบัตร)">${v?fmtNum(v):'-'}</td>`);
         return;
       }
       if (['Invoice Credit','Order Credit'].includes(s)) {
         cells.push('<td></td>');
         return;
       }
-      // Front1-4
+      // Front1-4 — EDITABLE input (เหมือนช่องนำเงินเข้า)
       const idx = ['Front1','Front2','Front3','Front4'].indexOf(s);
       const v = idx >= 0 ? frontVals[idx] : 0;
-      const raw = idx >= 0 ? calcCashFromBills(s) : 0;
-      const cin = idx >= 0 ? cashInOf(s) : 0;
-      cells.push(`<td data-drawer-station="${s}" style="text-align:right;color:${v?'var(--purple)':'var(--text3)'};font-weight:${v?'600':'400'}" title="Raw ${fmtNum(raw)} − นำเงินเข้า ${fmtNum(cin)} = ${fmtNum(v)}">${v?fmtNum(v):'-'}</td>`);
+      cells.push(`<td><input class="input sum-cell" data-k="cashDrawer_${s}" type="number" value="${v||''}" step="0.01" placeholder="0" style="width:95%;padding:3px 6px;font-size:.78rem;text-align:right;border-color:var(--purple)"></td>`);
     });
     
     return `<tr>
