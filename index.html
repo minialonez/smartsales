@@ -13066,7 +13066,7 @@ async function renderUsers(el) {
   el.innerHTML = `
     <div class="flex justify-between items-center mb-4">
       <div class="page-title">จัดการผู้ใช้</div>
-      <button class="btn btn-primary btn-sm">${ICONS.plus} เพิ่มผู้ใช้</button>
+      <button class="btn btn-primary btn-sm" id="btn-add-user">${ICONS.plus} เพิ่มผู้ใช้</button>
     </div>
     <div class="card-flat">
       <table>
@@ -13078,7 +13078,7 @@ async function renderUsers(el) {
             <td><span class="badge ${u.role==='admin'?'badge-purple':'badge-info'}">${u.role}</span></td>
             <td>${(u.permissions||[]).map(p=>`<span class="badge badge-muted">${p}</span>`).join(' ')}</td>
             <td><span class="badge badge-success">${u.status}</span></td>
-            <td><button class="btn btn-ghost btn-icon">${ICONS.edit}</button></td>
+            <td><button class="btn btn-ghost btn-icon btn-edit-user" data-user='${JSON.stringify(u).replace(/'/g,"&#39;")}' title="แก้ไข">${ICONS.edit}</button></td>
           </tr>`).join('')}
         </tbody>
       </table>
@@ -13092,6 +13092,128 @@ async function renderUsers(el) {
       </p>
     </div>
   `;
+  
+  // ── Helper: เปิด modal เพิ่ม/แก้ไข user ──
+  function openUserModal(existingUser) {
+    const isEdit = !!existingUser;
+    const u = existingUser || { username: '', display_name: '', role: 'user', permissions: ['read'], status: 'active' };
+    const allPerms = ['read', 'write', 'delete', 'manage_users'];
+    
+    openModal(`${isEdit?'✏️ แก้ไข':ICONS.plus+' เพิ่ม'} ผู้ใช้`, `
+      <div class="flex-col gap-3">
+        <div class="input-group">
+          <label>Username ${isEdit?'<span class="text-xs text-dim">(แก้ไม่ได้)</span>':''}</label>
+          <input class="input" id="u-username" value="${u.username||''}" ${isEdit?'readonly style="background:rgba(255,255,255,.02)"':''} placeholder="เช่น jake หรือ 0812345678">
+        </div>
+        <div class="input-group">
+          <label>รหัสผ่าน ${isEdit?'<span class="text-xs text-dim">(ปล่อยว่าง = ไม่เปลี่ยน)</span>':''}</label>
+          <input type="password" class="input" id="u-password" placeholder="${isEdit?'••• ปล่อยว่างถ้าไม่เปลี่ยน':'กรอกรหัสผ่าน'}" autocomplete="new-password">
+        </div>
+        <div class="input-group">
+          <label>ชื่อที่แสดง</label>
+          <input class="input" id="u-display-name" value="${u.display_name||''}" placeholder="เช่น Jake Thompson">
+        </div>
+        <div class="flex gap-2">
+          <div class="input-group flex-1">
+            <label>บทบาท</label>
+            <select class="select" id="u-role">
+              <option value="user" ${u.role==='user'?'selected':''}>user</option>
+              <option value="admin" ${u.role==='admin'?'selected':''}>admin</option>
+            </select>
+          </div>
+          <div class="input-group flex-1">
+            <label>สถานะ</label>
+            <select class="select" id="u-status">
+              <option value="active" ${u.status==='active'?'selected':''}>active</option>
+              <option value="inactive" ${u.status==='inactive'?'selected':''}>inactive</option>
+            </select>
+          </div>
+        </div>
+        <div class="input-group">
+          <label>สิทธิ์ (เลือกได้หลายอัน)</label>
+          <div class="flex gap-2 flex-wrap" id="u-perms">
+            ${allPerms.map(p => `
+              <label class="flex items-center gap-1 text-sm" style="cursor:pointer;padding:4px 8px;background:rgba(255,255,255,.03);border-radius:5px;border:1px solid var(--border)">
+                <input type="checkbox" class="u-perm" value="${p}" ${(u.permissions||[]).includes(p)?'checked':''}>
+                ${p}
+              </label>
+            `).join('')}
+          </div>
+        </div>
+        <div class="flex gap-2 mt-2">
+          <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ยกเลิก</button>
+          ${isEdit?'<button class="btn btn-ghost btn-sm" id="u-delete" style="color:var(--danger);border:1px solid var(--danger)">ลบ</button>':''}
+          <button class="btn btn-primary btn-sm flex-1" id="u-save">${ICONS.check} ${isEdit?'บันทึก':'เพิ่มผู้ใช้'}</button>
+        </div>
+      </div>
+    `);
+    
+    document.getElementById('u-save')?.addEventListener('click', async () => {
+      const username = document.getElementById('u-username').value.trim();
+      const password = document.getElementById('u-password').value;
+      const display_name = document.getElementById('u-display-name').value.trim();
+      const role = document.getElementById('u-role').value;
+      const status = document.getElementById('u-status').value;
+      const permissions = Array.from(document.querySelectorAll('.u-perm:checked')).map(c => c.value);
+      
+      if (!username) { toast('กรอก Username', 'error'); return; }
+      if (!isEdit && !password) { toast('กรอกรหัสผ่าน', 'error'); return; }
+      if (!display_name) { toast('กรอกชื่อที่แสดง', 'error'); return; }
+      
+      const btn = document.getElementById('u-save');
+      btn.disabled = true;
+      btn.textContent = 'กำลังบันทึก...';
+      
+      try {
+        const payload = { username, display_name, role, status, permissions };
+        if (password) payload.password = password;
+        const action = isEdit ? 'updateUser' : 'createUser';
+        const result = await api(action, payload);
+        if (result?.success === false || result?.error) {
+          throw new Error(result.message || result.error || 'ไม่สำเร็จ');
+        }
+        closeModal();
+        toast(`✓ ${isEdit?'อัปเดต':'เพิ่ม'} ${username} แล้ว`, 'success');
+        renderUsers(el); // reload
+      } catch(err) {
+        toast('ไม่สำเร็จ: ' + (err.message || err), 'error');
+        btn.disabled = false;
+        btn.textContent = (isEdit?'บันทึก':'เพิ่มผู้ใช้');
+      }
+    });
+    
+    // Delete (edit mode only)
+    document.getElementById('u-delete')?.addEventListener('click', async () => {
+      if (!confirm(`ลบผู้ใช้ "${u.username}"?\nลบแล้วกู้คืนไม่ได้`)) return;
+      const btn = document.getElementById('u-delete');
+      btn.disabled = true;
+      try {
+        const result = await api('deleteUser', { username: u.username });
+        if (result?.success === false || result?.error) {
+          throw new Error(result.message || result.error || 'ไม่สำเร็จ');
+        }
+        closeModal();
+        toast(`ลบ ${u.username} แล้ว`, 'success');
+        renderUsers(el);
+      } catch(err) {
+        toast('ลบไม่สำเร็จ: ' + (err.message || err), 'error');
+        btn.disabled = false;
+      }
+    });
+  }
+  
+  // ── Handlers ──
+  document.getElementById('btn-add-user')?.addEventListener('click', () => openUserModal(null));
+  el.querySelectorAll('.btn-edit-user').forEach(btn => {
+    btn.addEventListener('click', () => {
+      try {
+        const u = JSON.parse(btn.dataset.user.replace(/&#39;/g, "'"));
+        openUserModal(u);
+      } catch(err) {
+        toast('ข้อมูลผู้ใช้ไม่ถูกต้อง', 'error');
+      }
+    });
+  });
 }
 
 // ── Initialize after all declarations are ready ──
