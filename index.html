@@ -2511,13 +2511,23 @@ async function renderMain(el) {
     }
     
     // ── Invoice merged (Invoice + Order + Payment) ──
+    // สูตร: (Cash Drawer − นำเงินเข้า) + Transfer + Card + Cheque + Refund − ยอดขาย
+    //   diff > 0  → ได้รับเงินเกิน
+    //   diff < 0  → ได้รับเงินไม่ครบ (ติดลบ)
     if (station === 'Invoice') {
       const stations3 = ['Invoice', 'Order', 'Payment'];
       
-      // Cash Drawer = summary Invoice (รวม 3 stations) → fallback sum bills
+      // Cash Drawer (รวม 3 stations)
       const drawerSummary = summaryOrZero('Cash Drawer', 'Invoice');
       const drawerBills = stations3.reduce((s, st) => s + calcCashFromBills(st), 0);
       const drawer = drawerSummary || drawerBills;
+      
+      // นำเงินเข้า (รวม 3 stations) — ต้องลบออกจาก cash drawer
+      //   เพราะ cash drawer มีทั้งเงินทอนที่ user ใส่เข้าไปและเงินขายจริง
+      let cashInSum = 0;
+      stations3.forEach(st => {
+        cashInSum += _getSummaryValue('cashIn', st);
+      });
       
       // Transfer/Card/Cheque/Refund: summary ก่อน → bills
       let otherOutflow = 0;
@@ -2528,22 +2538,23 @@ async function renderMain(el) {
         otherOutflow += summaryOrBills('Refund', 'Refund', st);
       });
       
-      const outflowSum = drawer + otherOutflow;
+      // (Cash Drawer - นำเงินเข้า) + อื่นๆ
+      const effectiveInflow = (drawer - cashInSum) + otherOutflow;
       
-      // Sales: summary ก่อน → bills (แต่ถ้า summary มีค่า 0 = ใช้ 0 จริงๆ ไม่ fallback)
+      // ยอดขาย
       let salesSum = 0;
       stations3.forEach(st => {
         const summaryVal = summaryRow('ยอดขาย', st);
-        if (summaryVal !== null) {
-          salesSum += summaryVal;
-        } else {
-          salesSum += calcSales(st);
-        }
+        if (summaryVal !== null) salesSum += summaryVal;
+        else salesSum += calcSales(st);
       });
       
-      if (!outflowSum && !salesSum) return { diff: 0, isOk: null, empty: true };
+      if (!effectiveInflow && !salesSum) return { diff: 0, isOk: null, empty: true };
       
-      const diff = outflowSum - salesSum;
+      // diff = effective inflow − sales
+      //   บวก (effective > sales)  → ได้รับเงินเกิน
+      //   ลบ (effective < sales)   → ได้รับเงินไม่ครบ
+      const diff = effectiveInflow - salesSum;
       return { diff, isOk: Math.abs(diff) < 1.0, empty: false };
     }
     
