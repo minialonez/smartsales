@@ -10638,30 +10638,55 @@ async function renderMatching(el) {
       }
       
       // ══════════════════════════════════════════════════════════
-      // PASS 1: Match เงินเข้า (stmt amount > 0)
+      // SINGLE UNIFIED PASS — กฎ match ง่ายที่สุด
+      //   1. บิล Type ∈ [Transfer, Card, Cheque] + ยังไม่ match
+      //   2. วันที่ตรงกัน
+      //   3. ยอดตรงกัน 2 ทศนิยม (ใช้ billMatchAmount: baht หรือ สุทธิ)
+      //   4. ทิศทาง:
+      //      - บิลที่ชัดเจน (Front station + prefix income/expense) → ต้องตรงทิศ
+      //      - บิล MANUAL/ไม่ชัดเจน → allow ทั้ง 2 ทิศ
       // ══════════════════════════════════════════════════════════
+      
+      function billDirection(b) {
+        const prefix = String(b.bill_no || '').substring(0, 2).toUpperCase();
+        const isFront = String(b.station || '').startsWith('Front');
+        const incomePrefixes = ['SS','OS','SP','S2','BS','PC'];
+        const expensePrefixes = ['PP','PS','MS','PX','SC','JS','JR'];
+        if (isFront || incomePrefixes.includes(prefix)) return 'income';
+        if (expensePrefixes.includes(prefix)) return 'expense';
+        return 'unknown';  // MANUAL, no prefix, Invoice/Order/Payment station ไม่มี prefix ชัด
+      }
+      function isCompatible(bill, stmtAmount) {
+        const dir = billDirection(bill);
+        if (dir === 'unknown') return true;
+        return (dir === 'income' && stmtAmount > 0) || (dir === 'expense' && stmtAmount < 0);
+      }
+      
       const idx = {};
       const used = new Set();
-      let billsInRange = 0;
+      let billsInRange = 0, expBillsInRange = 0;
       
       for (let bi = 0; bi < billList.length; bi++) {
         const b = billList[bi];
-        if (!isIncomeBill(b)) continue;
+        if (!canMatch(b)) continue;
         
         const d = toISODate(b.date);
         if (!d || d < dateFrom || d > dateTo) continue;
         
-        // ใช้ billMatchAmount (baht ถ้าไม่มี fee, สุทธิ ถ้ามี)
         const mAmt = billMatchAmount(b);
         if (!mAmt) continue;
         
         const k = d + '|' + k2(mAmt);
         if (!idx[k]) idx[k] = [];
         idx[k].push({ bi });
-        billsInRange++;
+        
+        const dir = billDirection(b);
+        if (dir === 'expense') expBillsInRange++;
+        else billsInRange++; // income + unknown
       }
       
-      let matched = 0, skippedNeg = 0, skippedRange = 0, noMatch = 0, stmtsInRange = 0;
+      let matched = 0, matchedExp = 0;
+      let skippedNeg = 0, skippedRange = 0, noMatch = 0, stmtsInRange = 0;
       
       uploadedStatements.forEach(stmt => {
         if (stmt.match_status === 'matched') return;
@@ -10673,7 +10698,7 @@ async function renderMatching(el) {
         stmtsInRange++;
         
         const sa = Number(stmt.amount || 0);
-        if (sa <= 0) { skippedNeg++; return; }
+        if (!sa) return;
         
         const k = sd + '|' + k2(sa);
         const candidates = idx[k] || [];
@@ -10682,11 +10707,10 @@ async function renderMatching(el) {
         for (let c = 0; c < candidates.length; c++) {
           const bi = candidates[c].bi;
           if (used.has(bi)) continue;
-          // Exact check (2-decimal precision) — กันเผื่อ collision ใน bucket
-          if (k2(billMatchAmount(billList[bi])) === k2(sa)) {
-            foundIdx = bi;
-            break;
-          }
+          const bill = billList[bi];
+          if (!isCompatible(bill, sa)) continue;
+          foundIdx = bi;
+          break;
         }
         
         if (foundIdx >= 0) {
@@ -10703,82 +10727,13 @@ async function renderMatching(el) {
           stmt.match_station = bill.station || '';
           stmt.match_bill = bill.bill_no || `${bill.station}|${bill.type}|฿${bill.amount}`;
           stmt.matched_at = new Date().toISOString();
-          stmt.match_method = 'auto_sameday';
+          stmt.match_method = sa > 0 ? 'auto_sameday' : 'auto_expense';
           
-          matched++;
+          if (sa > 0) matched++;
+          else matchedExp++;
         } else {
-          noMatch++;
-        }
-      });
-
-      // ══════════════════════════════════════════════════════════
-      // PASS 2: Match เงินออก (stmt amount < 0)
-      // ══════════════════════════════════════════════════════════
-      // PASS 2: Match เงินออก (stmt amount < 0)
-      // ใช้ netAmount เหมือน Pass 1: 
-      //   บิลไม่มี fee → match ยอดเต็ม (BAHT)
-      //   บิลมี fee → match ยอดสุทธิ (BAHT − WHT − TF − CF)
-      // ══════════════════════════════════════════════════════════
-      const expIdx = {};
-      const expUsed = new Set();
-      let expBillsInRange = 0;
-      
-      for (let bi = 0; bi < billList.length; bi++) {
-        const b = billList[bi];
-        if (!isExpenseBill(b)) continue;
-        
-        const d = toISODate(b.date);
-        if (!d || d < dateFrom || d > dateTo) continue;
-        
-        // กฎเดียวกับ Pass 1: baht ถ้าไม่มี fee, สุทธิ ถ้ามี
-        const mAmt = billMatchAmount(b);
-        if (!mAmt) continue;
-        
-        const k = d + '|' + k2(mAmt);
-        if (!expIdx[k]) expIdx[k] = [];
-        expIdx[k].push({ bi });
-        expBillsInRange++;
-      }
-      
-      let matchedExp = 0;
-      uploadedStatements.forEach(stmt => {
-        if (stmt.match_status === 'matched') return;
-        const sa = Number(stmt.amount || 0);
-        if (sa >= 0) return; // เฉพาะเงินออก
-        
-        const sd = toISODate(stmt.date || stmt.trans_date);
-        if (!sd || sd < dateFrom || sd > dateTo) return;
-        
-        const k = sd + '|' + k2(sa);
-        const cands = expIdx[k] || [];
-        
-        let foundIdx = -1;
-        for (let c = 0; c < cands.length; c++) {
-          const bi = cands[c].bi;
-          if (expUsed.has(bi)) continue;
-          if (k2(billMatchAmount(billList[bi])) === k2(sa)) {
-            foundIdx = bi;
-            break;
-          }
-        }
-        
-        if (foundIdx >= 0) {
-          expUsed.add(foundIdx);
-          const bill = billList[foundIdx];
-          
-          bill.match_status = 'matched';
-          bill.confirmation = stmt.bank || '';
-          bill.pay_date = bill.date;
-          bill.matched_stmt_ref = stmt.ref_no || '';
-          bill.matched_at = new Date().toISOString();
-          
-          stmt.match_status = 'matched';
-          stmt.match_station = bill.station || '';
-          stmt.match_bill = bill.bill_no || `${bill.station}|${bill.type}|฿${bill.amount}`;
-          stmt.matched_at = new Date().toISOString();
-          stmt.match_method = 'auto_expense';
-          
-          matchedExp++;
+          if (sa > 0) noMatch++;
+          else skippedNeg++;
         }
       });
 
@@ -10791,10 +10746,66 @@ async function renderMatching(el) {
         store.put(JSON.stringify(statementsByBank), 'sf_statementsByBank');
         tx.oncomplete = () => {
           let msg = `✅ Auto Match ${fmtDate(dateFrom)} → ${fmtDate(dateTo)}\n\n`;
-          msg += `💰 เงินเข้า (SS/OS/SP): ${matched}\n`;
-          msg += `💸 เงินออก (PP/PS): ${matchedExp}\n`;
-          msg += `✗ ไม่เจอคู่: ${noMatch}\n\n`;
-          msg += `(Stmt ในช่วง: ${stmtsInRange} · Bills ในช่วง: ${billsInRange} รับ + ${expBillsInRange} จ่าย)`;
+          msg += `💰 เงินเข้า match: ${matched}\n`;
+          msg += `💸 เงินออก match: ${matchedExp}\n`;
+          const totalNoMatch = noMatch + skippedNeg;
+          msg += `✗ ไม่เจอคู่: ${totalNoMatch}\n\n`;
+          msg += `(Stmt ในช่วง: ${stmtsInRange} · Bills: ${billsInRange} รับ + ${expBillsInRange} จ่าย)`;
+          
+          // ── Diagnostic: ถ้ามี stmt ไม่ match → แสดง 3 ตัวอย่าง + เหตุผล ──
+          if (totalNoMatch > 0) {
+            const unmatchedStmts = uploadedStatements.filter(s => {
+              if (s.match_status === 'matched') return false;
+              const sd = toISODate(s.date || s.trans_date);
+              return sd && sd >= dateFrom && sd <= dateTo && Number(s.amount);
+            });
+            
+            if (unmatchedStmts.length > 0) {
+              msg += `\n\n━━ ตัวอย่าง Stmt ที่ match ไม่เจอ ━━`;
+              const samples = unmatchedStmts.slice(0, 3);
+              samples.forEach(stmt => {
+                const sd = toISODate(stmt.date || stmt.trans_date);
+                const sa = Number(stmt.amount || 0);
+                msg += `\n\n📌 ${fmtDate(sd)} · ${sa > 0 ? '+' : ''}${fmtNum(sa)} (${stmt.bank||'?'})`;
+                
+                // หาเหตุผลที่ไม่ match
+                // 1. หา bill วันเดียวกัน + ยอดเดียวกัน (ผ่าน filter หรือไม่)
+                const sameAmtSameDate = billList.filter(b => {
+                  const bd = toISODate(b.date);
+                  return bd === sd && k2(billMatchAmount(b)) === k2(sa);
+                });
+                
+                if (sameAmtSameDate.length > 0) {
+                  msg += `\n  เจอบิล ${sameAmtSameDate.length} รายการวันเดียวยอดเดียวกัน แต่:`;
+                  sameAmtSameDate.slice(0, 2).forEach(b => {
+                    const reasons = [];
+                    if (!MATCHABLE_TYPES.includes(b.type || '')) reasons.push(`Type="${b.type}" ไม่อยู่ใน [Transfer/Card/Cheque]`);
+                    if (b.match_status === 'matched') reasons.push('match แล้ว');
+                    if (b.match_status === 'paid') reasons.push('paid');
+                    if (b.match_status === 'void') reasons.push('void');
+                    if (!isCompatible(b, sa)) reasons.push(`ทิศทางไม่ตรง (บิล=${billDirection(b)}, stmt=${sa>0?'เข้า':'ออก'})`);
+                    msg += `\n    • ${b.bill_no||'(no#)'} ${b.station||'?'}/${b.type||'?'}: ${reasons.join(', ') || 'บิลน่าจะ match ได้'}`;
+                  });
+                } else {
+                  // ลองหายอดเดียวกันแต่วันต่าง (ใกล้เคียง)
+                  const sameAmtOtherDate = billList.filter(b => k2(billMatchAmount(b)) === k2(sa)).slice(0, 2);
+                  if (sameAmtOtherDate.length > 0) {
+                    msg += `\n  ไม่เจอบิลวันเดียวกัน · พบยอดเดียวกันวันอื่น:`;
+                    sameAmtOtherDate.forEach(b => {
+                      msg += `\n    • ${b.bill_no||'(no#)'} วันที่ ${fmtDate(b.date)}`;
+                    });
+                  } else {
+                    msg += `\n  ไม่เจอบิลที่ยอดตรงเลย (ทั้งวันเดียวกันและวันอื่น)`;
+                  }
+                }
+              });
+              
+              if (unmatchedStmts.length > 3) {
+                msg += `\n\n(…อีก ${unmatchedStmts.length - 3} รายการ — ดูในหน้า Statement Matching)`;
+              }
+            }
+          }
+          
           alert(msg);
           uploadedStatements = getAllStatements();
           render();
