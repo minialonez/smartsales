@@ -3729,9 +3729,10 @@ async function renderMain(el) {
       $whtOut.addEventListener('input', () => { whtManuallyEdited = true; });
       
       function feeApplies() {
-        // แสดงช่อง fee เมื่อ Type = Transfer หรือ Card (ไม่สน station/prefix)
+        // แสดงช่อง fee เมื่อ Type = Transfer, Cheque, หรือ Card
+        // Transfer & Cheque ใช้ UI เดียวกัน (WHT + ค่าโอน/ค่าธรรมเนียม)
         const type = $type.value || '';
-        return type === 'Transfer' || type === 'Card';
+        return type === 'Transfer' || type === 'Cheque' || type === 'Card';
       }
       
       // สูตรตาม Excel: C = ROUND((B/1.07) * 1%, 2)
@@ -3758,7 +3759,8 @@ async function renderMain(el) {
         if (type === 'Card') {
           $feeTransfer.style.display = 'none';
           $feeCard.style.display = 'flex';
-        } else if (type === 'Transfer') {
+        } else if (type === 'Transfer' || type === 'Cheque') {
+          // Transfer + Cheque → ใช้ UI เดียวกัน (WHT + ค่าโอน/ค่าธรรมเนียม)
           $feeTransfer.style.display = 'flex';
           $feeCard.style.display = 'none';
         }
@@ -3772,7 +3774,7 @@ async function renderMain(el) {
         
         let wht = 0, tf = 0, cf = 0;
         
-        if (applies && type === 'Transfer') {
+        if (applies && (type === 'Transfer' || type === 'Cheque')) {
           $base.value = calcBase(amount).toFixed(2);
           // Auto-fill WHT — เว้นแต่ user แก้เอง
           if (!whtManuallyEdited) {
@@ -3786,7 +3788,7 @@ async function renderMain(el) {
         
         const net = Math.round((amount - wht - tf - cf) * 100) / 100;
         
-        if (applies && (type === 'Transfer' || type === 'Card')) {
+        if (applies) {
           $summary.style.display = 'block';
           document.getElementById('ab-sum-full').textContent = '฿' + amount.toFixed(2);
           document.getElementById('ab-sum-wht-row').style.display = wht > 0 ? 'flex' : 'none';
@@ -3816,7 +3818,7 @@ async function renderMain(el) {
         const applies = feeApplies();
         
         let whtAmount = 0, transferFee = 0, cardFee = 0;
-        if (applies && type === 'Transfer') {
+        if (applies && (type === 'Transfer' || type === 'Cheque')) {
           // WHT: ใช้ค่าจาก input โดยตรง (อาจถูก user แก้เอง หรือ auto-calc)
           whtAmount = Number($whtOut.value) || 0;
           transferFee = Number($tf.value) || 0;
@@ -4241,26 +4243,35 @@ async function renderMain(el) {
               </div>
             </div>
             
-            <!-- Fee section: แสดงเฉพาะ Type = Transfer/Card -->
+            <!-- Fee section: เหมือน Add Bill — Transfer/Cheque → WHT+ค่าโอน, Card → ค่าธรรมเนียมบัตร -->
             <div id="eb-fee-box" style="background:rgba(79,156,249,.05);border:1px solid rgba(79,156,249,.2);border-radius:6px;padding:10px;display:none">
-              <div style="font-size:.85rem;color:var(--info);font-weight:600;margin-bottom:8px">⚡ การหัก / ค่าธรรมเนียม</div>
-              <div class="flex gap-2">
+              <div style="font-size:.85rem;color:var(--info);font-weight:600;margin-bottom:8px">⚡ การหัก / ค่าธรรมเนียม <span style="color:var(--text3);font-weight:400">— WHT คำนวณอัตโนมัติจากยอด (แก้ไขได้)</span></div>
+              <div class="flex gap-2" id="eb-fee-transfer" style="display:none">
                 <div class="input-group flex-1">
-                  <label style="color:var(--purple)">หัก ณ ที่จ่าย</label>
-                  <input type="number" class="input" id="eb-wht" value="${Number(b.wht_amount)||0}" step="0.01" style="color:var(--purple)">
+                  <label>ฐานก่อน VAT</label>
+                  <input type="number" class="input" id="eb-base" readonly style="background:rgba(255,255,255,.02)">
                 </div>
                 <div class="input-group flex-1">
-                  <label style="color:var(--warn)">ค่าโอน</label>
+                  <label style="color:var(--purple)">หัก ณ ที่จ่าย 1%</label>
+                  <input type="number" class="input" id="eb-wht" value="${Number(b.wht_amount)||0}" step="0.01" style="color:var(--purple)" title="auto-calc = ROUND(ยอด/1.07 × 1%, 2)">
+                </div>
+                <div class="input-group flex-1">
+                  <label style="color:var(--warn)">ค่าโอน / ค่าธรรมเนียม</label>
                   <input type="number" class="input" id="eb-transfer-fee" value="${Number(b.transfer_fee)||0}" step="0.01" style="color:var(--warn)">
                 </div>
+              </div>
+              <div class="flex gap-2" id="eb-fee-card" style="display:none">
                 <div class="input-group flex-1">
                   <label style="color:var(--warn)">ค่าธรรมเนียมบัตร</label>
                   <input type="number" class="input" id="eb-card-fee" value="${Number(b.card_fee)||0}" step="0.01" style="color:var(--warn)">
                 </div>
               </div>
-              <div id="eb-net-row" style="margin-top:8px;padding:8px 10px;background:rgba(0,0,0,.2);border-radius:5px;display:flex;justify-content:space-between;align-items:center">
-                <span class="text-xs">สุทธิเข้าบัญชี</span>
-                <span id="eb-net-val" style="font-weight:600;color:var(--success);font-size:1.05rem">฿${(Number(b.amount)||0).toFixed(2)}</span>
+              <div id="eb-summary" style="margin-top:10px;padding:10px;background:rgba(0,0,0,.2);border-radius:5px;font-size:.9rem">
+                <div style="display:flex;justify-content:space-between;padding:3px 0"><span>ยอดเต็ม</span><span id="eb-sum-full">฿0.00</span></div>
+                <div id="eb-sum-wht-row" style="display:none;justify-content:space-between;padding:3px 0;color:var(--purple)"><span>− หัก ณ ที่จ่าย 1%</span><span id="eb-sum-wht">฿0.00</span></div>
+                <div id="eb-sum-tf-row" style="display:none;justify-content:space-between;padding:3px 0;color:var(--warn)"><span>− ค่าโอน / ค่าธรรมเนียม</span><span id="eb-sum-tf">฿0.00</span></div>
+                <div id="eb-sum-cf-row" style="display:none;justify-content:space-between;padding:3px 0;color:var(--warn)"><span>− ค่าธรรมเนียมบัตร</span><span id="eb-sum-cf">฿0.00</span></div>
+                <div style="display:flex;justify-content:space-between;padding:8px 0 0;border-top:1px solid var(--border);margin-top:4px;font-weight:600;color:var(--success);font-size:1.05rem"><span>สุทธิ (ยอดโอนจริงที่คาดหวัง)</span><span id="eb-sum-net">฿0.00</span></div>
               </div>
             </div>
             
@@ -4306,55 +4317,105 @@ async function renderMain(el) {
           </div>
         `);
         
-        // ── Fee UI: show/hide + live net calc + auto-WHT on amount change ──
+        // ── Fee UI: show/hide + live net + auto-WHT on amount change ──
+        // เหมือน Add Bill: Transfer/Cheque → WHT+ค่าโอน, Card → ค่าธรรมเนียมบัตร
         const $ebType = document.getElementById('eb-type');
         const $ebAmount = document.getElementById('eb-amount');
+        const $ebBase = document.getElementById('eb-base');
         const $ebWht = document.getElementById('eb-wht');
         const $ebTf = document.getElementById('eb-transfer-fee');
         const $ebCf = document.getElementById('eb-card-fee');
         const $ebFeeBox = document.getElementById('eb-fee-box');
-        const $ebNet = document.getElementById('eb-net-val');
+        const $ebFeeTransfer = document.getElementById('eb-fee-transfer');
+        const $ebFeeCard = document.getElementById('eb-fee-card');
+        const $ebSummary = document.getElementById('eb-summary');
         
-        // Track ว่า user แก้ WHT เองหรือยัง (ตั้งแต่เปิด modal)
-        // ถ้าแก้แล้ว → เมื่อ amount เปลี่ยน จะไม่ overwrite WHT อัตโนมัติ
+        // Track ว่า user แก้ WHT เองหรือยัง (ถ้าแก้แล้ว → ไม่ overwrite อัตโนมัติ)
         let ebWhtManuallyEdited = false;
         $ebWht?.addEventListener('input', () => { ebWhtManuallyEdited = true; });
         
         function ebCalcWHT(amount) {
           if (!amount || amount <= 0) return 0;
-          // ตาม Excel: ROUND((B/1.07) * 1%, 2)
           return Math.round((amount / 1.07) * 0.01 * 100) / 100;
+        }
+        function ebCalcBase(amount) {
+          if (!amount || amount <= 0) return 0;
+          return Math.round((amount / 1.07) * 100) / 100;
+        }
+        function ebFeeApplies() {
+          const t = $ebType.value || '';
+          return t === 'Transfer' || t === 'Cheque' || t === 'Card';
         }
         
         function ebUpdateFeeUI() {
           const t = $ebType.value || '';
-          const show = (t === 'Transfer' || t === 'Card');
-          $ebFeeBox.style.display = show ? 'block' : 'none';
-          if (show) ebUpdateNet();
+          const applies = ebFeeApplies();
+          if (!applies) {
+            $ebFeeBox.style.display = 'none';
+            return;
+          }
+          $ebFeeBox.style.display = 'block';
+          if (t === 'Card') {
+            $ebFeeTransfer.style.display = 'none';
+            $ebFeeCard.style.display = 'flex';
+          } else {
+            // Transfer หรือ Cheque
+            $ebFeeTransfer.style.display = 'flex';
+            $ebFeeCard.style.display = 'none';
+          }
+          ebUpdateSummary();
         }
         
-        function ebUpdateNet() {
-          const amt = Number($ebAmount.value) || 0;
-          const wht = Number($ebWht.value) || 0;
-          const tf = Number($ebTf.value) || 0;
-          const cf = Number($ebCf.value) || 0;
-          const net = Math.round((amt - wht - tf - cf) * 100) / 100;
-          $ebNet.textContent = '฿' + net.toFixed(2);
+        function ebUpdateSummary() {
+          const amount = Number($ebAmount.value) || 0;
+          const t = $ebType.value || '';
+          const applies = ebFeeApplies();
+          let wht = 0, tf = 0, cf = 0;
+          
+          if (applies && (t === 'Transfer' || t === 'Cheque')) {
+            $ebBase.value = ebCalcBase(amount).toFixed(2);
+            wht = Number($ebWht.value) || 0;
+            tf = Number($ebTf.value) || 0;
+          } else if (applies && t === 'Card') {
+            cf = Number($ebCf.value) || 0;
+          }
+          
+          const net = Math.round((amount - wht - tf - cf) * 100) / 100;
+          
+          if (applies) {
+            document.getElementById('eb-sum-full').textContent = '฿' + amount.toFixed(2);
+            document.getElementById('eb-sum-wht-row').style.display = wht > 0 ? 'flex' : 'none';
+            document.getElementById('eb-sum-wht').textContent = '−฿' + wht.toFixed(2);
+            document.getElementById('eb-sum-tf-row').style.display = tf > 0 ? 'flex' : 'none';
+            document.getElementById('eb-sum-tf').textContent = '−฿' + tf.toFixed(2);
+            document.getElementById('eb-sum-cf-row').style.display = cf > 0 ? 'flex' : 'none';
+            document.getElementById('eb-sum-cf').textContent = '−฿' + cf.toFixed(2);
+            document.getElementById('eb-sum-net').textContent = '฿' + net.toFixed(2);
+          }
         }
         
-        // เมื่อ amount เปลี่ยน + type=Transfer + user ยังไม่ได้แก้ WHT เอง → auto-recalc
+        // เมื่อ amount เปลี่ยน + type=Transfer/Cheque + ยังไม่ได้แก้ WHT เอง → auto-recalc
         function ebOnAmountChange() {
           const t = $ebType.value || '';
-          if (t === 'Transfer' && !ebWhtManuallyEdited) {
+          if ((t === 'Transfer' || t === 'Cheque') && !ebWhtManuallyEdited) {
             $ebWht.value = ebCalcWHT(Number($ebAmount.value) || 0).toFixed(2);
           }
-          ebUpdateNet();
+          ebUpdateSummary();
         }
         
-        $ebType?.addEventListener('change', ebUpdateFeeUI);
+        // เมื่อเปลี่ยน Type → reset flag (ให้ auto-calc ใหม่ในครั้งถัดไป)
+        $ebType?.addEventListener('change', () => {
+          ebWhtManuallyEdited = false;
+          // ถ้าเพิ่งเปลี่ยนเป็น Transfer/Cheque + WHT ว่าง → auto-fill
+          const t = $ebType.value || '';
+          if ((t === 'Transfer' || t === 'Cheque') && (!Number($ebWht.value) || $ebWht.value === '0')) {
+            $ebWht.value = ebCalcWHT(Number($ebAmount.value) || 0).toFixed(2);
+          }
+          ebUpdateFeeUI();
+        });
         $ebAmount?.addEventListener('input', ebOnAmountChange);
-        $ebTf?.addEventListener('input', ebUpdateNet);
-        $ebCf?.addEventListener('input', ebUpdateNet);
+        $ebTf?.addEventListener('input', ebUpdateSummary);
+        $ebCf?.addEventListener('input', ebUpdateSummary);
         
         ebUpdateFeeUI(); // init
         
@@ -4372,9 +4433,9 @@ async function renderMain(el) {
           b.remarks2 = document.getElementById('eb-remarks2').value;
           b.match_status = document.getElementById('eb-status').value;
           
-          // Fee fields: บันทึกเฉพาะ Type = Transfer/Card
+          // Fee fields: บันทึกเฉพาะ Type = Transfer/Cheque/Card
           // ถ้า Type อื่น → เคลียร์ค่าทิ้ง (ให้ consistency กับ logic แสดงผล)
-          if (b.type === 'Transfer' || b.type === 'Card') {
+          if (b.type === 'Transfer' || b.type === 'Cheque' || b.type === 'Card') {
             b.wht_amount = Number(document.getElementById('eb-wht').value) || 0;
             b.transfer_fee = Number(document.getElementById('eb-transfer-fee').value) || 0;
             b.card_fee = Number(document.getElementById('eb-card-fee').value) || 0;
