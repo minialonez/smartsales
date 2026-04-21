@@ -2637,9 +2637,9 @@ async function renderMain(el) {
     if (hidePaid) data = data.filter(b => b.match_status !== 'paid');
     
     // ── Filter by match status ──
-    //   "ยังไม่ match" = Type ใน [Transfer, Card, Cheque] หรือ Type ว่าง
-    //   (Type=Cash, Refund ไม่ต้อง match — ไม่แสดงในกลุ่มนี้)
-    const MATCHABLE_TYPES_FILTER = ['Transfer', 'Card', 'Cheque', '', null, undefined];
+    //   "ยังไม่ match" = Type ใน [Transfer, Card, Cheque, Refund] หรือ Type ว่าง
+    //   (Type=Cash ไม่ต้อง match — ไม่แสดงในกลุ่มนี้ เพราะ auto matched แล้ว)
+    const MATCHABLE_TYPES_FILTER = ['Transfer', 'Card', 'Cheque', 'Refund', '', null, undefined];
     const isUnmatchedCandidate = (b) => {
       const isMatched = b.match_status === 'matched' || b.match_status === 'paid';
       const isVoid = b.match_status === 'void';
@@ -4352,10 +4352,10 @@ async function renderMain(el) {
         };
         
         // กฎ matched ใหม่:
-        //   Type = Cash                     → auto matched (ไม่ต้องใส่ confirmation)
-        //   Type = Transfer/Card/Cheque     → matched ก็ต่อเมื่อมี confirmation
-        //   Type = Refund / Unknown / ว่าง  → pending เสมอ
-        const MATCHABLE_TYPES_INLINE = ['Transfer', 'Card', 'Cheque'];
+        //   Type = Cash                             → auto matched (ไม่ต้องใส่ confirmation)
+        //   Type = Transfer/Card/Cheque/Refund     → matched ก็ต่อเมื่อมี confirmation
+        //   Type = Unknown / ว่าง                  → pending เสมอ
+        const MATCHABLE_TYPES_INLINE = ['Transfer', 'Card', 'Cheque', 'Refund'];
         
         // ── Auto status change เมื่อกรอก confirmation ──
         if (field === 'confirmation') {
@@ -9825,12 +9825,21 @@ async function renderMatching(el) {
         // ยอดตรง ±5% หรือ ±1 บาท (ใช้ absolute รองรับเงินเข้า/ออก)
         const absStmt = Math.abs(stmtAmt);
         
-        // ── Filter กฎใหม่ (ง่ายกว่าเดิม): ──
-        //   Match เฉพาะ Type = Transfer, Card, Cheque
+        // ── Filter กฎใหม่: ──
+        //   Match เฉพาะ Type = Transfer, Card, Cheque, Refund
         //   + ทิศทาง (เงินเข้า/ออก) ตาม prefix และ station
-        const MATCHABLE_TYPES = ['Transfer', 'Card', 'Cheque'];
-        const EXPENSE_PREFIXES = ['PP','PS','PR','MS','MR','PX'];
-        const INCOME_PREFIXES = ['SS','OS','SP','SR','OR','JR','JS','SC'];
+        const MATCHABLE_TYPES = ['Transfer', 'Card', 'Cheque', 'Refund'];
+        // ── Direction prefixes (fixed per business rules) ──
+        //   เงินเข้า (stmt > 0):
+        //     ลูกหนี้:    SS, OS, SP, S2 (ขายสด + ตัดชำระ + Front POS อนาคต)
+        //     เจ้าหนี้:   BS, PC (supplier คืนเงินเราสด)
+        //     Front station: ทุกบิล (บิล Front ปัจจุบันที่ bill_no ว่าง)
+        //   เงินออก (stmt < 0):
+        //     ลูกหนี้:    SC, JS, JR (ใบลดหนี้ลูกหนี้ — คืนเงินลูกค้า)
+        //     เจ้าหนี้:   PP, PS, MS, PX (ตัดชำระ + ซื้อสด + ค่าขนส่ง)
+        //   ไม่ขึ้นเลย: SR, OR, PR, MR, BR (เชื่อ — รอ SP/PP)
+        const INCOME_PREFIXES = ['SS','OS','SP','S2','BS','PC'];
+        const EXPENSE_PREFIXES = ['PP','PS','MS','PX','SC','JS','JR'];
         
         const canMatchBill = (b) => {
           if (!MATCHABLE_TYPES.includes(b.type || '')) return false;
@@ -10271,18 +10280,25 @@ async function renderMatching(el) {
       
       function isIncomeBill(b) {
         if (!canMatch(b)) return false;
-        // เงินเข้า = Front station หรือ prefix ฝั่งลูกหนี้ (SS/OS/SP)
+        // เงินเข้า:
+        //   ลูกหนี้: SS, OS, SP, S2 (ขายสด + ตัดชำระ + Front POS อนาคต)
+        //   เจ้าหนี้: BS, PC (supplier คืนเงินสด)
+        //   Front station: รับเงินสด/โอน (บิลว่างหรือมี prefix)
+        //   ไม่รวม: SR/OR (เชื่อ รอ SP), SC/JS/JR (ใบลดหนี้ = เงินออก)
         const prefix = String(b.bill_no || '').substring(0, 2).toUpperCase();
         const isFrontStation = String(b.station || '').startsWith('Front');
-        const isIncomePrefix = ['SS','OS','SP','SR','OR'].includes(prefix);
+        const isIncomePrefix = ['SS','OS','SP','S2','BS','PC'].includes(prefix);
         return isFrontStation || isIncomePrefix;
       }
       
       function isExpenseBill(b) {
         if (!canMatch(b)) return false;
-        // เงินออก = prefix ฝั่งเจ้าหนี้ (PP/PS/PR/MS/MR)
+        // เงินออก:
+        //   เจ้าหนี้ (จ่าย supplier): PP, PS, MS, PX
+        //   ลูกหนี้ (คืนเงินลูกค้า): SC, JS, JR
+        //   ไม่รวม: PR/MR (เชื่อ รอ PP), BR (เชื่อ รอ PP)
         const prefix = String(b.bill_no || '').substring(0, 2).toUpperCase();
-        return ['PP','PS','PR','MS','MR'].includes(prefix);
+        return ['PP','PS','MS','PX','SC','JS','JR'].includes(prefix);
       }
       
       // ══════════════════════════════════════════════════════════
