@@ -2499,16 +2499,13 @@ async function renderMain(el) {
     //   
     //   incomeSide    = ยอดขาย + ยอดคืนสินค้า
     //   accountedSide = Cash Drawer (adjusted) + Transfer + Card + Cheque + Refund + นำเงินออก
-    //   diff = incomeSide − accountedSide
-    //     > 0 → เงินขาด 🔴
-    //     < 0 → เงินเกิน 🟢
+    //   diff = accountedSide − incomeSide
+    //     < 0 → เงินขาด 🔴 (รอโอน/card/cheque มาเติมให้ถึง 0)
+    //     > 0 → เงินเกิน 🟡 (ลิ้นชัก/ยอด match มากกว่าที่ควร)
     //     = 0 → OK ✅
     //
-    // ทิศทาง sign ตามที่ user ต้องการ:
-    //   cashIn ↑ → drawer adjusted ↓ → accountedSide ↓ → diff ↑ (บวก) ✓
-    //   sales ↑ → incomeSide ↑ → diff ↑ (บวก) ✓
-    //   returns abs ↑ (stored ↓) → incomeSide ↓ → diff ↓ (ลบ) ✓
-    //   cashOut ↑ → accountedSide ↑ → diff ↓ (ลบ) ✓
+    // ก่อน auto matching: Transfer/Card/Cheque/Refund = 0 → diff = ลบ (เงินขาด)
+    // หลัง matching ครบ: diff → 0
     //
     // Note: Transfer/Card/Cheque/Refund ใช้เฉพาะ matched bills (xlsm SUMIFS with F<>"")
     // ══════════════════════════════════════════════════════════════
@@ -2554,15 +2551,14 @@ async function renderMain(el) {
     
     if (!incomeSide && !accountedSide && !drawerRaw && !sales) return { diff: 0, isOk: null, empty: true };
     
-    let diff = incomeSide - accountedSide;
-    
-    // Credit stations: flip sign (outflow direction)
-    //   Invoice Credit = SC bills = เราต้องจ่ายเงินคืน → ติดลบจนกว่าจะจ่ายครบ
-    //   Order Credit = OR bills = ลูกค้าต้องจ่าย → ติดลบจนกว่าจะรับเงิน
-    //   เมื่อ matched ครบ → diff = 0 (OK)
-    if (station === 'Invoice Credit' || station === 'Order Credit') {
-      diff = -diff;
-    }
+    // diff = accountedSide − incomeSide
+    //   ก่อน match → ลบ (เงินขาด)
+    //   หลัง match ครบ → 0
+    //   เกิน → บวก
+    // สูตรเดียวใช้ได้หมดรวม Invoice Credit / Order Credit
+    // (IC = หนี้ที่เราต้องจ่าย: ก่อนจ่าย sales>0, accounted=0 → diff ลบ = ยังค้างจ่าย ✓)
+    // (OC = ลูกค้าค้างจ่าย: ก่อนรับ sales>0, accounted=0 → diff ลบ = ยังรอรับเงิน ✓)
+    const diff = accountedSide - incomeSide;
     
     return { diff, isOk: Math.abs(diff) < 1.0, empty: false };
   }
