@@ -10584,14 +10584,22 @@ async function renderMatching(el) {
     async function runAutoMatchRange(dateFrom, dateTo) {
       toast(`กำลัง Auto Match: ${fmtDate(dateFrom)} → ${fmtDate(dateTo)}...`, 'info');
 
-      // ── Helper: คำนวณยอดสุทธิ (หลังหัก WHT + ค่าโอน + Card fee) ──
-      function netAmount(b) {
-        const amt = Math.abs(Number(b.amount || 0));
-        const wht = Number(b.wht_amount || 0);
-        const tf = Number(b.transfer_fee || 0);
-        const cf = Number(b.card_fee || 0);
-        return Math.round((amt - wht - tf - cf) * 100) / 100;
+      // ── ยอดที่ใช้ match ตามกฎง่ายๆ: ──
+      //   ถ้ามียอดสุทธิ (fee ใดๆ > 0) → match สุทธิ = amount − fees
+      //   ถ้าไม่มี → match baht = amount
+      function billMatchAmount(b) {
+        const amt = Math.abs(Number(b.amount) || 0);
+        const wht = Number(b.wht_amount) || 0;
+        const tf = Number(b.transfer_fee) || 0;
+        const cf = Number(b.card_fee) || 0;
+        const totalFees = wht + tf + cf;
+        return totalFees > 0 ? (amt - totalFees) : amt;
       }
+      // Alias เดิมสำหรับ backward-compat (กรณีที่มีโค้ดอื่นเรียก)
+      function netAmount(b) { return billMatchAmount(b); }
+      
+      // ── Key สำหรับ index match — 2 ทศนิยม เพื่อเจอตรงเป๊ะ ──
+      const k2 = (n) => Math.round(Math.abs(n) * 100);
       
       // ── กฎ match ใหม่ (ง่ายกว่าเดิม): ── 
       //   Match เฉพาะ Type = Transfer, Card, Cheque (ไม่สนใจ prefix)
@@ -10643,11 +10651,11 @@ async function renderMatching(el) {
         const d = toISODate(b.date);
         if (!d || d < dateFrom || d > dateTo) continue;
         
-        // ใช้ยอดสุทธิ (เงินที่จะเข้าบัญชีจริง) เป็น key
-        const netAmt = Math.round(netAmount(b));
-        if (!netAmt) continue;
+        // ใช้ billMatchAmount (baht ถ้าไม่มี fee, สุทธิ ถ้ามี)
+        const mAmt = billMatchAmount(b);
+        if (!mAmt) continue;
         
-        const k = d + '|' + netAmt;
+        const k = d + '|' + k2(mAmt);
         if (!idx[k]) idx[k] = [];
         idx[k].push({ bi });
         billsInRange++;
@@ -10667,14 +10675,15 @@ async function renderMatching(el) {
         const sa = Number(stmt.amount || 0);
         if (sa <= 0) { skippedNeg++; return; }
         
-        const k = sd + '|' + Math.round(sa);
+        const k = sd + '|' + k2(sa);
         const candidates = idx[k] || [];
         
         let foundIdx = -1;
         for (let c = 0; c < candidates.length; c++) {
           const bi = candidates[c].bi;
           if (used.has(bi)) continue;
-          if (Math.round(netAmount(billList[bi])) === Math.round(sa)) {
+          // Exact check (2-decimal precision) — กันเผื่อ collision ใน bucket
+          if (k2(billMatchAmount(billList[bi])) === k2(sa)) {
             foundIdx = bi;
             break;
           }
@@ -10721,11 +10730,11 @@ async function renderMatching(el) {
         const d = toISODate(b.date);
         if (!d || d < dateFrom || d > dateTo) continue;
         
-        // ใช้ยอดสุทธิ (= ยอดเต็มเมื่อไม่มี fee) เป็น key
-        const netAmt = Math.round(Math.abs(netAmount(b)));
-        if (!netAmt) continue;
+        // กฎเดียวกับ Pass 1: baht ถ้าไม่มี fee, สุทธิ ถ้ามี
+        const mAmt = billMatchAmount(b);
+        if (!mAmt) continue;
         
-        const k = d + '|' + netAmt;
+        const k = d + '|' + k2(mAmt);
         if (!expIdx[k]) expIdx[k] = [];
         expIdx[k].push({ bi });
         expBillsInRange++;
@@ -10740,15 +10749,14 @@ async function renderMatching(el) {
         const sd = toISODate(stmt.date || stmt.trans_date);
         if (!sd || sd < dateFrom || sd > dateTo) return;
         
-        const absSa = Math.round(Math.abs(sa));
-        const k = sd + '|' + absSa;
+        const k = sd + '|' + k2(sa);
         const cands = expIdx[k] || [];
         
         let foundIdx = -1;
         for (let c = 0; c < cands.length; c++) {
           const bi = cands[c].bi;
           if (expUsed.has(bi)) continue;
-          if (Math.round(Math.abs(netAmount(billList[bi]))) === absSa) {
+          if (k2(billMatchAmount(billList[bi])) === k2(sa)) {
             foundIdx = bi;
             break;
           }
