@@ -2495,14 +2495,22 @@ async function renderMain(el) {
     
     // ══════════════════════════════════════════════════════════════
     // สูตรเดียวสำหรับทุก Station (ตามที่ user กำหนด):
-    //   LHS = (Cash Drawer − นำเงินเข้า) + Transfer + Card + Cheque + Refund
-    //   RHS = ยอดขาย + ยอดคืนสินค้า
-    //   diff = LHS − RHS
-    //     > 0 → เงินเกิน 🟢
-    //     < 0 → เงินขาด 🔴
+    //   Cash Drawer ที่แสดง = raw − นำเงินเข้า  (ปรับในช่อง display แล้ว)
+    //   
+    //   incomeSide    = ยอดขาย + ยอดคืนสินค้า
+    //   accountedSide = Cash Drawer (adjusted) + Transfer + Card + Cheque + Refund + นำเงินออก
+    //   diff = incomeSide − accountedSide
+    //     > 0 → เงินขาด 🔴
+    //     < 0 → เงินเกิน 🟢
     //     = 0 → OK ✅
-    //   *Transfer/Card/Cheque/Refund ใช้เฉพาะบิลที่ matched แล้ว (ตาม xlsm SUMIFS with F<>"")
-    //   *Cash Drawer ต้องเป็นค่า RAW (includes cashIn) — ถ้ามาจาก user นับธนบัตร ตรงเป๊ะ
+    //
+    // ทิศทาง sign ตามที่ user ต้องการ:
+    //   cashIn ↑ → drawer adjusted ↓ → accountedSide ↓ → diff ↑ (บวก) ✓
+    //   sales ↑ → incomeSide ↑ → diff ↑ (บวก) ✓
+    //   returns abs ↑ (stored ↓) → incomeSide ↓ → diff ↓ (ลบ) ✓
+    //   cashOut ↑ → accountedSide ↑ → diff ↓ (ลบ) ✓
+    //
+    // Note: Transfer/Card/Cheque/Refund ใช้เฉพาะ matched bills (xlsm SUMIFS with F<>"")
     // ══════════════════════════════════════════════════════════════
     
     // Helper: รวมค่าจาก 3 stations (Invoice+Order+Payment) ถ้า station='Invoice', ไม่งั้น 1 station
@@ -2510,19 +2518,20 @@ async function renderMain(el) {
     
     const sumStations = (fn) => stationsFor(station).reduce((s, st) => s + fn(st), 0);
     
-    // Drawer: ใช้ค่าของ station หลัก (Invoice drawer ครอบคลุม Order+Payment ด้วย)
-    let drawer = 0;
+    // Drawer RAW (รวม cashIn)
+    let drawerRaw = 0;
     if (station === 'Invoice') {
-      const countedCash = calcCashDrawer('Invoice'); // user นับธนบัตร (RAW)
-      drawer = countedCash > 0 
+      const countedCash = calcCashDrawer('Invoice');
+      drawerRaw = countedCash > 0 
         ? countedCash 
         : (summaryOrZero('Cash Drawer', 'Invoice') || ['Invoice','Order','Payment'].reduce((s,st)=>s+calcCashFromBills(st), 0));
     } else {
-      drawer = summaryOrBills('Cash Drawer', 'Cash', station);
+      drawerRaw = summaryOrBills('Cash Drawer', 'Cash', station);
     }
     
-    // cashIn, sales, returns: summary (sum ทุก station ที่เกี่ยวข้อง)
+    // cashIn, cashOut, returns, sales
     const cashIn = sumStations(st => _getSummaryValue('cashIn', st));
+    const cashOut = sumStations(st => _getSummaryValue('cashOut', st));
     const returns = sumStations(st => _getSummaryValue('returns', st));
     let sales = 0;
     stationsFor(station).forEach(st => {
@@ -2530,19 +2539,22 @@ async function renderMain(el) {
       sales += (summaryVal !== null ? summaryVal : calcSales(st));
     });
     
-    // Transfer/Card/Cheque/Refund: ใช้เฉพาะ matched bills (calcAutoValue)
+    // Drawer adjusted = raw − cashIn (ใช้ค่าเดียวกับ display)
+    const drawer = drawerRaw - cashIn;
+    
+    // Transfer/Card/Cheque/Refund: ใช้เฉพาะ matched bills
     const transfer = sumStations(st => calcAutoValue('Transfer', st));
     const card = sumStations(st => calcAutoValue('Card', st));
     const cheque = sumStations(st => calcAutoValue('Cheque', st));
     const refund = sumStations(st => calcAutoValue('Refund', st));
     
-    // สูตรเดียว
-    const LHS = (drawer - cashIn) + transfer + card + cheque + refund;
-    const RHS = sales + returns;
+    // สูตร
+    const incomeSide = sales + returns;
+    const accountedSide = drawer + transfer + card + cheque + refund + cashOut;
     
-    if (!LHS && !RHS && !drawer && !sales) return { diff: 0, isOk: null, empty: true };
+    if (!incomeSide && !accountedSide && !drawerRaw && !sales) return { diff: 0, isOk: null, empty: true };
     
-    const diff = LHS - RHS;
+    const diff = incomeSide - accountedSide;
     return { diff, isOk: Math.abs(diff) < 1.0, empty: false };
   }
 
@@ -3130,13 +3142,25 @@ async function renderMain(el) {
   // ── Helper: Cash Drawer row (คำนวณอัตโนมัติจากบิล Type=Cash) ──
   //   Invoice + Order + Payment = merge เป็น cell เดียว (colspan=3)
   //   เพราะเงินสดรวมกันทั้ง 3 station
+  //   ★ แสดงค่า adjusted = raw − นำเงินเข้า  (เพื่อให้ตรงสูตร Sum)
   function buildCashDrawerRow() {
-    // Merged total ของ Invoice + Order + Payment
-    const mergedInvoiceTotal = ['Invoice','Order','Payment']
-      .reduce((s, st) => s + calcCashFromBills(st), 0);
+    // Helper: ค่า cashIn สำหรับ station
+    const cashInOf = (st) => {
+      const summaryVal = summaryRow('นำเงินเข้า', st);
+      return summaryVal !== null ? summaryVal : (Number(mainSummary['cashIn_' + st]) || 0);
+    };
     
-    // Per-station values (เฉพาะ Front1-4)
-    const frontVals = ['Front1','Front2','Front3','Front4'].map(s => calcCashFromBills(s));
+    // Merged total ของ Invoice + Order + Payment (adjusted)
+    const mergedInvoiceRaw = ['Invoice','Order','Payment']
+      .reduce((s, st) => s + calcCashFromBills(st), 0);
+    const mergedCashIn = ['Invoice','Order','Payment'].reduce((s,st) => s + cashInOf(st), 0);
+    const mergedInvoiceTotal = mergedInvoiceRaw - mergedCashIn;
+    
+    // Per-station values (เฉพาะ Front1-4) — adjusted
+    const frontVals = ['Front1','Front2','Front3','Front4'].map(s => {
+      const raw = calcCashFromBills(s);
+      return raw - cashInOf(s);
+    });
     const frontTotal = frontVals.reduce((a,b)=>a+b, 0);
     const allSum = frontTotal + mergedInvoiceTotal;
     
@@ -3146,7 +3170,7 @@ async function renderMain(el) {
       if (s === 'Invoice') {
         // Merged cell colspan=3
         const v = mergedInvoiceTotal;
-        cells.push(`<td colspan="3" data-drawer-station="Invoice" style="text-align:center;color:${v?'var(--purple)':'var(--text3)'};font-weight:${v?'700':'400'};border-left:1px dashed var(--border);border-right:1px dashed var(--border);background:rgba(91,124,250,.04)" title="รวม Invoice + Order + Payment (เงินสดรวมลิ้นชัก)">${v?fmtNum(v):'-'}</td>`);
+        cells.push(`<td colspan="3" data-drawer-station="Invoice" style="text-align:center;color:${v?'var(--purple)':'var(--text3)'};font-weight:${v?'700':'400'};border-left:1px dashed var(--border);border-right:1px dashed var(--border);background:rgba(91,124,250,.04)" title="Cash Drawer Raw (${fmtNum(mergedInvoiceRaw)}) − นำเงินเข้า (${fmtNum(mergedCashIn)}) = ${fmtNum(v)}">${v?fmtNum(v):'-'}</td>`);
         return;
       }
       if (['Invoice Credit','Order Credit'].includes(s)) {
@@ -3156,7 +3180,9 @@ async function renderMain(el) {
       // Front1-4
       const idx = ['Front1','Front2','Front3','Front4'].indexOf(s);
       const v = idx >= 0 ? frontVals[idx] : 0;
-      cells.push(`<td data-drawer-station="${s}" style="text-align:right;color:${v?'var(--purple)':'var(--text3)'};font-weight:${v?'600':'400'}">${v?fmtNum(v):'-'}</td>`);
+      const raw = idx >= 0 ? calcCashFromBills(s) : 0;
+      const cin = idx >= 0 ? cashInOf(s) : 0;
+      cells.push(`<td data-drawer-station="${s}" style="text-align:right;color:${v?'var(--purple)':'var(--text3)'};font-weight:${v?'600':'400'}" title="Raw ${fmtNum(raw)} − นำเงินเข้า ${fmtNum(cin)} = ${fmtNum(v)}">${v?fmtNum(v):'-'}</td>`);
     });
     
     return `<tr>
@@ -4277,27 +4303,49 @@ async function renderMain(el) {
         const field = inp.dataset.field;
         billList[idx][field] = inp.value;
         
-        // Helper: render() แบบเก็บ scroll position
+        // Helper: render() แบบเก็บ scroll position (จับทุก scroll container)
         const renderKeepScroll = () => {
-          const mainScroll = el.scrollTop || document.getElementById('main')?.scrollTop || 0;
-          const tableWrap = el.querySelector('.table-wrap');
-          const tableScroll = tableWrap?.scrollTop || 0;
+          // Capture ทุก scroll position ที่เป็นไปได้
+          const scrolls = {
+            window: window.scrollY || window.pageYOffset || 0,
+            body: document.body?.scrollTop || 0,
+            html: document.documentElement?.scrollTop || 0,
+            main: document.getElementById('main')?.scrollTop || 0,
+            el: el.scrollTop || 0,
+            tableWrap: el.querySelector('.table-wrap')?.scrollTop || 0,
+          };
           const focusedField = document.activeElement?.dataset?.field;
           const focusedIdx = document.activeElement?.closest?.('tr')?.dataset?.idx;
+          const selStart = document.activeElement?.selectionStart;
+          const selEnd = document.activeElement?.selectionEnd;
           
           render();
           
-          // Restore after DOM update
+          // Restore after DOM rebuild
           requestAnimationFrame(() => {
+            // ลองทุก target ที่อาจมี scroll
+            if (scrolls.window) window.scrollTo(0, scrolls.window);
+            if (scrolls.body && document.body) document.body.scrollTop = scrolls.body;
+            if (scrolls.html && document.documentElement) document.documentElement.scrollTop = scrolls.html;
             const main = document.getElementById('main');
-            if (main) main.scrollTop = mainScroll;
+            if (main && scrolls.main) main.scrollTop = scrolls.main;
+            if (scrolls.el) el.scrollTop = scrolls.el;
             const newTableWrap = el.querySelector('.table-wrap');
-            if (newTableWrap) newTableWrap.scrollTop = tableScroll;
-            // Re-focus the input that was being edited (if still exists)
+            if (newTableWrap && scrolls.tableWrap) newTableWrap.scrollTop = scrolls.tableWrap;
+            
+            // Re-focus input ที่กำลังแก้อยู่
             if (focusedField && focusedIdx != null) {
               const selector = `tr[data-idx="${focusedIdx}"] [data-field="${focusedField}"]`;
               const newInp = el.querySelector(selector);
-              if (newInp) newInp.focus();
+              if (newInp) {
+                newInp.focus();
+                // คืน cursor position
+                try {
+                  if (selStart != null && selEnd != null && newInp.setSelectionRange) {
+                    newInp.setSelectionRange(selStart, selEnd);
+                  }
+                } catch(e) {}
+              }
             }
           });
         };
@@ -10561,12 +10609,14 @@ function renderData(el) {
       
       let totalBills = 0, totalDays = 0, failed = 0;
       const errors = [];
+      const dateReport = []; // เก็บรายงานวันที่ต่อไฟล์
       
       for (const file of files) {
         try {
           const result = await importDailyXlsm(file);
           totalBills += result.billsImported;
           totalDays++;
+          dateReport.push({ file: file.name, iso: result.dateISO, bills: result.billsImported });
         } catch(err) {
           failed++;
           errors.push(`${file.name}: ${err.message}`);
@@ -10589,14 +10639,18 @@ function renderData(el) {
       
       e.target.value = '';
       
+      // แสดงรายงาน — ทุกไฟล์กับวันที่จริงที่ parse ได้ (ให้ user ตรวจ)
       let resultMsg = `✅ Import สำเร็จ ${totalDays}/${files.length} วัน\n` +
-                      `📋 บิลรวม ${totalBills} รายการ`;
+                      `📋 บิลรวม ${totalBills} รายการ\n\n` +
+                      `📅 วันที่ที่ parse ได้:\n` +
+                      dateReport.slice(0, 10).map(x => 
+                        `  ${x.file.replace('.xlsm','')} → ${x.iso} (${x.bills} บิล)`
+                      ).join('\n');
+      if (dateReport.length > 10) resultMsg += `\n  ... และอีก ${dateReport.length - 10} ไฟล์`;
       if (failed > 0) {
         resultMsg += `\n\n❌ Error ${failed} ไฟล์:\n` + errors.slice(0, 5).join('\n');
-        alert(resultMsg);
-      } else {
-        toast(resultMsg, 'success', 8000);
       }
+      alert(resultMsg);
       render();
     });
     
@@ -12023,11 +12077,29 @@ async function importDailyXlsm(file) {
   const mainSheet = sheets['Main'] || sheets[Object.keys(sheets)[0]];
   if (!mainSheet) throw new Error('ไม่พบ Sheet "Main"');
   
-  // ── 1. อ่านวันที่จาก B2 (row 2, col 2) ──
-  const b2 = mainSheet[1]?.[1]; // 0-indexed
-  const dateISO = toISODate(b2);
-  if (!dateISO) throw new Error(`B2 ไม่ใช่วันที่ที่ถูกต้อง: ${b2} (type: ${typeof b2})`);
-  console.log(`[Import ${file.name}] B2=${b2} → dateISO=${dateISO}`);
+  // ── 1. อ่านวันที่ — ใช้ filename เป็นหลัก (reliable), B2 เป็น fallback ──
+  // Filename format: YYYYMMDD_*.xlsm (เช่น 20260102_Daily_JKN.xlsm)
+  const dateFromName = (() => {
+    const m = file.name.match(/(\d{4})(\d{2})(\d{2})/);
+    if (!m) return '';
+    let y = Number(m[1]); if (y > 2400) y -= 543;
+    return `${y}-${m[2]}-${m[3]}`;
+  })();
+  
+  const b2 = mainSheet[1]?.[1];
+  const dateFromB2 = toISODate(b2);
+  
+  // ใช้ filename ก่อน → ถ้าไม่เจอใช้ B2
+  const dateISO = dateFromName || dateFromB2;
+  
+  if (!dateISO) {
+    throw new Error(`ไม่สามารถ parse วันที่ได้\n  Filename: ${file.name}\n  B2: ${b2} (type: ${typeof b2})`);
+  }
+  
+  if (dateFromName && dateFromB2 && dateFromName !== dateFromB2) {
+    console.warn(`⚠️ ${file.name}: filename=${dateFromName} ≠ B2=${dateFromB2} — ใช้ filename`);
+  }
+  console.log(`[Import ${file.name}] filename=${dateFromName} · B2=${dateFromB2} · using=${dateISO}`);
   
   // ── 2. อ่าน Summary (rows 3-11, cols C-K) ──
   const LABELS = {
@@ -12108,15 +12180,14 @@ async function importDailyXlsm(file) {
   billList = billList.filter(b => toISODate(b.date) !== dateISO);
   const deleted = beforeCount - billList.length;
   
-  // ── 5. อ่านบิล (rows 15+) ──
+  // ── 5. อ่านบิล (rows 15+) — ใช้ dateISO (จาก filename) เป็นวันที่ทุกบิลในไฟล์เดียวกัน ──
   let billsImported = 0;
-  let sampleDates = [];
   for (let r = 14; r < mainSheet.length; r++) {
     const row = mainSheet[r];
     if (!row) continue;
     
     const billNo = String(row[0] || '').trim();
-    const billDateRaw = row[1];
+    // SKIP col 1 (B = Bill Date ในไฟล์) — ใช้ dateISO เดียวกันทั้งไฟล์ (ไม่ trust Excel date parsing)
     const station = String(row[2] || '').trim();
     const type = String(row[3] || '').trim();
     const amount = Number(row[4]);
@@ -12128,12 +12199,9 @@ async function importDailyXlsm(file) {
     if (!station && !type && !amount) continue;
     if (isNaN(amount) || amount === 0) continue;
     
-    const billDateISO = toISODate(billDateRaw) || dateISO;
-    if (billsImported < 3) sampleDates.push({ raw: billDateRaw, iso: billDateISO });
-    
     billList.push({
       bill_no: billNo || '',
-      date: billDateISO,
+      date: dateISO,  // ★ ใช้ dateISO ตรงๆ (= วันที่จาก filename)
       station: station,
       type: type,
       amount: amount,
@@ -12142,14 +12210,13 @@ async function importDailyXlsm(file) {
       remarks2: remarks2,
       bank: bank,
       match_status: type === 'Cash' ? 'matched' : 'pending',
-      pay_date: type === 'Cash' ? billDateISO : undefined,
+      pay_date: type === 'Cash' ? dateISO : undefined,
       _imported_from: file.name,
       _imported_at: new Date().toISOString(),
     });
     billsImported++;
   }
   
-  console.log(`[Import ${file.name}] Sample bill dates:`, sampleDates);
   return { dateISO, billsImported, summaryRows: 9, deleted };
 }
 
