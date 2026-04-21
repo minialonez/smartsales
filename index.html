@@ -381,11 +381,11 @@ function fmtDate(d) {
   return str.split(' ')[0];
 }
 function fmtNum(n) { return new Intl.NumberFormat('th-TH',{minimumFractionDigits:2,maximumFractionDigits:2}).format(n); }
-// Sum diff formatter: +1, -18, +0.50 (sign prefix + integer when whole)
+// Sum diff formatter: แสดง 2 ทศนิยมเสมอ (เช่น +1.00, -18.50, +0.50)
+// สอดคล้องกับแถวอื่นที่ใช้ fmtNum (2 ทศนิยม)
 function fmtDiff(n) {
   const abs = Math.abs(n);
-  const isWhole = abs === Math.floor(abs);
-  const formatted = isWhole ? abs.toLocaleString('th-TH') : new Intl.NumberFormat('th-TH',{minimumFractionDigits:2,maximumFractionDigits:2}).format(abs);
+  const formatted = new Intl.NumberFormat('th-TH',{minimumFractionDigits:2,maximumFractionDigits:2}).format(abs);
   return (n >= 0 ? '+' : '-') + formatted;
 }
 // Sum color: OK=green, เงินเกิน(+)=orange, เงินขาด(-)=red
@@ -3167,6 +3167,61 @@ async function renderMain(el) {
 
     bindMainEvents();
   }
+  
+  // ── renderKeepScroll: re-render หน้าโดย preserve scroll position ──
+  // ใช้แทน render() หลังแก้ไขบิล/Add Bill/Bulk ops เพื่อไม่ให้ scroll เด้งขึ้นบน
+  function renderKeepScroll() {
+    // 1. Capture scroll positions จากทุก container ที่เป็นไปได้
+    const scrollTargets = [
+      { el: window, x: window.scrollX, y: window.scrollY },
+      { el: document.documentElement, x: 0, y: document.documentElement.scrollTop },
+      { el: document.body, x: 0, y: document.body.scrollTop },
+    ];
+    // Also capture any scrollable ancestor of el
+    let node = el?.parentElement;
+    while (node && node !== document.body) {
+      const s = getComputedStyle(node);
+      if ((s.overflowY === 'auto' || s.overflowY === 'scroll') && node.scrollHeight > node.clientHeight) {
+        scrollTargets.push({ el: node, x: node.scrollLeft, y: node.scrollTop });
+      }
+      node = node.parentElement;
+    }
+    // Capture activeElement info (to restore focus)
+    const activeId = document.activeElement?.id;
+    const activeField = document.activeElement?.dataset?.field;
+    const activeIdx = document.activeElement?.closest?.('tr')?.dataset?.idx;
+    const activeSelStart = document.activeElement?.selectionStart;
+    const activeSelEnd = document.activeElement?.selectionEnd;
+    
+    // 2. Render
+    render();
+    
+    // 3. Restore in rAF (หลัง DOM อัปเดตแล้ว) — ใช้ 2x rAF เผื่อ browser paint
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        scrollTargets.forEach(t => {
+          try {
+            if (t.el === window) window.scrollTo(t.x, t.y);
+            else { t.el.scrollLeft = t.x; t.el.scrollTop = t.y; }
+          } catch(_) {}
+        });
+        // Restore focus
+        try {
+          let target = null;
+          if (activeId) target = document.getElementById(activeId);
+          else if (activeIdx != null && activeField) {
+            target = document.querySelector(`tr[data-idx="${activeIdx}"] [data-field="${activeField}"]`);
+          }
+          if (target && typeof target.focus === 'function') {
+            target.focus();
+            if (activeSelStart != null && target.setSelectionRange) {
+              try { target.setSelectionRange(activeSelStart, activeSelEnd); } catch(_) {}
+            }
+          }
+        } catch(_) {}
+      });
+    });
+  }
 
   // ── Helper: สร้าง row ที่กรอกเอง (cashIn, cashOut, returns) ──
   function buildSumRow(key, label, color, editable) {
@@ -3868,7 +3923,7 @@ async function renderMain(el) {
           ? ` (สุทธิ ฿${(amount - whtAmount - transferFee - cardFee).toFixed(2)})` 
           : '';
         toast(`เพิ่มบิล฿${amount.toFixed(2)}${netNote}`, 'success');
-        render();
+        renderKeepScroll();
       });
     });
 
@@ -3913,7 +3968,7 @@ async function renderMain(el) {
         persistMainState();
         closeModal();
         toast(`ตั้งค่า ${field} สำเร็จ ${count} รายการ`, 'success');
-        render();
+        renderKeepScroll();
       });
     });
 
@@ -3932,7 +3987,7 @@ async function renderMain(el) {
       });
       persistMainState();
       toast(`ตั้ง Due Date อัตโนมัติ ${count} รายการ (วันที่ 20 ของเดือนถัดไป)`, 'success');
-      render();
+      renderKeepScroll();
     });
     // ── Check issues button (เปิด modal validation) ──
     document.getElementById('btn-check-issues')?.addEventListener('click', () => {
@@ -4468,7 +4523,7 @@ async function renderMain(el) {
           persistMainState();
           closeModal();
           toast(`✓ บันทึกแล้ว — ${b.bill_no||'(ไม่มีเลข)'}`, 'success');
-          render();
+          renderKeepScroll();
         });
         
         document.getElementById('eb-delete')?.addEventListener('click', () => {
@@ -4477,7 +4532,7 @@ async function renderMain(el) {
           persistMainState();
           closeModal();
           toast('ลบบิลแล้ว', 'success');
-          render();
+          renderKeepScroll();
         });
       });
     });
@@ -4571,7 +4626,7 @@ async function renderMain(el) {
       }, 200));
     });
 
-    // Bill list cells — in-place edit
+    // Bill list cells — in-place edit (NO full render → ไม่มี scroll เด้ง)
     el.querySelectorAll('.bl-cell').forEach(inp => {
       inp.addEventListener('change', () => {
         const tr = inp.closest('tr');
@@ -4579,51 +4634,16 @@ async function renderMain(el) {
         const field = inp.dataset.field;
         billList[idx][field] = inp.value;
         
-        // Helper: render() แบบเก็บ scroll position (จับทุก scroll container)
-        const renderKeepScroll = () => {
-          // Capture ทุก scroll position ที่เป็นไปได้
-          const scrolls = {
-            window: window.scrollY || window.pageYOffset || 0,
-            body: document.body?.scrollTop || 0,
-            html: document.documentElement?.scrollTop || 0,
-            main: document.getElementById('main')?.scrollTop || 0,
-            el: el.scrollTop || 0,
-            tableWrap: el.querySelector('.table-wrap')?.scrollTop || 0,
-          };
-          const focusedField = document.activeElement?.dataset?.field;
-          const focusedIdx = document.activeElement?.closest?.('tr')?.dataset?.idx;
-          const selStart = document.activeElement?.selectionStart;
-          const selEnd = document.activeElement?.selectionEnd;
+        // ── Surgical update: อัปเดตแค่ pay_date cell + status badge ใน row นี้ ──
+        // ไม่ re-render ทั้งหน้า → ไม่มี scroll bounce
+        const updateRowStatus = (b) => {
+          // อัปเดต pay_date input ในแถวเดียวกัน
+          const payDateInp = tr.querySelector('input[data-field="pay_date"]');
+          if (payDateInp) payDateInp.value = b.pay_date ? toISODate(b.pay_date) : '';
           
-          render();
-          
-          // Restore after DOM rebuild
-          requestAnimationFrame(() => {
-            // ลองทุก target ที่อาจมี scroll
-            if (scrolls.window) window.scrollTo(0, scrolls.window);
-            if (scrolls.body && document.body) document.body.scrollTop = scrolls.body;
-            if (scrolls.html && document.documentElement) document.documentElement.scrollTop = scrolls.html;
-            const main = document.getElementById('main');
-            if (main && scrolls.main) main.scrollTop = scrolls.main;
-            if (scrolls.el) el.scrollTop = scrolls.el;
-            const newTableWrap = el.querySelector('.table-wrap');
-            if (newTableWrap && scrolls.tableWrap) newTableWrap.scrollTop = scrolls.tableWrap;
-            
-            // Re-focus input ที่กำลังแก้อยู่
-            if (focusedField && focusedIdx != null) {
-              const selector = `tr[data-idx="${focusedIdx}"] [data-field="${focusedField}"]`;
-              const newInp = el.querySelector(selector);
-              if (newInp) {
-                newInp.focus();
-                // คืน cursor position
-                try {
-                  if (selStart != null && selEnd != null && newInp.setSelectionRange) {
-                    newInp.setSelectionRange(selStart, selEnd);
-                  }
-                } catch(e) {}
-              }
-            }
-          });
+          // อัปเดต confirmation input (เผื่อ code เปลี่ยน)
+          const confInp = tr.querySelector('input[data-field="confirmation"]');
+          if (confInp && confInp !== inp) confInp.value = b.confirmation || '';
         };
         
         // กฎ matched ใหม่:
@@ -4661,7 +4681,8 @@ async function renderMain(el) {
             }
           }
           persistMainState();
-          renderKeepScroll();
+          updateRowStatus(b);
+          updateSumCheckRow(); // ยอดรวมอาจเปลี่ยน (matched bill affect auto value)
           return;
         }
         
@@ -4699,12 +4720,16 @@ async function renderMain(el) {
             }
           }
           persistMainState();
-          renderKeepScroll();
+          updateRowStatus(b);
+          updateSumCheckRow(); // matched status เปลี่ยน → sum เปลี่ยน
           return;
         }
         
+        // ช่องอื่นๆ (date, station, amount, remarks, bank, due_date, pay_date)
+        // → แค่ save ไม่ render เลย
         persistMainState();
-        if (field === 'station') renderKeepScroll();
+        // ถ้าเปลี่ยน amount หรือ station → sum อาจเปลี่ยน
+        if (field === 'amount' || field === 'station') updateSumCheckRow();
       });
     });
 
@@ -9839,6 +9864,7 @@ async function renderSales(el) {
 // ── Matching ────────────────────────────────────────────────
 async function renderMatching(el) {
   let bankFilter = 'ALL', matchFilter = 'ALL';
+  let dirFilter = 'ALL'; // 'ALL' | 'in' | 'out'
   let dateFrom = '', dateTo = '';
   const bankColors = { KTB:'#00a4e4', KBANK:'#138f2d', 'BBL NW':'#ff7b00', BBL:'#1e3a7b' };
 
@@ -9851,6 +9877,10 @@ async function renderMatching(el) {
     // Filter by match status
     if (matchFilter === 'matched') data = data.filter(s => s.match_status === 'matched');
     else if (matchFilter === 'unmatched') data = data.filter(s => s.match_status !== 'matched');
+    
+    // Filter by direction (เงินเข้า/ออก)
+    if (dirFilter === 'in') data = data.filter(s => Number(s.amount || 0) > 0);
+    else if (dirFilter === 'out') data = data.filter(s => Number(s.amount || 0) < 0);
     
     // Filter by date range
     if (dateFrom || dateTo) {
@@ -9889,6 +9919,28 @@ async function renderMatching(el) {
     const totalUnmatched = allStmts.length - totalMatched;
     const filteredMatched = data.filter(s=>s.match_status==='matched').length;
     const filteredUnmatched = data.length - filteredMatched;
+    
+    // Count in/out (ใช้ data ที่ผ่าน bank+match filter แล้ว เพื่อให้ count ตามบริบท)
+    const dataBeforeDir = (() => {
+      let d = uploadedStatements.length > 0 ? [...uploadedStatements] : [];
+      if (bankFilter !== 'ALL') d = d.filter(s => s.bank === bankFilter);
+      if (matchFilter === 'matched') d = d.filter(s => s.match_status === 'matched');
+      else if (matchFilter === 'unmatched') d = d.filter(s => s.match_status !== 'matched');
+      if (dateFrom || dateTo) {
+        d = d.filter(s => {
+          const dt = toISODate(s.date || s.trans_date);
+          if (!dt) return true;
+          if (dateFrom && dt < dateFrom) return false;
+          if (dateTo && dt > dateTo) return false;
+          return true;
+        });
+      }
+      return d;
+    })();
+    const countIn = dataBeforeDir.filter(s => Number(s.amount||0) > 0).length;
+    const countOut = dataBeforeDir.filter(s => Number(s.amount||0) < 0).length;
+    const sumIn = dataBeforeDir.filter(s => Number(s.amount||0) > 0).reduce((a,s)=>a+Number(s.amount||0),0);
+    const sumOut = dataBeforeDir.filter(s => Number(s.amount||0) < 0).reduce((a,s)=>a+Number(s.amount||0),0);
 
     el.innerHTML = `
       <div class="flex justify-between items-center mb-3">
@@ -9914,6 +9966,10 @@ async function renderMatching(el) {
         <button class="pill ${matchFilter==='ALL'?'active':''}" data-mf="ALL">ทั้งหมด (${allStmts.length})</button>
         <button class="pill ${matchFilter==='unmatched'?'active':''}" data-mf="unmatched" style="--pill-color:var(--danger)">✗ ยังไม่ Match (${totalUnmatched})</button>
         <button class="pill ${matchFilter==='matched'?'active':''}" data-mf="matched" style="--pill-color:var(--success)">✓ Matched (${totalMatched})</button>
+        <span style="margin-left:12px;padding-left:12px;border-left:1px solid var(--border)" class="text-xs text-dim">ทิศทาง:</span>
+        <button class="pill ${dirFilter==='ALL'?'active':''}" data-dir="ALL">ทั้งหมด</button>
+        <button class="pill ${dirFilter==='in'?'active':''}" data-dir="in" style="--pill-color:var(--success)" title="฿${fmtNum(sumIn)}">💰 เข้า (${countIn})</button>
+        <button class="pill ${dirFilter==='out'?'active':''}" data-dir="out" style="--pill-color:var(--danger)" title="฿${fmtNum(Math.abs(sumOut))}">💸 ออก (${countOut})</button>
         <span style="margin-left:16px" class="text-xs text-dim">ช่วงวันที่:</span>
         <input type="date" class="input" id="match-date-from" value="${dateFrom}" style="width:145px;padding:3px 6px;font-size:.78rem" title="จาก">
         <span class="text-xs">→</span>
@@ -9944,7 +10000,7 @@ async function renderMatching(el) {
                   <td>${fmtDate(s.date)}</td>
                   <td>${s.time}</td>
                   <td class="text-xs" style="font-family:var(--mono)">${s.ref_no}</td>
-                  <td style="text-align:right;font-weight:600;color:var(--success)">฿${fmtNum(s.amount)}</td>
+                  <td style="text-align:right;font-weight:600;color:${Number(s.amount)>=0?'var(--success)':'var(--danger)'}">${Number(s.amount)>=0?'+':''}${fmtNum(s.amount)}</td>
                   <td class="truncate" style="max-width:170px;color:var(--text)">
                     ${s.description}
                     ${(s.sender_bank_name || s.sender_account || s.sender_name) ? `<br><span class="text-xs" style="color:var(--info);font-family:var(--mono)">
@@ -9975,6 +10031,9 @@ async function renderMatching(el) {
     });
     el.querySelectorAll('.pill[data-mf]').forEach(btn => {
       btn.addEventListener('click', () => { matchFilter = btn.dataset.mf; render(); });
+    });
+    el.querySelectorAll('.pill[data-dir]').forEach(btn => {
+      btn.addEventListener('click', () => { dirFilter = btn.dataset.dir; render(); });
     });
     document.getElementById('match-date-from')?.addEventListener('change', e => { dateFrom = e.target.value; render(); });
     document.getElementById('match-date-to')?.addEventListener('change', e => { dateTo = e.target.value; render(); });
@@ -10656,7 +10715,16 @@ async function renderMatching(el) {
         if (expensePrefixes.includes(prefix)) return 'expense';
         return 'unknown';  // MANUAL, no prefix, Invoice/Order/Payment station ไม่มี prefix ชัด
       }
-      function isCompatible(bill, stmtAmount) {
+      function isCompatible(bill, stmt) {
+        const stmtAmount = Number(stmt.amount || 0);
+        const stmtBank = String(stmt.bank || '').toUpperCase().replace(/\s+/g, ' ').trim();
+        const station = String(bill.station || '');
+        
+        // ── Bank ↔ Station pairing rules ──
+        // BBL NW ไม่ match กับบิล Front* (คนละบัญชี/คนละเครื่องรับเงิน)
+        if (stmtBank === 'BBL NW' && station.startsWith('Front')) return false;
+        
+        // ── Direction check ──
         const dir = billDirection(bill);
         if (dir === 'unknown') return true;
         return (dir === 'income' && stmtAmount > 0) || (dir === 'expense' && stmtAmount < 0);
@@ -10708,7 +10776,7 @@ async function renderMatching(el) {
           const bi = candidates[c].bi;
           if (used.has(bi)) continue;
           const bill = billList[bi];
-          if (!isCompatible(bill, sa)) continue;
+          if (!isCompatible(bill, stmt)) continue;
           foundIdx = bi;
           break;
         }
@@ -10783,7 +10851,13 @@ async function renderMatching(el) {
                     if (b.match_status === 'matched') reasons.push('match แล้ว');
                     if (b.match_status === 'paid') reasons.push('paid');
                     if (b.match_status === 'void') reasons.push('void');
-                    if (!isCompatible(b, sa)) reasons.push(`ทิศทางไม่ตรง (บิล=${billDirection(b)}, stmt=${sa>0?'เข้า':'ออก'})`);
+                    // Bank ↔ station pairing
+                    const stmtBankUp = String(stmt.bank||'').toUpperCase().replace(/\s+/g,' ').trim();
+                    if (stmtBankUp === 'BBL NW' && String(b.station||'').startsWith('Front')) {
+                      reasons.push(`BBL NW ไม่ match กับ Front* (กฎ bank pairing)`);
+                    } else if (!isCompatible(b, stmt)) {
+                      reasons.push(`ทิศทางไม่ตรง (บิล=${billDirection(b)}, stmt=${sa>0?'เข้า':'ออก'})`);
+                    }
                     msg += `\n    • ${b.bill_no||'(no#)'} ${b.station||'?'}/${b.type||'?'}: ${reasons.join(', ') || 'บิลน่าจะ match ได้'}`;
                   });
                 } else {
