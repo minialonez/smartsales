@@ -11539,8 +11539,12 @@ function detectReconFileType(sheet) {
 
 // ── Parser File Type 1: การชำระเงิน (SP/PP หลัก + child bills) ──
 function parseReconPaymentMain(sheet, kind) {
-  // kind: 'sp' (ลูกหนี้) หรือ 'pp' (เจ้าหนี้)
+  // kind: 'sp' (ลูกหนี้) → SP + child: SS/SR/OS/OR/SC/JS/JR
+  //       'pp' (เจ้าหนี้) → PP + child: PS/PR/MS/MR/BS/BR/PC/PX
   const HEADER_PREFIX = kind === 'sp' ? 'SP' : 'PP';
+  const CHILD_REGEX = kind === 'sp' 
+    ? /^(SS|SR|OS|OR|SC|JS|JR)\d{5}-/
+    : /^(PS|PR|MS|MR|BS|BR|PC|PX)\d{5}-/;
   const payments = [];
   let current = null;
   
@@ -11551,7 +11555,7 @@ function parseReconPaymentMain(sheet, kind) {
     const first = String(r[0] || '').trim();
     if (!first) continue;
     
-    // Header row: SP/PP
+    // Header row: SP (ลูกหนี้) หรือ PP (เจ้าหนี้)
     if (first.startsWith(HEADER_PREFIX) && /^\w{2}\d{5}-\d+/.test(first)) {
       if (current) payments.push(current);
       current = {
@@ -11564,18 +11568,31 @@ function parseReconPaymentMain(sheet, kind) {
         bills: [],
       };
     }
-    // Child row: SR/OR/PR/MR/SC/JS/JR/PC/BS/BR/PX
-    else if (current && /^(SS|SR|OS|OR|SC|JS|JR|SP|PS|PR|MS|MR|PC|BS|BR|PP|PX)\d{5}-/.test(first)) {
+    // Child row: ใช้ regex แยกตาม kind
+    else if (current && CHILD_REGEX.test(first)) {
+      const prefix = first.substring(0, 2).toUpperCase();
+      // Sign logic:
+      //   SP: SC/JS/JR = ใบลดหนี้ลูกหนี้ → ยอดติดลบ (คืนเงิน)
+      //   PP: BS/BR/PC/PX = ใบลดหนี้/ส่วนลดเจ้าหนี้ → ยอดติดลบ (ได้คืน)
+      const isNegative = kind === 'sp' 
+        ? ['SC','JS','JR'].includes(prefix)
+        : ['BS','BR','PC','PX'].includes(prefix);
+      let amount = Number(r[5]) || 0;
+      // ถ้า prefix บ่งว่าต้องติดลบ แต่ยอดเป็นบวก → ทำให้ติดลบ
+      if (isNegative && amount > 0) amount = -amount;
+      
       current.bills.push({
         bill_no: first,
+        prefix: prefix,
         ref_no: String(r[1] || ''),
         bill_date: excelDateToISO(r[2]),
         due_date: excelDateToISO(r[3]),
         type_desc: String(r[4] || ''),
-        amount: Number(r[5]) || 0,
+        amount: amount,
         wht: Number(r[6]) || 0,
         fee: Number(r[7]) || 0,
         net: Number(r[8]) || 0,
+        is_negative: isNegative,
       });
     }
   }
