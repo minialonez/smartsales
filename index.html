@@ -185,7 +185,7 @@ tr.row-danger td{background:rgba(239,87,87,.06);border-left:3px solid var(--dang
 
 <!-- Hidden file inputs -->
 <input type="file" id="file-sales" accept=".xlsx,.xlsm,.xls,.csv" style="display:none">
-<input type="file" id="file-stmt" accept=".xlsx,.xlsm,.xls,.csv" style="display:none">
+<input type="file" id="file-stmt" accept=".xlsx,.xlsm,.xls,.csv" multiple style="display:none">
 
 <!-- Login Page -->
 <div id="login-page">
@@ -580,6 +580,33 @@ function triggerFileUpload(inputId, callback) {
   inp.click();
 }
 
+// ── Multi-file upload (สำหรับ statement หลายไฟล์พร้อมกัน) ──
+// callback(result, fileName, meta) โดย meta = { index, total, isLast }
+// Caller รับผิดชอบ accumulate + final toast/persist/render เองผ่าน meta.isLast
+function triggerMultiFileUpload(inputId, callback) {
+  const inp = document.getElementById(inputId);
+  inp.value = '';
+  inp.onchange = async () => {
+    const files = Array.from(inp.files || []);
+    if (files.length === 0) return;
+    if (files.length > 1) toast(`กำลังอ่าน ${files.length} ไฟล์...`, 'info');
+    else toast('กำลังอ่านไฟล์...', 'info');
+    
+    for (let i = 0; i < files.length; i++) {
+      const meta = { index: i, total: files.length, isLast: i === files.length - 1 };
+      try {
+        const result = await parseExcelFile(files[i]);
+        await callback(result, files[i].name, meta);
+      } catch (err) {
+        toast(`❌ ${files[i].name}: ${err.message}`, 'error', 5000);
+        // ยังคง callback เพื่อให้ caller ได้รู้ว่าไฟล์นี้ล้มเหลว → accumulate ถูก
+        await callback(null, files[i].name, { ...meta, error: err.message });
+      }
+    }
+  };
+  inp.click();
+}
+
 // ── Statement Upload Handler ──
 let uploadedStatements = [];
 
@@ -702,7 +729,8 @@ function parseStatementSender(bank, description, action) {
   return null;
 }
 
-function handleStmtUpload(result, fileName) {
+function handleStmtUpload(result, fileName, opts = {}) {
+  const silent = !!opts.silent;
   const rows = [];
   const nameLC = fileName.toLowerCase();
 
@@ -1011,6 +1039,11 @@ function handleStmtUpload(result, fileName) {
   // Backward compat: uploadedStatements = รวมทุกธนาคารที่ sort แล้ว
   uploadedStatements = getAllStatements();
   
+  // Silent mode: ไม่ persist/toast/navigate — caller เป็นผู้รับผิดชอบ (batch upload)
+  if (silent) {
+    return { bank, added, skipped, buddhistCount };
+  }
+  
   // Persist
   try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(e) {}
   
@@ -1020,6 +1053,8 @@ function handleStmtUpload(result, fileName) {
 
   // Re-render matching page with uploaded data
   if (currentPage === 'matching') navigateTo('matching');
+  
+  return { bank, added, skipped, buddhistCount };
 }
 
 // ── Statement Storage by Bank (สะสมได้ + แยกธนาคาร) ──
@@ -3697,14 +3732,10 @@ async function renderMain(el) {
       const $summary = document.getElementById('ab-summary');
       
       function feeApplies() {
-        // เฉพาะ FRONT/SS/SR เท่านั้นที่หักได้
-        const prefix = $bill.value.substring(0,2).toUpperCase();
-        const station = $station.value || '';
+        // แสดงช่อง fee เมื่อ Type = Transfer หรือ Card (ไม่สน station/prefix)
+        // ผู้ใช้สามารถใส่ค่าธรรมเนียม/หักเองได้เสมอ
         const type = $type.value || '';
-        const isFront = station.startsWith('Front');
-        const isSSSR = prefix === 'SS' || prefix === 'SR';
-        const isCardOrTransfer = type === 'Transfer' || type === 'Card';
-        return (isFront || isSSSR) && isCardOrTransfer;
+        return type === 'Transfer' || type === 'Card';
       }
       
       function updateFeeUI() {
@@ -4205,10 +4236,34 @@ async function renderMain(el) {
                 </select>
               </div>
               <div class="input-group flex-1">
-                <label>Baht</label>
+                <label>Baht (ยอดเต็ม)</label>
                 <input type="number" class="input" id="eb-amount" value="${b.amount||0}" step="0.01">
               </div>
             </div>
+            
+            <!-- Fee section: แสดงเฉพาะ Type = Transfer/Card -->
+            <div id="eb-fee-box" style="background:rgba(79,156,249,.05);border:1px solid rgba(79,156,249,.2);border-radius:6px;padding:10px;display:none">
+              <div style="font-size:.85rem;color:var(--info);font-weight:600;margin-bottom:8px">⚡ การหัก / ค่าธรรมเนียม</div>
+              <div class="flex gap-2">
+                <div class="input-group flex-1">
+                  <label style="color:var(--purple)">หัก ณ ที่จ่าย</label>
+                  <input type="number" class="input" id="eb-wht" value="${Number(b.wht_amount)||0}" step="0.01" style="color:var(--purple)">
+                </div>
+                <div class="input-group flex-1">
+                  <label style="color:var(--warn)">ค่าโอน</label>
+                  <input type="number" class="input" id="eb-transfer-fee" value="${Number(b.transfer_fee)||0}" step="0.01" style="color:var(--warn)">
+                </div>
+                <div class="input-group flex-1">
+                  <label style="color:var(--warn)">ค่าธรรมเนียมบัตร</label>
+                  <input type="number" class="input" id="eb-card-fee" value="${Number(b.card_fee)||0}" step="0.01" style="color:var(--warn)">
+                </div>
+              </div>
+              <div id="eb-net-row" style="margin-top:8px;padding:8px 10px;background:rgba(0,0,0,.2);border-radius:5px;display:flex;justify-content:space-between;align-items:center">
+                <span class="text-xs">สุทธิเข้าบัญชี</span>
+                <span id="eb-net-val" style="font-weight:600;color:var(--success);font-size:1.05rem">฿${(Number(b.amount)||0).toFixed(2)}</span>
+              </div>
+            </div>
+            
             <div class="flex gap-2">
               <div class="input-group flex-1">
                 <label>Confirmation (ธนาคาร/Cash)</label>
@@ -4251,6 +4306,35 @@ async function renderMain(el) {
           </div>
         `);
         
+        // ── Fee UI: show/hide + live net calc ──
+        const $ebType = document.getElementById('eb-type');
+        const $ebAmount = document.getElementById('eb-amount');
+        const $ebWht = document.getElementById('eb-wht');
+        const $ebTf = document.getElementById('eb-transfer-fee');
+        const $ebCf = document.getElementById('eb-card-fee');
+        const $ebFeeBox = document.getElementById('eb-fee-box');
+        const $ebNet = document.getElementById('eb-net-val');
+        
+        function ebUpdateFeeUI() {
+          const t = $ebType.value || '';
+          const show = (t === 'Transfer' || t === 'Card');
+          $ebFeeBox.style.display = show ? 'block' : 'none';
+          if (show) ebUpdateNet();
+        }
+        function ebUpdateNet() {
+          const amt = Number($ebAmount.value) || 0;
+          const wht = Number($ebWht.value) || 0;
+          const tf = Number($ebTf.value) || 0;
+          const cf = Number($ebCf.value) || 0;
+          const net = Math.round((amt - wht - tf - cf) * 100) / 100;
+          $ebNet.textContent = '฿' + net.toFixed(2);
+        }
+        ebUpdateFeeUI(); // init
+        [$ebType, $ebAmount, $ebWht, $ebTf, $ebCf].forEach(el => {
+          el?.addEventListener('input', () => { ebUpdateFeeUI(); ebUpdateNet(); });
+          el?.addEventListener('change', () => { ebUpdateFeeUI(); ebUpdateNet(); });
+        });
+        
         document.getElementById('eb-save')?.addEventListener('click', () => {
           b.bill_no = document.getElementById('eb-bill').value.trim();
           b.date = document.getElementById('eb-date').value;
@@ -4264,6 +4348,20 @@ async function renderMain(el) {
           b.remarks1 = document.getElementById('eb-remarks1').value;
           b.remarks2 = document.getElementById('eb-remarks2').value;
           b.match_status = document.getElementById('eb-status').value;
+          
+          // Fee fields: บันทึกเฉพาะ Type = Transfer/Card
+          // ถ้า Type อื่น → เคลียร์ค่าทิ้ง (ให้ consistency กับ logic แสดงผล)
+          if (b.type === 'Transfer' || b.type === 'Card') {
+            b.wht_amount = Number(document.getElementById('eb-wht').value) || 0;
+            b.transfer_fee = Number(document.getElementById('eb-transfer-fee').value) || 0;
+            b.card_fee = Number(document.getElementById('eb-card-fee').value) || 0;
+            b.wht_enabled = b.wht_amount > 0;
+          } else {
+            b.wht_amount = 0;
+            b.transfer_fee = 0;
+            b.card_fee = 0;
+            b.wht_enabled = false;
+          }
           
           // Auto-matched rule: Cash type without confirmation → still matched
           if (b.type === 'Cash' && b.match_status === 'pending') {
@@ -9700,7 +9798,7 @@ async function renderMatching(el) {
       <div class="flex justify-between items-center mb-3">
         <div class="page-title">Statement Matching</div>
         <div class="flex gap-2 items-center">
-          <button class="btn btn-outline btn-sm" id="btn-stmt-upload">${ICONS.file} วาง Statement</button>
+          <button class="btn btn-outline btn-sm" id="btn-stmt-upload" title="วางได้หลายไฟล์พร้อมกัน (Ctrl/Shift+คลิก)">${ICONS.file} วาง Statement</button>
           <button class="btn btn-outline btn-sm" id="btn-dedup-stmts" title="ลบ statement ซ้ำ (date+time HH:MM+amount+ref)">🧹 ลบซ้ำ</button>
           <button class="btn btn-ghost btn-sm" id="btn-unmatch-all" style="color:var(--warn);border:1px solid var(--warn)" title="ยกเลิก match ทั้งหมด (ไม่ลบข้อมูล)">↩ Unmatch ทั้งหมด</button>
           <button class="btn btn-primary btn-sm" id="btn-auto-match">${ICONS.pulse} Auto Match</button>
@@ -9793,7 +9891,60 @@ async function renderMatching(el) {
       });
     });
     document.getElementById('btn-stmt-upload')?.addEventListener('click', () => {
-      triggerFileUpload('file-stmt', (result, name) => { handleStmtUpload(result, name); render(); });
+      // ── Multi-file statement upload ──
+      // Accumulate stats ระหว่างไฟล์ → final toast/persist/render เมื่อ isLast
+      let batch = null;
+      triggerMultiFileUpload('file-stmt', async (result, name, meta) => {
+        // Init batch accumulator ที่ไฟล์แรก
+        if (meta.index === 0) {
+          batch = { ok: 0, fail: 0, added: 0, skipped: 0, buddhist: 0, byBank: {}, errors: [] };
+        }
+        
+        // Error ตอน parse → accumulate fail แล้วไปต่อ
+        if (meta.error) {
+          batch.fail++;
+          batch.errors.push(`${name}: ${meta.error}`);
+        } else if (result) {
+          // Silent mode → ได้ stats กลับมา
+          const r = handleStmtUpload(result, name, { silent: true });
+          if (r) {
+            batch.ok++;
+            batch.added += r.added;
+            batch.skipped += r.skipped;
+            batch.buddhist += r.buddhistCount;
+            batch.byBank[r.bank] = (batch.byBank[r.bank] || 0) + r.added;
+          }
+        }
+        
+        // ไฟล์สุดท้าย → finalize
+        if (meta.isLast) {
+          // Persist ครั้งเดียว
+          try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(e) {}
+          
+          // Single summary toast
+          if (meta.total === 1 && batch.ok === 1) {
+            // ไฟล์เดียว — toast แบบเดิม
+            const firstBank = Object.keys(batch.byBank)[0] || '?';
+            const bhMsg = batch.buddhist > 0 ? ` · แปลง พ.ศ.→ค.ศ. ${batch.buddhist} รายการ` : '';
+            const dupMsg = batch.skipped > 0 ? ` · ข้าม ${batch.skipped} ซ้ำ` : '';
+            toast(`อ่าน Statement ${firstBank} สำเร็จ — เพิ่ม ${batch.added} รายการ${dupMsg}${bhMsg}`, 'success');
+          } else {
+            // หลายไฟล์ — สรุปรวม
+            const bankList = Object.entries(batch.byBank).map(([b, n]) => `${b} +${n}`).join(' · ');
+            let msg = `📥 อ่าน ${batch.ok}/${meta.total} ไฟล์สำเร็จ — เพิ่ม ${batch.added} รายการ`;
+            if (bankList) msg += `\n${bankList}`;
+            if (batch.skipped > 0) msg += ` · ข้าม ${batch.skipped} ซ้ำ`;
+            if (batch.buddhist > 0) msg += ` · แปลง พ.ศ. ${batch.buddhist}`;
+            if (batch.fail > 0) msg += ` · ❌ ล้มเหลว ${batch.fail}`;
+            toast(msg, batch.fail > 0 ? 'warn' : 'success', 8000);
+          }
+          
+          // Navigate + render ครั้งเดียว
+          if (currentPage === 'matching') navigateTo('matching');
+          render();
+          batch = null;
+        }
+      });
     });
     
     // ── Dedup Statement (manual, safe — preview before delete) ──
