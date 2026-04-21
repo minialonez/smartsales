@@ -10241,11 +10241,26 @@ async function renderMatching(el) {
           }
         };
         
+        // ── Helper: ยอดที่ใช้ match สำหรับบิลทั่วไป ──
+        //   มี fee → ยอดสุทธิ (amount − WHT − TF − CF)
+        //   ไม่มี fee → baht (amount)
+        // (cashflow/SP ไม่มี fee field → ใช้ amount ตรงๆ)
+        const mmBillMatchAmt = (b) => {
+          const amt = Math.abs(Number(b.amount) || 0);
+          // SP / cashflow ไม่มี fee field — ใช้ amount ตรงๆ
+          if (b._cashflow || b._supplierPayment) return amt;
+          const wht = Number(b.wht_amount) || 0;
+          const tf = Number(b.transfer_fee) || 0;
+          const cf = Number(b.card_fee) || 0;
+          const fees = wht + tf + cf;
+          return fees > 0 ? (amt - fees) : amt;
+        };
+        
         const candidates = [
           ...billList.filter(b => {
             if (b.match_status === 'matched' || b.match_status === 'paid') return false;
             if (!canMatchBill(b)) return false;
-            const amtDiff = Math.abs(Math.abs(Number(b.amount)) - absStmt);
+            const amtDiff = Math.abs(mmBillMatchAmt(b) - absStmt);
             return amtDiff < 1 || amtDiff < absStmt * 0.05;
           }),
           // Cashflow: deposit/supplier/transfer - filter by direction
@@ -10263,10 +10278,10 @@ async function renderMatching(el) {
             return amtDiff < 1 || amtDiff < absStmt * 0.05;
           }),
         ];
-        // Sort: ยอดตรง + วันที่ใกล้ที่สุด
+        // Sort: ยอดตรง + วันที่ใกล้ที่สุด (ใช้ net สำหรับบิลที่มี fee)
         candidates.sort((a, b) => {
-          const aExact = Math.abs(Math.abs(Number(a.amount)) - absStmt) < 0.01 ? 0 : 1;
-          const bExact = Math.abs(Math.abs(Number(b.amount)) - absStmt) < 0.01 ? 0 : 1;
+          const aExact = Math.abs(mmBillMatchAmt(a) - absStmt) < 0.01 ? 0 : 1;
+          const bExact = Math.abs(mmBillMatchAmt(b) - absStmt) < 0.01 ? 0 : 1;
           if (aExact !== bExact) return aExact - bExact;
           const aDate = toISODate(a.date), bDate = toISODate(b.date);
           return Math.abs(new Date(aDate) - new Date(stmtDate)) - Math.abs(new Date(bDate) - new Date(stmtDate));
@@ -10348,8 +10363,12 @@ async function renderMatching(el) {
           if (!bc) return;
           
           bc.innerHTML = list.length ? list.map((b, i) => {
-            const amtDiff = Math.abs(Math.abs(Number(b.amount)) - Math.abs(stmtAmt));
+            const matchAmt = mmBillMatchAmt(b);
+            const amtDiff = Math.abs(matchAmt - Math.abs(stmtAmt));
             const isExact = amtDiff < 0.01;
+            // ถ้าบิลมี fee → แสดงทั้งสุทธิและ baht เพื่อเห็นภาพ
+            const hasFee = !b._cashflow && !b._supplierPayment && 
+                           matchAmt !== Math.abs(Number(b.amount) || 0);
             const sourceTag = b._supplierPayment 
               ? (b._supplierPayment.payment_method === 'เช็ค' 
                 ? `<span class="badge" style="background:rgba(244,180,26,.15);color:var(--warn);font-size:.65rem">📝 เช็ค ${b._supplierPayment.cheque_no||''}</span>` 
@@ -10367,7 +10386,8 @@ async function renderMatching(el) {
                   <div class="text-xs text-muted">${fmtDate(b.date)} · ${b.station||''} · ${b.type||''} · ${b.remarks1||''}</div>
                 </div>
                 <div style="text-align:right">
-                  <div style="font-weight:700;color:${isExact?'var(--success)':'var(--warn)'}">฿${fmtNum(Math.abs(b.amount))}</div>
+                  <div style="font-weight:700;color:${isExact?'var(--success)':'var(--warn)'}">฿${fmtNum(matchAmt)}</div>
+                  ${hasFee?`<div class="text-xs" style="color:var(--text3)">baht ฿${fmtNum(Math.abs(Number(b.amount)||0))} − หัก</div>`:''}
                   ${isExact?'<div class="text-xs" style="color:var(--success)">✓ ตรงเป๊ะ</div>':`<div class="text-xs text-muted">ต่าง ${fmtNum(amtDiff)}</div>`}
                 </div>
               </div>
