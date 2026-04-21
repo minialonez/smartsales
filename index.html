@@ -8164,6 +8164,8 @@ const NAV_ITEMS = [
   { id:'pprpt',     icon:'file',    label:'PP Report' },
   { id:'transferlog', icon:'pulse', label:'Transfer Log' },
   { id:'matching',  icon:'pulse',   label:'Matching' },
+  { id:'sp_recon',  icon:'check',   label:'📥 ตรวจ SP (ลูกหนี้)' },
+  { id:'pp_recon',  icon:'check',   label:'📤 ตรวจ PP (เจ้าหนี้)' },
   { id:'debt',      icon:'card',    label:'ติดตามหนี้' },
   { id:'data',      icon:'folder',  label:'จัดการข้อมูล' },
   { id:'alerts',    icon:'bell',    label:'แจ้งเตือน', badge: true },
@@ -8372,6 +8374,8 @@ const PAGE_RENDERERS = {
   reports: renderReports,
   tax_export: renderTaxExport,
   users: renderUsers,
+  sp_recon: renderSpRecon,
+  pp_recon: renderPpRecon,
 };
 
 // ── Dashboard ───────────────────────────────────────────────
@@ -11429,6 +11433,726 @@ async function renderTaxExport(el) {
 }
 
 // ── Users ───────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════
+// SP / PP Reconciliation Module
+//   - Upload 3 ไฟล์ Smart (การชำระ / ประเภทชำระ / ภาษี)
+//   - Parse + แสดง Report format (เหมือน xlsm Report sheet)
+//   - Compare กับ daily ที่ match ในระบบ
+//   - Export VAT report
+// ════════════════════════════════════════════════════════════════
+
+// Storage: แยก SP กับ PP
+let spReconData = null; // { payments: [...], types: [...], taxBills: [...], merged: [...] }
+let ppReconData = null;
+
+// ── Persist ──
+async function saveReconData(kind, data) {
+  const key = kind === 'sp' ? 'sf_spRecon' : 'sf_ppRecon';
+  try {
+    const db = await new Promise((res, rej) => {
+      const r = indexedDB.open('SmartFinanceDB', 1);
+      r.onsuccess = () => res(r.result);
+      r.onerror = () => rej(r.error);
+    });
+    const tx = db.transaction('data', 'readwrite');
+    tx.objectStore('data').put(JSON.stringify(data), key);
+  } catch(e) { console.error('Save recon failed:', e); }
+}
+async function loadReconData(kind) {
+  const key = kind === 'sp' ? 'sf_spRecon' : 'sf_ppRecon';
+  try {
+    const db = await new Promise((res, rej) => {
+      const r = indexedDB.open('SmartFinanceDB', 1);
+      r.onsuccess = () => res(r.result);
+      r.onerror = () => rej(r.error);
+    });
+    const tx = db.transaction('data', 'readonly');
+    const req = tx.objectStore('data').get(key);
+    return new Promise(res => {
+      req.onsuccess = () => res(req.result ? JSON.parse(req.result) : null);
+      req.onerror = () => res(null);
+    });
+  } catch(e) { return null; }
+}
+
+// ── Parser: ตรวจว่าเป็นไฟล์แบบไหน (auto-detect ไม่สนชื่อไฟล์) ──
+// Returns: { type: 'payment_main'|'payment_type'|'tax_sales'|'tax_purchase', kind: 'sp'|'pp'|null }
+function detectReconFileType(sheet) {
+  // สแกนหา indicator ในแถวบน
+  const topRows = sheet.slice(0, 10).map(r => (r||[]).map(c => String(c||'')).join('|'));
+  const topText = topRows.join('\n');
+  
+  let type = 'unknown';
+  let kind = null;
+  
+  // ── File type detection ──
+  if (topText.includes('ภาษีขาย')) {
+    type = 'tax_sales';
+    kind = 'sp';
+  } else if (topText.includes('ภาษีซื้อ')) {
+    type = 'tax_purchase';
+    kind = 'pp';
+  } else if (topText.includes('ตามประเภท') || topText.includes('ประเภทชำระ')) {
+    type = 'payment_type';
+  } else if (topText.includes('การชำระเงิน') || topText.includes('การจ่ายเงิน')) {
+    type = 'payment_main';
+  } else {
+    // Fallback: ดูโครงสร้าง
+    for (let i = 2; i < Math.min(10, sheet.length); i++) {
+      const r = sheet[i];
+      if (!r || !r[0]) continue;
+      const first = String(r[0]);
+      if (/^\(A[A-Z]-|\(B[A-Z]-/.test(first)) { type = 'payment_type'; break; }
+      if (/^(SP|PP)\d{5}-/.test(first)) { type = 'payment_main'; break; }
+    }
+  }
+  
+  // ── Kind detection (SP vs PP) — หาจาก prefix ของเอกสารใน data ──
+  if (!kind && (type === 'payment_main' || type === 'payment_type')) {
+    let spCount = 0, ppCount = 0;
+    for (let i = 0; i < sheet.length; i++) {
+      const r = sheet[i];
+      if (!r) continue;
+      for (let c = 0; c < Math.min(r.length, 3); c++) {
+        const s = String(r[c] || '');
+        if (/^SP\d{5}-/.test(s)) spCount++;
+        else if (/^PP\d{5}-/.test(s)) ppCount++;
+      }
+      if (spCount + ppCount > 5) break;
+    }
+    kind = spCount > ppCount ? 'sp' : (ppCount > 0 ? 'pp' : null);
+  }
+  
+  return { type, kind };
+}
+
+// ── Parser File Type 1: การชำระเงิน (SP/PP หลัก + child bills) ──
+function parseReconPaymentMain(sheet, kind) {
+  // kind: 'sp' (ลูกหนี้) หรือ 'pp' (เจ้าหนี้)
+  const HEADER_PREFIX = kind === 'sp' ? 'SP' : 'PP';
+  const payments = [];
+  let current = null;
+  
+  // ข้ามแถว header (row 0-1)
+  for (let i = 2; i < sheet.length; i++) {
+    const r = sheet[i];
+    if (!r) continue;
+    const first = String(r[0] || '').trim();
+    if (!first) continue;
+    
+    // Header row: SP/PP
+    if (first.startsWith(HEADER_PREFIX) && /^\w{2}\d{5}-\d+/.test(first)) {
+      if (current) payments.push(current);
+      current = {
+        no: first,
+        date: excelDateToISO(r[1]),
+        customer: String(r[2] || ''),
+        amount_gross: Number(r[3]) || 0,
+        amount_deduct: Number(r[4]) || 0,
+        amount_net: Number(r[5]) || 0,
+        bills: [],
+      };
+    }
+    // Child row: SR/OR/PR/MR/SC/JS/JR/PC/BS/BR/PX
+    else if (current && /^(SS|SR|OS|OR|SC|JS|JR|SP|PS|PR|MS|MR|PC|BS|BR|PP|PX)\d{5}-/.test(first)) {
+      current.bills.push({
+        bill_no: first,
+        ref_no: String(r[1] || ''),
+        bill_date: excelDateToISO(r[2]),
+        due_date: excelDateToISO(r[3]),
+        type_desc: String(r[4] || ''),
+        amount: Number(r[5]) || 0,
+        wht: Number(r[6]) || 0,
+        fee: Number(r[7]) || 0,
+        net: Number(r[8]) || 0,
+      });
+    }
+  }
+  if (current) payments.push(current);
+  return payments;
+}
+
+// ── Parser File Type 2: ตามประเภท/ประเภทชำระ ──
+function parseReconPaymentType(sheet, kind) {
+  const HEADER_PREFIX = kind === 'sp' ? 'SP' : 'PP';
+  const result = [];
+  let currentCust = null;
+  let currentPay = null;
+  
+  for (let i = 2; i < sheet.length; i++) {
+    const r = sheet[i];
+    if (!r) continue;
+    const first = String(r[0] || '').trim();
+    if (!first) continue;
+    
+    // Customer header: (AP-00001)
+    if (/^\(\w{2}-\d+\)/.test(first)) {
+      currentCust = first;
+    }
+    // Payment: SP/PP number
+    else if (first.startsWith(HEADER_PREFIX) && /^\w{2}\d{5}-\d+/.test(first)) {
+      currentPay = {
+        no: first,
+        date: excelDateToISO(r[1]),
+        amount: Number(r[2]) || 0,
+        customer: currentCust,
+        methods: [], // [{type: 'เงินสด|โอนเงิน|เช็ค', date, amount, bank}]
+      };
+      result.push(currentPay);
+    }
+    // Method row: เงินสด / โอนเงิน / เช็ค
+    else if (/^(เงินสด|โอนเงิน|เช็ค|เงินโอน)/.test(first) && currentPay) {
+      currentPay.methods.push({
+        type: first,
+        date: excelDateToISO(r[2]),
+        bank: String(r[3] || ''),
+        amount: Number(r[5]) || 0,
+      });
+    }
+  }
+  return result;
+}
+
+// ── Parser File Type 3: ภาษีขาย / ภาษีซื้อ ──
+function parseReconTax(sheet) {
+  const result = [];
+  // Header อยู่ประมาณแถว 7
+  for (let i = 7; i < sheet.length; i++) {
+    const r = sheet[i];
+    if (!r) continue;
+    const seq = r[0];
+    if (!seq || isNaN(Number(seq))) continue; // ข้าม sub-total row
+    
+    const isPurchase = (r.length >= 12); // ภาษีซื้อมี col 12 (ref_doc)
+    if (isPurchase) {
+      result.push({
+        seq: Number(seq),
+        bill_date: excelDateToISO(r[1]),
+        ref_doc: String(r[2] || ''),
+        bill_no: String(r[4] || ''),
+        supplier: String(r[5] || ''),
+        tax_id: String(r[6] || ''),
+        branch: String(r[7] || ''),
+        amount: Number(r[8]) || 0,
+        vat: Number(r[9]) || 0,
+        novat: Number(r[10]) || 0,
+        total: Number(r[11]) || 0,
+      });
+    } else {
+      result.push({
+        seq: Number(seq),
+        bill_date: excelDateToISO(r[1]),
+        bill_no: String(r[2] || ''),
+        customer: String(r[4] || ''),
+        tax_id: String(r[5] || ''),
+        branch: String(r[6] || ''),
+        amount: Number(r[7]) || 0,
+        vat: Number(r[8]) || 0,
+        novat: Number(r[9]) || 0,
+        total: Number(r[10]) || 0,
+      });
+    }
+  }
+  return result;
+}
+
+// Helper: Excel date → ISO
+function excelDateToISO(v) {
+  if (!v) return '';
+  if (typeof v === 'number' && v > 10000) {
+    const epoch = new Date(1899, 11, 30);
+    const d = new Date(epoch.getTime() + v * 86400000);
+    return d.getFullYear() + '-' + 
+           String(d.getMonth()+1).padStart(2,'0') + '-' + 
+           String(d.getDate()).padStart(2,'0');
+  }
+  if (typeof v === 'string' && v.match(/\d{1,2}\/\d{1,2}\/\d{4}/)) {
+    const m = v.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+    let y = Number(m[3]); if (y > 2400) y -= 543;
+    return y + '-' + m[2].padStart(2,'0') + '-' + m[1].padStart(2,'0');
+  }
+  if (v instanceof Date) {
+    return v.getFullYear() + '-' +
+           String(v.getMonth()+1).padStart(2,'0') + '-' +
+           String(v.getDate()).padStart(2,'0');
+  }
+  return '';
+}
+
+// ── Merge: รวม payment_main + payment_type + tax ──
+function mergeReconData(paymentMain, paymentType, taxData, kind) {
+  // Key = SP/PP number
+  const byNo = {};
+  paymentMain.forEach(p => {
+    byNo[p.no] = { ...p, methods: [] };
+  });
+  paymentType.forEach(pt => {
+    if (byNo[pt.no]) {
+      byNo[pt.no].methods = pt.methods;
+      if (!byNo[pt.no].customer && pt.customer) byNo[pt.no].customer = pt.customer;
+    } else {
+      byNo[pt.no] = { no: pt.no, date: pt.date, customer: pt.customer, amount_net: pt.amount, bills: [], methods: pt.methods };
+    }
+  });
+  
+  // Tax bills — map ที่ bill_no ในบิล child
+  const taxByBillNo = {};
+  taxData.forEach(t => { if (t.bill_no) taxByBillNo[t.bill_no] = t; });
+  Object.values(byNo).forEach(p => {
+    p.bills.forEach(b => {
+      if (taxByBillNo[b.bill_no]) {
+        b.is_vat = true;
+        b.vat = taxByBillNo[b.bill_no].vat;
+        b.novat_amount = taxByBillNo[b.bill_no].amount;
+      } else {
+        b.is_vat = false;
+      }
+    });
+  });
+  
+  return Object.values(byNo).sort((a, b) => (a.date||'').localeCompare(b.date||''));
+}
+
+// ── Common parser wrapper ──
+async function parseReconFiles(files, kind) {
+  const parsed = { payment_main: null, payment_type: null, tax: null };
+  const issues = [];
+  
+  for (const file of files) {
+    const data = await parseExcelFile(file);
+    const sheet = data.sheets ? data.sheets[data.sheetNames[0]] : null;
+    if (!sheet) { issues.push(`${file.name}: อ่านไฟล์ไม่ได้`); continue; }
+    
+    const { type, kind: detectedKind } = detectReconFileType(sheet);
+    
+    // ตรวจว่าไฟล์ตรงกับหน้า (SP vs PP)
+    if (detectedKind && detectedKind !== kind) {
+      issues.push(`${file.name}: เป็นไฟล์ ${detectedKind.toUpperCase()} แต่ upload ที่หน้า ${kind.toUpperCase()} — ข้าม`);
+      continue;
+    }
+    
+    if (type === 'payment_main') {
+      parsed.payment_main = parseReconPaymentMain(sheet, kind);
+    } else if (type === 'payment_type') {
+      parsed.payment_type = parseReconPaymentType(sheet, kind);
+    } else if (type === 'tax_sales' || type === 'tax_purchase') {
+      parsed.tax = parseReconTax(sheet);
+    } else {
+      issues.push(`${file.name}: ไม่รู้จักประเภทไฟล์`);
+    }
+  }
+  
+  const merged = mergeReconData(
+    parsed.payment_main || [],
+    parsed.payment_type || [],
+    parsed.tax || [],
+    kind
+  );
+  
+  return {
+    payments: parsed.payment_main || [],
+    types: parsed.payment_type || [],
+    taxBills: parsed.tax || [],
+    merged: merged,
+    issues: issues,
+    imported_at: new Date().toISOString(),
+  };
+}
+
+// ════════════════════════════════════════════════════════════════
+// Render: SP Reconciliation (ลูกหนี้)
+// ════════════════════════════════════════════════════════════════
+async function renderSpRecon(el) {
+  if (!spReconData) spReconData = await loadReconData('sp');
+  renderReconPage(el, 'sp', spReconData);
+}
+
+async function renderPpRecon(el) {
+  if (!ppReconData) ppReconData = await loadReconData('pp');
+  renderReconPage(el, 'pp', ppReconData);
+}
+
+function renderReconPage(el, kind, data) {
+  const TITLE = kind === 'sp' ? '📥 ตรวจการชำระ SP (ลูกหนี้)' : '📤 ตรวจการจ่าย PP (เจ้าหนี้)';
+  const HEADER_PREFIX = kind === 'sp' ? 'SP' : 'PP';
+  const PARTY_LABEL = kind === 'sp' ? 'ลูกค้า' : 'เจ้าหนี้';
+  
+  let filterView = 'report'; // report | main | summary | vat
+  let filterMethod = 'ALL';
+  
+  function render() {
+    const hasData = data && data.merged && data.merged.length > 0;
+    
+    el.innerHTML = `
+      <div class="flex justify-between items-center mb-3">
+        <div>
+          <div class="page-title">${TITLE}</div>
+          ${hasData ? `<div class="text-xs text-dim">Import: ${new Date(data.imported_at).toLocaleString('th-TH')} · ${data.merged.length} รายการ</div>` : ''}
+        </div>
+        <div class="flex gap-2">
+          <label class="btn btn-primary btn-sm" style="cursor:pointer">
+            ${ICONS.download} Upload 3 ไฟล์
+            <input type="file" id="recon-files" accept=".xls,.xlsx" multiple style="display:none">
+          </label>
+          ${hasData ? `
+            <button class="btn btn-outline btn-sm" id="recon-export">📥 Export VAT Report</button>
+            <button class="btn btn-ghost btn-sm" id="recon-clear" style="color:var(--danger)">✕ ล้าง</button>
+          ` : ''}
+        </div>
+      </div>
+      
+      ${!hasData ? `
+        <div class="card" style="padding:40px;text-align:center">
+          <div style="font-size:3rem;margin-bottom:12px">📂</div>
+          <div class="font-semi" style="color:var(--text);margin-bottom:8px">ยังไม่มีข้อมูล</div>
+          <p class="text-sm text-muted mb-3">
+            Upload 3 ไฟล์ Excel จาก Smart (เรียงไฟล์ไหนก่อนก็ได้ ระบบจะ detect auto)<br><br>
+            <strong>${kind==='sp'?'ลูกหนี้':'เจ้าหนี้'}:</strong><br>
+            • การชำระเงิน${kind==='pp'?' (การจ่ายเงิน)':''}.xls (${HEADER_PREFIX} หลัก + child bills)<br>
+            • การชำระเงิน-ประเภท${kind==='pp'?' (การจ่าย-ประเภท)':''}.xls (วิธีชำระ: เงินสด/โอน/เช็ค)<br>
+            • ภาษี${kind==='sp'?'ขาย':'ซื้อ'}.xls (บิล VAT/NOVAT)
+          </p>
+        </div>
+      ` : `
+        ${renderReconTabs(filterView)}
+        <div id="recon-body">
+          ${renderReconContent(filterView, filterMethod, data, kind)}
+        </div>
+      `}
+    `;
+    
+    // Events
+    document.getElementById('recon-files')?.addEventListener('change', async e => {
+      const files = Array.from(e.target.files);
+      if (files.length === 0) return;
+      toast(`กำลัง parse ${files.length} ไฟล์...`, 'info');
+      try {
+        const parsed = await parseReconFiles(files, kind);
+        if (parsed.issues && parsed.issues.length) {
+          console.warn('Recon parse issues:', parsed.issues);
+          alert('⚠️ คำเตือน:\n\n' + parsed.issues.join('\n'));
+        }
+        if (parsed.merged.length === 0) {
+          toast('❌ ไม่พบข้อมูล — ตรวจว่า upload ไฟล์ถูกหน้าไหม (SP vs PP)', 'error', 8000);
+          return;
+        }
+        if (kind === 'sp') {
+          spReconData = parsed;
+          data = spReconData;
+        } else {
+          ppReconData = parsed;
+          data = ppReconData;
+        }
+        await saveReconData(kind, parsed);
+        toast(`✅ Import สำเร็จ — ${parsed.merged.length} ${HEADER_PREFIX}`, 'success');
+        render();
+      } catch(err) {
+        console.error(err);
+        toast(`❌ Parse ผิดพลาด: ${err.message}`, 'error');
+      }
+    });
+    
+    document.getElementById('recon-clear')?.addEventListener('click', () => {
+      if (!confirm('ล้างข้อมูล Reconciliation?')) return;
+      if (kind === 'sp') spReconData = null;
+      else ppReconData = null;
+      saveReconData(kind, null);
+      data = null;
+      render();
+    });
+    
+    document.getElementById('recon-export')?.addEventListener('click', () => {
+      exportReconReport(data, kind);
+    });
+    
+    el.querySelectorAll('.recon-tab').forEach(btn => {
+      btn.addEventListener('click', () => {
+        filterView = btn.dataset.tab;
+        const body = document.getElementById('recon-body');
+        if (body) body.innerHTML = renderReconContent(filterView, filterMethod, data, kind);
+        el.querySelectorAll('.recon-tab').forEach(b => b.classList.toggle('active', b.dataset.tab === filterView));
+      });
+    });
+  }
+  
+  render();
+}
+
+function renderReconTabs(active) {
+  const tabs = [
+    {id:'report', label:'📑 Report (เอกสาร)'},
+    {id:'main', label:'📋 Main (รวมดิบ)'},
+    {id:'summary', label:'📊 หน้ารวม (ต่อคู่ค้า)'},
+    {id:'vat', label:'🏛️ VAT (ส่งบัญชี)'},
+  ];
+  return `
+    <div class="flex gap-2 mb-3">
+      ${tabs.map(t => `<button class="pill recon-tab ${active===t.id?'active':''}" data-tab="${t.id}">${t.label}</button>`).join('')}
+    </div>
+  `;
+}
+
+function renderReconContent(view, filterMethod, data, kind) {
+  if (view === 'report') return renderReconReport(data, kind);
+  if (view === 'main') return renderReconMain(data, kind);
+  if (view === 'summary') return renderReconSummary(data, kind);
+  if (view === 'vat') return renderReconVAT(data, kind);
+  return '';
+}
+
+// ── View: Report (เหมือน xlsm Report sheet) ──
+function renderReconReport(data, kind) {
+  const PARTY_LABEL = kind === 'sp' ? 'ลูกค้า' : 'เจ้าหนี้';
+  const rows = data.merged;
+  
+  return `
+    <div class="card-flat">
+      <div class="table-wrap" style="max-height:650px;overflow-y:auto">
+        <table style="font-size:.82rem">
+          <thead style="position:sticky;top:0;background:var(--surface2);z-index:10">
+            <tr>
+              <th style="min-width:150px">เลขเอกสาร</th>
+              <th>วันที่ชำระ</th>
+              <th>${PARTY_LABEL}</th>
+              <th style="text-align:right">รวมชำระจริง</th>
+              <th colspan="2" style="text-align:center;background:rgba(45,212,160,.08)">💵 เงินสด</th>
+              <th colspan="2" style="text-align:center;background:rgba(79,156,249,.08)">🏦 โอนเงิน</th>
+              <th colspan="2" style="text-align:center;background:rgba(245,166,35,.08)">📄 เช็ค</th>
+            </tr>
+            <tr style="font-size:.75rem">
+              <th colspan="4"></th>
+              <th style="text-align:right">วันที่</th><th style="text-align:right">ยอด</th>
+              <th style="text-align:right">วันที่</th><th style="text-align:right">ยอด</th>
+              <th style="text-align:right">วันที่</th><th style="text-align:right">ยอด</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows.map(p => {
+              const cash = p.methods.find(m => m.type.includes('เงินสด'));
+              const transfer = p.methods.find(m => m.type.includes('โอน'));
+              const cheque = p.methods.find(m => m.type.includes('เช็ค'));
+              return `
+                <tr style="background:rgba(91,124,250,.06);border-top:2px solid var(--border)">
+                  <td style="font-weight:600;font-family:var(--mono);color:var(--text)">${p.no}</td>
+                  <td>${fmtDate(p.date)}</td>
+                  <td class="truncate" style="max-width:200px" title="${p.customer||''}">${p.customer||''}</td>
+                  <td style="text-align:right;font-weight:600">฿${fmtNum(p.amount_net||0)}</td>
+                  <td style="text-align:right">${cash?fmtDate(cash.date):'-'}</td>
+                  <td style="text-align:right;color:var(--success)">${cash?'฿'+fmtNum(cash.amount):''}</td>
+                  <td style="text-align:right">${transfer?fmtDate(transfer.date):'-'}</td>
+                  <td style="text-align:right;color:var(--info)">${transfer?'฿'+fmtNum(transfer.amount):''}${transfer?.bank?'<br><span class="text-xs text-muted">'+transfer.bank+'</span>':''}</td>
+                  <td style="text-align:right">${cheque?fmtDate(cheque.date):'-'}</td>
+                  <td style="text-align:right;color:var(--warn)">${cheque?'฿'+fmtNum(cheque.amount):''}</td>
+                </tr>
+                ${p.bills.map(b => `
+                  <tr style="font-size:.78rem">
+                    <td style="padding-left:30px;font-family:var(--mono);color:var(--text2)">${b.bill_no}</td>
+                    <td class="text-xs">${fmtDate(b.bill_date)}</td>
+                    <td colspan="2" class="text-xs text-muted truncate" style="max-width:280px" title="${b.type_desc||''}">${b.type_desc||''} ${b.is_vat?'<span class="badge badge-success" style="font-size:.6rem">VAT</span>':''}</td>
+                    <td colspan="6" style="text-align:right;color:${b.amount<0?'var(--danger)':'var(--text2)'}">
+                      ฿${fmtNum(b.amount)}
+                      ${b.is_vat && b.vat ? ` <span class="text-xs text-muted">(VAT ฿${fmtNum(b.vat)})</span>` : ''}
+                    </td>
+                  </tr>
+                `).join('')}
+              `;
+            }).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+// ── View: Main (รวมทุกคอลัมน์) ──
+function renderReconMain(data, kind) {
+  const rows = data.merged;
+  let seq = 0;
+  return `
+    <div class="card-flat">
+      <div class="table-wrap" style="max-height:650px;overflow-y:auto">
+        <table style="font-size:.78rem">
+          <thead style="position:sticky;top:0;background:var(--surface2)">
+            <tr>
+              <th>#</th><th>VAT?</th><th>เลขเอกสาร</th><th>วันที่</th><th>ลูกค้า/เจ้าหนี้</th>
+              <th style="text-align:right">จำนวนเงิน</th><th>หมายเหตุ</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows.map(p => {
+              const parentRow = `
+                <tr style="background:rgba(91,124,250,.08);font-weight:600">
+                  <td>${++seq}</td><td>-</td>
+                  <td style="font-family:var(--mono);color:var(--text)">${p.no}</td>
+                  <td>${fmtDate(p.date)}</td>
+                  <td class="truncate" style="max-width:220px" title="${p.customer||''}">${p.customer||''}</td>
+                  <td style="text-align:right">฿${fmtNum(p.amount_net||0)}</td>
+                  <td></td>
+                </tr>
+              `;
+              const childRows = p.bills.map(b => `
+                <tr>
+                  <td>${++seq}</td>
+                  <td>${b.is_vat?'<span class="badge badge-success" style="font-size:.65rem">Y</span>':'N'}</td>
+                  <td style="font-family:var(--mono);padding-left:20px">${b.bill_no}</td>
+                  <td>${fmtDate(b.bill_date)}</td>
+                  <td class="text-xs text-muted">${b.ref_no||''}</td>
+                  <td style="text-align:right;color:${b.amount<0?'var(--danger)':'var(--text2)'}">฿${fmtNum(b.amount)}</td>
+                  <td class="text-xs truncate" style="max-width:200px">${b.type_desc||''}</td>
+                </tr>
+              `).join('');
+              return parentRow + childRows;
+            }).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+// ── View: Summary (หน้ารวมต่อคู่ค้า) ──
+function renderReconSummary(data, kind) {
+  const PARTY_LABEL = kind === 'sp' ? 'ลูกค้า' : 'เจ้าหนี้';
+  const byCust = {};
+  data.merged.forEach(p => {
+    const k = p.customer || '(ไม่ระบุ)';
+    if (!byCust[k]) byCust[k] = { customer: k, paymentCount: 0, total: 0, vat: 0, novat: 0, bills: 0 };
+    byCust[k].paymentCount++;
+    byCust[k].total += Number(p.amount_net || 0);
+    p.bills.forEach(b => {
+      byCust[k].bills++;
+      if (b.is_vat) {
+        byCust[k].vat += Number(b.novat_amount || 0);
+      } else {
+        byCust[k].novat += Number(b.amount || 0);
+      }
+    });
+  });
+  const rows = Object.values(byCust).sort((a,b) => b.total - a.total);
+  const grandTotal = rows.reduce((s,r) => s+r.total, 0);
+  const grandVat = rows.reduce((s,r) => s+r.vat, 0);
+  const grandNovat = rows.reduce((s,r) => s+r.novat, 0);
+  
+  return `
+    <div class="flex gap-3 mb-3">
+      ${statCard(`${PARTY_LABEL}ทั้งหมด`, rows.length+' ราย', '', 'var(--primary)', ICONS.users)}
+      ${statCard('ยอดรวม', '฿'+fmtNum(grandTotal), rows.reduce((s,r)=>s+r.bills,0)+' บิล', 'var(--success)', ICONS.dollar)}
+      ${statCard('VAT', '฿'+fmtNum(grandVat), '', 'var(--info)', ICONS.file)}
+      ${statCard('NOVAT', '฿'+fmtNum(grandNovat), '', 'var(--purple)', ICONS.file)}
+    </div>
+    <div class="card-flat">
+      <div class="table-wrap" style="max-height:580px;overflow-y:auto">
+        <table>
+          <thead style="position:sticky;top:0;background:var(--surface2)">
+            <tr>
+              <th>${PARTY_LABEL}</th>
+              <th style="text-align:right">${kind==='sp'?'SP':'PP'} ครั้ง</th>
+              <th style="text-align:right">บิลรวม</th>
+              <th style="text-align:right">ยอดรวม</th>
+              <th style="text-align:right">VAT</th>
+              <th style="text-align:right">NOVAT</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows.map(r => `
+              <tr>
+                <td class="truncate" style="max-width:340px" title="${r.customer}">${r.customer}</td>
+                <td style="text-align:right">${r.paymentCount}</td>
+                <td style="text-align:right">${r.bills}</td>
+                <td style="text-align:right;font-weight:600">฿${fmtNum(r.total)}</td>
+                <td style="text-align:right;color:var(--info)">฿${fmtNum(r.vat)}</td>
+                <td style="text-align:right;color:var(--purple)">฿${fmtNum(r.novat)}</td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+// ── View: VAT (ส่งบัญชี) ──
+function renderReconVAT(data, kind) {
+  const taxRows = data.taxBills || [];
+  const totalAmount = taxRows.reduce((s,r) => s+Number(r.amount||0), 0);
+  const totalVAT = taxRows.reduce((s,r) => s+Number(r.vat||0), 0);
+  const totalTotal = taxRows.reduce((s,r) => s+Number(r.total||0), 0);
+  const PARTY_LABEL = kind === 'sp' ? 'ลูกค้า' : 'เจ้าหนี้';
+  
+  return `
+    <div class="flex gap-3 mb-3">
+      ${statCard('บิลทั้งหมด', taxRows.length, '', 'var(--primary)', ICONS.file)}
+      ${statCard('ยอดก่อน VAT', '฿'+fmtNum(totalAmount), '', 'var(--info)', ICONS.dollar)}
+      ${statCard('VAT', '฿'+fmtNum(totalVAT), '', 'var(--purple)', ICONS.bar)}
+      ${statCard('รวม', '฿'+fmtNum(totalTotal), '', 'var(--success)', ICONS.check)}
+    </div>
+    <div class="card-flat">
+      <div class="table-wrap" style="max-height:580px;overflow-y:auto">
+        <table style="font-size:.8rem">
+          <thead style="position:sticky;top:0;background:var(--surface2)">
+            <tr>
+              <th>#</th><th>วันที่</th><th>เลขที่บิล</th>
+              ${kind==='pp'?'<th>ref_doc</th>':''}
+              <th>${PARTY_LABEL}</th><th>เลขภาษี</th>
+              <th style="text-align:right">ก่อน VAT</th>
+              <th style="text-align:right">VAT</th>
+              <th style="text-align:right">รวม</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${taxRows.map(r => `
+              <tr>
+                <td>${r.seq}</td>
+                <td>${fmtDate(r.bill_date)}</td>
+                <td style="font-family:var(--mono);color:var(--text)">${r.bill_no||''}</td>
+                ${kind==='pp'?`<td class="text-xs">${r.ref_doc||''}</td>`:''}
+                <td class="truncate" style="max-width:220px" title="${r.customer||r.supplier||''}">${r.customer||r.supplier||''}</td>
+                <td class="text-xs">${r.tax_id||''}</td>
+                <td style="text-align:right">฿${fmtNum(r.amount)}</td>
+                <td style="text-align:right;color:var(--purple)">฿${fmtNum(r.vat)}</td>
+                <td style="text-align:right;font-weight:600">฿${fmtNum(r.total)}</td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+// ── Export to XLSX ──
+function exportReconReport(data, kind) {
+  if (!data || !data.merged) { toast('ไม่มีข้อมูล', 'error'); return; }
+  const wb = XLSX.utils.book_new();
+  
+  // Sheet: VAT
+  if (data.taxBills && data.taxBills.length) {
+    const vatRows = [];
+    vatRows.push(['#','วันที่','เลขที่บิล', kind==='pp'?'ref_doc':'', kind==='sp'?'ลูกค้า':'เจ้าหนี้','เลขภาษี','สาขา','ก่อน VAT','VAT','ยกเว้น','รวม']);
+    data.taxBills.forEach(r => {
+      vatRows.push([r.seq, r.bill_date, r.bill_no, kind==='pp'?(r.ref_doc||''):'', r.customer||r.supplier||'', r.tax_id, r.branch, r.amount, r.vat, r.novat, r.total]);
+    });
+    const ws = XLSX.utils.aoa_to_sheet(vatRows);
+    XLSX.utils.book_append_sheet(wb, ws, 'VAT');
+  }
+  
+  // Sheet: Main
+  const mainRows = [['#','VAT?','เลขเอกสาร','วันที่','คู่ค้า','จำนวนเงิน','หมายเหตุ']];
+  let seq = 0;
+  data.merged.forEach(p => {
+    mainRows.push([++seq, '', p.no, p.date, p.customer||'', p.amount_net, '']);
+    p.bills.forEach(b => {
+      mainRows.push([++seq, b.is_vat?'Y':'N', b.bill_no, b.bill_date, b.ref_no, b.amount, b.type_desc]);
+    });
+  });
+  const ws2 = XLSX.utils.aoa_to_sheet(mainRows);
+  XLSX.utils.book_append_sheet(wb, ws2, 'Main');
+  
+  const fn = `${kind.toUpperCase()}_Recon_${data.imported_at.substring(0,10)}.xlsx`;
+  XLSX.writeFile(wb, fn);
+  toast(`✅ Export: ${fn}`, 'success');
+}
+
 async function renderUsers(el) {
   const res = await api('getUsers');
   const users = res.data || [];
