@@ -13096,7 +13096,9 @@ async function renderUsers(el) {
   // ── Helper: เปิด modal เพิ่ม/แก้ไข user ──
   function openUserModal(existingUser) {
     const isEdit = !!existingUser;
-    const u = existingUser || { username: '', display_name: '', role: 'user', permissions: ['read'], status: 'active' };
+    // Default ใหม่: role='staff' + ['read','write'] → match pattern DEMO/ระบบเดิม
+    // ถ้าใช้ 'user' + ['read'] อย่างเดียว จะไม่เห็นข้อมูล/บันทึกอะไรไม่ได้
+    const u = existingUser || { username: '', display_name: '', role: 'staff', permissions: ['read','write'], status: 'active' };
     const allPerms = ['read', 'write', 'delete', 'manage_users'];
     
     openModal(`${isEdit?'✏️ แก้ไข':ICONS.plus+' เพิ่ม'} ผู้ใช้`, `
@@ -13105,10 +13107,12 @@ async function renderUsers(el) {
           <label>Username ${isEdit?'<span class="text-xs text-dim">(แก้ไม่ได้)</span>':''}</label>
           <input class="input" id="u-username" value="${u.username||''}" ${isEdit?'readonly style="background:rgba(255,255,255,.02)"':''} placeholder="เช่น jake หรือ 0812345678">
         </div>
+        ${isEdit ? '' : `
         <div class="input-group">
-          <label>รหัสผ่าน ${isEdit?'<span class="text-xs text-dim">(ปล่อยว่าง = ไม่เปลี่ยน)</span>':''}</label>
-          <input type="password" class="input" id="u-password" placeholder="${isEdit?'••• ปล่อยว่างถ้าไม่เปลี่ยน':'กรอกรหัสผ่าน'}" autocomplete="new-password">
+          <label>รหัสผ่าน</label>
+          <input type="password" class="input" id="u-password" placeholder="กรอกรหัสผ่าน" autocomplete="new-password">
         </div>
+        `}
         <div class="input-group">
           <label>ชื่อที่แสดง</label>
           <input class="input" id="u-display-name" value="${u.display_name||''}" placeholder="เช่น Jake Thompson">
@@ -13117,10 +13121,12 @@ async function renderUsers(el) {
           <div class="input-group flex-1">
             <label>บทบาท</label>
             <select class="select" id="u-role">
-              <option value="user" ${u.role==='user'?'selected':''}>user</option>
+              <option value="staff" ${u.role==='staff'?'selected':''}>staff</option>
               <option value="admin" ${u.role==='admin'?'selected':''}>admin</option>
+              <option value="user" ${u.role==='user'?'selected':''}>user</option>
             </select>
           </div>
+          ${isEdit ? `
           <div class="input-group flex-1">
             <label>สถานะ</label>
             <select class="select" id="u-status">
@@ -13128,6 +13134,7 @@ async function renderUsers(el) {
               <option value="inactive" ${u.status==='inactive'?'selected':''}>inactive</option>
             </select>
           </div>
+          ` : '<div class="flex-1"></div>'}
         </div>
         <div class="input-group">
           <label>สิทธิ์ (เลือกได้หลายอัน)</label>
@@ -13140,6 +13147,7 @@ async function renderUsers(el) {
             `).join('')}
           </div>
         </div>
+        ${isEdit?'<div class="text-xs text-dim" style="padding:6px 10px;background:rgba(244,180,26,.08);border-radius:5px">💡 รหัสผ่านแก้ไม่ได้จาก UI — หากต้องการ reset ให้ลบ user แล้วสร้างใหม่</div>':''}
         <div class="flex gap-2 mt-2">
           <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ยกเลิก</button>
           ${isEdit?'<button class="btn btn-ghost btn-sm" id="u-delete" style="color:var(--danger);border:1px solid var(--danger)">ลบ</button>':''}
@@ -13150,10 +13158,12 @@ async function renderUsers(el) {
     
     document.getElementById('u-save')?.addEventListener('click', async () => {
       const username = document.getElementById('u-username').value.trim();
-      const password = document.getElementById('u-password').value;
+      const passwordEl = document.getElementById('u-password');
+      const password = passwordEl ? passwordEl.value : '';
       const display_name = document.getElementById('u-display-name').value.trim();
       const role = document.getElementById('u-role').value;
-      const status = document.getElementById('u-status').value;
+      const statusEl = document.getElementById('u-status');
+      const status = statusEl ? statusEl.value : 'active';
       const permissions = Array.from(document.querySelectorAll('.u-perm:checked')).map(c => c.value);
       
       if (!username) { toast('กรอก Username', 'error'); return; }
@@ -13165,9 +13175,16 @@ async function renderUsers(el) {
       btn.textContent = 'กำลังบันทึก...';
       
       try {
-        const payload = { username, display_name, role, status, permissions };
-        if (password) payload.password = password;
-        const action = isEdit ? 'updateUser' : 'createUser';
+        let payload, action;
+        if (isEdit) {
+          // updateUser ใน backend ใช้ user_id เป็น key (ไม่ใช่ username)
+          payload = { user_id: u.user_id, display_name, role, status, permissions };
+          action = 'updateUser';
+        } else {
+          // createUser: username + password บังคับ
+          payload = { username, password, display_name, role, permissions };
+          action = 'createUser';
+        }
         const result = await api(action, payload);
         if (result?.success === false || result?.error) {
           throw new Error(result.message || result.error || 'ไม่สำเร็จ');
@@ -13188,7 +13205,8 @@ async function renderUsers(el) {
       const btn = document.getElementById('u-delete');
       btn.disabled = true;
       try {
-        const result = await api('deleteUser', { username: u.username });
+        // deleteUser ใน backend ใช้ user_id เป็น key
+        const result = await api('deleteUser', { user_id: u.user_id });
         if (result?.success === false || result?.error) {
           throw new Error(result.message || result.error || 'ไม่สำเร็จ');
         }
