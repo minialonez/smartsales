@@ -3660,6 +3660,7 @@ async function renderMain(el) {
           <!-- Fee/WHT Section -->
           <div id="ab-fee-box" style="background:rgba(79,156,249,.05);border:1px solid rgba(79,156,249,.2);border-radius:6px;padding:10px;display:none">
             <div style="font-size:.85rem;color:var(--info);font-weight:600;margin-bottom:8px">⚡ การหัก / ค่าธรรมเนียม <span style="color:var(--text3);font-weight:400">— WHT คำนวณอัตโนมัติจากยอดขาย (แก้ไขได้)</span></div>
+            <!-- Transfer/Cheque row: ฐาน + WHT + ค่าโอน -->
             <div class="flex gap-2" id="ab-fee-transfer" style="display:none">
               <div class="input-group flex-1">
                 <label>ฐานก่อน VAT</label>
@@ -3674,9 +3675,10 @@ async function renderMain(el) {
                 <input type="number" class="input" id="ab-transfer-fee" value="12" step="0.01" style="color:var(--warn)">
               </div>
             </div>
-            <div class="flex gap-2" id="ab-fee-card" style="display:none">
+            <!-- Extra fee row: แสดงเมื่อ Card (ค่าธรรมเนียมบัตร) หรือ Cheque (ค่าธรรมเนียม) -->
+            <div class="flex gap-2" id="ab-fee-extra" style="display:none;margin-top:8px">
               <div class="input-group flex-1">
-                <label style="color:var(--warn)">ค่าธรรมเนียมบัตร</label>
+                <label style="color:var(--warn)" id="ab-card-label">ค่าธรรมเนียมบัตร</label>
                 <input type="number" class="input" id="ab-card-fee" value="0" step="0.01" style="color:var(--warn)">
               </div>
             </div>
@@ -3684,7 +3686,7 @@ async function renderMain(el) {
               <div style="display:flex;justify-content:space-between;padding:3px 0"><span>ยอดเต็ม</span><span id="ab-sum-full">฿0.00</span></div>
               <div id="ab-sum-wht-row" style="display:none;justify-content:space-between;padding:3px 0;color:var(--purple)"><span>− หัก ณ ที่จ่าย 1%</span><span id="ab-sum-wht">฿0.00</span></div>
               <div id="ab-sum-tf-row" style="display:none;justify-content:space-between;padding:3px 0;color:var(--warn)"><span>− ค่าโอน</span><span id="ab-sum-tf">฿0.00</span></div>
-              <div id="ab-sum-cf-row" style="display:none;justify-content:space-between;padding:3px 0;color:var(--warn)"><span>− ค่าธรรมเนียมบัตร</span><span id="ab-sum-cf">฿0.00</span></div>
+              <div id="ab-sum-cf-row" style="display:none;justify-content:space-between;padding:3px 0;color:var(--warn)"><span id="ab-sum-cf-label">− ค่าธรรมเนียมบัตร</span><span id="ab-sum-cf">฿0.00</span></div>
               <div style="display:flex;justify-content:space-between;padding:8px 0 0;border-top:1px solid var(--border);margin-top:4px;font-weight:600;color:var(--success);font-size:1.05rem"><span>สุทธิ (ยอดโอนจริงที่คาดหวัง)</span><span id="ab-sum-net">฿0.00</span></div>
             </div>
           </div>
@@ -3721,8 +3723,10 @@ async function renderMain(el) {
       const $cf = document.getElementById('ab-card-fee');
       const $feeBox = document.getElementById('ab-fee-box');
       const $feeTransfer = document.getElementById('ab-fee-transfer');
-      const $feeCard = document.getElementById('ab-fee-card');
+      const $feeExtra = document.getElementById('ab-fee-extra');
+      const $cardLabel = document.getElementById('ab-card-label');
       const $summary = document.getElementById('ab-summary');
+      const $sumCfLabel = document.getElementById('ab-sum-cf-label');
       
       // Track ว่า user แก้ WHT เองหรือยัง (ถ้าแก้แล้ว = ห้าม auto-overwrite)
       let whtManuallyEdited = false;
@@ -3730,13 +3734,11 @@ async function renderMain(el) {
       
       function feeApplies() {
         // แสดงช่อง fee เมื่อ Type = Transfer, Cheque, หรือ Card
-        // Transfer & Cheque ใช้ UI เดียวกัน (WHT + ค่าโอน/ค่าธรรมเนียม)
         const type = $type.value || '';
         return type === 'Transfer' || type === 'Cheque' || type === 'Card';
       }
       
       // สูตรตาม Excel: C = ROUND((B/1.07) * 1%, 2)
-      // ใช้กับยอด "ค่าสินค้ารวม VAT 7%"
       function calcWHT(amount) {
         if (!amount || amount <= 0) return 0;
         return Math.round((amount / 1.07) * 0.01 * 100) / 100;
@@ -3756,13 +3758,23 @@ async function renderMain(el) {
         }
         $feeBox.style.display = 'block';
         
+        // แสดงแถวตาม Type:
+        //   Transfer: ฐาน + WHT + ค่าโอน (ไม่มี extra)
+        //   Cheque:   ฐาน + WHT + ค่าโอน + extra (label: ค่าธรรมเนียม)
+        //   Card:     extra (label: ค่าธรรมเนียมบัตร)
         if (type === 'Card') {
           $feeTransfer.style.display = 'none';
-          $feeCard.style.display = 'flex';
-        } else if (type === 'Transfer' || type === 'Cheque') {
-          // Transfer + Cheque → ใช้ UI เดียวกัน (WHT + ค่าโอน/ค่าธรรมเนียม)
+          $feeExtra.style.display = 'flex';
+          $cardLabel.textContent = 'ค่าธรรมเนียมบัตร';
+          $sumCfLabel.textContent = '− ค่าธรรมเนียมบัตร';
+        } else if (type === 'Cheque') {
           $feeTransfer.style.display = 'flex';
-          $feeCard.style.display = 'none';
+          $feeExtra.style.display = 'flex';
+          $cardLabel.textContent = 'ค่าธรรมเนียม';
+          $sumCfLabel.textContent = '− ค่าธรรมเนียม';
+        } else if (type === 'Transfer') {
+          $feeTransfer.style.display = 'flex';
+          $feeExtra.style.display = 'none';
         }
         updateSummary();
       }
@@ -3782,6 +3794,7 @@ async function renderMain(el) {
           }
           wht = Number($whtOut.value) || 0;
           tf = Number($tf.value) || 0;
+          if (type === 'Cheque') cf = Number($cf.value) || 0;
         } else if (applies && type === 'Card') {
           cf = Number($cf.value) || 0;
         }
@@ -3804,7 +3817,6 @@ async function renderMain(el) {
       }
       
       // Trigger recalc เมื่อเปลี่ยน type/amount/fee
-      // เมื่อ amount เปลี่ยน → reset flag "manual edited" (ให้ WHT re-calc ใหม่ตามยอดใหม่)
       $type?.addEventListener('change', updateFeeUI);
       $station?.addEventListener('change', updateFeeUI);
       $bill?.addEventListener('input', updateFeeUI);
@@ -10693,6 +10705,11 @@ async function renderMatching(el) {
       // ══════════════════════════════════════════════════════════
       // PASS 2: Match เงินออก (stmt amount < 0)
       // ══════════════════════════════════════════════════════════
+      // PASS 2: Match เงินออก (stmt amount < 0)
+      // ใช้ netAmount เหมือน Pass 1: 
+      //   บิลไม่มี fee → match ยอดเต็ม (BAHT)
+      //   บิลมี fee → match ยอดสุทธิ (BAHT − WHT − TF − CF)
+      // ══════════════════════════════════════════════════════════
       const expIdx = {};
       const expUsed = new Set();
       let expBillsInRange = 0;
@@ -10704,10 +10721,11 @@ async function renderMatching(el) {
         const d = toISODate(b.date);
         if (!d || d < dateFrom || d > dateTo) continue;
         
-        const amt = Math.round(Math.abs(Number(b.amount || 0)));
-        if (!amt) continue;
+        // ใช้ยอดสุทธิ (= ยอดเต็มเมื่อไม่มี fee) เป็น key
+        const netAmt = Math.round(Math.abs(netAmount(b)));
+        if (!netAmt) continue;
         
-        const k = d + '|' + amt;
+        const k = d + '|' + netAmt;
         if (!expIdx[k]) expIdx[k] = [];
         expIdx[k].push({ bi });
         expBillsInRange++;
@@ -10730,7 +10748,7 @@ async function renderMatching(el) {
         for (let c = 0; c < cands.length; c++) {
           const bi = cands[c].bi;
           if (expUsed.has(bi)) continue;
-          if (Math.round(Math.abs(Number(billList[bi].amount))) === absSa) {
+          if (Math.round(Math.abs(netAmount(billList[bi]))) === absSa) {
             foundIdx = bi;
             break;
           }
