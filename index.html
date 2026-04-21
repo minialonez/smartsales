@@ -10305,10 +10305,21 @@ async function renderMatching(el) {
             </div>
             
             <div class="text-xs text-dim">
-              ${candidates.length?`🎯 เจอบิลที่ยอดใกล้เคียง ${candidates.length} รายการ (แนะนำด้านบน)`:'⚠️ ไม่เจอบิลยอดตรง — ค้นหาด้วยตนเอง'}
+              ${candidates.length?`🎯 เจอบิลที่ยอดใกล้เคียง ${candidates.length} รายการ · <span style="color:var(--info)">💡 ติ๊กได้หลายบิล — รวมกันให้ตรงยอด stmt</span>`:'⚠️ ไม่เจอบิลยอดตรง — ค้นหาด้วยตนเอง'}
             </div>
             
             <div id="mm-bill-list" style="max-height:300px;overflow-y:auto;border:1px solid var(--border);border-radius:8px"></div>
+            
+            <div id="mm-sum-bar" style="display:none;padding:10px;background:rgba(79,156,249,.08);border:1px solid rgba(79,156,249,.3);border-radius:6px;font-size:.88rem">
+              <div class="flex justify-between items-center">
+                <span>เลือก <span id="mm-sum-count">0</span> บิล · รวม</span>
+                <span id="mm-sum-amount" style="font-weight:700">฿0.00</span>
+              </div>
+              <div class="flex justify-between items-center" style="margin-top:4px">
+                <span class="text-xs text-dim">เทียบ stmt ฿${fmtNum(Math.abs(stmtAmt))}</span>
+                <span id="mm-sum-diff" class="text-xs">—</span>
+              </div>
+            </div>
             
             <div style="padding:10px;background:var(--surface2);border-radius:8px;margin-top:8px">
               <div class="text-xs font-semi" style="margin-bottom:6px">✏️ หรือกรอกเลขบิลเอง (กรณีบิลยังไม่อยู่ในระบบ)</div>
@@ -10330,8 +10341,47 @@ async function renderMatching(el) {
           </div>
         `);
         
-        let selectedIdx = null; // index into `displayList` (dynamic)
+        const selectedIdxs = new Set(); // indices into `displayList` (multi-select)
         let displayList = [];
+        
+        // Update sum bar + enable/disable confirm based on selection
+        function updateSumBar() {
+          const bar = document.getElementById('mm-sum-bar');
+          const cnt = selectedIdxs.size;
+          if (cnt === 0) {
+            if (bar) bar.style.display = 'none';
+            // ให้ confirm เปิดได้ถ้ากรอก manual bill
+            const manualBill = (document.getElementById('mm-manual-bill')?.value || '').trim();
+            document.getElementById('mm-confirm').disabled = !manualBill;
+            return;
+          }
+          if (bar) bar.style.display = 'block';
+          // รวมยอด (ใช้ mmBillMatchAmt เหมือนตอน match)
+          let sum = 0;
+          selectedIdxs.forEach(i => {
+            const b = displayList[i];
+            if (!b) return;
+            // สำหรับบิลที่ติ๊กรวม: SC (credit note) amount เป็นลบอยู่แล้วในระบบ ใช้ Number ตรงๆ
+            // (ไม่ใช้ abs เพราะต้องการ offset)
+            const isSC = String(b.bill_no||'').substring(0,2).toUpperCase() === 'SC' || 
+                         String(b.bill_no||'').substring(0,2).toUpperCase() === 'JS' || 
+                         String(b.bill_no||'').substring(0,2).toUpperCase() === 'JR';
+            const val = mmBillMatchAmt(b); // positive
+            sum += isSC ? -val : val;
+          });
+          const stmtAbs = Math.abs(stmtAmt);
+          const diff = Math.abs(sum - stmtAbs);
+          const isMatch = diff < 0.01;
+          document.getElementById('mm-sum-count').textContent = cnt;
+          document.getElementById('mm-sum-amount').textContent = '฿' + fmtNum(sum);
+          const diffEl = document.getElementById('mm-sum-diff');
+          if (isMatch) {
+            diffEl.innerHTML = '<span style="color:var(--success);font-weight:600">✓ ตรงเป๊ะ</span>';
+          } else {
+            diffEl.innerHTML = `<span style="color:var(--warn)">ต่าง ${fmtNum(sum - stmtAbs)}</span>`;
+          }
+          document.getElementById('mm-confirm').disabled = !isMatch;
+        }
         
         function renderBillList(searchText) {
           let list;
@@ -10377,7 +10427,8 @@ async function renderMatching(el) {
                 ? `<span class="badge" style="background:var(--info-bg);color:var(--info);font-size:.65rem">💰 CF</span>`
                 : `<span class="badge badge-muted" style="font-size:.65rem">📄 Bill</span>`;
             return `
-              <div class="mm-item" data-di="${i}" style="padding:10px;border-bottom:1px solid var(--border);cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:10px">
+              <div class="mm-item" data-di="${i}" style="padding:10px;border-bottom:1px solid var(--border);cursor:pointer;display:flex;align-items:center;gap:10px">
+                <input type="checkbox" class="mm-chk" data-di="${i}" style="width:18px;height:18px;cursor:pointer;accent-color:var(--info)">
                 <div style="flex:1">
                   <div class="flex items-center gap-2">
                     <span class="font-semi">${b.bill_no||'(ไม่มีเลข)'}</span>
@@ -10394,30 +10445,58 @@ async function renderMatching(el) {
             `;
           }).join('') : '<div style="padding:20px;text-align:center;color:var(--text3)">ไม่พบบิล / รายการ / เช็ค</div>';
           
-          bc.querySelectorAll('.mm-item').forEach(item => {
-            item.addEventListener('click', () => {
-              bc.querySelectorAll('.mm-item').forEach(i => i.style.background = '');
+          // Toggle ด้วยคลิกที่แถวหรือ checkbox
+          const toggleSelect = (idx, item) => {
+            if (selectedIdxs.has(idx)) {
+              selectedIdxs.delete(idx);
+              item.style.background = '';
+              const chk = item.querySelector('.mm-chk');
+              if (chk) chk.checked = false;
+            } else {
+              selectedIdxs.add(idx);
               item.style.background = 'rgba(79,156,249,.15)';
-              selectedIdx = Number(item.dataset.di);
-              document.getElementById('mm-confirm').disabled = false;
+              const chk = item.querySelector('.mm-chk');
+              if (chk) chk.checked = true;
+            }
+            updateSumBar();
+          };
+          bc.querySelectorAll('.mm-item').forEach(item => {
+            item.addEventListener('click', (e) => {
+              if (e.target.classList.contains('mm-chk')) return; // checkbox ดูแลเอง
+              toggleSelect(Number(item.dataset.di), item);
             });
           });
+          bc.querySelectorAll('.mm-chk').forEach(chk => {
+            chk.addEventListener('click', (e) => {
+              e.stopPropagation();
+              const item = chk.closest('.mm-item');
+              toggleSelect(Number(chk.dataset.di), item);
+            });
+          });
+          // restore visual state เมื่อ re-render
+          selectedIdxs.forEach(idx => {
+            const item = bc.querySelector(`.mm-item[data-di="${idx}"]`);
+            if (item) {
+              item.style.background = 'rgba(79,156,249,.15)';
+              const chk = item.querySelector('.mm-chk');
+              if (chk) chk.checked = true;
+            }
+          });
+          updateSumBar();
         }
         
         renderBillList('');
         document.getElementById('mm-search')?.addEventListener('input', debounce(e => renderBillList(e.target.value), 200));
         
-        // ── Enable confirm เมื่อกรอกเลขบิลเอง ──
+        // ── Enable confirm เมื่อกรอกเลขบิลเอง (เฉพาะกรณีไม่มี bill ที่เลือก) ──
         document.getElementById('mm-manual-bill')?.addEventListener('input', (e) => {
-          if (e.target.value.trim()) {
-            // ยกเลิก selection จาก list (ถ้ามี)
-            selectedIdx = null;
-            const bc = document.getElementById('mm-bill-list');
-            if (bc) bc.querySelectorAll('.mm-item').forEach(i => i.style.background = '');
+          if (e.target.value.trim() && selectedIdxs.size === 0) {
             document.getElementById('mm-confirm').disabled = false;
-          } else if (selectedIdx === null) {
+          } else if (selectedIdxs.size === 0) {
             document.getElementById('mm-confirm').disabled = true;
           }
+          // ถ้ามี bill selected อยู่แล้ว → ให้ updateSumBar เป็นคนตัดสิน
+          if (selectedIdxs.size > 0) updateSumBar();
         });
         
         document.getElementById('mm-confirm')?.addEventListener('click', () => {
@@ -10425,45 +10504,51 @@ async function renderMatching(el) {
           const manualStation = (document.getElementById('mm-manual-station')?.value || 'Invoice').trim();
           const reason = document.getElementById('mm-reason').value || '';
           
-          // ── กรณี 1: เลือกบิลจาก list ──
+          // ── กรณี 1: เลือกบิลจาก list (1 หรือหลายบิล) ──
           // ── กรณี 2: กรอกเลขบิลเอง ──
           let matchBillNo = '';
           let matchStation = '';
           let targetLabel = '';
+          const matchedBills = []; // สำหรับ multi: เก็บเลขบิลทั้งหมด
           
-          if (selectedIdx !== null && displayList[selectedIdx]) {
-            // เลือกจาก list
-            const match = displayList[selectedIdx];
-            matchBillNo = match.bill_no || '';
-            matchStation = match.station || '';
-            
-            // อัปเดต Bill / Cashflow / Supplier Payment
-            if (match._supplierPayment) {
-              const sp = match._supplierPayment;
-              sp.match_status = 'matched';
-              sp.match_stmt_ref = stmt.ref_no || '';
-              sp.matched_at = new Date().toISOString();
-              if (sp.payment_method === 'เช็ค') {
-                sp.cheque_cleared_date = toISODate(stmt.date);
-                sp.cleared_statement_ref = stmt.ref_no || '';
-                targetLabel = `📝 เช็ค ${sp.cheque_no} (${sp.supplier_name})`;
+          if (selectedIdxs.size > 0) {
+            // อัปเดตทุกบิลที่ติ๊ก
+            const idxArr = Array.from(selectedIdxs);
+            idxArr.forEach(di => {
+              const match = displayList[di];
+              if (!match) return;
+              matchedBills.push(match.bill_no || '(no#)');
+              if (match._supplierPayment) {
+                const sp = match._supplierPayment;
+                sp.match_status = 'matched';
+                sp.match_stmt_ref = stmt.ref_no || '';
+                sp.matched_at = new Date().toISOString();
+                if (sp.payment_method === 'เช็ค') {
+                  sp.cheque_cleared_date = toISODate(stmt.date);
+                  sp.cleared_statement_ref = stmt.ref_no || '';
+                }
+              } else if (match._cashflow) {
+                match._cashflow.match_status = 'matched';
+                match._cashflow.match_stmt_ref = stmt.ref_no || '';
               } else {
-                targetLabel = `🏭 SP ${sp.pp_no||sp.id} (${sp.supplier_name})`;
+                match.match_status = 'matched';
+                match.confirmation = stmt.bank || '';
+                match.pay_date = match.date;
+                match.matched_stmt_ref = stmt.ref_no || '';
+                match.matched_at = new Date().toISOString();
               }
-            } else if (match._cashflow) {
-              match._cashflow.match_status = 'matched';
-              match._cashflow.match_stmt_ref = stmt.ref_no || '';
-              targetLabel = `💰 CF ${match.bill_no}`;
-            } else {
-              match.match_status = 'matched';
-              match.confirmation = stmt.bank || ''; // ใส่ธนาคาร
-              match.pay_date = match.date; // ใส่วันโอน
-              match.matched_stmt_ref = stmt.ref_no || '';
-              match.matched_at = new Date().toISOString();
-              targetLabel = `📄 ${match.bill_no}`;
-            }
+            });
+            // ใช้บิลแรกเป็น primary reference, ที่เหลือ append
+            const first = displayList[idxArr[0]];
+            matchBillNo = matchedBills.length > 1 
+              ? matchedBills.join(' + ') 
+              : (first?.bill_no || '');
+            matchStation = first?.station || '';
+            targetLabel = matchedBills.length > 1 
+              ? `📎 ${matchedBills.length} บิล: ${matchedBills.join(' + ')}` 
+              : `📄 ${matchedBills[0]}`;
           } else if (manualBill) {
-            // กรอกเลขบิลเอง (ไม่มีบิลในระบบ — แค่บันทึกการ match)
+            // กรอกเลขบิลเอง
             matchBillNo = manualBill;
             matchStation = manualStation;
             targetLabel = `✏️ ${manualBill} (กรอกเอง)`;
@@ -10474,12 +10559,14 @@ async function renderMatching(el) {
           
           // อัปเดต Statement
           stmt.match_status = 'matched';
-          stmt.match_method = 'manual';
+          stmt.match_method = matchedBills.length > 1 ? 'manual_multi' : 'manual';
           stmt.match_station = matchStation;
           stmt.match_bill = matchBillNo;
+          if (matchedBills.length > 1) stmt.matched_bills = matchedBills;  // traceability
+          else delete stmt.matched_bills;
           stmt.matched_at = new Date().toISOString();
           stmt.matched_by = currentUser?.display_name || 'Admin';
-          stmt.match_reason = reason || (manualBill ? 'กรอกเลขบิลเอง' : '');
+          stmt.match_reason = reason || (manualBill ? 'กรอกเลขบิลเอง' : (matchedBills.length > 1 ? `รวม ${matchedBills.length} บิล` : ''));
           
           // Persist
           try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(e) {}
@@ -10502,19 +10589,25 @@ async function renderMatching(el) {
         
         if (!confirm(`ยกเลิกการ match กับ ${stmt.match_bill}?`)) return;
         
-        // ปลด bill ด้วย (ถ้าเจอ)
-        const bill = billList.find(b => b.bill_no === stmt.match_bill);
-        if (bill && !bill.paid_by_sp) {
-          bill.match_status = 'pending';
-          delete bill.confirmation;    // ล้างธนาคาร (auto-filled)
-          delete bill.pay_date;        // ล้างวันโอน (auto-filled)
-          delete bill.matched_stmt_ref;
-          delete bill.matched_at;
-          // ⚠️ ไม่ลบ bill.bank — เป็นช่อง manual ที่ user กรอกเอง
-        }
+        // รองรับ multi-bill match: ใช้ matched_bills ถ้ามี ไม่งั้น fallback เป็น match_bill
+        const billNumbersToUnmatch = Array.isArray(stmt.matched_bills) && stmt.matched_bills.length 
+          ? stmt.matched_bills 
+          : [stmt.match_bill];
+        
+        billNumbersToUnmatch.forEach(bn => {
+          const bill = billList.find(b => b.bill_no === bn);
+          if (bill && !bill.paid_by_sp) {
+            bill.match_status = 'pending';
+            delete bill.confirmation;
+            delete bill.pay_date;
+            delete bill.matched_stmt_ref;
+            delete bill.matched_at;
+          }
+        });
         
         stmt.match_status = 'unmatched';
         delete stmt.match_bill;
+        delete stmt.matched_bills;
         delete stmt.match_station;
         delete stmt.match_method;
         delete stmt.matched_at;
