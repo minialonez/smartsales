@@ -2493,111 +2493,57 @@ async function renderMain(el) {
       return s !== null ? s : 0;
     };
     
-    // ── Front1-4: สูตร xlsm (C12) ──
-    //   LHS = drawer + transfer + card + cheque + refund  (row 7 + row 8:11)
-    //   RHS = cashIn + sales + cashOut + returns         (row 3:6)
-    //   diff = LHS - RHS
-    //   diff > 0 → ได้รับเงินเกิน
-    //   diff < 0 → ได้รับเงินไม่ครบ
-    if (['Front1', 'Front2', 'Front3', 'Front4'].includes(station)) {
-      const cashIn = _getSummaryValue('cashIn', station);
-      const sales = _getSummaryValue('sales', station);
-      const cashOut = _getSummaryValue('cashOut', station);
-      const returns = _getSummaryValue('returns', station);
-      const drawer = summaryOrBills('Cash Drawer', 'Cash', station);
-      const transfer = summaryOrBills('Transfer', 'Transfer', station);
-      const card = summaryOrBills('Card', 'Card', station);
-      const cheque = summaryOrBills('Cheque', 'Cheque', station);
-      const refund = summaryOrBills('Refund', 'Refund', station);
-      
-      const LHS = drawer + transfer + card + cheque + refund;
-      const RHS = cashIn + sales + cashOut + returns;
-      
-      if (!LHS && !RHS) return { diff: 0, isOk: null, empty: true };
-      
-      const diff = LHS - RHS;
-      return { diff, isOk: Math.abs(diff) < 1.0, empty: false };
-    }
+    // ══════════════════════════════════════════════════════════════
+    // สูตรเดียวสำหรับทุก Station (ตามที่ user กำหนด):
+    //   LHS = (Cash Drawer − นำเงินเข้า) + Transfer + Card + Cheque + Refund
+    //   RHS = ยอดขาย + ยอดคืนสินค้า
+    //   diff = LHS − RHS
+    //     > 0 → เงินเกิน 🟢
+    //     < 0 → เงินขาด 🔴
+    //     = 0 → OK ✅
+    //   *Transfer/Card/Cheque/Refund ใช้เฉพาะบิลที่ matched แล้ว (ตาม xlsm SUMIFS with F<>"")
+    //   *Cash Drawer ต้องเป็นค่า RAW (includes cashIn) — ถ้ามาจาก user นับธนบัตร ตรงเป๊ะ
+    // ══════════════════════════════════════════════════════════════
     
-    // ── Invoice merged (Invoice + Order + Payment) ──
-    // สูตร xlsm G12: SUM(G7, G8:I11) = SUM(G4:I4)
-    //   LHS = drawer_Invoice_only + (transfer+card+cheque+refund for 3 stations)
-    //   RHS = sum of sales for 3 stations
-    //   diff = LHS - RHS
-    //   (ไม่รวม cashIn, cashOut, returns เพราะ xlsm ไม่รวมในสมการนี้)
-    //   NOTE: ถ้า drawer มาจาก user นับธนบัตรจริง (raw count) จะรวม cashIn อยู่
-    //   → ต้องลบ cashIn+cashOut ออกก่อน (xlsm: G7 = O10 - G3 - G5)
+    // Helper: รวมค่าจาก 3 stations (Invoice+Order+Payment) ถ้า station='Invoice', ไม่งั้น 1 station
+    const stationsFor = (st) => (st === 'Invoice') ? ['Invoice', 'Order', 'Payment'] : [st];
+    
+    const sumStations = (fn) => stationsFor(station).reduce((s, st) => s + fn(st), 0);
+    
+    // Drawer: ใช้ค่าของ station หลัก (Invoice drawer ครอบคลุม Order+Payment ด้วย)
+    let drawer = 0;
     if (station === 'Invoice') {
-      const stations3 = ['Invoice', 'Order', 'Payment'];
-      
-      // Cash Drawer (only Invoice station has drawer - ถือว่าเป็นลิ้นชักรวม 3 stations)
-      const drawerSummary = summaryOrZero('Cash Drawer', 'Invoice');
-      const countedCash = calcCashDrawer('Invoice'); // user นับธนบัตร
-      let drawer;
-      if (countedCash > 0) {
-        // User นับธนบัตรจริง → raw count รวม cashIn อยู่
-        // ต้องลบ cashIn+cashOut ออก (ตรงตามสูตร G7 = O10 - G3 - G5)
-        const cashIn_Invoice = _getSummaryValue('cashIn', 'Invoice');
-        const cashOut_Invoice = _getSummaryValue('cashOut', 'Invoice');
-        drawer = countedCash - cashIn_Invoice - cashOut_Invoice;
-      } else {
-        // Summary value (already adjusted - xlsm convention)
-        drawer = drawerSummary || stations3.reduce((s, st) => s + calcCashFromBills(st), 0);
-      }
-      
-      // Transfer/Card/Cheque/Refund: summary ก่อน → bills (รวม 3 stations)
-      let otherSum = 0;
-      stations3.forEach(st => {
-        otherSum += summaryOrBills('Transfer', 'Transfer', st);
-        otherSum += summaryOrBills('Card', 'Card', st);
-        otherSum += summaryOrBills('Cheque', 'Cheque', st);
-        otherSum += summaryOrBills('Refund', 'Refund', st);
-      });
-      
-      // ยอดขาย (รวม 3 stations)
-      let salesSum = 0;
-      stations3.forEach(st => {
-        const summaryVal = summaryRow('ยอดขาย', st);
-        if (summaryVal !== null) salesSum += summaryVal;
-        else salesSum += calcSales(st);
-      });
-      
-      const LHS = drawer + otherSum;
-      const RHS = salesSum;
-      
-      if (!LHS && !RHS) return { diff: 0, isOk: null, empty: true };
-      
-      const diff = LHS - RHS;
-      return { diff, isOk: Math.abs(diff) < 1.0, empty: false };
+      const countedCash = calcCashDrawer('Invoice'); // user นับธนบัตร (RAW)
+      drawer = countedCash > 0 
+        ? countedCash 
+        : (summaryOrZero('Cash Drawer', 'Invoice') || ['Invoice','Order','Payment'].reduce((s,st)=>s+calcCashFromBills(st), 0));
+    } else {
+      drawer = summaryOrBills('Cash Drawer', 'Cash', station);
     }
     
-    // ── Invoice Credit / Order Credit ──
-    // Business rule: Credit stations เก็บยอดลดหนี้/คืน → Refund = ยอดขาย → Sum = OK
-    // Invoice Credit: Excel มี Refund = ยอดขาย (จากสูตร SUMIFS)
-    // Order Credit: Excel ไม่มี Refund → auto-fill = ยอดขาย เพื่อให้ Sum = OK เหมือนกัน
-    if (station === 'Invoice Credit' || station === 'Order Credit') {
-      const salesSummaryVal = summaryRow('ยอดขาย', station);
-      const sales = salesSummaryVal !== null ? salesSummaryVal : calcSales(station);
-      
-      const cashOut = summaryOrZero('นำเงินออก', station);
-      const returns = summaryOrZero('ยอดคืนสินค้า', station);
-      const drawer = summaryOrZero('Cash Drawer', station);
-      const transfer = summaryOrZero('Transfer', station);
-      const card = summaryOrZero('Card', station);
-      const cheque = summaryOrZero('Cheque', station);
-      // Refund: ถ้า summary มี → ใช้ · ถ้าไม่มี → auto = sales (ทำให้ balance)
-      const refundRaw = summaryOrZero('Refund', station);
-      const refund = refundRaw || sales;
-      
-      const outflow = cashOut + returns + drawer + transfer + card + cheque + refund;
-      
-      if (!outflow && !sales) return { diff: 0, isOk: null, empty: true };
-      
-      const diff = outflow - sales;
-      return { diff, isOk: Math.abs(diff) < 1.0, empty: false };
-    }
+    // cashIn, sales, returns: summary (sum ทุก station ที่เกี่ยวข้อง)
+    const cashIn = sumStations(st => _getSummaryValue('cashIn', st));
+    const returns = sumStations(st => _getSummaryValue('returns', st));
+    let sales = 0;
+    stationsFor(station).forEach(st => {
+      const summaryVal = summaryRow('ยอดขาย', st);
+      sales += (summaryVal !== null ? summaryVal : calcSales(st));
+    });
     
-    return { diff: 0, isOk: null, empty: true };
+    // Transfer/Card/Cheque/Refund: ใช้เฉพาะ matched bills (calcAutoValue)
+    const transfer = sumStations(st => calcAutoValue('Transfer', st));
+    const card = sumStations(st => calcAutoValue('Card', st));
+    const cheque = sumStations(st => calcAutoValue('Cheque', st));
+    const refund = sumStations(st => calcAutoValue('Refund', st));
+    
+    // สูตรเดียว
+    const LHS = (drawer - cashIn) + transfer + card + cheque + refund;
+    const RHS = sales + returns;
+    
+    if (!LHS && !RHS && !drawer && !sales) return { diff: 0, isOk: null, empty: true };
+    
+    const diff = LHS - RHS;
+    return { diff, isOk: Math.abs(diff) < 1.0, empty: false };
   }
 
   function render() {
@@ -12079,8 +12025,9 @@ async function importDailyXlsm(file) {
   
   // ── 1. อ่านวันที่จาก B2 (row 2, col 2) ──
   const b2 = mainSheet[1]?.[1]; // 0-indexed
-  const dateISO = toDailyISO(b2);
-  if (!dateISO) throw new Error(`B2 ไม่ใช่วันที่ที่ถูกต้อง: ${b2}`);
+  const dateISO = toISODate(b2);
+  if (!dateISO) throw new Error(`B2 ไม่ใช่วันที่ที่ถูกต้อง: ${b2} (type: ${typeof b2})`);
+  console.log(`[Import ${file.name}] B2=${b2} → dateISO=${dateISO}`);
   
   // ── 2. อ่าน Summary (rows 3-11, cols C-K) ──
   const LABELS = {
@@ -12122,21 +12069,38 @@ async function importDailyXlsm(file) {
     });
   }
   
-  // ── 3. อ่าน Cash counting (M2:O11) ──
-  // M2 is row 2 col 13 (0-indexed: row 1 col 12)
+  // ── 3. อ่าน Cash counting (M2:O11) และปรับ Invoice drawer ให้เป็น RAW ──
+  // xlsm เก็บ G7 = O10 - G3 - G5 (adjusted). เราต้องการ raw (= O10) เพื่อใช้สูตรเดียวกันทุก station
   if (!cashCount.__byDate) cashCount.__byDate = {};
   cashCount.__byDate[dateISO] = cashCount.__byDate[dateISO] || {};
   const dayCash = cashCount.__byDate[dateISO];
   
+  let invoiceDrawerRaw = 0;
   for (let r = 1; r < 11; r++) {
     const row = mainSheet[r];
     if (!row) continue;
     const denom = Number(row[12]); // M
     const count = Number(row[13]); // N
     if (denom && count) {
-      // สมมติ Invoice station (ลิ้นชักรวม)
       dayCash[denom + '_Invoice'] = count;
+      invoiceDrawerRaw += denom * count;
     }
+  }
+  
+  // Fallback: ถ้าไม่มีข้อมูลนับธนบัตร → คำนวณ raw จาก G7 + G3 + G5
+  if (!invoiceDrawerRaw) {
+    const g7 = Number(mainSheet[6]?.[6]) || 0;
+    const g3 = Number(mainSheet[2]?.[6]) || 0;
+    const g5 = Number(mainSheet[4]?.[6]) || 0;
+    invoiceDrawerRaw = g7 + g3 + g5;
+  }
+  
+  // Override mainSummary Cash Drawer for Invoice (raw value)
+  if (invoiceDrawerRaw > 0) {
+    mainSummary.cashDrawer_Invoice = invoiceDrawerRaw;
+    if (!mainSummary.__byDate[dateISO]['Cash Drawer']) mainSummary.__byDate[dateISO]['Cash Drawer'] = {};
+    mainSummary.__byDate[dateISO]['Cash Drawer']['Invoice'] = invoiceDrawerRaw;
+    console.log(`[Import] Invoice drawer RAW = ${invoiceDrawerRaw} (xlsm G7 = ${mainSheet[6]?.[6]}, adjusted)`);
   }
   
   // ── 4. ลบบิลเดิมของวันที่นี้ (ป้องกันซ้ำ) ──
@@ -12146,12 +12110,13 @@ async function importDailyXlsm(file) {
   
   // ── 5. อ่านบิล (rows 15+) ──
   let billsImported = 0;
-  for (let r = 14; r < mainSheet.length; r++) { // row 15 = index 14
+  let sampleDates = [];
+  for (let r = 14; r < mainSheet.length; r++) {
     const row = mainSheet[r];
     if (!row) continue;
     
     const billNo = String(row[0] || '').trim();
-    const billDate = row[1];
+    const billDateRaw = row[1];
     const station = String(row[2] || '').trim();
     const type = String(row[3] || '').trim();
     const amount = Number(row[4]);
@@ -12160,11 +12125,11 @@ async function importDailyXlsm(file) {
     const remarks2 = String(row[8] || '').trim();
     const bank = String(row[9] || '').trim();
     
-    // ข้ามแถวที่ไม่มีข้อมูลบิล
     if (!station && !type && !amount) continue;
     if (isNaN(amount) || amount === 0) continue;
     
-    const billDateISO = toDailyISO(billDate) || dateISO;
+    const billDateISO = toISODate(billDateRaw) || dateISO;
+    if (billsImported < 3) sampleDates.push({ raw: billDateRaw, iso: billDateISO });
     
     billList.push({
       bill_no: billNo || '',
@@ -12172,7 +12137,6 @@ async function importDailyXlsm(file) {
       station: station,
       type: type,
       amount: amount,
-      // SKIP: confirmation, pay_date (user จะ match เอง)
       confirmation: '',
       remarks1: remarks1,
       remarks2: remarks2,
@@ -12185,36 +12149,8 @@ async function importDailyXlsm(file) {
     billsImported++;
   }
   
+  console.log(`[Import ${file.name}] Sample bill dates:`, sampleDates);
   return { dateISO, billsImported, summaryRows: 9, deleted };
-}
-
-// Helper: convert value to YYYY-MM-DD
-function toDailyISO(v) {
-  if (!v) return '';
-  if (v instanceof Date) {
-    return v.getFullYear() + '-' +
-      String(v.getMonth()+1).padStart(2,'0') + '-' +
-      String(v.getDate()).padStart(2,'0');
-  }
-  if (typeof v === 'number' && v > 10000) {
-    // Excel serial
-    const epoch = new Date(1899, 11, 30);
-    const d = new Date(epoch.getTime() + v * 86400000);
-    return d.getFullYear() + '-' +
-      String(d.getMonth()+1).padStart(2,'0') + '-' +
-      String(d.getDate()).padStart(2,'0');
-  }
-  const s = String(v);
-  // dd/mm/yyyy (with optional BE year)
-  let m = s.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
-  if (m) {
-    let y = Number(m[3]); if (y > 2400) y -= 543;
-    return y + '-' + m[2].padStart(2,'0') + '-' + m[1].padStart(2,'0');
-  }
-  // yyyy-mm-dd
-  m = s.match(/(\d{4})-(\d{1,2})-(\d{1,2})/);
-  if (m) return m[1] + '-' + m[2].padStart(2,'0') + '-' + m[3].padStart(2,'0');
-  return '';
 }
 
 async function renderSpRecon(el) {
