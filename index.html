@@ -11635,6 +11635,18 @@ function renderData(el) {
         <div id="sync-status" class="text-xs text-muted mt-2" style="display:none"></div>
       </div>
       
+      <!-- Sheet Health Check -->
+      <div class="card mb-3" style="border:1.5px solid var(--info);background:rgba(79,156,249,.04)">
+        <div class="flex justify-between items-center">
+          <div>
+            <div class="font-semi" style="color:var(--info)">🔍 ตรวจสอบ Google Sheet</div>
+            <div class="text-xs text-muted mt-1">เช็คว่า Sheet มีแท็บครบตามที่ระบบต้องการหรือไม่ · ดู row counts · แสดงรายการ sheet ที่ขาด</div>
+          </div>
+          <button class="btn btn-info btn-sm" id="btn-check-sheets">🔍 ตรวจสอบ</button>
+        </div>
+        <div id="sheet-check-result" style="display:none;margin-top:10px;padding:12px;background:var(--surface2);border-radius:6px;font-family:monospace;font-size:.78rem;white-space:pre-wrap;max-height:400px;overflow-y:auto"></div>
+      </div>
+      
       <!-- Daily Import Section -->
       <div class="card mb-3" style="border:1.5px solid var(--primary);background:rgba(91,124,250,.04)">
         <div class="flex justify-between items-center mb-3">
@@ -11711,6 +11723,81 @@ function renderData(el) {
     `;
     
     // ── Sync from Cloud ──
+    // ── Sheet Health Check ──
+    document.getElementById('btn-check-sheets')?.addEventListener('click', async () => {
+      const btn = document.getElementById('btn-check-sheets');
+      const result = document.getElementById('sheet-check-result');
+      btn.disabled = true;
+      btn.textContent = '⏳ กำลังตรวจ...';
+      result.style.display = 'block';
+      result.textContent = 'กำลังเชื่อมต่อ backend...';
+      
+      try {
+        const r = await api('listSheets', {});
+        if (r?.success === false) {
+          // Backend ยังไม่มี endpoint นี้
+          result.innerHTML = 
+            '❌ <strong>Backend ไม่รองรับ listSheets</strong>\n\n' +
+            'ต้องเพิ่ม function ใน code.gs ก่อน:\n' +
+            '  1. เปิด check_sheets.gs ที่ผม generate ให้\n' +
+            '  2. Paste ทั้งไฟล์ไว้ท้าย code.gs\n' +
+            '  3. เพิ่ม case ใน handleRequest() switch:\n' +
+            '       case \'listSheets\': return listSheets(req);\n' +
+            '  4. Deploy ใหม่\n\n' +
+            'หรือ: เปิด Apps Script editor → รัน function <strong>checkAllSheets()</strong> → View Log (Ctrl+Enter)';
+          btn.disabled = false;
+          btn.textContent = '🔍 ตรวจสอบ';
+          return;
+        }
+        
+        const d = r.data || r;
+        let out = '';
+        out += `📊 Spreadsheet: ${d.spreadsheet_id || 'unknown'}\n`;
+        out += `   Total sheets: ${d.total_sheets}\n\n`;
+        
+        // Fixed sheets
+        out += `━━━ Fixed Sheets (ต้องมี) ━━━\n`;
+        (d.fixed || []).forEach(f => {
+          const icon = f.exists ? '✅' : '❌';
+          out += `  ${icon} ${f.name.padEnd(25)} ${f.exists ? `(${f.rows} rows)` : '— ขาด!'}\n`;
+        });
+        
+        // Dynamic
+        out += `\n━━━ Year-based Sheets ━━━\n`;
+        if (d.dynamic && d.dynamic.length) {
+          d.dynamic.forEach(s => {
+            out += `  ✅ ${s.name.padEnd(25)} (${s.rows} rows)\n`;
+          });
+        } else {
+          out += '  (ไม่มี — จะสร้างอัตโนมัติเมื่อใช้ครั้งแรก)\n';
+        }
+        
+        // Extras
+        if (d.extras && d.extras.length) {
+          out += `\n━━━ Extra Sheets (ไม่อยู่ใน schema) ━━━\n`;
+          d.extras.forEach(s => out += `  🔹 ${s.name.padEnd(25)} (${s.rows} rows)\n`);
+        }
+        
+        // Summary
+        out += `\n━━━ สรุป ━━━\n`;
+        if (d.missing && d.missing.length > 0) {
+          out += `❌ Missing: ${d.missing.join(', ')}\n`;
+          out += `   → รัน createMissingSheets() ใน Apps Script editor\n`;
+        } else {
+          out += `✨ Fixed sheets ครบทุกอัน — ระบบพร้อมใช้งาน\n`;
+        }
+        
+        result.textContent = out;
+        btn.disabled = false;
+        btn.textContent = '🔍 ตรวจสอบ';
+      } catch(err) {
+        result.textContent = '❌ Error: ' + err.message + '\n\nดู Console (F12) สำหรับรายละเอียด';
+        console.error('[check-sheets]', err);
+        btn.disabled = false;
+        btn.textContent = '🔍 ลองใหม่';
+      }
+    });
+    
     document.getElementById('btn-sync-cloud')?.addEventListener('click', async () => {
       const yearsCount = Number(document.getElementById('sync-years').value) || 2;
       const now = new Date();
