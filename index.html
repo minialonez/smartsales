@@ -222,6 +222,7 @@ tr.row-danger td{background:rgba(239,87,87,.06);border-left:3px solid var(--dang
     <nav class="sidebar-nav" id="sidebar-nav"></nav>
     <div class="sidebar-footer">
       <div class="sidebar-user" id="sidebar-user"></div>
+      <div id="sync-status-badge" style="font-size:.72rem;padding:4px 8px;background:rgba(255,255,255,.03);border-radius:5px;margin-bottom:8px;cursor:pointer;user-select:none" title="คลิกเพื่อ sync ทันที">☁ Ready</div>
       <button class="sidebar-logout" onclick="doLogout()">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
         ออกจากระบบ
@@ -1241,6 +1242,247 @@ let transferLog = {
 // แก้ปัญหา lag กับ billList 8,000+ records: cache invalidate ทันที, localStorage I/O debounce
 var _persistTimer = null;
 var _stateVersion = 0;  // ← bump ทุกครั้งที่ state เปลี่ยน (สำหรับ cache invalidation)
+// ══════════════════════════════════════════════════════════════
+// HYBRID SYNC MANAGER
+//   - Local-first: persistMainState() เขียน local ทันที (ไม่เปลี่ยน)
+//   - Background push: queue dirty flags → debounced batch save to backend
+//   - Auto pull on login: ถ้า local ว่าง → ดึงจาก cloud
+//   - Visible status: "Synced Xs ago" หรือ "⚠ offline"
+// ══════════════════════════════════════════════════════════════
+const syncManager = {
+  enabled: true,            // toggle ผ่าน localStorage['sf_sync_enabled']
+  pushDelayMs: 5000,        // debounce 5s หลัง mutation สุดท้าย
+  dirty: new Set(),         // types ที่ต้อง push: 'bills','stmts','payments','cashflow','suppliers','meta'
+  lastPushAt: 0,
+  lastPullAt: 0,
+  pushTimer: null,
+  status: 'idle',           // idle | pushing | pulling | error | offline
+  lastError: null,
+  listeners: [],            // callbacks สำหรับ UI
+  stats: { pushed: 0, pulled: 0, errors: 0 },
+  
+  init() {
+    const saved = localStorage.getItem('sf_sync_enabled');
+    if (saved === '0' || saved === 'false') this.enabled = false;
+    const lp = Number(localStorage.getItem('sf_sync_last_pull') || 0);
+    if (lp) this.lastPullAt = lp;
+  },
+  
+  setEnabled(on) {
+    this.enabled = !!on;
+    localStorage.setItem('sf_sync_enabled', on ? '1' : '0');
+    this._emit();
+  },
+  
+  onChange(fn) { this.listeners.push(fn); },
+  _emit() { this.listeners.forEach(fn => { try { fn(this); } catch(_){} }); },
+  
+  // Called จาก persistMainState → mark type ว่า dirty แล้ว schedule push
+  markDirty(type) {
+    if (!this.enabled) return;
+    if (type) this.dirty.add(type);
+    else ['bills','stmts','payments','cashflow','suppliers','meta'].forEach(t => this.dirty.add(t));
+    this._schedulePush();
+  },
+  
+  _schedulePush() {
+    if (this.pushTimer) clearTimeout(this.pushTimer);
+    this.pushTimer = setTimeout(() => this._flushPush(), this.pushDelayMs);
+  },
+  
+  // Push dirty data to backend (ส่งเป็น batch)
+  async _flushPush() {
+    if (!this.enabled || this.dirty.size === 0) return;
+    if (this.status === 'pushing') return; // อย่า concurrent push
+    
+    const types = Array.from(this.dirty);
+    this.dirty.clear();
+    this.status = 'pushing';
+    this._emit();
+    
+    const results = { ok: 0, fail: 0, errors: [] };
+    const by = window.currentUser?.display_name || 'Admin';
+    
+    for (const type of types) {
+      try {
+        if (type === 'bills') {
+          await api('saveDailySales', { bills: billList, created_by: by });
+        } else if (type === 'stmts') {
+          await api('saveStatements', { statements: getAllStatements(), created_by: by });
+        } else if (type === 'payments') {
+          await api('savePayments', { payments: paymentList, created_by: by });
+        } else if (type === 'cashflow') {
+          await api('saveCashflow', { records: cashflowList, created_by: by });
+        } else if (type === 'suppliers') {
+          await api('saveSuppliers', { records: supplierList, created_by: by });
+          await api('saveSupplierPayments', { records: supplierPayments, created_by: by });
+        } else if (type === 'meta') {
+          await api('saveDailyMeta', { summary: mainSummary, cash_count: cashCount });
+        }
+        results.ok++;
+      } catch(err) {
+        results.fail++;
+        results.errors.push(`${type}: ${err.message}`);
+        this.dirty.add(type); // re-queue for next cycle
+      }
+    }
+    
+    this.lastPushAt = Date.now();
+    this.stats.pushed += results.ok;
+    this.stats.errors += results.fail;
+    this.status = results.fail ? 'error' : 'idle';
+    this.lastError = results.errors[0] || null;
+    this._emit();
+  },
+  
+  // Auto-pull: เรียกจาก showApp หลัง login
+  //   mode='auto': pull เฉพาะเมื่อ local ว่าง (หรือ lastPull เก่ามาก)
+  //   mode='force': pull เสมอ
+  async pullFromCloud(yearsCount = 2, mode = 'auto') {
+    if (!this.enabled) return { skipped: 'disabled' };
+    
+    if (mode === 'auto') {
+      const hasLocalData = billList.length > 0 || getAllStatements().length > 0;
+      const lastPullRecent = Date.now() - this.lastPullAt < 30 * 60 * 1000; // 30 min
+      if (hasLocalData && lastPullRecent) {
+        return { skipped: 'has_local_and_recent' };
+      }
+    }
+    
+    this.status = 'pulling';
+    this._emit();
+    
+    const stats = { bills: 0, stmts: 0, payments: 0, cashflow: 0, suppliers: 0, meta: 0, errors: [] };
+    const now = new Date();
+    const years = [];
+    for (let i = 0; i < yearsCount; i++) years.push(String(now.getFullYear() - i));
+    
+    try {
+      // Bills
+      const seenBillKeys = new Set(billList.map(b => `${b.bill_no||''}|${b.date||''}|${b.amount||0}|${b.station||''}`));
+      for (const y of years) {
+        try {
+          const r = await api('getDailySales', { year: y });
+          const items = (r?.data?.data) || r?.data || [];
+          items.forEach(b => {
+            const key = `${b.bill_no||''}|${b.date||''}|${b.amount||0}|${b.station||''}`;
+            if (!seenBillKeys.has(key)) {
+              billList.push(b);
+              seenBillKeys.add(key);
+              stats.bills++;
+            }
+          });
+        } catch(err) { stats.errors.push(`Bills ${y}: ${err.message}`); }
+      }
+      
+      // Stmts
+      const seenStmtKeys = new Set();
+      Object.values(statementsByBank).forEach(arr => {
+        (arr||[]).forEach(s => seenStmtKeys.add(`${s.bank}|${s.date}|${s.time}|${s.amount}|${s.ref_no||''}`));
+      });
+      for (const y of years) {
+        try {
+          const r = await api('getStatements', { year: y });
+          const items = (r?.data?.data) || r?.data || [];
+          items.forEach(s => {
+            const key = `${s.bank}|${s.date}|${s.time}|${s.amount}|${s.ref_no||''}`;
+            if (!seenStmtKeys.has(key)) {
+              if (!statementsByBank[s.bank]) statementsByBank[s.bank] = [];
+              statementsByBank[s.bank].push(s);
+              seenStmtKeys.add(key);
+              stats.stmts++;
+            }
+          });
+        } catch(err) { stats.errors.push(`Stmts ${y}: ${err.message}`); }
+      }
+      uploadedStatements = getAllStatements();
+      
+      // Payments / Cashflow / Suppliers (รวม)
+      try {
+        const r = await api('getPayments');
+        const items = (r?.data?.data) || r?.data || [];
+        const seen = new Set(paymentList.map(p => p.sp_no || p.id));
+        items.forEach(p => {
+          const k = p.sp_no || p.id;
+          if (k && !seen.has(k)) { paymentList.push(p); seen.add(k); stats.payments++; }
+        });
+      } catch(err) { stats.errors.push(`SP: ${err.message}`); }
+      
+      try {
+        const r = await api('getCashflow');
+        const items = (r?.data?.data) || r?.data || [];
+        const seen = new Set(cashflowList.map(c => c.id));
+        items.forEach(c => {
+          if (c.id && !seen.has(c.id)) { cashflowList.push(c); seen.add(c.id); stats.cashflow++; }
+        });
+      } catch(err) { stats.errors.push(`CF: ${err.message}`); }
+      
+      try {
+        const r = await api('getSuppliers');
+        const items = (r?.data?.data) || r?.data || [];
+        const seen = new Set(supplierList.map(s => s.supplier_id || s.id || s.name));
+        items.forEach(s => {
+          const k = s.supplier_id || s.id || s.name;
+          if (k && !seen.has(k)) { supplierList.push(s); seen.add(k); stats.suppliers++; }
+        });
+      } catch(err) { stats.errors.push(`Suppliers: ${err.message}`); }
+      
+      // Meta
+      for (const y of years) {
+        try {
+          const r = await api('getDailyMeta', { year: y });
+          if (r?.data?.summary?.__byDate) {
+            if (!mainSummary.__byDate) mainSummary.__byDate = {};
+            Object.entries(r.data.summary.__byDate).forEach(([d, v]) => {
+              if (!mainSummary.__byDate[d]) { mainSummary.__byDate[d] = v; stats.meta++; }
+            });
+          }
+          if (r?.data?.cash_count?.__byDate) {
+            if (!cashCount.__byDate) cashCount.__byDate = {};
+            Object.entries(r.data.cash_count.__byDate).forEach(([d, v]) => {
+              if (!cashCount.__byDate[d]) cashCount.__byDate[d] = v;
+            });
+          }
+        } catch(err) { stats.errors.push(`Meta ${y}: ${err.message}`); }
+      }
+      
+      // Persist locally (หลัง merge แล้ว)
+      if (typeof persistMainState === 'function') persistMainState();
+      if (typeof invalidateBillsCache === 'function') invalidateBillsCache();
+      
+      this.lastPullAt = Date.now();
+      localStorage.setItem('sf_sync_last_pull', String(this.lastPullAt));
+      this.stats.pulled += Object.values(stats).filter(v => typeof v === 'number').reduce((a,b)=>a+b,0);
+      this.status = stats.errors.length ? 'error' : 'idle';
+      this.lastError = stats.errors[0] || null;
+      this._emit();
+      return stats;
+    } catch(err) {
+      this.status = 'error';
+      this.lastError = err.message;
+      this._emit();
+      throw err;
+    }
+  },
+  
+  // คืน text สำหรับ status badge
+  statusText() {
+    if (!this.enabled) return { text: 'Sync ปิด', color: 'var(--text3)' };
+    if (this.status === 'pushing') return { text: '☁ กำลังบันทึก…', color: 'var(--info)' };
+    if (this.status === 'pulling') return { text: '☁ กำลังดึงข้อมูล…', color: 'var(--info)' };
+    if (this.status === 'error') return { text: '⚠ Sync ผิดพลาด', color: 'var(--warn)' };
+    if (this.dirty.size > 0) return { text: `⏳ รอบันทึก (${this.dirty.size})`, color: 'var(--warn)' };
+    if (this.lastPushAt > 0) {
+      const ago = Math.round((Date.now() - this.lastPushAt) / 1000);
+      const agoStr = ago < 60 ? `${ago}s` : ago < 3600 ? `${Math.round(ago/60)}m` : `${Math.round(ago/3600)}h`;
+      return { text: `☁ Synced ${agoStr} ที่แล้ว`, color: 'var(--success)' };
+    }
+    return { text: '☁ Ready', color: 'var(--text3)' };
+  },
+};
+syncManager.init();
+window.syncManager = syncManager;
+
 function persistMainState() {
   // Bump version → invalidate ทุก cache ที่ check _stateVersion
   _stateVersion++;
@@ -1265,6 +1507,10 @@ function persistMainState() {
       safeStorage.set('sf_transferLog', JSON.stringify(transferLog));
     } catch (e) { console.warn('Could not persist:', e); }
   }, 500);
+  
+  // Hybrid: mark ทุกอย่าง dirty → syncManager จะ debounce push backend
+  // (ไม่ block UI — เป็น fire-and-forget)
+  try { syncManager.markDirty(); } catch(_) {}
 }
 
 // Flush pending writes ทันที (เรียกก่อน save หรือปิดหน้า)
@@ -8649,6 +8895,46 @@ function showApp() {
   navigateTo('main');
   // โหลด meta data จาก backend (กันกรณีล้าง localStorage)
   loadMetaFromBackend().catch(err => console.warn('loadMeta failed:', err));
+  
+  // Hybrid sync: auto-pull ถ้า local ว่าง (เช่น เครื่องใหม่/browser ใหม่)
+  // จะ skip อัตโนมัติถ้ามี local data + lastPull ภายใน 30 นาที
+  setTimeout(() => {
+    if (!syncManager.enabled) return;
+    syncManager.pullFromCloud(2, 'auto')
+      .then(r => {
+        if (r?.skipped) {
+          console.log('[sync] auto-pull skipped:', r.skipped);
+        } else if (r) {
+          const total = (r.bills||0) + (r.stmts||0) + (r.payments||0) + (r.cashflow||0);
+          if (total > 0) {
+            toast(`☁️ Auto-sync: โหลด ${total} รายการใหม่จาก cloud`, 'success', 4000);
+            // Refresh current page to show new data
+            if (currentPage) navigateTo(currentPage);
+          }
+        }
+      })
+      .catch(err => console.warn('[sync] auto-pull failed:', err));
+  }, 1500); // delay 1.5s ให้หน้า Main render เสร็จก่อน
+  
+  // Wire up sync status badge (refresh ทุก 5s หรือเมื่อ syncManager emit)
+  const badge = document.getElementById('sync-status-badge');
+  if (badge) {
+    const update = () => {
+      const s = syncManager.statusText();
+      badge.textContent = s.text;
+      badge.style.color = s.color;
+    };
+    update();
+    syncManager.onChange(update);
+    setInterval(update, 5000); // refresh "X s ago" text
+    // Click to force push now
+    badge.onclick = async () => {
+      if (syncManager.status !== 'idle' && syncManager.status !== 'error') return;
+      syncManager.dirty.add('meta'); // ensure something to push
+      await syncManager._flushPush();
+      toast('Sync สำเร็จ', 'success', 1500);
+    };
+  }
 }
 
 // ── โหลด summary/cash_count/change ย้อนหลังจาก backend → merge เข้า mainSummary, cashCount ──
@@ -10408,7 +10694,7 @@ async function renderMatching(el) {
               <div class="text-xs font-semi" style="margin-bottom:6px">✏️ หรือกรอกเลขบิลเอง (กรณีบิลยังไม่อยู่ในระบบ)</div>
               <div class="flex gap-2">
                 <input class="input" id="mm-manual-bill" placeholder="เลขบิล เช่น SS00126-001234" style="flex:1">
-                <input class="input" id="mm-manual-station" placeholder="Station" value="Invoice" style="width:100px">
+                <input class="input" id="mm-manual-station" placeholder="Station" style="width:100px">
               </div>
             </div>
             
@@ -10584,7 +10870,7 @@ async function renderMatching(el) {
         
         document.getElementById('mm-confirm')?.addEventListener('click', () => {
           const manualBill = (document.getElementById('mm-manual-bill')?.value || '').trim();
-          const manualStation = (document.getElementById('mm-manual-station')?.value || 'Invoice').trim();
+          const manualStation = (document.getElementById('mm-manual-station')?.value || '').trim();
           const reason = document.getElementById('mm-reason').value || '';
           
           // ── กรณี 1: เลือกบิลจาก list (1 หรือหลายบิล) ──
@@ -11107,6 +11393,26 @@ function renderData(el) {
         ${statCard('Statement', totalStmts, '', 'var(--purple)', ICONS.file)}
       </div>
       
+      <!-- Sync from Cloud Section -->
+      <div class="card mb-3" style="border:1.5px solid var(--success);background:rgba(45,212,160,.04)">
+        <div class="flex justify-between items-center">
+          <div>
+            <div class="font-semi" style="color:var(--success)">☁️ Sync ข้อมูลจาก Cloud (Google Sheet)</div>
+            <div class="text-xs text-muted mt-1">ดึง bills + statements + SP + cashflow + suppliers กลับมาที่ browser เครื่องนี้ · <strong>ใช้เมื่อเปิดเครื่องใหม่ หรือ browser ใหม่</strong></div>
+          </div>
+          <div class="flex gap-2 items-center">
+            <select class="select" id="sync-years" style="width:110px">
+              <option value="1">ปีนี้</option>
+              <option value="2" selected>2 ปี</option>
+              <option value="3">3 ปี</option>
+              <option value="5">5 ปี</option>
+            </select>
+            <button class="btn btn-primary btn-sm" id="btn-sync-cloud">☁️ ดึงข้อมูล</button>
+          </div>
+        </div>
+        <div id="sync-status" class="text-xs text-muted mt-2" style="display:none"></div>
+      </div>
+      
       <!-- Daily Import Section -->
       <div class="card mb-3" style="border:1.5px solid var(--primary);background:rgba(91,124,250,.04)">
         <div class="flex justify-between items-center mb-3">
@@ -11181,6 +11487,163 @@ function renderData(el) {
         </div>
       </div>
     `;
+    
+    // ── Sync from Cloud ──
+    document.getElementById('btn-sync-cloud')?.addEventListener('click', async () => {
+      const yearsCount = Number(document.getElementById('sync-years').value) || 2;
+      const now = new Date();
+      const years = [];
+      for (let i = 0; i < yearsCount; i++) years.push(String(now.getFullYear() - i));
+      
+      const btn = document.getElementById('btn-sync-cloud');
+      const statusEl = document.getElementById('sync-status');
+      btn.disabled = true;
+      btn.textContent = '⏳ กำลังดึง...';
+      statusEl.style.display = 'block';
+      statusEl.style.color = 'var(--info)';
+      statusEl.textContent = `กำลังดึงข้อมูล ${yearsCount} ปี (${years.join(', ')})...`;
+      
+      const stats = { bills: 0, stmts: 0, payments: 0, cashflow: 0, suppliers: 0, meta: 0, errors: [] };
+      
+      try {
+        // 1) Bills (per year)
+        const mergedBills = [];
+        const seenBillKeys = new Set(billList.map(b => `${b.bill_no||''}|${b.date||''}|${b.amount||0}|${b.station||''}`));
+        for (const y of years) {
+          try {
+            statusEl.textContent = `กำลังดึง Bills ปี ${y}...`;
+            const r = await api('getDailySales', { year: y });
+            const items = (r?.data?.data) || r?.data || [];
+            items.forEach(b => {
+              const key = `${b.bill_no||''}|${b.date||''}|${b.amount||0}|${b.station||''}`;
+              if (!seenBillKeys.has(key)) {
+                mergedBills.push(b);
+                seenBillKeys.add(key);
+                stats.bills++;
+              }
+            });
+          } catch(err) { stats.errors.push(`Bills ${y}: ${err.message}`); }
+        }
+        if (mergedBills.length) billList = billList.concat(mergedBills);
+        
+        // 2) Statements (per year)
+        for (const y of years) {
+          try {
+            statusEl.textContent = `กำลังดึง Statements ปี ${y}...`;
+            const r = await api('getStatements', { year: y });
+            const items = (r?.data?.data) || r?.data || [];
+            const seenStmtKeys = new Set();
+            Object.values(statementsByBank).forEach(arr => {
+              (arr||[]).forEach(s => seenStmtKeys.add(`${s.bank}|${s.date}|${s.time}|${s.amount}|${s.ref_no||''}`));
+            });
+            items.forEach(s => {
+              const key = `${s.bank}|${s.date}|${s.time}|${s.amount}|${s.ref_no||''}`;
+              if (!seenStmtKeys.has(key)) {
+                if (!statementsByBank[s.bank]) statementsByBank[s.bank] = [];
+                statementsByBank[s.bank].push(s);
+                seenStmtKeys.add(key);
+                stats.stmts++;
+              }
+            });
+          } catch(err) { stats.errors.push(`Stmts ${y}: ${err.message}`); }
+        }
+        uploadedStatements = getAllStatements();
+        
+        // 3) Payments (SP) — ไม่มี year param ดึงทั้งหมด
+        try {
+          statusEl.textContent = 'กำลังดึง SP Payments...';
+          const r = await api('getPayments');
+          const items = (r?.data?.data) || r?.data || [];
+          const seenSp = new Set(paymentList.map(p => p.sp_no || p.id));
+          items.forEach(p => {
+            const key = p.sp_no || p.id;
+            if (key && !seenSp.has(key)) {
+              paymentList.push(p);
+              seenSp.add(key);
+              stats.payments++;
+            }
+          });
+        } catch(err) { stats.errors.push(`SP: ${err.message}`); }
+        
+        // 4) Cashflow
+        try {
+          statusEl.textContent = 'กำลังดึง Cashflow...';
+          const r = await api('getCashflow');
+          const items = (r?.data?.data) || r?.data || [];
+          const seenCf = new Set(cashflowList.map(c => c.id));
+          items.forEach(c => {
+            if (c.id && !seenCf.has(c.id)) {
+              cashflowList.push(c);
+              seenCf.add(c.id);
+              stats.cashflow++;
+            }
+          });
+        } catch(err) { stats.errors.push(`Cashflow: ${err.message}`); }
+        
+        // 5) Suppliers
+        try {
+          statusEl.textContent = 'กำลังดึง Suppliers...';
+          const r = await api('getSuppliers');
+          const items = (r?.data?.data) || r?.data || [];
+          const seenSup = new Set(supplierList.map(s => s.supplier_id || s.id || s.name));
+          items.forEach(s => {
+            const key = s.supplier_id || s.id || s.name;
+            if (key && !seenSup.has(key)) {
+              supplierList.push(s);
+              seenSup.add(key);
+              stats.suppliers++;
+            }
+          });
+        } catch(err) { stats.errors.push(`Suppliers: ${err.message}`); }
+        
+        // 6) Meta (summary + cashCount) — loadMetaFromBackend existing
+        try {
+          statusEl.textContent = 'กำลังดึง Daily Summary...';
+          for (const y of years) {
+            const r = await api('getDailyMeta', { year: y });
+            if (r?.data?.summary?.__byDate) {
+              if (!mainSummary.__byDate) mainSummary.__byDate = {};
+              Object.entries(r.data.summary.__byDate).forEach(([d, v]) => {
+                if (!mainSummary.__byDate[d]) { mainSummary.__byDate[d] = v; stats.meta++; }
+              });
+            }
+            if (r?.data?.cash_count?.__byDate) {
+              if (!cashCount.__byDate) cashCount.__byDate = {};
+              Object.entries(r.data.cash_count.__byDate).forEach(([d, v]) => {
+                if (!cashCount.__byDate[d]) cashCount.__byDate[d] = v;
+              });
+            }
+          }
+        } catch(err) { stats.errors.push(`Meta: ${err.message}`); }
+        
+        // Persist + refresh
+        persistMainState();
+        invalidateBillsCache();
+        
+        const errMsg = stats.errors.length ? `\n\n⚠️ ข้อผิดพลาด:\n${stats.errors.slice(0,3).join('\n')}` : '';
+        const summary = 
+          `✅ Sync สำเร็จ\n\n` +
+          `  • Bills: +${stats.bills}\n` +
+          `  • Statements: +${stats.stmts}\n` +
+          `  • SP Payments: +${stats.payments}\n` +
+          `  • Cashflow: +${stats.cashflow}\n` +
+          `  • Suppliers: +${stats.suppliers}\n` +
+          `  • Summary/Meta: +${stats.meta} วัน` + errMsg;
+        alert(summary);
+        
+        statusEl.style.color = stats.errors.length ? 'var(--warn)' : 'var(--success)';
+        statusEl.textContent = `✓ เสร็จ — Bills +${stats.bills}, Stmts +${stats.stmts}, SP +${stats.payments}, CF +${stats.cashflow}, Suppliers +${stats.suppliers}`;
+        
+        render(); // refresh counters
+      } catch(err) {
+        statusEl.style.color = 'var(--danger)';
+        statusEl.textContent = `✗ Sync ล้มเหลว: ${err.message}`;
+        toast('Sync ล้มเหลว: ' + err.message, 'error');
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '☁️ ดึงข้อมูล';
+      }
+    });
     
     // ── Backup JSON ──
     // ── Clear Daily ทั้งหมด ──
