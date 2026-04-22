@@ -2566,10 +2566,13 @@ async function renderMain(el) {
     const cashIn = sumStations(st => _getSummaryValue('cashIn', st));
     const cashOut = sumStations(st => _getSummaryValue('cashOut', st));
     const returns = sumStations(st => _getSummaryValue('returns', st));
+    // sales: ใช้ calcSales() ตรงๆ (รู้วิธีเลือก summary/bills ตาม station แล้ว)
+    //   - Front1-4: flat summary ก่อน → fallback bills
+    //   - Invoice/Order/Payment/IC/OC: bills ของวันนั้นเสมอ
+    // ก่อนหน้านี้ใช้ summaryRow() → bug: labelObj['Invoice']=undefined → return 0 → ไม่ fallback
     let sales = 0;
     stationsFor(station).forEach(st => {
-      const summaryVal = summaryRow('ยอดขาย', st);
-      sales += (summaryVal !== null ? summaryVal : calcSales(st));
+      sales += calcSales(st);
     });
     
     // Drawer adjusted = raw − cashIn (ใช้ค่าเดียวกับ display)
