@@ -2804,6 +2804,225 @@ function getCashForDate(dateISO) {
   }
 })();
 
+// ══════════════════════════════════════════════════════════════
+// QUICK MATCH / UNMATCH — ในหน้า Main (ไม่ต้องไปหน้า Matching)
+// ══════════════════════════════════════════════════════════════
+
+// Unmatch bill + statement ที่ผูกกันอยู่ (2-way)
+function quickUnmatchBill(b) {
+  if (!b) return;
+  if (b.match_status !== 'matched') { toast('บิลนี้ไม่ได้อยู่ในสถานะ matched', 'info'); return; }
+  
+  const stmtRef = b.matched_stmt_ref;
+  const bank = b.confirmation || b.bank || '?';
+  
+  if (!confirm(`ยกเลิก match บิล ${b.bill_no||'(ไม่มีเลข)'}?\n\n• Bill → pending, ล้าง confirmation/pay_date\n${stmtRef?`• Statement (${bank} · ref ${stmtRef}) → unmatched`:''}`)) return;
+  
+  // 1) หา statement ที่ผูกอยู่ → unmatch
+  let stmtCleared = false;
+  if (stmtRef) {
+    const allStmts = getAllStatements();
+    const stmt = allStmts.find(s => s.ref_no === stmtRef);
+    if (stmt) {
+      stmt.match_status = 'unmatched';
+      delete stmt.match_bill;
+      delete stmt.matched_bills;
+      delete stmt.match_station;
+      delete stmt.match_method;
+      delete stmt.matched_at;
+      delete stmt.matched_by;
+      delete stmt.match_reason;
+      stmtCleared = true;
+    }
+  }
+  
+  // 2) Unmatch bill
+  b.match_status = 'pending';
+  delete b.confirmation;
+  delete b.pay_date;
+  delete b.matched_stmt_ref;
+  delete b.matched_at;
+  
+  try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(_){}
+  persistMainState();
+  invalidateBillsCache();
+  
+  toast(`ยกเลิก match สำเร็จ${stmtCleared?' — statement กลับเป็น pending แล้ว':' (ไม่เจอ statement ผูกอยู่)'}`, 'success');
+  
+  // Re-render หน้า Main
+  const mainEl = document.getElementById('main');
+  if (mainEl && typeof currentPage !== 'undefined' && currentPage === 'main') navigateTo('main');
+}
+
+// Open Quick Match modal: เลือก statement วันเดียวกัน + ธนาคารเดียวกัน
+function openQuickMatchModal(b) {
+  if (!b) return;
+  const billDate = toISODate(b.date);
+  const billAmt = Math.abs(Number(b.amount)||0);
+  const billBank = String(b.bank||'').trim().toUpperCase();
+  
+  // State ของ modal
+  let selectedBank = billBank || 'ALL'; // default = bank ของ bill
+  let selectedStmtRef = '';
+  
+  function computeCandidates() {
+    const all = getAllStatements();
+    return all.filter(s => {
+      if (s.match_status === 'matched') return false;
+      const sDate = toISODate(s.date || s.trans_date);
+      if (sDate !== billDate) return false;
+      if (selectedBank !== 'ALL' && String(s.bank||'').toUpperCase() !== selectedBank) return false;
+      // ทิศทาง: bill type Transfer/Cheque/Card = receive → statement amount > 0
+      // (ยกเว้น Refund แต่ quick-match ไม่เปิดให้ Refund อยู่แล้ว)
+      // default: match ทั้งทิศทางไปก่อน เพื่อ flexibility
+      return true;
+    }).sort((a,c) => {
+      // ยอดตรงเป๊ะขึ้นก่อน
+      const da = Math.abs(Math.abs(Number(a.amount)||0) - billAmt);
+      const dc = Math.abs(Math.abs(Number(c.amount)||0) - billAmt);
+      return da - dc;
+    });
+  }
+  
+  // นับ statement แต่ละธนาคาร (เฉพาะวันนั้น + unmatched)
+  function computeBankCounts() {
+    const counts = {};
+    getAllStatements().forEach(s => {
+      if (s.match_status === 'matched') return;
+      const sDate = toISODate(s.date || s.trans_date);
+      if (sDate !== billDate) return;
+      const bk = String(s.bank||'UNKNOWN').toUpperCase();
+      counts[bk] = (counts[bk]||0) + 1;
+    });
+    return counts;
+  }
+  
+  function renderList() {
+    const list = computeCandidates();
+    const container = document.getElementById('qm-stmt-list');
+    if (!container) return;
+    
+    if (list.length === 0) {
+      container.innerHTML = `<div style="padding:20px;text-align:center;color:var(--text3);font-size:.85rem">
+        ไม่พบ statement ${selectedBank!=='ALL'?`ของ ${selectedBank} `:''}วันที่ ${fmtDate(billDate)} ที่ยังไม่ถูก match
+      </div>`;
+      return;
+    }
+    
+    container.innerHTML = list.map(s => {
+      const absAmt = Math.abs(Number(s.amount)||0);
+      const isExact = Math.abs(absAmt - billAmt) < 0.01;
+      const isSelected = s.ref_no === selectedStmtRef;
+      const dir = Number(s.amount) >= 0 ? '+' : '−';
+      const dirColor = Number(s.amount) >= 0 ? 'var(--success)' : 'var(--danger)';
+      return `
+        <div class="qm-item" data-ref="${s.ref_no||''}" 
+             style="padding:10px 12px;border-bottom:1px solid var(--border);cursor:pointer;${isSelected?'background:rgba(79,156,249,.12)':''};${isExact?'border-left:3px solid var(--success)':''}">
+          <div class="flex justify-between items-center">
+            <div style="flex:1;min-width:0">
+              <div style="font-weight:700;color:${dirColor};font-size:.9rem">${dir}฿${fmtNum(absAmt)}</div>
+              <div class="text-xs text-muted" style="margin-top:2px">
+                ${fmtDate(s.date)} · ${s.bank||'?'} · ref: ${s.ref_no||'-'}
+              </div>
+              ${s.description?`<div class="text-xs" style="color:var(--text2);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${String(s.description).substring(0,80)}</div>`:''}
+            </div>
+            ${isExact?'<span class="badge badge-success" style="font-size:.7rem">ยอดตรง ✓</span>':`<span class="text-xs" style="color:var(--text3)">ต่าง ฿${fmtNum(Math.abs(absAmt-billAmt))}</span>`}
+          </div>
+        </div>
+      `;
+    }).join('');
+    
+    // Wire click
+    container.querySelectorAll('.qm-item').forEach(el => {
+      el.addEventListener('click', () => {
+        selectedStmtRef = el.dataset.ref;
+        renderList();
+        document.getElementById('qm-confirm').disabled = !selectedStmtRef;
+      });
+    });
+  }
+  
+  const bankCounts = computeBankCounts();
+  const allBanks = ['KTB','KBANK','BBL','BBL NW'];
+  
+  openModal(`🔗 Match Bill → Statement`, `
+    <div class="flex-col gap-3" style="min-width:500px">
+      <div style="padding:10px;background:var(--bg2);border-radius:6px;font-size:.85rem">
+        Bill: <b>${b.bill_no||'(ไม่มีเลข)'}</b> · ${b.type||'-'} · <b style="color:var(--success)">฿${fmtNum(billAmt)}</b> · ${fmtDate(billDate)}
+        ${b.station?`<br><span class="text-xs text-muted">Station: ${b.station}</span>`:''}
+        ${billBank?`<br><span class="text-xs text-muted">Bank ที่ระบุ: ${billBank}</span>`:''}
+      </div>
+      
+      <div>
+        <div class="text-xs text-dim" style="margin-bottom:6px">เลือกธนาคาร:</div>
+        <div class="flex gap-1 flex-wrap" id="qm-bank-pills">
+          ${allBanks.map(bk => {
+            const c = bankCounts[bk]||0;
+            const active = selectedBank === bk;
+            return `<button class="pill ${active?'active':''}" data-bank="${bk}" ${c===0?'style="opacity:.4"':''}>${bk} (${c})</button>`;
+          }).join('')}
+          <button class="pill ${selectedBank==='ALL'?'active':''}" data-bank="ALL">ทั้งหมด</button>
+        </div>
+      </div>
+      
+      <div>
+        <div class="text-xs text-dim" style="margin-bottom:6px">Statement วันเดียวกันที่ยังไม่ match:</div>
+        <div id="qm-stmt-list" style="max-height:280px;overflow-y:auto;border:1px solid var(--border);border-radius:6px"></div>
+      </div>
+      
+      <div class="flex gap-2 mt-2">
+        <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ยกเลิก</button>
+        <button class="btn btn-primary btn-sm flex-1" id="qm-confirm" disabled>${ICONS.check} ผูกเข้ากัน</button>
+      </div>
+    </div>
+  `);
+  
+  // Wire bank pills
+  document.querySelectorAll('#qm-bank-pills [data-bank]').forEach(p => {
+    p.addEventListener('click', () => {
+      selectedBank = p.dataset.bank;
+      document.querySelectorAll('#qm-bank-pills .pill').forEach(x => x.classList.toggle('active', x.dataset.bank === selectedBank));
+      selectedStmtRef = '';
+      document.getElementById('qm-confirm').disabled = true;
+      renderList();
+    });
+  });
+  
+  renderList();
+  
+  document.getElementById('qm-confirm')?.addEventListener('click', () => {
+    const allStmts = getAllStatements();
+    const stmt = allStmts.find(s => s.ref_no === selectedStmtRef);
+    if (!stmt) { toast('ไม่พบ statement', 'error'); return; }
+    
+    // Update bill
+    b.match_status = 'matched';
+    b.confirmation = stmt.bank || '';
+    if (!b.pay_date) b.pay_date = toISODate(stmt.date) || toISODate(b.date);
+    b.matched_stmt_ref = stmt.ref_no || '';
+    b.matched_at = new Date().toISOString();
+    
+    // Update statement
+    stmt.match_status = 'matched';
+    stmt.match_method = 'quick_manual';
+    stmt.match_station = b.station || '';
+    stmt.match_bill = b.bill_no || '';
+    stmt.matched_at = new Date().toISOString();
+    stmt.matched_by = currentUser?.display_name || 'Admin';
+    stmt.match_reason = 'Quick match จากหน้า Main';
+    delete stmt.matched_bills; // single-bill match
+    
+    try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(_){}
+    persistMainState();
+    invalidateBillsCache();
+    closeModal();
+    toast(`Match สำเร็จ: ${b.bill_no||'(bill)'} ↔ ${stmt.bank} ฿${fmtNum(Math.abs(Number(stmt.amount)||0))}`, 'success');
+    
+    // Re-render
+    if (typeof currentPage !== 'undefined' && currentPage === 'main') navigateTo('main');
+  });
+}
+
 // ── Render Main Page (Summary + Bill List + Change Counting) ──
 async function renderMain(el) {
   let filterStation = 'ALL';
@@ -3232,10 +3451,6 @@ async function renderMain(el) {
           </div>
           <button class="btn btn-primary btn-sm" id="btn-gen-smart">${ICONS.download} Smart (SS/OS/OR/SR)</button>
           <button class="btn btn-info btn-sm" id="btn-import-pos" style="background:var(--info);color:#fff">${ICONS.download} Front POS</button>
-          <label class="btn btn-outline btn-sm" style="cursor:pointer" title="Import Daily JSON ที่ convert ไว้แล้ว (หลายวันรวด)">
-            📅 Batch Import (JSON)
-            <input type="file" id="btn-import-daily-json" accept=".json" style="display:none">
-          </label>
           <button class="btn ${showChange?'btn-primary':'btn-outline'} btn-sm" id="btn-toggle-change">🪙 นับธนบัตร</button>
           <button class="btn btn-outline btn-sm" id="btn-check-issues">🔍 ตรวจสอบ</button>
           <button class="btn btn-success btn-sm" id="btn-save-main">${ICONS.check} บันทึก</button>
@@ -3440,7 +3655,7 @@ async function renderMain(el) {
           <button class="btn btn-outline btn-sm" id="btn-bulk-date">📅 Bulk</button>
           <button class="btn btn-outline btn-sm" id="btn-auto-duedate">⚡ Auto Due</button>
           <button class="btn btn-sm" id="btn-delete-selected" style="background:var(--danger);color:#fff;display:none">🗑 ลบที่เลือก (<span id="del-count">0</span>)</button>
-          <button class="btn btn-outline btn-sm" id="btn-clear-bl">ล้าง</button>
+          <button class="btn btn-outline btn-sm" id="btn-clear-bl" title="ล้างข้อมูลเฉพาะวันนี้ ไม่กระทบวันอื่น">🗑 ล้างวันนี้ (${fmtDate(selectedDate)})</button>
         </div>
       </div>
 
@@ -3621,6 +3836,20 @@ async function renderMain(el) {
                     </td>
                     <td style="white-space:nowrap;text-align:center">
                       <button class="btn-edit-bill" data-idx="${realIdx}" title="แก้ไขบิล" style="background:var(--info-bg);border:1px solid var(--info);color:var(--info);padding:3px 10px;border-radius:4px;cursor:pointer;font-size:.8rem">✏️ แก้ไข</button>
+                      ${(() => {
+                        // Quick Match / Unmatch — เฉพาะ Transfer/Card/Cheque (ข้าม Cash)
+                        if (isVoid || b.paid_by_sp) return '';
+                        if (!['Transfer','Card','Cheque'].includes(b.type)) return '';
+                        // Matched สภาพเดียว (ไม่รวม paid จาก SP) → Unmatch
+                        if (b.match_status === 'matched') {
+                          return `<button class="btn-qm-unmatch" data-idx="${realIdx}" title="ยกเลิก match — statement กลับเป็น pending ด้วย" style="background:transparent;border:1px solid var(--danger);color:var(--danger);padding:3px 8px;margin-left:4px;border-radius:4px;cursor:pointer;font-size:.78rem">🔓 Unmatch</button>`;
+                        }
+                        // ยังไม่ match → Match
+                        if (isPendingMatch || isAwaitingClear || (b.type === 'Cheque' && !isBounced && !isPaid)) {
+                          return `<button class="btn-qm-match" data-idx="${realIdx}" title="เลือก statement มา match" style="background:var(--info-bg);border:1px solid var(--info);color:var(--info);padding:3px 8px;margin-left:4px;border-radius:4px;cursor:pointer;font-size:.78rem;font-weight:600">🔗 Match</button>`;
+                        }
+                        return '';
+                      })()}
                     </td>
                   </tr>`;
                 }).join('')
@@ -3819,230 +4048,6 @@ async function renderMain(el) {
       triggerFileUpload('file-sales', parseFrontPosReport);
     });
     
-    // ══════════════════════════════════════════════════════════════
-    // Batch Daily JSON Import — หลายวันรวดเดียว
-    // รองรับ JSON ที่สร้างจาก batch_convert_daily.py
-    // Structure: { billList, mainSummary, statementsByBank, filesProcessed }
-    // ══════════════════════════════════════════════════════════════
-    document.getElementById('btn-import-daily-json')?.addEventListener('change', async e => {
-      const f = e.target.files[0];
-      if (!f) return;
-      try {
-        const text = await f.text();
-        const data = JSON.parse(text);
-        
-        if (!Array.isArray(data.billList)) {
-          toast('ไฟล์ JSON ไม่ถูก format (ต้องมี billList, statementsByBank)', 'error');
-          return;
-        }
-        
-        const nBills = data.billList?.length || 0;
-        const nKtb = data.statementsByBank?.KTB?.length || 0;
-        const nKbank = data.statementsByBank?.KBANK?.length || 0;
-        const nBblNw = data.statementsByBank?.['BBL NW']?.length || 0;
-        const nSummary = Object.keys(data.mainSummary || {}).length;
-        const nFiles = data.filesProcessed?.length || 0;
-        const dateList = data.filesProcessed?.map(f => f.date).sort() || [];
-        const dateRange = dateList.length > 0 ? `${dateList[0]} → ${dateList[dateList.length-1]}` : '';
-        
-        openModal(`📅 Import Daily Files — ${nFiles} ไฟล์`, `
-          <div class="flex-col gap-3">
-            <div style="padding:12px;background:rgba(79,156,249,.08);border-radius:8px">
-              <div class="text-sm font-semi">${nFiles} ไฟล์ · ${dateRange}</div>
-              <div class="text-xs text-muted" style="margin-top:6px;line-height:1.8">
-                • 📄 Bills: <strong>${nBills}</strong> รายการ<br>
-                • 🏦 KTB Statement: <strong>${nKtb}</strong> ธุรกรรม<br>
-                • 🏦 KBANK Statement: <strong>${nKbank}</strong> ธุรกรรม<br>
-                • 🏦 BBL NW Statement: <strong>${nBblNw}</strong> ธุรกรรม<br>
-                • 📊 Daily Summary: <strong>${nSummary}</strong> วัน
-              </div>
-            </div>
-            
-            <div class="input-group">
-              <label>โหมดการ import</label>
-              <div class="flex gap-2" id="di-mode-pills">
-                <button type="button" class="pill active" data-mode="merge">🔀 Merge (เพิ่มเข้าของเดิม)</button>
-                <button type="button" class="pill" data-mode="replace">🗑 Replace (แทนที่ทั้งหมด)</button>
-              </div>
-              <input type="hidden" id="di-mode" value="merge">
-              <div class="text-xs text-muted mt-1">Merge: เก็บบิลเดิมทั้งหมด + เพิ่มบิลใหม่ · Replace: ลบของเดิมทิ้ง</div>
-            </div>
-            
-            <div class="input-group">
-              <label><input type="checkbox" id="di-skip-dup" checked> ข้ามบิลซ้ำ (bill_no + type + ยอด ตรงกัน)</label>
-              <label><input type="checkbox" id="di-skip-stmt-dup" checked> ข้าม statement ซ้ำ (ref + date + amount)</label>
-            </div>
-            
-            <div class="flex gap-2 mt-2">
-              <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ยกเลิก</button>
-              <button class="btn btn-primary btn-sm flex-1" id="di-confirm">${ICONS.check} ยืนยัน Import</button>
-            </div>
-          </div>
-        `);
-        
-        document.querySelectorAll('#di-mode-pills [data-mode]').forEach(btn => {
-          btn.addEventListener('click', () => {
-            const m = btn.dataset.mode;
-            document.querySelectorAll('#di-mode-pills .pill').forEach(p => p.classList.toggle('active', p.dataset.mode === m));
-            document.getElementById('di-mode').value = m;
-          });
-        });
-        
-        document.getElementById('di-confirm')?.addEventListener('click', () => {
-          const mode = document.getElementById('di-mode').value;
-          const skipDup = document.getElementById('di-skip-dup').checked;
-          const skipStmtDup = document.getElementById('di-skip-stmt-dup').checked;
-          
-          let billsAdded = 0, billsSkipped = 0;
-          let stmtAdded = 0, stmtSkipped = 0;
-          
-          // ── Bills ──
-          if (mode === 'replace') {
-            billList = [];
-          }
-          // Composite dedup key: bill_no + type + amount (เก็บ split payment ได้)
-          // เลขบิลเดียวกันที่จ่ายคนละ method/ยอดจะไม่ถูกมองว่าซ้ำ
-          const makeDupKey = (b) => `${b.bill_no||''}|${b.type||b.pay_method||''}|${Number(b.amount)||0}`;
-          const existingBillSet = skipDup ? new Set(billList.filter(b => b.bill_no).map(makeDupKey)) : null;
-          
-          data.billList.forEach(b => {
-            // Skip dup by composite key (bill_no เปล่าจะผ่านเสมอ เพราะไม่มี bill_no ให้ dedup)
-            const dupKey = makeDupKey(b);
-            if (skipDup && b.bill_no && existingBillSet.has(dupKey)) {
-              billsSkipped++;
-              return;
-            }
-            // Normalize bill format ให้ตรงกับระบบ
-            // SP/SC/JS/JR ไม่ auto-fill bank จาก confirmation
-            const _bp = String(b.bill_no || '').toUpperCase();
-            const _noBank = _bp.startsWith('SP') || _bp.startsWith('SC') || _bp.startsWith('JS') || _bp.startsWith('JR');
-            const newBill = {
-              bill_no: b.bill_no || '',
-              date: b.date_th || b.date || '',
-              station: b.station || '',
-              type: b.type || '',
-              amount: Number(b.amount) || 0,
-              confirmation: b.confirmation || '',
-              pay_date: b.pay_date || '',
-              remarks1: b.remarks1 || '',
-              remarks2: b.remarks2 || '',
-              bank: _noBank ? '' : (b.confirmation || ''),
-              match_status: 'pending',
-              source: 'daily_import',
-              source_file: b.source_file || '',
-            };
-            billList.push(newBill);
-            if (b.bill_no && existingBillSet) existingBillSet.add(dupKey);
-            billsAdded++;
-          });
-          
-          // ── Main Summary — Store per-date + flatten for currently selected date ──
-          // Legacy keys: sales_Front1, cashIn_Front2 etc. (flat)
-          // New keys: dailySummaries[date] = full nested summary
-          if (!mainSummary || typeof mainSummary !== 'object') mainSummary = {};
-          if (!mainSummary.__byDate) mainSummary.__byDate = {};
-          
-          // Map Thai labels → legacy key prefix
-          const LABEL_MAP = {
-            'นำเงินเข้า': 'cashIn',
-            'ยอดขาย': 'sales',
-            'นำเงินออก': 'cashOut',
-            'ยอดคืนสินค้า': 'returns',
-            'Cash Drawer': 'cashDrawer',
-            'Transfer': 'transfer',
-            'Card': 'card',
-            'Cheque': 'cheque',
-            'Refund': 'refund',
-          };
-          
-          let summaryDates = [];
-          Object.entries(data.mainSummary || {}).forEach(([date, summary]) => {
-            // Store full summary by date (for later switching)
-            mainSummary.__byDate[date] = summary;
-            summaryDates.push(date);
-          });
-          
-          // Apply summary of most recent date as "active" (flat keys)
-          // so that Main page summary table shows numbers
-          if (summaryDates.length > 0) {
-            summaryDates.sort();
-            const activeDate = summaryDates[summaryDates.length - 1];
-            const activeSummary = mainSummary.__byDate[activeDate];
-            if (activeSummary) {
-              Object.entries(activeSummary).forEach(([thLabel, stations]) => {
-                const prefix = LABEL_MAP[thLabel];
-                if (!prefix) return;
-                ['Front1', 'Front2', 'Front3', 'Front4', 'Invoice', 'Order', 'Payment', 'Invoice Credit', 'Order Credit'].forEach(st => {
-                  const val = stations[st];
-                  if (val != null && val !== 0) {
-                    mainSummary[prefix + '_' + st] = val;
-                  }
-                });
-              });
-            }
-          }
-          
-          // ── Change Data (นับธนบัตรทอน) — import ไปเก็บใน cashCount.__byDate ──
-          if (data.changeData && typeof data.changeData === 'object') {
-            if (!cashCount.__byDate) cashCount.__byDate = {};
-            Object.entries(data.changeData).forEach(([dateISO, stationData]) => {
-              if (!cashCount.__byDate[dateISO]) cashCount.__byDate[dateISO] = {};
-              Object.entries(stationData || {}).forEach(([station, denoms]) => {
-                Object.entries(denoms || {}).forEach(([denom, count]) => {
-                  const key = denom + '_' + station;
-                  cashCount.__byDate[dateISO][key] = Number(count) || 0;
-                });
-              });
-            });
-          }
-          
-          // ── Statements ──
-          if (mode === 'replace') {
-            statementsByBank = { KTB: [], KBANK: [], 'BBL NW': [], BBL: [], TTB: [], UNKNOWN: [] };
-          } else {
-            if (!statementsByBank) statementsByBank = { KTB: [], KBANK: [], 'BBL NW': [], BBL: [], TTB: [], UNKNOWN: [] };
-            ['KTB', 'KBANK', 'BBL NW', 'BBL', 'TTB', 'UNKNOWN'].forEach(k => {
-              if (!Array.isArray(statementsByBank[k])) statementsByBank[k] = [];
-            });
-          }
-          
-          ['KTB', 'KBANK', 'BBL NW', 'BBL', 'TTB'].forEach(bankKey => {
-            const incoming = data.statementsByBank[bankKey] || [];
-            const existing = statementsByBank[bankKey] || [];
-            const dupSet = skipStmtDup ? new Set(existing.map(s => `${s.ref_no||''}|${s.date}|${s.amount}`)) : null;
-            
-            incoming.forEach(s => {
-              const key = `${s.ref_no||''}|${s.date}|${s.amount}`;
-              if (skipStmtDup && dupSet.has(key)) {
-                stmtSkipped++;
-                return;
-              }
-              existing.push(s);
-              if (dupSet) dupSet.add(key);
-              stmtAdded++;
-            });
-            statementsByBank[bankKey] = existing;
-          });
-          
-          // Persist + refresh uploadedStatements (ให้ Matching page เห็นข้อมูล)
-          uploadedStatements = getAllStatements();
-          try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(e) {}
-          persistMainState();
-          
-          closeModal();
-          toast(
-            `✅ Import สำเร็จ — บิล ${billsAdded}${billsSkipped?' ('+billsSkipped+' ซ้ำ)':''} · Statement ${stmtAdded}${stmtSkipped?' ('+stmtSkipped+' ซ้ำ)':''}`,
-            'success',
-            5000
-          );
-          render();
-        });
-      } catch (err) {
-        console.error(err);
-        toast('Import ไม่สำเร็จ: ' + err.message, 'error');
-      }
-      e.target.value = '';
-    });
     document.getElementById('btn-toggle-change')?.addEventListener('click', () => {
       showChange = !showChange; render();
     });
@@ -4811,6 +4816,28 @@ async function renderMain(el) {
     });
     
     // ── ปุ่มแก้ไขบิล (✏️) — เปิด modal ──
+    // ── Quick Match: เปิด modal เลือก statement ในวันเดียวกัน ──
+    el.querySelectorAll('.btn-qm-match').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const idx = Number(btn.dataset.idx);
+        const b = billList[idx];
+        if (!b) return;
+        openQuickMatchModal(b);
+      });
+    });
+    
+    // ── Quick Unmatch ──
+    el.querySelectorAll('.btn-qm-unmatch').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const idx = Number(btn.dataset.idx);
+        const b = billList[idx];
+        if (!b) return;
+        quickUnmatchBill(b);
+      });
+    });
+    
     el.querySelectorAll('.btn-edit-bill').forEach(btn => {
       btn.addEventListener('click', (e) => {
         e.stopPropagation();
