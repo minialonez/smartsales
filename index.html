@@ -524,19 +524,24 @@ function parseExcelFile(file) {
     reader.onload = (e) => {
       try {
         if (isCsv) {
-          // CSV → ลองอ่านเป็น TIS-620 (CP874) ก่อน ถ้าเป็นไทย
+          // CSV → auto-detect encoding: UTF-8 strict → Windows-874 (TIS-620) fallback
+          // วิธีนี้แก้ปัญหา KBANK/ธนาคารไทยแสดงภาษาประหลาด เพราะอ่าน encoding ผิด
           const bytes = new Uint8Array(e.target.result);
           let text = '';
           try {
-            // ลอง TIS-620 ก่อน (สำหรับ BBL/KTB/KBANK export CSV)
-            text = new TextDecoder('tis-620').decode(bytes);
-            // ถ้ามี char UTF-8 BOM หรือ char แปลก → ใช้ UTF-8 แทน
-            if (text.charCodeAt(0) === 0xFEFF || /[\uFFFD]{3,}/.test(text.substring(0, 500))) {
+            // ลอง UTF-8 แบบ strict ก่อน — ถ้า valid ใช้เลย (ครอบคลุม UTF-8 with/without BOM)
+            text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+          } catch {
+            // UTF-8 fail → ใช้ Windows-874 (Thai) — ไฟล์ bank ไทยส่วนใหญ่ใช้ตัวนี้
+            try {
+              text = new TextDecoder('windows-874').decode(bytes);
+            } catch {
+              // หมดทาง → UTF-8 replaceable
               text = new TextDecoder('utf-8').decode(bytes);
             }
-          } catch (err) {
-            text = new TextDecoder('utf-8').decode(bytes);
           }
+          // ตัด BOM ถ้ามี
+          if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
           // Parse CSV
           const workbook = XLSX.read(text, { type: 'string', cellDates: false, raw: true });
           const result = {};
@@ -742,6 +747,7 @@ function handleStmtUpload(result, fileName, opts = {}) {
   // KBANK:  ชื่อไฟล์ resultFile_* หรือมี "K-DEPOSIT" / "กสิกร"
   // BBL NW: ชื่อไฟล์ MyDownLoad* หรือเลขบัญชี 266-4-414113
   // BBL:    ชื่อไฟล์ Activity-* หรือเลขบัญชี 266-4-448384
+  // TTB:    ชื่อไฟล์ ACCHIST_*.xlsx หรือมี "Debit/Credit" + "Transaction type"
   // ══════════════════════════════════════════════════════════
   let bank = 'UNKNOWN';
   
@@ -750,10 +756,12 @@ function handleStmtUpload(result, fileName, opts = {}) {
   else if (nameLC.startsWith('resultfile')) bank = 'KBANK';
   else if (nameLC.startsWith('mydownload')) bank = 'BBL NW';
   else if (nameLC.startsWith('activity')) bank = 'BBL';
+  else if (nameLC.startsWith('acchist')) bank = 'TTB';
   else if (nameLC.includes('ktb') || nameLC.includes('กรุงไทย')) bank = 'KTB';
   else if (nameLC.includes('kbank') || nameLC.includes('kasikorn') || nameLC.includes('กสิกร')) bank = 'KBANK';
   else if (nameLC.includes('bbl nw') || nameLC.includes('bblnw')) bank = 'BBL NW';
   else if (nameLC.includes('bbl') || nameLC.includes('กรุงเทพ')) bank = 'BBL';
+  else if (nameLC.includes('ttb') || nameLC.includes('ทหารไทย')) bank = 'TTB';
 
   // 2) ตรวจจากเนื้อหา (override ถ้าชัดเจนกว่า)
   const firstSheet = result.sheets[result.sheetNames[0]] || [];
@@ -764,7 +772,9 @@ function handleStmtUpload(result, fileName, opts = {}) {
   else if (contentJoin.includes('266-4-414113')) bank = 'BBL NW';
   else if (contentJoin.includes('909-0-77302') || contentLC.includes('teller id')) bank = 'KTB';
   else if (contentLC.includes('k-deposit') || contentJoin.includes('กสิกร')) bank = 'KBANK';
-  else if (contentJoin.includes('วันที่ทำรายการ') && contentJoin.includes('หักบัญชี') && bank === 'UNKNOWN') bank = 'BBL';
+  else if (contentLC.includes('debit/credit') && contentLC.includes('transaction type')) bank = 'TTB';
+  else if (contentJoin.includes('ttb YALA') || contentLC.includes('at ttb ')) bank = 'TTB';
+  else if (contentJoin.includes('วันที่ทำรายการ') && contentJoin.includes('หักบัญชี')) bank = 'BBL';
   else if (contentJoin.includes('วันที่') && contentJoin.includes('หักบัญชี') && bank === 'UNKNOWN') bank = 'BBL NW';
 
   // helper: แปลง date โดยตรวจจับ พ.ศ. พิเศษ
@@ -1024,8 +1034,65 @@ function handleStmtUpload(result, fileName, opts = {}) {
         rows.push({ bank, date: convertDate(dateVal), time: extractTimeStr(dateVal), ref_no: String(r[7]||''), description: String(r[2]||''), amount: credit || -debit, match_status: 'unmatched', match_station: '', match_bill: '' });
       }
     }
+  } else if (bank === 'TTB') {
+    // TTB XLSX: ACCHIST_*.xlsx
+    // Header R1: Date | Time | Debit/Credit | Transaction type | Transaction description | Company name | Company account | Currency | Amount
+    // Data: "13/01/2026" | "09:17" | "Credit"/"Debit" | "Withdraw by Cheque" | "Deposit by cheque at ttb YALA" | "บจก. ..." | "3991079207" | "THB" | "20,975.00" / "-500.00"
+    const sheet = firstSheet;
+    // หา header row (อาจไม่ใช่ R0 เสมอ)
+    let hRow = 0;
+    for (let i = 0; i < Math.min(5, sheet.length); i++) {
+      const joined = (sheet[i]||[]).map(x => String(x||'').toLowerCase()).join('|');
+      if (joined.includes('date') && joined.includes('debit') && joined.includes('amount')) {
+        hRow = i; break;
+      }
+    }
+    
+    function parseTTBAmt(val) {
+      if (val == null || val === '') return 0;
+      // รองรับทั้ง string "20,975.00" และ number ตรงๆ
+      return Number(String(val).replace(/,/g, '').trim()) || 0;
+    }
+    
+    for (let i = hRow + 1; i < sheet.length; i++) {
+      const r = sheet[i];
+      if (!r || !r[0]) continue;
+      const dateRaw = r[0];
+      // Date format DD/MM/YYYY (Gregorian)
+      const dateStr = convertDate(dateRaw); // convertDate handles DD/MM/YYYY
+      if (!dateStr) continue;
+      
+      const dirCol = String(r[2]||'').trim().toLowerCase(); // Credit/Debit
+      const txType = String(r[3]||'').trim();
+      const txDesc = String(r[4]||'').trim();
+      const coName = String(r[5]||'').trim(); // Company name (ชื่อลูกค้า/ผู้รับ)
+      const coAcc = String(r[6]||'').trim();  // Company account
+      const rawAmt = parseTTBAmt(r[8]);       // อาจเป็นบวกหรือลบอยู่แล้ว
+      if (!rawAmt) continue;
+      
+      // TTB: บางครั้ง amount เป็นบวกเสมอ + dir บอกทิศ
+      // ถ้า amount ไม่มี sign → ใช้ dir กำหนด
+      let signedAmt;
+      if (rawAmt < 0) {
+        signedAmt = rawAmt; // มี sign อยู่แล้ว
+      } else {
+        signedAmt = dirCol.startsWith('debit') ? -rawAmt : rawAmt;
+      }
+      
+      rows.push({
+        bank,
+        date: dateStr,
+        time: String(r[1]||'').trim(),
+        ref_no: coAcc, // ใช้เลขบัญชีเป็น ref (TTB ไม่มี ref แยก)
+        description: [txType, txDesc].filter(Boolean).join(' · '),
+        amount: signedAmt,
+        sender_name: coName,
+        sender_account: coAcc,
+        sender_bank_name: '', // TTB ไม่ให้ชื่อธนาคารต้นทาง
+        match_status: 'unmatched',
+      });
+    }
   } else {
-    // Unknown format — ลองอ่าน sheet แรกเป็น generic
     const sheet = firstSheet;
     for (let i = 1; i < sheet.length; i++) {
       const r = sheet[i];
@@ -1058,7 +1125,7 @@ function handleStmtUpload(result, fileName, opts = {}) {
 }
 
 // ── Statement Storage by Bank (สะสมได้ + แยกธนาคาร) ──
-let statementsByBank = { KTB: [], KBANK: [], 'BBL NW': [], BBL: [], UNKNOWN: [] };
+let statementsByBank = { KTB: [], KBANK: [], 'BBL NW': [], BBL: [], TTB: [], UNKNOWN: [] };
 
 function addStatementRows(bank, rows) {
   if (!statementsByBank[bank]) statementsByBank[bank] = [];
@@ -1140,7 +1207,7 @@ function getAllStatements() {
 
 function clearStatementsByBank(bank) {
   if (bank === 'ALL') {
-    statementsByBank = { KTB: [], KBANK: [], 'BBL NW': [], BBL: [], UNKNOWN: [] };
+    statementsByBank = { KTB: [], KBANK: [], 'BBL NW': [], BBL: [], TTB: [], UNKNOWN: [] };
   } else {
     statementsByBank[bank] = [];
   }
@@ -3174,6 +3241,9 @@ async function renderMain(el) {
   // ── renderKeepScroll: re-render หน้าโดย preserve scroll position ──
   // ใช้แทน render() หลังแก้ไขบิล/Add Bill/Bulk ops เพื่อไม่ให้ scroll เด้งขึ้นบน
   function renderKeepScroll() {
+    // Defensive: ให้แน่ใจว่า Sum/calcs ใช้ข้อมูล bills ล่าสุด ไม่ใช่ cache
+    invalidateBillsCache();
+    
     // 1. Capture scroll positions จากทุก container ที่เป็นไปได้
     const scrollTargets = [
       { el: window, x: window.scrollX, y: window.scrollY },
@@ -3514,15 +3584,15 @@ async function renderMain(el) {
           
           // ── Statements ──
           if (mode === 'replace') {
-            statementsByBank = { KTB: [], KBANK: [], 'BBL NW': [], BBL: [], UNKNOWN: [] };
+            statementsByBank = { KTB: [], KBANK: [], 'BBL NW': [], BBL: [], TTB: [], UNKNOWN: [] };
           } else {
-            if (!statementsByBank) statementsByBank = { KTB: [], KBANK: [], 'BBL NW': [], BBL: [], UNKNOWN: [] };
-            ['KTB', 'KBANK', 'BBL NW', 'BBL', 'UNKNOWN'].forEach(k => {
+            if (!statementsByBank) statementsByBank = { KTB: [], KBANK: [], 'BBL NW': [], BBL: [], TTB: [], UNKNOWN: [] };
+            ['KTB', 'KBANK', 'BBL NW', 'BBL', 'TTB', 'UNKNOWN'].forEach(k => {
               if (!Array.isArray(statementsByBank[k])) statementsByBank[k] = [];
             });
           }
           
-          ['KTB', 'KBANK', 'BBL NW', 'BBL'].forEach(bankKey => {
+          ['KTB', 'KBANK', 'BBL NW', 'BBL', 'TTB'].forEach(bankKey => {
             const incoming = data.statementsByBank[bankKey] || [];
             const existing = statementsByBank[bankKey] || [];
             const dupSet = skipStmtDup ? new Set(existing.map(s => `${s.ref_no||''}|${s.date}|${s.amount}`)) : null;
@@ -3604,6 +3674,7 @@ async function renderMain(el) {
       billList = billList.filter(b => !toDeleteSet.has(b));
       
       persistMainState();
+      invalidateBillsCache();
       toast(`ลบ ${toDelete.length} บิลสำเร็จ`, 'success');
       render();
     });
@@ -3634,6 +3705,7 @@ async function renderMain(el) {
       }
       
       persistMainState();
+      invalidateBillsCache();
       render();
       toast('ล้างข้อมูลของ ' + fmtDate(selectedDate) + ' แล้ว', 'success');
     });
@@ -3921,6 +3993,7 @@ async function renderMain(el) {
         };
         billList.push(newBill);
         persistMainState();
+        invalidateBillsCache();
         closeModal();
         const netNote = (whtAmount || transferFee || cardFee) 
           ? ` (สุทธิ ฿${(amount - whtAmount - transferFee - cardFee).toFixed(2)})` 
@@ -4524,6 +4597,7 @@ async function renderMain(el) {
           }
           
           persistMainState();
+          invalidateBillsCache();    // ให้ Sum/Cash Drawer รีคำนวณจาก bills ล่าสุด
           closeModal();
           toast(`✓ บันทึกแล้ว — ${b.bill_no||'(ไม่มีเลข)'}`, 'success');
           renderKeepScroll();
@@ -4531,8 +4605,12 @@ async function renderMain(el) {
         
         document.getElementById('eb-delete')?.addEventListener('click', () => {
           if (!confirm(`ลบบิล ${b.bill_no||'(ไม่มีเลข)'}?\n${b.type} · ฿${fmtNum(b.amount)} · ${fmtDate(b.date)}\n\nลบแล้วกู้คืนไม่ได้`)) return;
-          billList.splice(idx, 1);
+          // ใช้ reference (b) แทน idx — กัน idx shift ถ้ามี mutation อื่น
+          const realIdx = billList.indexOf(b);
+          if (realIdx < 0) { toast('บิลไม่อยู่ในระบบแล้ว', 'warn'); closeModal(); return; }
+          billList.splice(realIdx, 1);
           persistMainState();
+          invalidateBillsCache();    // สำคัญ: ล้าง cache ให้ Sum refresh
           closeModal();
           toast('ลบบิลแล้ว', 'success');
           renderKeepScroll();
@@ -9869,7 +9947,7 @@ async function renderMatching(el) {
   let bankFilter = 'ALL', matchFilter = 'ALL';
   let dirFilter = 'ALL'; // 'ALL' | 'in' | 'out'
   let dateFrom = '', dateTo = '';
-  const bankColors = { KTB:'#00a4e4', KBANK:'#138f2d', 'BBL NW':'#ff7b00', BBL:'#1e3a7b' };
+  const bankColors = { KTB:'#00a4e4', KBANK:'#138f2d', 'BBL NW':'#ff7b00', BBL:'#1e3a7b', TTB:'#ff0066' };
 
   function render() {
     let data = uploadedStatements.length > 0 ? [...uploadedStatements] : [];
@@ -9915,6 +9993,7 @@ async function renderMatching(el) {
       KBANK: (statementsByBank.KBANK || []).length,
       'BBL NW': (statementsByBank['BBL NW'] || []).length,
       BBL: (statementsByBank.BBL || []).length,
+      TTB: (statementsByBank.TTB || []).length,
     };
 
     const allStmts = uploadedStatements;
@@ -9957,11 +10036,12 @@ async function renderMatching(el) {
       </div>
       <div class="flex justify-between items-center mb-3">
         <div class="flex gap-2 flex-wrap items-center">
-          ${['ALL','KTB','KBANK','BBL NW','BBL'].map(b => {
-            const count = b === 'ALL' ? (bankCounts.KTB+bankCounts.KBANK+(bankCounts['BBL NW']||0)+bankCounts.BBL) : bankCounts[b] || 0;
+          ${['ALL','KTB','KBANK','BBL NW','BBL','TTB'].map(b => {
+            const total = bankCounts.KTB+bankCounts.KBANK+(bankCounts['BBL NW']||0)+bankCounts.BBL+(bankCounts.TTB||0);
+            const count = b === 'ALL' ? total : bankCounts[b] || 0;
             return `<button class="pill ${bankFilter===b?'active':''}" data-bank="${b}" ${b!=='ALL'?`style="--pill-color:${bankColors[b]}"`:''}>${b}${count?` <span style="opacity:.7">(${count})</span>`:''}</button>`;
           }).join('')}
-          ${(bankCounts.KTB+bankCounts.KBANK+(bankCounts['BBL NW']||0)+bankCounts.BBL) > 0 ? '<button class="btn btn-ghost btn-sm" id="btn-clear-stmts" style="color:var(--danger)">✕ ล้าง Statement</button>' : ''}
+          ${(bankCounts.KTB+bankCounts.KBANK+(bankCounts['BBL NW']||0)+bankCounts.BBL+(bankCounts.TTB||0)) > 0 ? '<button class="btn btn-ghost btn-sm" id="btn-clear-stmts" style="color:var(--danger)">✕ ล้าง Statement</button>' : ''}
         </div>
       </div>
       <div class="flex gap-2 mb-3 items-center">
@@ -11480,7 +11560,7 @@ function renderData(el) {
       billList = [];
       paymentList = [];
       cashflowList = [];
-      statementsByBank = { KTB: [], KBANK: [], 'BBL NW': [], BBL: [], UNKNOWN: [] };
+      statementsByBank = { KTB: [], KBANK: [], 'BBL NW': [], BBL: [], TTB: [], UNKNOWN: [] };
       try {
         ['sf_billList','sf_paymentList','sf_cashflowList','sf_mainSummary','sf_cashCount','sf_statementsByBank'].forEach(k => safeStorage.del?.(k));
       } catch(e) {}
