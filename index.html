@@ -1229,6 +1229,8 @@ let billList = []; // ศูนย์กลางข้อมูล: Smart bills
 // กัน TypeError เมื่อ syncManager เรียกก่อนที่หน้า Main จะ render
 window.invalidateBillsCache = window.invalidateBillsCache || function() {};
 let paymentList = []; // SP List พร้อม Parent-Child
+let spTempList = []; // SP-TEMP: partial payment tracking (C approach)
+let customerList = []; // Customer master (from Google Sheets customers)
 let cashflowList = []; // เงินเข้า-ออก: Deposit, Withdrawal, Transfer, Misc
 let supplierList = []; // Master Supplier data (ชื่อ, เลขบัญชี, ธนาคาร)
 let supplierPayments = []; // รายการที่จะโอน / โอนแล้ว (PP)
@@ -5380,6 +5382,393 @@ async function renderBillList(el) { return renderMain(el); }
 // ══════════════════════════════════════════════════════════════
 // Render Payments Page (SP List พร้อม Parent-Child)
 // ══════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
+// SP-TEMP — Partial Payment Tracking
+// Schema: { no, created_at, cust_code, cust_name, expected_total,
+//           partials: [{date, amount, method, bank, stmt_ref, notes}],
+//           status: 'open'|'complete'|'graduated'|'cancelled',
+//           linked_sp, parent_temp, graduated_at, updated_at }
+// ════════════════════════════════════════════════════════════════
+
+function spTempCounter() {
+  // Rolling global counter — derive from existing list + localStorage
+  let max = 0;
+  spTempList.forEach(t => {
+    const m = String(t.no||'').match(/SP-TEMP-(\d+)/);
+    if (m) max = Math.max(max, Number(m[1]));
+  });
+  const saved = Number(localStorage.getItem('sf_spTempCounter') || 0);
+  return Math.max(max, saved) + 1;
+}
+
+function genSpTempNo() {
+  const n = spTempCounter();
+  localStorage.setItem('sf_spTempCounter', String(n));
+  return 'SP-TEMP-' + String(n).padStart(4, '0');
+}
+
+function spTempPaidTotal(t) {
+  return (t.partials || []).reduce((s,p) => s + (Number(p.amount)||0), 0);
+}
+
+function spTempProgress(t) {
+  const paid = spTempPaidTotal(t);
+  const exp = Number(t.expected_total) || 0;
+  return { paid, expected: exp, pct: exp > 0 ? Math.round(paid / exp * 100) : 0, remaining: Math.max(0, exp - paid) };
+}
+
+function recomputeSpTempStatus(t) {
+  if (t.linked_sp) { t.status = 'graduated'; return; }
+  const p = spTempProgress(t);
+  if (p.expected > 0 && p.paid >= p.expected) t.status = 'complete';
+  else if (p.paid === 0) t.status = 'open';
+  else t.status = 'open'; // partial — open จนกว่าครบ
+}
+
+function markDirtySpTemps() {
+  persistMainState();
+  if (window.syncManager) syncManager.markDirty('sp_temps');
+}
+
+// Check for overpayment and auto-rollover
+function spTempCheckRollover(t, newPartial) {
+  const exp = Number(t.expected_total) || 0;
+  if (exp <= 0) return { split: false }; // ไม่รู้ expected → ไม่ rollover
+  
+  const currentPaid = spTempPaidTotal(t); // ก่อน add newPartial
+  const newAmount = Number(newPartial.amount) || 0;
+  const totalAfter = currentPaid + newAmount;
+  
+  if (totalAfter <= exp) return { split: false }; // ไม่เกิน
+  
+  // Split
+  const fitsInThis = exp - currentPaid; // เหลือที่ต้องเติมเพื่อให้ครบ
+  const overflow = newAmount - fitsInThis; // ส่วนที่เกิน
+  
+  return {
+    split: true,
+    fitsInThis, overflow,
+    partialThis: { ...newPartial, amount: fitsInThis, _auto_split: true },
+    partialNext: { ...newPartial, amount: overflow, _auto_split: true },
+  };
+}
+
+// Customer typeahead HTML
+function spTempCustomerInput(id, selectedCode, selectedName) {
+  return `
+    <div style="position:relative">
+      <input class="input" id="${id}-search" placeholder="🔍 ค้นหาลูกค้า (รหัส / ชื่อ)" 
+             value="${selectedCode ? `(${selectedCode}) ${selectedName||''}` : ''}" 
+             autocomplete="off" style="width:100%">
+      <div id="${id}-drop" style="display:none;position:absolute;top:100%;left:0;right:0;background:var(--card);border:1px solid var(--border);border-radius:6px;max-height:260px;overflow-y:auto;z-index:10;box-shadow:0 4px 12px rgba(0,0,0,.3)"></div>
+      <input type="hidden" id="${id}-code" value="${selectedCode||''}">
+      <input type="hidden" id="${id}-name" value="${selectedName||''}">
+    </div>
+  `;
+}
+
+function spTempWireCustomerInput(id) {
+  const search = document.getElementById(id + '-search');
+  const drop = document.getElementById(id + '-drop');
+  const codeInput = document.getElementById(id + '-code');
+  const nameInput = document.getElementById(id + '-name');
+  if (!search) return;
+  
+  function doSearch(q) {
+    q = String(q||'').toLowerCase().trim();
+    if (!q) { drop.style.display = 'none'; return; }
+    const matches = customerList.filter(c => {
+      const code = String(c.cust_code||c.cust_id||'').toLowerCase();
+      const name = String(c.cust_name||'').toLowerCase();
+      return code.includes(q) || name.includes(q);
+    }).slice(0, 20);
+    
+    if (matches.length === 0) {
+      drop.innerHTML = '<div style="padding:8px;color:var(--text3);font-size:.85rem">ไม่พบลูกค้า — กรอกเองได้</div>';
+      drop.style.display = 'block';
+      return;
+    }
+    
+    drop.innerHTML = matches.map(c => {
+      const code = c.cust_code || c.cust_id || '';
+      const name = c.cust_name || '';
+      return `<div class="sp-cust-opt" data-code="${code}" data-name="${name.replace(/"/g,'&quot;')}" 
+              style="padding:6px 10px;cursor:pointer;border-bottom:1px solid var(--border);font-size:.85rem">
+              <span style="font-family:monospace;color:var(--info)">${code}</span> · ${name}
+              </div>`;
+    }).join('');
+    drop.style.display = 'block';
+    
+    drop.querySelectorAll('.sp-cust-opt').forEach(opt => {
+      opt.addEventListener('mouseenter', () => opt.style.background = 'var(--bg2)');
+      opt.addEventListener('mouseleave', () => opt.style.background = '');
+      opt.addEventListener('click', () => {
+        const code = opt.dataset.code;
+        const name = opt.dataset.name;
+        search.value = `(${code}) ${name}`;
+        codeInput.value = code;
+        nameInput.value = name;
+        drop.style.display = 'none';
+      });
+    });
+  }
+  
+  search.addEventListener('input', () => doSearch(search.value));
+  search.addEventListener('focus', () => { if (search.value) doSearch(search.value); });
+  document.addEventListener('click', e => {
+    if (!search.contains(e.target) && !drop.contains(e.target)) drop.style.display = 'none';
+  });
+}
+
+// Modal: Create new SP-TEMP
+function openSpTempModal() {
+  const tempNo = genSpTempNo();
+  openModal('➕ สร้าง SP ชั่วคราว', `
+    <div class="flex-col gap-3" style="min-width:400px">
+      <div class="input-group">
+        <label>เลข SP ชั่วคราว</label>
+        <input class="input" id="tsp-no" value="${tempNo}" readonly style="background:var(--bg2)">
+      </div>
+      
+      <div class="input-group">
+        <label>ลูกค้า *</label>
+        ${spTempCustomerInput('tsp-cust', '', '')}
+        <div class="text-xs text-muted mt-1">ค้นจาก customer master — ถ้าไม่เจอ กรอก code+ชื่อเอง</div>
+      </div>
+      
+      <div class="input-group">
+        <label>ยอดรวมทั้งหมดที่คาด (Expected) *</label>
+        <input type="number" class="input" id="tsp-expected" placeholder="เช่น 100000" step="0.01">
+        <div class="text-xs text-muted mt-1">ยอด SP เต็มที่ POS จะออกให้ — จะเทียบเวลา graduate</div>
+      </div>
+      
+      <div style="padding:10px;background:var(--bg2);border-radius:6px">
+        <div style="font-weight:600;margin-bottom:8px">💰 Partial แรก (วันนี้)</div>
+        <div class="flex gap-2">
+          <div class="input-group flex-1">
+            <label>จำนวน</label>
+            <input type="number" class="input" id="tsp-p-amount" placeholder="0.00" step="0.01">
+          </div>
+          <div class="input-group flex-1">
+            <label>วันที่</label>
+            <input type="date" class="input" id="tsp-p-date" value="${todayISO()}">
+          </div>
+        </div>
+        <div class="flex gap-2">
+          <div class="input-group flex-1">
+            <label>วิธี</label>
+            <select class="input" id="tsp-p-method">
+              <option value="Transfer">Transfer</option>
+              <option value="Cash">Cash</option>
+              <option value="Cheque">Cheque</option>
+            </select>
+          </div>
+          <div class="input-group flex-1">
+            <label>ธนาคาร</label>
+            <input class="input" id="tsp-p-bank" placeholder="KTB / BBL / ...">
+          </div>
+        </div>
+        <div class="input-group">
+          <label>Stmt ref / หมายเหตุ</label>
+          <input class="input" id="tsp-p-notes" placeholder="">
+        </div>
+      </div>
+      
+      <div class="flex gap-2 mt-2">
+        <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ยกเลิก</button>
+        <button class="btn btn-warn btn-sm flex-1" id="tsp-confirm" style="background:var(--warn);color:#fff">${ICONS.check} สร้าง</button>
+      </div>
+    </div>
+  `);
+  spTempWireCustomerInput('tsp-cust');
+  
+  document.getElementById('tsp-confirm')?.addEventListener('click', () => {
+    const code = document.getElementById('tsp-cust-code').value.trim();
+    const name = document.getElementById('tsp-cust-name').value.trim() || 
+                 document.getElementById('tsp-cust-search').value.trim();
+    const expected = Number(document.getElementById('tsp-expected').value) || 0;
+    const pAmt = Number(document.getElementById('tsp-p-amount').value) || 0;
+    
+    if (!name) { toast('กรอกข้อมูลลูกค้า', 'error'); return; }
+    if (expected <= 0) { toast('กรอก expected total', 'error'); return; }
+    if (pAmt <= 0) { toast('กรอก partial amount', 'error'); return; }
+    
+    const partial = {
+      date: document.getElementById('tsp-p-date').value,
+      amount: pAmt,
+      method: document.getElementById('tsp-p-method').value,
+      bank: document.getElementById('tsp-p-bank').value,
+      stmt_ref: '',
+      notes: document.getElementById('tsp-p-notes').value,
+    };
+    
+    const now = new Date().toISOString();
+    const newTemp = {
+      no: tempNo, created_at: now, updated_at: now,
+      cust_code: code, cust_name: name,
+      expected_total: expected,
+      partials: [],
+      status: 'open', linked_sp: '', parent_temp: '', graduated_at: '',
+    };
+    
+    // Check rollover
+    const check = spTempCheckRollover(newTemp, partial);
+    if (check.split) {
+      newTemp.partials.push(check.partialThis);
+      recomputeSpTempStatus(newTemp);
+      spTempList.push(newTemp);
+      
+      // Rollover
+      const nextNo = genSpTempNo();
+      const nextTemp = {
+        no: nextNo, created_at: now, updated_at: now,
+        cust_code: code, cust_name: name,
+        expected_total: 0, // ยังไม่รู้ → user แก้ทีหลัง
+        partials: [check.partialNext],
+        status: 'open', linked_sp: '', parent_temp: tempNo, graduated_at: '',
+      };
+      spTempList.push(nextTemp);
+      toast(`⚠️ เกิน ${check.overflow.toLocaleString()} → สร้าง ${nextNo} อัตโนมัติ`, 'info');
+    } else {
+      newTemp.partials.push(partial);
+      recomputeSpTempStatus(newTemp);
+      spTempList.push(newTemp);
+    }
+    
+    markDirtySpTemps();
+    closeModal();
+    toast(`สร้าง ${tempNo} สำเร็จ`, 'success');
+    // Re-render caller
+    const mainEl = document.getElementById('main');
+    if (mainEl && typeof currentPage !== 'undefined' && currentPage === 'payments') navigateTo('payments');
+  });
+}
+
+// Modal: Add partial to existing SP-TEMP
+function openPartialModal(tempNo) {
+  const t = spTempList.find(x => x.no === tempNo);
+  if (!t) return;
+  const p = spTempProgress(t);
+  
+  openModal(`+ Partial ใน ${tempNo}`, `
+    <div class="flex-col gap-3" style="min-width:380px">
+      <div style="padding:10px;background:var(--bg2);border-radius:6px;font-size:.85rem">
+        ลูกค้า: <b>(${t.cust_code}) ${t.cust_name}</b><br>
+        Expected: ${fmtNum(p.expected)} · Paid: ${fmtNum(p.paid)} · เหลือ: <b style="color:var(--warn)">${fmtNum(p.remaining)}</b>
+      </div>
+      
+      <div class="flex gap-2">
+        <div class="input-group flex-1">
+          <label>จำนวน</label>
+          <input type="number" class="input" id="prt-amount" placeholder="${p.remaining}" step="0.01" autofocus>
+        </div>
+        <div class="input-group flex-1">
+          <label>วันที่</label>
+          <input type="date" class="input" id="prt-date" value="${todayISO()}">
+        </div>
+      </div>
+      <div class="flex gap-2">
+        <div class="input-group flex-1">
+          <label>วิธี</label>
+          <select class="input" id="prt-method">
+            <option value="Transfer">Transfer</option>
+            <option value="Cash">Cash</option>
+            <option value="Cheque">Cheque</option>
+          </select>
+        </div>
+        <div class="input-group flex-1">
+          <label>ธนาคาร</label>
+          <input class="input" id="prt-bank">
+        </div>
+      </div>
+      <div class="input-group">
+        <label>Stmt ref / หมายเหตุ</label>
+        <input class="input" id="prt-notes">
+      </div>
+      
+      <div class="flex gap-2 mt-2">
+        <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ยกเลิก</button>
+        <button class="btn btn-primary btn-sm flex-1" id="prt-confirm">${ICONS.check} เพิ่ม partial</button>
+      </div>
+    </div>
+  `);
+  
+  document.getElementById('prt-confirm')?.addEventListener('click', () => {
+    const amt = Number(document.getElementById('prt-amount').value) || 0;
+    if (amt <= 0) { toast('กรอกจำนวน', 'error'); return; }
+    
+    const partial = {
+      date: document.getElementById('prt-date').value,
+      amount: amt,
+      method: document.getElementById('prt-method').value,
+      bank: document.getElementById('prt-bank').value,
+      stmt_ref: '',
+      notes: document.getElementById('prt-notes').value,
+    };
+    
+    const check = spTempCheckRollover(t, partial);
+    if (check.split) {
+      // Split: ส่วนที่พอดี → t, ส่วนเกิน → ใหม่
+      t.partials.push(check.partialThis);
+      t.updated_at = new Date().toISOString();
+      recomputeSpTempStatus(t);
+      
+      const nextNo = genSpTempNo();
+      const nowStr = new Date().toISOString();
+      const nextTemp = {
+        no: nextNo, created_at: nowStr, updated_at: nowStr,
+        cust_code: t.cust_code, cust_name: t.cust_name,
+        expected_total: 0,
+        partials: [check.partialNext],
+        status: 'open', linked_sp: '', parent_temp: t.no, graduated_at: '',
+      };
+      spTempList.push(nextTemp);
+      toast(`⚠️ เกิน ${check.overflow.toLocaleString()} → สร้าง ${nextNo} อัตโนมัติ`, 'info');
+    } else {
+      t.partials.push(partial);
+      t.updated_at = new Date().toISOString();
+      recomputeSpTempStatus(t);
+      toast(`เพิ่ม partial ${amt.toLocaleString()} สำเร็จ`, 'success');
+    }
+    
+    markDirtySpTemps();
+    closeModal();
+    if (typeof currentPage !== 'undefined' && currentPage === 'payments') navigateTo('payments');
+  });
+}
+
+// Graduate: match SP-TEMP → real SP
+function spTempFindGraduationCandidates(realSp) {
+  // realSp: {sp_no, cust_id/cust_code, total, ...}
+  const code = String(realSp.cust_code || realSp.cust_id || '').trim();
+  const amount = Number(realSp.total || realSp.amount) || 0;
+  
+  // Extract code from customer string "(BB-00015)บริษัท..." if needed
+  let effectiveCode = code;
+  if (!effectiveCode && realSp.cust_name) {
+    const m = String(realSp.cust_name).match(/^\(([A-Z]{2}-\d+)\)/);
+    if (m) effectiveCode = m[1];
+  }
+  
+  return spTempList.filter(t => {
+    if (t.status === 'graduated' || t.status === 'cancelled') return false;
+    if (t.cust_code !== effectiveCode) return false;
+    const paid = spTempPaidTotal(t);
+    return Math.abs(paid - amount) < 1; // ±1 บาท
+  });
+}
+
+function spTempGraduate(tempNo, realSpNo, realSpDate) {
+  const t = spTempList.find(x => x.no === tempNo);
+  if (!t) return false;
+  t.linked_sp = realSpNo;
+  t.status = 'graduated';
+  t.graduated_at = realSpDate || new Date().toISOString();
+  t.updated_at = new Date().toISOString();
+  markDirtySpTemps();
+  return true;
+}
+
 async function renderPayments(el) {
   let filterStatus = 'ALL';
   let searchText = '';
@@ -5541,67 +5930,51 @@ async function renderPayments(el) {
     document.getElementById('btn-import-sp')?.addEventListener('click', () => triggerFileUpload('file-sales', parseSPReport));
     
     // ── สร้าง SP ชั่วคราว ──
-    document.getElementById('btn-add-temp-sp')?.addEventListener('click', () => {
-      const tempNo = 'SP-TEMP-' + String(Date.now()).slice(-6);
-      openModal('➕ สร้าง SP ชั่วคราว', `
-        <div class="flex-col gap-3">
-          <div class="input-group">
-            <label>เลข SP ชั่วคราว</label>
-            <input class="input" id="tsp-no" value="${tempNo}" placeholder="SP-TEMP-xxx">
-            <div class="text-xs text-muted mt-1">ระบบจะสร้างให้อัตโนมัติ (แก้ได้) — เปลี่ยนเป็นเลขจริงภายหลังได้</div>
-          </div>
-          <div class="flex gap-2">
-            <div class="input-group flex-1">
-              <label>วันที่</label>
-              <input type="date" class="input" id="tsp-date" value="${todayISO()}">
-            </div>
-            <div class="input-group flex-1">
-              <label>ยอดเงิน</label>
-              <input type="number" class="input" id="tsp-amount" placeholder="0.00" step="0.01">
-            </div>
-          </div>
-          <div class="flex gap-2">
-            <div class="input-group flex-1">
-              <label>รหัสลูกค้า (ถ้ามี)</label>
-              <input class="input" id="tsp-cust-id" placeholder="เช่น BA-00494">
-            </div>
-            <div class="input-group flex-1">
-              <label>ชื่อลูกค้า</label>
-              <input class="input" id="tsp-cust-name" placeholder="ชื่อลูกค้า / บริษัท">
-            </div>
-          </div>
-          <div class="input-group">
-            <label>หมายเหตุ</label>
-            <input class="input" id="tsp-note" placeholder="เช่น รอเลข SP จาก Smart, โอนมา KTB ยังไม่ทราบจากใคร">
-          </div>
-          <div class="flex gap-2 mt-2">
-            <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ยกเลิก</button>
-            <button class="btn btn-warn btn-sm flex-1" id="tsp-confirm" style="background:var(--warn);color:#fff">${ICONS.check} สร้าง SP ชั่วคราว</button>
-          </div>
-        </div>
-      `);
-      document.getElementById('tsp-confirm')?.addEventListener('click', () => {
-        const spNo = document.getElementById('tsp-no').value.trim() || tempNo;
-        const amount = Number(document.getElementById('tsp-amount').value) || 0;
-        if (!amount) { toast('กรอกยอดเงิน', 'error'); return; }
-        paymentList.push({
-          sp_no: spNo,
-          date: document.getElementById('tsp-date').value,
-          cust_id: document.getElementById('tsp-cust-id').value,
-          cust_name: document.getElementById('tsp-cust-name').value || '(ยังไม่ทราบ)',
-          amount: amount,
-          total: amount,
-          cash: 0,
-          transfer: amount,
-          cheque: 0,
-          bills: [],
-          match_status: 'pending',
-          note: document.getElementById('tsp-note').value,
-          is_temp: true,
-        });
-        persistMainState();
-        closeModal();
-        toast(`สร้าง ${spNo} สำเร็จ — อย่าลืมมาแก้เป็นเลข SP จริงภายหลัง`, 'success');
+    document.getElementById('btn-add-temp-sp')?.addEventListener('click', async () => {
+      // Load customer list if empty
+      if (customerList.length === 0) {
+        try {
+          const res = await api('getCustomers', {});
+          if (res.success && Array.isArray(res.data)) customerList = res.data;
+        } catch(e) { console.warn('getCustomers failed', e); }
+      }
+      openSpTempModal();
+    });
+    
+    // Expand/add partial to existing SP-TEMP
+    el.querySelectorAll('.btn-add-partial').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const tempNo = btn.dataset.no;
+        openPartialModal(tempNo);
+      });
+    });
+    
+    // Delete partial row
+    el.querySelectorAll('.btn-del-partial').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const tempNo = btn.dataset.no;
+        const idx = Number(btn.dataset.idx);
+        const t = spTempList.find(x => x.no === tempNo);
+        if (!t) return;
+        if (!confirm(`ลบ partial #${idx+1} ของ ${tempNo}?`)) return;
+        t.partials.splice(idx, 1);
+        t.updated_at = new Date().toISOString();
+        recomputeSpTempStatus(t);
+        markDirtySpTemps();
+        render();
+      });
+    });
+    
+    // Delete whole SP-TEMP
+    el.querySelectorAll('.btn-del-temp').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const tempNo = btn.dataset.no;
+        if (!confirm(`ลบ ${tempNo} ทั้งหมด?`)) return;
+        spTempList = spTempList.filter(x => x.no !== tempNo);
+        markDirtySpTemps();
         render();
       });
     });
@@ -13660,7 +14033,9 @@ let spV2State = {
   nextCounter: 1,        // SP counter (global, no reset)
   filterVat: 'ALL',      // ALL | Y | N
   filterPaid: 'ALL',     // ALL | paid | unpaid
-  view: 'main',          // main | report
+  view: 'main',          // main | report | sellbills
+  groupByCustomer: false, // ← Sell Bills: group by customer
+  expandedCustomers: new Set(), // ← which customers are expanded
   rawPayMain: [],        // parsed file 1
   rawPayType: [],        // parsed file 2
   rawTaxSales: [],       // parsed file 3
@@ -14022,6 +14397,25 @@ async function renderSpRecon(el) {
     spV2DownloadSellBills();
   });
   
+  // ── Group by customer toggle ──
+  document.getElementById('spv2-btn-group-cust')?.addEventListener('click', () => {
+    spV2State.groupByCustomer = !spV2State.groupByCustomer;
+    renderSpRecon(el);
+  });
+  
+  // ── Expand/collapse customer group ──
+  el.querySelectorAll('.spv2-cust-header').forEach(row => {
+    row.addEventListener('click', () => {
+      const custName = row.dataset.cust;
+      if (spV2State.expandedCustomers.has(custName)) {
+        spV2State.expandedCustomers.delete(custName);
+      } else {
+        spV2State.expandedCustomers.add(custName);
+      }
+      renderSpRecon(el);
+    });
+  });
+  
   // Wire edit buttons in Report view
   el.querySelectorAll('.spv2-edit-pay').forEach(btn => {
     btn.addEventListener('click', (e) => {
@@ -14051,6 +14445,35 @@ async function renderSpRecon(el) {
       renderSpRecon(el);
     });
   });
+  
+  // Inline edit for payment method fields (date + amount)
+  el.querySelectorAll('.spv2-edit-cell').forEach(inp => {
+    inp.addEventListener('change', () => {
+      const idx = Number(inp.dataset.idx);
+      const field = inp.dataset.field;
+      const row = spV2State.mainRows[idx];
+      if (!row) return;
+      
+      if (field.endsWith('_amt')) {
+        row[field] = Number(inp.value) || 0;
+      } else {
+        row[field] = inp.value;
+      }
+      
+      // Recompute pay_total from all method amounts
+      row.pay_total = (Number(row.cash_amt)||0) 
+                    + (Number(row.transfer_amt)||0) 
+                    + (Number(row.cheque_amt)||0) 
+                    + (Number(row.credit_amt)||0);
+      
+      persistSpV2();
+      // Re-render only if stats need update — use light refresh
+      renderSpRecon(el);
+    });
+    
+    // Prevent row click propagation
+    inp.addEventListener('click', e => e.stopPropagation());
+  });
 }
 
 // Render Main table (20 cols)
@@ -14058,29 +14481,48 @@ function spV2RenderMainTable(rows) {
   const fmt = v => v == null || v === '' || v === 0 ? '' : (typeof v === 'number' ? fmtNum(v) : String(v));
   const fmtD = v => v ? String(v).substring(0, 10) : '';
   
+  // 2-level header — matching Excel layout
   const thead = `
-    <thead style="position:sticky;top:0;background:var(--card);z-index:1;border-bottom:2px solid var(--border)">
-      <tr style="font-size:.7rem">
-        <th style="text-align:center;padding:6px">#</th>
-        <th style="text-align:center;padding:6px">B<br>Y/N</th>
-        <th style="text-align:left;padding:6px">C: เลขเอกสาร</th>
-        <th style="text-align:left;padding:6px">D: อ้างอิง</th>
-        <th style="text-align:left;padding:6px">E: วันขาย/ลูกค้า</th>
-        <th style="text-align:left;padding:6px">G: หมายเหตุ</th>
-        <th style="text-align:right;padding:6px">H: ยอด</th>
-        <th style="text-align:right;padding:6px">I: รวมชำระ</th>
-        <th style="text-align:center;padding:6px">J: วันสด</th>
-        <th style="text-align:right;padding:6px">K: สด</th>
-        <th style="text-align:center;padding:6px">L: วันโอน</th>
-        <th style="text-align:right;padding:6px">M: โอน</th>
-        <th style="text-align:center;padding:6px">N: วันเช็ค</th>
-        <th style="text-align:right;padding:6px">O: เช็ค</th>
-        <th style="text-align:center;padding:6px">P: วันลด</th>
-        <th style="text-align:right;padding:6px">Q: ลด</th>
-        <th style="text-align:left;padding:6px">S: SP Number</th>
-        <th style="text-align:center;padding:6px">T: Pay Date</th>
+    <thead style="position:sticky;top:0;background:var(--card);z-index:2;border-bottom:2px solid var(--border)">
+      <tr style="font-size:.72rem;background:var(--bg2)">
+        <th rowspan="2" style="text-align:center;padding:6px;border-right:1px solid var(--border)">#</th>
+        <th rowspan="2" style="text-align:center;padding:6px;border-right:1px solid var(--border)">Y/N</th>
+        <th rowspan="2" style="text-align:left;padding:6px;border-right:1px solid var(--border)">เลขที่เอกสาร</th>
+        <th rowspan="2" style="text-align:left;padding:6px;border-right:1px solid var(--border)">เอกสารอ้างอิง</th>
+        <th rowspan="2" style="text-align:left;padding:6px;border-right:1px solid var(--border)">ลูกค้า / วันขาย</th>
+        <th rowspan="2" style="text-align:left;padding:6px;border-right:1px solid var(--border)">หมายเหตุ</th>
+        <th rowspan="2" style="text-align:right;padding:6px;border-right:1px solid var(--border)">จำนวนเงิน</th>
+        <th rowspan="2" style="text-align:right;padding:6px;border-right:2px solid var(--border)">รวมชำระจริง</th>
+        <th colspan="2" style="text-align:center;padding:6px;background:rgba(250,200,100,.15);border-right:1px solid var(--border)">💵 เงินสด</th>
+        <th colspan="2" style="text-align:center;padding:6px;background:rgba(100,200,150,.15);border-right:1px solid var(--border)">🏦 โอนเงิน</th>
+        <th colspan="2" style="text-align:center;padding:6px;background:rgba(150,180,240,.15);border-right:1px solid var(--border)">📋 เช็ค</th>
+        <th colspan="2" style="text-align:center;padding:6px;background:rgba(240,150,150,.15);border-right:2px solid var(--border)">💸 ใบลดหนี้</th>
+        <th rowspan="2" style="text-align:left;padding:6px;border-right:1px solid var(--border)">SP Number</th>
+        <th rowspan="2" style="text-align:center;padding:6px">Pay Date</th>
+      </tr>
+      <tr style="font-size:.68rem;background:var(--bg2);color:var(--text2)">
+        <th style="text-align:center;padding:4px">วันที่รับ</th>
+        <th style="text-align:right;padding:4px;border-right:1px solid var(--border)">ยอด</th>
+        <th style="text-align:center;padding:4px">วันที่รับ</th>
+        <th style="text-align:right;padding:4px;border-right:1px solid var(--border)">ยอด</th>
+        <th style="text-align:center;padding:4px">วันที่รับ</th>
+        <th style="text-align:right;padding:4px;border-right:1px solid var(--border)">ยอด</th>
+        <th style="text-align:center;padding:4px">วันที่รับ</th>
+        <th style="text-align:right;padding:4px;border-right:2px solid var(--border)">ยอด</th>
       </tr>
     </thead>
+  `;
+  
+  // Editable date/amount cell for headers
+  const editDate = (origIdx, field, val) => `
+    <input type="date" class="spv2-edit-cell" data-idx="${origIdx}" data-field="${field}" 
+           value="${String(val||'').substring(0,10)}" 
+           style="width:100%;background:transparent;border:none;color:var(--text);padding:2px 4px;font-size:.72rem;text-align:center">
+  `;
+  const editAmt = (origIdx, field, val) => `
+    <input type="number" step="0.01" class="spv2-edit-cell" data-idx="${origIdx}" data-field="${field}" 
+           value="${val ? Number(val) : ''}" placeholder=""
+           style="width:100%;background:transparent;border:none;color:var(--text);padding:2px 4px;font-size:.72rem;text-align:right">
   `;
   
   const tbody = rows.map(r => {
@@ -14091,6 +14533,7 @@ function spV2RenderMainTable(rows) {
       ? (paid === true ? 'background:rgba(63,196,143,.08)' : paid === false ? 'background:rgba(239,87,87,.08)' : '')
       : '';
     const vatColor = r.vat_flag === 'Y' ? 'var(--info)' : 'var(--warn)';
+    
     return `
       <tr style="font-size:.75rem;${rowBg};${isHdr?'font-weight:600':''}">
         <td style="text-align:center;padding:4px 6px">${r.seq}</td>
@@ -14106,21 +14549,27 @@ function spV2RenderMainTable(rows) {
         <td style="padding:4px 6px;font-size:.7rem">${r.note1 || ''}</td>
         <td style="text-align:right;padding:4px 6px">${fmt(r.amount)}</td>
         <td style="text-align:right;padding:4px 6px;color:var(--success)">${isHdr?fmt(r.pay_total):''}</td>
-        <td style="text-align:center;padding:4px 6px;font-size:.7rem">${fmtD(r.cash_date)}</td>
-        <td style="text-align:right;padding:4px 6px">${fmt(r.cash_amt)}</td>
-        <td style="text-align:center;padding:4px 6px;font-size:.7rem">${fmtD(r.transfer_date)}</td>
-        <td style="text-align:right;padding:4px 6px">${fmt(r.transfer_amt)}</td>
-        <td style="text-align:center;padding:4px 6px;font-size:.7rem">${fmtD(r.cheque_date)}</td>
-        <td style="text-align:right;padding:4px 6px">${fmt(r.cheque_amt)}</td>
-        <td style="text-align:center;padding:4px 6px;font-size:.7rem">${fmtD(r.credit_date)}</td>
-        <td style="text-align:right;padding:4px 6px">${fmt(r.credit_amt)}</td>
+        
+        ${isHdr ? `
+          <td style="padding:2px 4px">${editDate(origIdx, 'cash_date', r.cash_date)}</td>
+          <td style="padding:2px 4px">${editAmt(origIdx, 'cash_amt', r.cash_amt)}</td>
+          <td style="padding:2px 4px">${editDate(origIdx, 'transfer_date', r.transfer_date)}</td>
+          <td style="padding:2px 4px">${editAmt(origIdx, 'transfer_amt', r.transfer_amt)}</td>
+          <td style="padding:2px 4px">${editDate(origIdx, 'cheque_date', r.cheque_date)}</td>
+          <td style="padding:2px 4px">${editAmt(origIdx, 'cheque_amt', r.cheque_amt)}</td>
+          <td style="padding:2px 4px">${editDate(origIdx, 'credit_date', r.credit_date)}</td>
+          <td style="padding:2px 4px">${editAmt(origIdx, 'credit_amt', r.credit_amt)}</td>
+        ` : `
+          <td colspan="8"></td>
+        `}
+        
         <td style="padding:4px 6px;font-family:monospace;color:${r._is_generated?'var(--info)':''}">${r.sp_number}</td>
         <td style="text-align:center;padding:4px 6px;font-size:.7rem">${fmtD(r.pay_date)}</td>
       </tr>
     `;
   }).join('');
   
-  return `<table style="width:100%;border-collapse:collapse;min-width:1600px">${thead}<tbody>${tbody}</tbody></table>`;
+  return `<table style="width:100%;border-collapse:collapse;min-width:1700px">${thead}<tbody>${tbody}</tbody></table>`;
 }
 
 // Render Report view (grouped, VAT only by default)
@@ -14360,20 +14809,15 @@ function spV2RenderSellBillsView() {
   let bills = spV2GenerateSellBills();
   
   // ── Filters ──
-  const { filterVat, filterPaid } = spV2State;
+  const { filterVat, filterPaid, groupByCustomer } = spV2State;
   if (filterVat === 'Y') bills = bills.filter(b => b._vat_flag === 'Y');
   else if (filterVat === 'N') bills = bills.filter(b => b._vat_flag === 'N');
   
   if (filterPaid === 'paid') bills = bills.filter(b => b.pay_status && b.pay_status !== 'ยกเลิก');
   else if (filterPaid === 'unpaid') bills = bills.filter(b => !b.pay_status);
   
-  // ── Sort: unpaid first, then customer A→Z ──
-  bills.sort((a, b) => {
-    const aUnpaid = !a.pay_status ? 0 : 1;
-    const bUnpaid = !b.pay_status ? 0 : 1;
-    if (aUnpaid !== bUnpaid) return aUnpaid - bUnpaid;
-    return String(a.customer).localeCompare(String(b.customer), 'th');
-  });
+  // ── Sort: bill_no ascending always ──
+  bills.sort((a, b) => String(a.bill_no).localeCompare(String(b.bill_no)));
   
   // Re-index seq for current display
   bills.forEach((b, i) => b.seq = i + 1);
@@ -14393,9 +14837,111 @@ function spV2RenderSellBillsView() {
       <div style="font-weight:700">📊 Sell Bills — ${bills.length} รายการ</div>
       ${unpaidTotal > 0 ? `<span style="color:var(--danger);font-weight:600">ค้างชำระรวม: ${fmtNum(unpaidTotal)}</span>` : ''}
       <div style="flex:1"></div>
+      <button class="btn ${groupByCustomer?'btn-primary':'btn-outline'} btn-sm" id="spv2-btn-group-cust">
+        ${groupByCustomer ? '📋 แสดงทุกบิล' : '👥 กลุ่มตามลูกค้า'}
+      </button>
       <button class="btn btn-success btn-sm" id="spv2-btn-download-sellbills">⬇️ Download XLSX</button>
-    </div>
+    </div>`;
+  
+  // ═══ GROUPED VIEW ═══
+  if (groupByCustomer) {
+    // Group bills by customer
+    const groups = {};
+    bills.forEach(b => {
+      const key = b.customer || '(ไม่มีชื่อ)';
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(b);
+    });
     
+    // Sort customers: unpaid total first (descending), then name
+    const entries = Object.entries(groups).map(([name, items]) => {
+      const unpaidAmt = items.filter(b => !b.pay_status).reduce((s,b) => s + b.total, 0);
+      const paidAmt = items.filter(b => b.pay_status && b.pay_status !== 'ยกเลิก').reduce((s,b) => s + b.total, 0);
+      const totalAmt = items.reduce((s,b) => s + b.total, 0);
+      return { name, items, unpaidAmt, paidAmt, totalAmt };
+    });
+    entries.sort((a, b) => {
+      if (a.unpaidAmt !== b.unpaidAmt) return b.unpaidAmt - a.unpaidAmt; // unpaid มากขึ้นก่อน
+      return String(a.name).localeCompare(String(b.name), 'th');
+    });
+    
+    html += `
+      <table style="width:100%;border-collapse:collapse;font-size:.8rem;min-width:900px">
+        <thead style="position:sticky;top:0;background:var(--card);z-index:1">
+          <tr style="background:var(--bg2);border-bottom:2px solid var(--border)">
+            <th style="padding:8px;text-align:center;width:40px"></th>
+            <th style="padding:8px;text-align:left">ชื่อลูกค้า</th>
+            <th style="padding:8px;text-align:center">จำนวนบิล</th>
+            <th style="padding:8px;text-align:right">ค้างชำระ</th>
+            <th style="padding:8px;text-align:right">ชำระแล้ว</th>
+            <th style="padding:8px;text-align:right">ยอดรวม</th>
+          </tr>
+        </thead>
+        <tbody>`;
+    
+    entries.forEach(({ name, items, unpaidAmt, paidAmt, totalAmt }) => {
+      const isExpanded = spV2State.expandedCustomers.has(name);
+      const hasUnpaid = unpaidAmt > 0;
+      const rowBg = hasUnpaid ? 'rgba(239,87,87,.04)' : 'rgba(63,196,143,.04)';
+      
+      html += `
+        <tr class="spv2-cust-header" data-cust="${name.replace(/"/g,'&quot;')}" 
+            style="cursor:pointer;background:${rowBg};border-bottom:1px solid var(--border);font-weight:600">
+          <td style="padding:8px;text-align:center;font-size:1rem">${isExpanded ? '▼' : '▶'}</td>
+          <td style="padding:8px">${String(name).substring(0, 55)}</td>
+          <td style="padding:8px;text-align:center">${items.length}</td>
+          <td style="padding:8px;text-align:right;color:${hasUnpaid?'var(--danger)':''}">${fmt(unpaidAmt)}</td>
+          <td style="padding:8px;text-align:right;color:var(--success)">${fmt(paidAmt)}</td>
+          <td style="padding:8px;text-align:right">${fmtNum(totalAmt)}</td>
+        </tr>`;
+      
+      // Child rows (only if expanded)
+      if (isExpanded) {
+        // Sort children by bill_no asc
+        const sorted = [...items].sort((a,b) => String(a.bill_no).localeCompare(String(b.bill_no)));
+        html += `<tr><td colspan="6" style="padding:0;background:var(--bg2)">
+          <table style="width:100%;border-collapse:collapse;font-size:.73rem">
+            <thead>
+              <tr style="border-bottom:1px solid var(--border);color:var(--text2)">
+                <th style="padding:4px 8px;text-align:center;width:40px">#</th>
+                <th style="padding:4px;text-align:center">วันที่</th>
+                <th style="padding:4px;text-align:left">เลขเอกสาร</th>
+                <th style="padding:4px;text-align:right">มูลค่า</th>
+                <th style="padding:4px;text-align:right">ภาษี</th>
+                <th style="padding:4px;text-align:right">รวม</th>
+                <th style="padding:4px;text-align:center">สถานะ</th>
+                <th style="padding:4px;text-align:center">วันที่ชำระ</th>
+              </tr>
+            </thead>
+            <tbody>`;
+        sorted.forEach((b, idx) => {
+          const isVoid = b.pay_status === 'ยกเลิก';
+          const isPaid = b.pay_status && !isVoid;
+          const statusColor = isVoid ? 'var(--text3)' : isPaid ? 'var(--success)' : 'var(--danger)';
+          const statusText = isPaid ? b.pay_status : (isVoid ? 'ยกเลิก' : 'ค้างชำระ');
+          const bg = isVoid ? 'rgba(128,128,128,.06)' : isPaid ? 'rgba(63,196,143,.02)' : 'rgba(239,87,87,.02)';
+          html += `
+            <tr style="background:${bg};border-bottom:1px solid var(--border)">
+              <td style="padding:3px 8px;text-align:center">${idx + 1}</td>
+              <td style="padding:3px;text-align:center">${fmtD(b.doc_date)}</td>
+              <td style="padding:3px;font-family:monospace">${b.bill_no}</td>
+              <td style="padding:3px;text-align:right">${fmt(b.value)}</td>
+              <td style="padding:3px;text-align:right">${fmt(b.vat)}</td>
+              <td style="padding:3px;text-align:right;font-weight:600">${fmt(b.total)}</td>
+              <td style="padding:3px;text-align:center;color:${statusColor};font-weight:600;font-size:.72rem">${statusText}</td>
+              <td style="padding:3px;text-align:center">${fmtD(b.pay_date)}</td>
+            </tr>`;
+        });
+        html += `</tbody></table></td></tr>`;
+      }
+    });
+    
+    html += `</tbody></table></div>`;
+    return html;
+  }
+  
+  // ═══ FLAT VIEW (default) ═══
+  html += `
     <table style="width:100%;border-collapse:collapse;font-size:.75rem;min-width:1400px">
       <thead style="position:sticky;top:0;background:var(--card);z-index:1">
         <tr style="background:var(--bg2);border-bottom:2px solid var(--border)">
@@ -14472,13 +15018,8 @@ function spV2DownloadSellBills() {
   if (filterPaid === 'paid') bills = bills.filter(b => b.pay_status && b.pay_status !== 'ยกเลิก');
   else if (filterPaid === 'unpaid') bills = bills.filter(b => !b.pay_status);
   
-  // Sort same as UI
-  bills.sort((a, b) => {
-    const aUnpaid = !a.pay_status ? 0 : 1;
-    const bUnpaid = !b.pay_status ? 0 : 1;
-    if (aUnpaid !== bUnpaid) return aUnpaid - bUnpaid;
-    return String(a.customer).localeCompare(String(b.customer), 'th');
-  });
+  // Sort by bill_no ascending (consistent with UI)
+  bills.sort((a, b) => String(a.bill_no).localeCompare(String(b.bill_no)));
   bills.forEach((b, i) => b.seq = i + 1);
   
   const fmtD = v => v ? String(v).substring(0, 10) : '';
