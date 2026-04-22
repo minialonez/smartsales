@@ -1342,7 +1342,12 @@ const syncManager = {
     if (!this.enabled) return { skipped: 'disabled' };
     
     if (mode === 'auto') {
-      const hasLocalData = billList.length > 0 || getAllStatements().length > 0;
+      // "มี local data พอแล้ว" = มีบิลพอสมควร + มี stmts อย่างน้อย 1
+      // ถ้า billList น้อยมาก (<10) → treat as empty แม้จะไม่ว่าง 100%
+      // เพราะอาจเป็นกรณี: summary โหลดจาก backend แต่ bills ยังว่าง
+      const hasEnoughBills = billList.length >= 10;
+      const hasStmts = getAllStatements().length > 0;
+      const hasLocalData = hasEnoughBills && hasStmts;
       const lastPullRecent = Date.now() - this.lastPullAt < 30 * 60 * 1000; // 30 min
       if (hasLocalData && lastPullRecent) {
         return { skipped: 'has_local_and_recent' };
@@ -3257,6 +3262,18 @@ async function renderMain(el) {
       ` : ''}
 
       <!-- ═══════ SECTION 3: Bill List Transactions (ส่วนล่าง) ═══════ -->
+      ${billList.length === 0 ? `
+      <div class="card-flat mb-3" style="padding:16px 20px;background:rgba(79,156,249,.08);border:1.5px solid rgba(79,156,249,.3)">
+        <div class="flex justify-between items-center gap-3">
+          <div>
+            <div class="font-semi" style="color:var(--info);font-size:.95rem">📭 ไม่มีบิลใน browser นี้</div>
+            <div class="text-xs text-muted mt-1">ถ้าเพิ่ง Login บนเครื่อง/browser ใหม่ กดปุ่มด้านขวาเพื่อดึงข้อมูลจาก cloud — หรือไปที่หน้า "จัดการข้อมูล" เพื่อ import</div>
+          </div>
+          <button class="btn btn-primary btn-sm" id="btn-quick-sync-bills" style="white-space:nowrap">☁️ ดึงข้อมูลจาก Cloud</button>
+        </div>
+      </div>
+      ` : ''}
+      
       <div class="flex justify-between items-center mb-2">
         <div class="font-semi">📋 Bill List (${billList.length} รายการ${paidCount?` · <span style="color:var(--success)">จ่ายแล้ว ${paidCount}</span>`:''}${filterDateFrom||filterDateTo?` · กรอง ${filterDateFrom||'…'} → ${filterDateTo||'…'}`:''}${filterBillSearch?` · <span style="color:var(--info)">🔍 ค้น "${filterBillSearch}" = ${data.length}</span>`:''})</div>
         <div class="flex gap-2 flex-wrap">
@@ -3923,6 +3940,29 @@ async function renderMain(el) {
       invalidateBillsCache();
       toast(`ลบ ${toDelete.length} บิลสำเร็จ`, 'success');
       render();
+    });
+    
+    // Quick sync button (แสดงเมื่อ billList ว่างเปล่า)
+    document.getElementById('btn-quick-sync-bills')?.addEventListener('click', async (e) => {
+      const btn = e.currentTarget;
+      btn.disabled = true;
+      btn.textContent = '⏳ กำลังดึง...';
+      try {
+        const stats = await syncManager.pullFromCloud(2, 'force');
+        const total = (stats.bills||0) + (stats.stmts||0) + (stats.payments||0) + (stats.cashflow||0);
+        if (total > 0) {
+          toast(`☁️ ดึงสำเร็จ — Bills +${stats.bills}, Stmts +${stats.stmts}, SP +${stats.payments}`, 'success', 4000);
+          render();
+        } else {
+          toast('ไม่พบข้อมูลใน cloud — อาจยังไม่ได้ save จากเครื่องอื่น', 'warn', 4000);
+          btn.disabled = false;
+          btn.textContent = '☁️ ดึงข้อมูลจาก Cloud';
+        }
+      } catch(err) {
+        toast('Sync ล้มเหลว: ' + err.message, 'error');
+        btn.disabled = false;
+        btn.textContent = '☁️ ดึงข้อมูลจาก Cloud';
+      }
     });
     
     document.getElementById('btn-clear-bl')?.addEventListener('click', () => {
