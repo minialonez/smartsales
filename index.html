@@ -1971,17 +1971,26 @@ function showValidationModal(validation, onContinue) {
         </div>
       ` : ''}
       <div class="flex gap-2 mt-2">
-        <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">${errors.length?'ปิด':'ยกเลิก'}</button>
-        ${errors.length === 0 && onContinue ? `<button class="btn btn-warn btn-sm flex-1" id="val-continue" style="background:var(--warn);color:#fff">${ICONS.check} ยืนยันบันทึก (ยังมีคำเตือน)</button>` : ''}
-        ${errors.length > 0 ? '<div class="text-xs text-muted" style="align-self:center;flex:1;text-align:center">แก้ไข error ก่อนจะบันทึกได้</div>' : ''}
+        <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ยกเลิก</button>
+        ${errors.length > 0 && onContinue ? `<button class="btn btn-sm flex-1" id="val-force-save" style="background:var(--danger);color:#fff;border:1px solid var(--danger)">⚠️ บันทึกทั้งๆ ที่มี error (${errors.length})</button>` : ''}
+        ${errors.length === 0 && onContinue ? `<button class="btn btn-warn btn-sm flex-1" id="val-continue" style="background:var(--warn);color:#fff">${ICONS.check} ยืนยันบันทึก (มีคำเตือน)</button>` : ''}
       </div>
     </div>
   `;
   
   const title = errors.length > 0 
-    ? '❌ พบปัญหาที่ต้องแก้ไข' 
+    ? `⚠️ พบ ${errors.length} error (ยืนยันได้ว่าจะบันทึกต่อ)` 
     : '⚠️ ตรวจสอบก่อนบันทึก';
   openModal(title, html);
+  
+  // ปุ่ม "บันทึกทั้งๆ ที่มี error" (force save)
+  if (errors.length > 0 && onContinue) {
+    document.getElementById('val-force-save')?.addEventListener('click', () => {
+      if (!confirm(`⚠️ ยืนยันว่าจะบันทึกทั้งๆ ที่มี error ${errors.length} รายการ?\n\nข้อมูลอาจไม่สมบูรณ์ — แต่ยัง push ขึ้น Sheet ได้`)) return;
+      closeModal();
+      onContinue();
+    });
+  }
   
   if (errors.length === 0 && onContinue) {
     document.getElementById('val-continue')?.addEventListener('click', () => {
@@ -4500,8 +4509,11 @@ async function renderMain(el) {
       const v = validateAll();
       
       if (v.errors.length > 0) {
-        showValidationModal(v, null);
-        return; // ห้ามบันทึก
+        // มี error → แสดง modal แต่ให้ user force-save ได้ถ้ายืนยัน
+        showValidationModal(v, async () => {
+          await actuallySaveMain();
+        });
+        return;
       }
       
       if (v.warnings.length > 0) {
