@@ -1306,24 +1306,41 @@ const syncManager = {
     for (const type of types) {
       try {
         if (type === 'bills') {
-          await api('saveDailySales', { bills: billList, created_by: by });
+          if (billList.length === 0) { continue; } // ไม่ push array ว่าง
+          const r = await api('saveDailySales', { rows: billList, created_by: by });
+          if (r?.success === false) throw new Error(r.error || 'API error');
         } else if (type === 'stmts') {
-          await api('saveStatements', { statements: getAllStatements(), created_by: by });
+          const allStmts = getAllStatements();
+          if (allStmts.length === 0) { continue; }
+          const r = await api('saveStatements', { rows: allStmts, created_by: by });
+          if (r?.success === false) throw new Error(r.error || 'API error');
         } else if (type === 'payments') {
-          await api('savePayments', { payments: paymentList, created_by: by });
+          if (paymentList.length === 0) { continue; }
+          const r = await api('savePayments', { payments: paymentList, created_by: by });
+          if (r?.success === false) throw new Error(r.error || 'API error');
         } else if (type === 'cashflow') {
-          await api('saveCashflow', { records: cashflowList, created_by: by });
+          if (cashflowList.length === 0) { continue; }
+          const r = await api('saveCashflow', { records: cashflowList, created_by: by });
+          if (r?.success === false) throw new Error(r.error || 'API error');
         } else if (type === 'suppliers') {
-          await api('saveSuppliers', { records: supplierList, created_by: by });
-          await api('saveSupplierPayments', { records: supplierPayments, created_by: by });
+          if (supplierList.length > 0) {
+            const r = await api('saveSuppliers', { records: supplierList, created_by: by });
+            if (r?.success === false) throw new Error(r.error || 'API error');
+          }
+          if (supplierPayments.length > 0) {
+            const r2 = await api('saveSupplierPayments', { records: supplierPayments, created_by: by });
+            if (r2?.success === false) throw new Error(r2.error || 'API error');
+          }
         } else if (type === 'meta') {
-          await api('saveDailyMeta', { summary: mainSummary, cash_count: cashCount });
+          const r = await api('saveDailyMeta', { summary: mainSummary, cash_count: cashCount });
+          if (r?.success === false) throw new Error(r.error || 'API error');
         }
         results.ok++;
       } catch(err) {
         results.fail++;
         results.errors.push(`${type}: ${err.message}`);
         this.dirty.add(type); // re-queue for next cycle
+        console.warn('[sync] push fail', type, err);
       }
     }
     
