@@ -14572,23 +14572,27 @@ async function renderSpRecon(el) {
     <div class="page-title">📥 ตรวจ SP (ลูกหนี้) — V2</div>
     
     <div class="card" style="margin-bottom:16px">
-      <div style="font-weight:600;margin-bottom:10px">📂 อัปโหลดไฟล์ Crystal Reports</div>
+      <div style="font-weight:600;margin-bottom:10px">📂 อัปโหลดไฟล์ Crystal Reports (3 ไฟล์)</div>
       <div class="flex gap-2 flex-wrap items-center">
-        <input type="file" id="spv2-file-main" accept=".xls,.xlsx" style="display:none">
-        <input type="file" id="spv2-file-type" accept=".xls,.xlsx" style="display:none">
-        <input type="file" id="spv2-file-tax" accept=".xls,.xlsx" style="display:none">
+        <input type="file" id="spv2-file-multi" accept=".xls,.xlsx" multiple style="display:none">
         
-        <button class="btn btn-outline btn-sm" id="spv2-btn-main">
-          📄 1. การชำระเงิน.xls ${spV2State.rawPayMain.length ? '<span class="badge badge-success">'+spV2State.rawPayMain.length+'</span>' : ''}
-        </button>
-        <button class="btn btn-outline btn-sm" id="spv2-btn-type">
-          📄 2. ตามประเภท.xls ${spV2State.rawPayType.length ? '<span class="badge badge-success">'+spV2State.rawPayType.length+'</span>' : ''}
-        </button>
-        <button class="btn btn-outline btn-sm" id="spv2-btn-tax">
-          📄 3. ภาษีขาย.xls ${spV2State.rawTaxSales.length ? '<span class="badge badge-success">'+spV2State.rawTaxSales.length+'</span>' : ''}
+        <button class="btn btn-primary btn-sm" id="spv2-btn-multi">
+          📂 เลือก 3 ไฟล์พร้อมกัน (Ctrl/Cmd + คลิก)
         </button>
         
-        <button class="btn btn-primary btn-sm" id="spv2-btn-merge" 
+        <div style="flex:1;display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-left:8px">
+          <span class="badge ${spV2State.rawPayMain.length?'badge-success':'badge-muted'}" style="font-size:.75rem">
+            ${spV2State.rawPayMain.length?'✓':'○'} การชำระเงิน ${spV2State.rawPayMain.length?`(${spV2State.rawPayMain.length})`:''}
+          </span>
+          <span class="badge ${spV2State.rawPayType.length?'badge-success':'badge-muted'}" style="font-size:.75rem">
+            ${spV2State.rawPayType.length?'✓':'○'} ตามประเภท ${spV2State.rawPayType.length?`(${spV2State.rawPayType.length})`:''}
+          </span>
+          <span class="badge ${spV2State.rawTaxSales.length?'badge-success':'badge-muted'}" style="font-size:.75rem">
+            ${spV2State.rawTaxSales.length?'✓':'○'} ภาษีขาย ${spV2State.rawTaxSales.length?`(${spV2State.rawTaxSales.length})`:''}
+          </span>
+        </div>
+        
+        <button class="btn btn-success btn-sm" id="spv2-btn-merge" 
           ${spV2State.rawPayMain.length && spV2State.rawPayType.length ? '' : 'disabled'}>
           🔗 รวม 3 ไฟล์ → สร้าง Main
         </button>
@@ -14596,6 +14600,9 @@ async function renderSpRecon(el) {
         ${spV2State.mainRows.length > 0 ? `
           <button class="btn btn-ghost btn-sm" id="spv2-btn-clear" style="color:var(--danger)">🗑 ล้างข้อมูล</button>
         ` : ''}
+      </div>
+      <div class="text-xs text-dim" style="margin-top:8px">
+        💡 เลือกทั้ง 3 ไฟล์พร้อมกัน (การชำระเงิน + ตามประเภท + ภาษีขาย) — ระบบจะ detect ประเภทเอง
       </div>
     </div>
     
@@ -14665,37 +14672,72 @@ async function renderSpRecon(el) {
   `;
   
   // ── Wire up ──
-  document.getElementById('spv2-btn-main')?.addEventListener('click', () => 
-    document.getElementById('spv2-file-main').click());
-  document.getElementById('spv2-btn-type')?.addEventListener('click', () => 
-    document.getElementById('spv2-file-type').click());
-  document.getElementById('spv2-btn-tax')?.addEventListener('click', () => 
-    document.getElementById('spv2-file-tax').click());
+  document.getElementById('spv2-btn-multi')?.addEventListener('click', () => 
+    document.getElementById('spv2-file-multi').click());
   
-  document.getElementById('spv2-file-main')?.addEventListener('change', async e => {
-    const f = e.target.files[0]; if (!f) return;
-    const r = await parseExcelFile(f);
-    const sheet = r.sheets[r.sheetNames[0]];
-    spV2State.rawPayMain = parseReconPaymentMain(sheet, 'sp');
-    toast(`อ่าน "การชำระเงิน" — ${spV2State.rawPayMain.length} SP`, 'success');
-    renderSpRecon(el);
-  });
-  
-  document.getElementById('spv2-file-type')?.addEventListener('change', async e => {
-    const f = e.target.files[0]; if (!f) return;
-    const r = await parseExcelFile(f);
-    const sheet = r.sheets[r.sheetNames[0]];
-    spV2State.rawPayType = parseReconPaymentType(sheet, 'sp');
-    toast(`อ่าน "ตามประเภท" — ${spV2State.rawPayType.length} SP`, 'success');
-    renderSpRecon(el);
-  });
-  
-  document.getElementById('spv2-file-tax')?.addEventListener('change', async e => {
-    const f = e.target.files[0]; if (!f) return;
-    const r = await parseExcelFile(f);
-    const sheet = r.sheets[r.sheetNames[0]];
-    spV2State.rawTaxSales = parseReconTax(sheet);
-    toast(`อ่าน "ภาษีขาย" — ${spV2State.rawTaxSales.length} records`, 'success');
+  document.getElementById('spv2-file-multi')?.addEventListener('change', async e => {
+    const files = Array.from(e.target.files || []);
+    if (files.length === 0) return;
+    
+    const results = { main: 0, type: 0, tax: 0, unknown: 0, wrong_kind: 0 };
+    const issues = [];
+    
+    toast(`กำลังอ่าน ${files.length} ไฟล์...`, 'info');
+    
+    for (const file of files) {
+      try {
+        const r = await parseExcelFile(file);
+        const sheet = r.sheets ? r.sheets[r.sheetNames[0]] : null;
+        if (!sheet) { issues.push(`${file.name}: อ่านไฟล์ไม่ได้`); continue; }
+        
+        const { type, kind: detectedKind } = detectReconFileType(sheet);
+        
+        // ตรวจว่าเป็นไฟล์ PP (เตือนว่าผิดหน้า)
+        if (detectedKind === 'pp') {
+          issues.push(`${file.name}: เป็นไฟล์ PP (เจ้าหนี้) — ข้าม`);
+          results.wrong_kind++;
+          continue;
+        }
+        
+        if (type === 'payment_main') {
+          spV2State.rawPayMain = parseReconPaymentMain(sheet, 'sp');
+          results.main = spV2State.rawPayMain.length;
+        } else if (type === 'payment_type') {
+          spV2State.rawPayType = parseReconPaymentType(sheet, 'sp');
+          results.type = spV2State.rawPayType.length;
+        } else if (type === 'tax_sales') {
+          spV2State.rawTaxSales = parseReconTax(sheet);
+          results.tax = spV2State.rawTaxSales.length;
+        } else if (type === 'tax_purchase') {
+          issues.push(`${file.name}: ภาษีซื้อ — ข้าม (ใช้กับหน้า PP)`);
+          results.wrong_kind++;
+        } else {
+          issues.push(`${file.name}: ไม่รู้จักประเภท`);
+          results.unknown++;
+        }
+      } catch (err) {
+        issues.push(`${file.name}: ${err.message}`);
+      }
+    }
+    
+    // Summary
+    const summary = [];
+    if (results.main > 0) summary.push(`การชำระเงิน ${results.main}`);
+    if (results.type > 0) summary.push(`ตามประเภท ${results.type}`);
+    if (results.tax > 0) summary.push(`ภาษีขาย ${results.tax}`);
+    
+    if (summary.length > 0) {
+      toast(`อ่านสำเร็จ: ${summary.join(' · ')}${issues.length?` (${issues.length} ไฟล์มีปัญหา)`:''}`, 'success', 4000);
+    } else {
+      toast('ไม่สามารถอ่านไฟล์ใดๆ ได้', 'error');
+    }
+    
+    if (issues.length > 0) {
+      console.warn('[SP V2 upload issues]', issues);
+      alert(`พบปัญหากับบางไฟล์:\n\n${issues.join('\n')}`);
+    }
+    
+    e.target.value = ''; // reset input
     renderSpRecon(el);
   });
   
