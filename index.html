@@ -14421,7 +14421,11 @@ function spV2BuildRows(payMain, payType, taxSales) {
       else if (/เช็ค/.test(m.type))            { methodInfo.cheque.d = m.date; methodInfo.cheque.a += m.amount; }
     });
     // Credit notes (JR/SC/JS amount negative)
-    const creditAmt = sp.bills.filter(b => b.amount < 0).reduce((s,b) => s + Math.abs(b.amount), 0);
+    // creditAmt = net ของ credit ใช้จริง = totalBills - cash - transfer - cheque
+    // สำหรับ case OR+JR offset กันพอดี → creditAmt = 0 (แต่ hasCreditActivity ยังเป็น true)
+    const hasCreditActivity = sp.bills.some(b => b.amount < 0);
+    const allBillsTotal = sp.bills.reduce((s,b) => s + b.amount, 0);
+    const creditAmt = allBillsTotal - methodInfo.cash.a - methodInfo.transfer.a - methodInfo.cheque.a;
     
     // ── NOVAT group: use original SP number ──
     if (novatBills.length > 0) {
@@ -14435,7 +14439,7 @@ function spV2BuildRows(payMain, payType, taxSales) {
         cash_date: methodInfo.cash.a > 0 ? methodInfo.cash.d : '', cash_amt: methodInfo.cash.a,
         transfer_date: methodInfo.transfer.a > 0 ? methodInfo.transfer.d : '', transfer_amt: methodInfo.transfer.a,
         cheque_date: methodInfo.cheque.a > 0 ? methodInfo.cheque.d : '', cheque_amt: methodInfo.cheque.a,
-        credit_date: creditAmt > 0 ? sp.date : '', credit_amt: creditAmt,
+        credit_date: hasCreditActivity ? sp.date : '', credit_amt: creditAmt,
         note2: '', sp_number: sp.no, pay_date: sp.date,
         _is_header: true, _group_id: sp.no,
       };
@@ -14483,6 +14487,7 @@ function spV2BuildRows(payMain, payType, taxSales) {
         vatHeader.cash_date = methodInfo.cash.a > 0 ? methodInfo.cash.d : ''; vatHeader.cash_amt = methodInfo.cash.a;
         vatHeader.transfer_date = methodInfo.transfer.a > 0 ? methodInfo.transfer.d : ''; vatHeader.transfer_amt = methodInfo.transfer.a;
         vatHeader.cheque_date = methodInfo.cheque.a > 0 ? methodInfo.cheque.d : ''; vatHeader.cheque_amt = methodInfo.cheque.a;
+        vatHeader.credit_date = hasCreditActivity ? sp.date : ''; vatHeader.credit_amt = creditAmt;
       } else if (vatTotal > 0) {
         // Mixed — VAT total as separate transfer payment (เฉพาะเมื่อมียอดจริง)
         vatHeader.transfer_date = sp.date;
@@ -14835,15 +14840,23 @@ function spV2RenderMainTable(rows) {
   `;
   
   // Editable date/amount cell for headers
-  const editDate = (origIdx, field, val) => `
+  // editDate: รองรับ disabled flag — readonly+grey เมื่อยังไม่มียอด (กันการใส่ date โดดๆ)
+  const editDate = (origIdx, field, val, disabled) => `
     <input type="date" class="spv2-edit-cell" data-idx="${origIdx}" data-field="${field}" 
            value="${String(val||'').substring(0,10)}" 
-           style="width:100%;background:transparent;border:none;color:var(--text);padding:2px 4px;font-size:.72rem;text-align:center">
+           ${disabled ? 'readonly title="กรอกยอดก่อน date จึงจะใช้ได้"' : ''}
+           style="width:100%;min-width:85px;background:transparent;border:none;color:var(--text);padding:1px 2px;font-size:.65rem;text-align:center${disabled ? ';opacity:.35;cursor:not-allowed' : ''}">
   `;
   const editAmt = (origIdx, field, val) => `
     <input type="number" step="0.01" class="spv2-edit-cell" data-idx="${origIdx}" data-field="${field}" 
            value="${val ? Number(val) : ''}" placeholder=""
            style="width:100%;background:transparent;border:none;color:var(--text);padding:2px 4px;font-size:.72rem;text-align:right">
+  `;
+  // editAmt variant: shows 0 (not blank) — for cases where corresponding date is set
+  const editAmtShowZero = (origIdx, field, val) => `
+    <input type="number" step="0.01" class="spv2-edit-cell" data-idx="${origIdx}" data-field="${field}" 
+           value="${Number(val) || 0}" placeholder=""
+           style="width:100%;background:transparent;color:var(--text);padding:2px 4px;font-size:.72rem;text-align:right;border:none">
   `;
   
   const tbody = rows.map(r => {
@@ -14869,23 +14882,23 @@ function spV2RenderMainTable(rows) {
         <td style="padding:4px 6px">${String(r.sale_date || '').substring(0, 40)}</td>
         <td style="padding:4px 6px;font-size:.7rem">${r.note1 || ''}</td>
         <td style="text-align:right;padding:4px 6px">${fmt(r.amount)}</td>
-        <td style="text-align:right;padding:4px 6px;color:var(--success)">${isHdr?fmt(r.pay_total):''}</td>
+        <td style="text-align:right;padding:4px 6px;color:var(--success)">${isHdr?fmtNum(Number(r.pay_total)||0):''}</td>
         
         ${isHdr ? (() => {
-          // แสดง date เฉพาะเมื่อมียอด — ถ้ายอด=0 ให้ว่างไว้ (user เข้าไปกรอก amt ก่อนแล้ว date จึงจะมีผล)
-          const cashHasAmt = Number(r.cash_amt) > 0;
-          const trfHasAmt = Number(r.transfer_amt) > 0;
-          const chqHasAmt = Number(r.cheque_amt) > 0;
-          const crdHasAmt = Number(r.credit_amt) > 0;
+          const cashAmt = Number(r.cash_amt) || 0;
+          const trfAmt = Number(r.transfer_amt) || 0;
+          const chqAmt = Number(r.cheque_amt) || 0;
+          const crdAmt = Number(r.credit_amt) || 0;
+          const hasCreditActivity = !!r.credit_date; // OR+JR offset case: credit_date set even if amt=0
           return `
-          <td style="padding:2px 4px">${editDate(origIdx, 'cash_date', cashHasAmt ? r.cash_date : '')}</td>
+          <td style="padding:2px 4px">${editDate(origIdx, 'cash_date', cashAmt !== 0 ? r.cash_date : '', cashAmt === 0)}</td>
           <td style="padding:2px 4px">${editAmt(origIdx, 'cash_amt', r.cash_amt)}</td>
-          <td style="padding:2px 4px">${editDate(origIdx, 'transfer_date', trfHasAmt ? r.transfer_date : '')}</td>
+          <td style="padding:2px 4px">${editDate(origIdx, 'transfer_date', trfAmt !== 0 ? r.transfer_date : '', trfAmt === 0)}</td>
           <td style="padding:2px 4px">${editAmt(origIdx, 'transfer_amt', r.transfer_amt)}</td>
-          <td style="padding:2px 4px">${editDate(origIdx, 'cheque_date', chqHasAmt ? r.cheque_date : '')}</td>
+          <td style="padding:2px 4px">${editDate(origIdx, 'cheque_date', chqAmt !== 0 ? r.cheque_date : '', chqAmt === 0)}</td>
           <td style="padding:2px 4px">${editAmt(origIdx, 'cheque_amt', r.cheque_amt)}</td>
-          <td style="padding:2px 4px">${editDate(origIdx, 'credit_date', crdHasAmt ? r.credit_date : '')}</td>
-          <td style="padding:2px 4px">${editAmt(origIdx, 'credit_amt', r.credit_amt)}</td>
+          <td style="padding:2px 4px">${editDate(origIdx, 'credit_date', r.credit_date, !hasCreditActivity && crdAmt === 0)}</td>
+          <td style="padding:2px 4px">${hasCreditActivity ? editAmtShowZero(origIdx, 'credit_amt', r.credit_amt) : editAmt(origIdx, 'credit_amt', r.credit_amt)}</td>
           `;
         })() : `
           <td colspan="8"></td>
