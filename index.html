@@ -1305,7 +1305,7 @@ const syncManager = {
   //   ปุ่ม "save daily" manual (หน้า Main) ที่มี logic replace-safe
   markDirty(type) {
     if (!this.enabled) return;
-    const SAFE_AUTO_TYPES = ['payments', 'cashflow', 'suppliers', 'meta'];
+    const SAFE_AUTO_TYPES = ['payments', 'sp_temps', 'cashflow', 'suppliers', 'meta'];
     if (type) {
       // Only auto-push if type is in safe list
       if (SAFE_AUTO_TYPES.includes(type)) this.dirty.add(type);
@@ -1369,6 +1369,13 @@ const syncManager = {
           const r = await api('savePayments', { payments: paymentList, created_by: by });
           if (r?.success === false) throw new Error(r.error || 'API error');
           this._fpCache.payments = fp;
+        } else if (type === 'sp_temps') {
+          // spTempList เล็ก (ชั่วคราว) — push เสมอเมื่อ dirty + fingerprint skip
+          const fp = this._fp({n: spTempList.length, paids: spTempList.map(t => (t.partials||[]).length), links: spTempList.map(t => t.linked_sp||'')});
+          if (fp === this._fpCache.sp_temps) { results.skipped++; continue; }
+          const r = await api('saveSpTemps', { records: spTempList, created_by: by });
+          if (r?.success === false) throw new Error(r.error || 'API error');
+          this._fpCache.sp_temps = fp;
         } else if (type === 'cashflow') {
           if (cashflowList.length === 0) continue;
           const fp = this._fp({n: cashflowList.length, first: cashflowList[0]?.id, last: cashflowList[cashflowList.length-1]?.id});
@@ -1517,6 +1524,22 @@ const syncManager = {
         });
       } catch(err) { stats.errors.push(`SP: ${err.message}`); console.warn('[sync] SP', err); }
       
+      // SP-TEMPs (replace-merge by no — backend is source of truth)
+      try {
+        const r = await api('getSpTemps');
+        if (r?.success === false) throw new Error(r.error || 'API error');
+        const items = (r?.data?.data) || (Array.isArray(r?.data) ? r.data : []) || [];
+        if (Array.isArray(items)) {
+          const byNo = {};
+          spTempList.forEach(t => { if (t.no) byNo[t.no] = t; });
+          items.forEach(t => {
+            if (!t.no) return;
+            if (!byNo[t.no]) { spTempList.push(t); }
+            else { Object.assign(byNo[t.no], t); } // เอา cloud ทับ (ถือเป็น source of truth)
+          });
+        }
+      } catch(err) { /* API อาจยังไม่มี — ไม่ critical */ console.warn('[sync] SpTemps', err?.message); }
+      
       try {
         const r = await api('getCashflow');
         if (r?.success === false) throw new Error(r.error || 'API error');
@@ -1613,6 +1636,7 @@ function persistMainState() {
       safeStorage.set('sf_mainSummary', JSON.stringify(mainSummary));
       safeStorage.set('sf_cashCount', JSON.stringify(cashCount));
       safeStorage.set('sf_paymentList', JSON.stringify(paymentList));
+      safeStorage.set('sf_spTempList', JSON.stringify(spTempList));
       safeStorage.set('sf_cashflowList', JSON.stringify(cashflowList));
       safeStorage.set('sf_supplierList', JSON.stringify(supplierList));
       safeStorage.set('sf_supplierPayments', JSON.stringify(supplierPayments));
@@ -1636,6 +1660,7 @@ function flushPersistState() {
       safeStorage.set('sf_mainSummary', JSON.stringify(mainSummary));
       safeStorage.set('sf_cashCount', JSON.stringify(cashCount));
       safeStorage.set('sf_paymentList', JSON.stringify(paymentList));
+      safeStorage.set('sf_spTempList', JSON.stringify(spTempList));
       safeStorage.set('sf_cashflowList', JSON.stringify(cashflowList));
       safeStorage.set('sf_supplierList', JSON.stringify(supplierList));
       safeStorage.set('sf_supplierPayments', JSON.stringify(supplierPayments));
@@ -2032,6 +2057,8 @@ async function restoreMainState() {
     // ── ข้อมูลเล็ก: localStorage เหมือนเดิม ──
     const savedPay = safeStorage.get('sf_paymentList');
     if (savedPay) paymentList = JSON.parse(savedPay);
+    const savedSpTemps = safeStorage.get('sf_spTempList');
+    if (savedSpTemps) { try { spTempList = JSON.parse(savedSpTemps); } catch(_) { spTempList = []; } }
     const savedCashflow = safeStorage.get('sf_cashflowList');
     if (savedCashflow) cashflowList = JSON.parse(savedCashflow);
     const savedSuppliers = safeStorage.get('sf_supplierList');
@@ -2467,10 +2494,15 @@ function parseSPReport(result, fileName) {
   persistMainState();
   toast(`นำเข้า SP สำเร็จ — ${count} SP, ${childCount} บิลที่ตัด${linkedCount?`, เชื่อมกับ Bill List ${linkedCount} บิล`:''}`, 'success');
   
-  // แจ้งเตือน merge candidates
+  // แจ้งเตือน merge candidates (OLD SP-TEMP in paymentList)
   if (tempsToMerge.length > 0) {
     setTimeout(() => showSpMergeDialog(tempsToMerge), 600);
   }
+  
+  // แจ้งเตือน graduate candidates (NEW spTempList)
+  // เลื่อนให้หลัง showSpMergeDialog — ถ้ามีทั้งคู่ ไม่ซ้อนกัน
+  const gradDelay = tempsToMerge.length > 0 ? 2000 : 600;
+  setTimeout(() => spTempAutoGraduateDialog(realSPs), gradDelay);
   
   if (currentPage === 'payments') navigateTo('payments');
 }
@@ -5769,10 +5801,140 @@ function spTempGraduate(tempNo, realSpNo, realSpDate) {
   return true;
 }
 
+// Manual graduate modal (กดจากปุ่ม 🎓 Graduate)
+function openGraduateTempModal(t) {
+  const p = spTempProgress(t);
+  // หา SP ที่น่าจะ match จาก paymentList (ยังไม่ถูก graduate, cust เดียวกัน, ยอดใกล้)
+  const candidates = paymentList.filter(sp => {
+    if (/^SP-TEMP-/.test(sp.sp_no)) return false; // ข้าม SP-TEMP ด้วยกัน
+    // เช็คว่าไม่มี SP-TEMP อื่น graduate ไปที่ sp นี้แล้ว
+    const alreadyLinked = spTempList.some(x => x.linked_sp === sp.sp_no);
+    if (alreadyLinked) return false;
+    const codeMatch = !t.cust_code || !sp.cust_id || sp.cust_id === t.cust_code;
+    const amtMatch = Math.abs(Number(sp.total||0) - p.paid) < 1;
+    return codeMatch && amtMatch;
+  });
+  
+  openModal(`🎓 Graduate ${t.no}`, `
+    <div class="flex-col gap-3" style="min-width:440px">
+      <div style="padding:10px;background:var(--bg2);border-radius:6px;font-size:.85rem">
+        ลูกค้า: <b>${t.cust_code?`(${t.cust_code})`:''} ${t.cust_name}</b><br>
+        ยอดที่รับแล้ว: <b style="color:var(--success)">฿${fmtNum(p.paid)}</b> · Expected: ฿${fmtNum(p.expected)}
+      </div>
+      
+      ${candidates.length > 0 ? `
+        <div>
+          <div class="text-sm" style="margin-bottom:6px;color:var(--text2)">🔗 SP จริงที่น่าจะเป็นตัวเดียวกัน:</div>
+          ${candidates.map(sp => `
+            <div class="flex items-center gap-2" style="padding:8px;border:1px solid var(--border);border-radius:6px;margin-bottom:4px;cursor:pointer" 
+                 onclick="document.getElementById('grad-sp-no').value='${sp.sp_no}'">
+              <input type="radio" name="grad-cand" value="${sp.sp_no}">
+              <div style="flex:1">
+                <div style="font-weight:600;color:var(--primary)">${sp.sp_no}</div>
+                <div class="text-xs text-muted">${sp.cust_name} · ฿${fmtNum(sp.total)} · ${fmtDate(sp.date)}</div>
+              </div>
+            </div>
+          `).join('')}
+        </div>
+      ` : '<div class="text-xs text-dim">ไม่พบ SP จริงที่ยอดตรง — กรอกเลขเอง</div>'}
+      
+      <div class="input-group">
+        <label>เลข SP จริง</label>
+        <input class="input" id="grad-sp-no" placeholder="เช่น SP00126-001032" autofocus>
+      </div>
+      <div class="input-group">
+        <label>วันที่ SP จริง</label>
+        <input type="date" class="input" id="grad-sp-date" value="${todayISO()}">
+      </div>
+      
+      <div class="flex gap-2 mt-2">
+        <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ยกเลิก</button>
+        <button class="btn btn-success btn-sm flex-1" id="grad-confirm">🎓 Graduate</button>
+      </div>
+    </div>
+  `);
+  
+  // Wire radio → input
+  document.querySelectorAll('input[name="grad-cand"]').forEach(r => {
+    r.addEventListener('change', () => {
+      document.getElementById('grad-sp-no').value = r.value;
+    });
+  });
+  
+  document.getElementById('grad-confirm')?.addEventListener('click', () => {
+    const realSpNo = document.getElementById('grad-sp-no').value.trim();
+    const realSpDate = document.getElementById('grad-sp-date').value;
+    if (!realSpNo) { toast('กรอกเลข SP จริง', 'error'); return; }
+    
+    spTempGraduate(t.no, realSpNo, realSpDate);
+    closeModal();
+    toast(`Graduate ${t.no} → ${realSpNo} สำเร็จ`, 'success');
+    if (typeof currentPage !== 'undefined' && currentPage === 'payments') navigateTo('payments');
+  });
+}
+
+// Auto-detect graduation candidates จาก SP ที่เพิ่ง import
+// เรียกจาก parseSPReport หลัง merge แล้ว
+function spTempAutoGraduateDialog(newRealSPs) {
+  const candidates = [];
+  newRealSPs.forEach(realSp => {
+    const matches = spTempFindGraduationCandidates(realSp);
+    matches.forEach(temp => {
+      candidates.push({ temp, real: realSp });
+    });
+  });
+  if (candidates.length === 0) return;
+  
+  openModal(`🎓 พบ SP-TEMP พร้อม Graduate (${candidates.length})`, `
+    <div class="flex-col gap-3">
+      <p class="text-sm text-dim">ระบบพบว่า SP-TEMP ต่อไปนี้ยอด partial รวมตรงกับ SP จริงที่เพิ่ง import — ต้องการ graduate หรือไม่?</p>
+      <div style="max-height:350px;overflow-y:auto;border:1px solid var(--border);border-radius:8px">
+        ${candidates.map((c, i) => {
+          const p = spTempProgress(c.temp);
+          return `
+            <div class="flex justify-between items-center" style="padding:12px;border-bottom:1px solid var(--border)">
+              <div style="flex:1">
+                <div class="text-sm">
+                  <span class="badge badge-warn">${c.temp.no}</span>
+                  → <span class="badge badge-success">${c.real.sp_no}</span>
+                </div>
+                <div class="text-xs text-muted" style="margin-top:4px">
+                  ${c.temp.cust_name} · รับแล้ว ฿${fmtNum(p.paid)} · ตรงกับ SP จริง ฿${fmtNum(c.real.total)}
+                </div>
+              </div>
+              <label class="flex items-center gap-2">
+                <input type="checkbox" class="temp-grad-cb" data-idx="${i}" checked>
+                <span class="text-xs">Graduate</span>
+              </label>
+            </div>
+          `;
+        }).join('')}
+      </div>
+      <div class="flex gap-2 mt-2">
+        <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ข้าม</button>
+        <button class="btn btn-success btn-sm flex-1" id="temp-grad-confirm">${ICONS.check} Graduate ที่เลือก</button>
+      </div>
+    </div>
+  `);
+  
+  document.getElementById('temp-grad-confirm')?.addEventListener('click', () => {
+    const checkedIdxs = Array.from(document.querySelectorAll('.temp-grad-cb:checked')).map(cb => Number(cb.dataset.idx));
+    let graduated = 0;
+    checkedIdxs.forEach(i => {
+      const { temp, real } = candidates[i];
+      if (spTempGraduate(temp.no, real.sp_no, real.date)) graduated++;
+    });
+    closeModal();
+    toast(`Graduate ${graduated} SP-TEMP สำเร็จ`, 'success');
+    if (currentPage === 'payments') navigateTo('payments');
+  });
+}
+
 async function renderPayments(el) {
   let filterStatus = 'ALL';
   let searchText = '';
   let expandedSP = new Set(); // SP ที่เปิดแสดง child
+  let expandedTemp = new Set(); // SP-TEMP ที่เปิดแสดง partials
 
   function render() {
     let data = paymentList;
@@ -5833,6 +5995,107 @@ async function renderPayments(el) {
         <span style="margin-left:auto"></span>
         ${sortToggleBtn('payment')}
       </div>
+
+      ${(() => {
+        const openTemps = spTempList.filter(t => t.status !== 'graduated' && t.status !== 'cancelled');
+        if (openTemps.length === 0) return '';
+        const openPaid = openTemps.reduce((s,t) => s + spTempPaidTotal(t), 0);
+        const openRemain = openTemps.reduce((s,t) => {
+          const exp = Number(t.expected_total) || 0;
+          return s + Math.max(0, exp - spTempPaidTotal(t));
+        }, 0);
+        return `
+        <div class="card-flat" style="margin-bottom:16px;border-left:4px solid var(--warn)">
+          <div style="padding:12px 16px;background:rgba(245,158,11,.08);border-bottom:1px solid var(--border)">
+            <div class="flex justify-between items-center">
+              <div>
+                <span style="font-weight:700;color:var(--warn)">🟡 SP ชั่วคราว</span>
+                <span class="text-xs text-dim" style="margin-left:8px">
+                  ${openTemps.length} รายการ · ชำระแล้ว ฿${fmtNum(openPaid)} · คงเหลือ ฿${fmtNum(openRemain)}
+                </span>
+              </div>
+              <div class="text-xs text-dim">แก้ SP-TEMP → SP จริงได้ตอน import หรือกดปุ่ม Graduate</div>
+            </div>
+          </div>
+          <div style="max-height:400px;overflow-y:auto">
+          ${openTemps.map(t => {
+            const p = spTempProgress(t);
+            const isOpen = expandedTemp.has(t.no);
+            const pctBar = Math.min(100, p.pct);
+            const barColor = p.pct >= 100 ? 'var(--success)' : p.pct > 0 ? 'var(--warn)' : 'var(--text3)';
+            const statusBadge = t.status === 'complete' ? 
+              '<span class="badge badge-success" style="font-size:.7rem">✓ ครบแล้ว พร้อม Graduate</span>' :
+              p.paid > 0 ? '<span class="badge badge-warn" style="font-size:.7rem">⏳ กำลังรับ</span>' :
+              '<span class="badge" style="background:var(--surface2);color:var(--text2);font-size:.7rem">Open</span>';
+            return `
+              <div style="padding:10px 16px;border-bottom:1px solid var(--border)">
+                <div class="flex items-center gap-3">
+                  <button class="btn btn-ghost btn-sm btn-toggle-temp" data-no="${t.no}" style="padding:2px 6px;min-width:28px">
+                    ${isOpen ? '▼' : '▶'}
+                  </button>
+                  <div style="flex:1;min-width:0">
+                    <div class="flex items-center gap-2" style="flex-wrap:wrap">
+                      <span style="font-weight:700;color:var(--warn);font-family:monospace">${t.no}</span>
+                      ${statusBadge}
+                      <span class="text-xs" style="color:var(--text)">
+                        ${t.cust_code ? `(${t.cust_code})` : ''} ${t.cust_name||'-'}
+                      </span>
+                    </div>
+                    <div class="flex items-center gap-3" style="margin-top:6px;font-size:.8rem">
+                      <span style="color:var(--text2)">Expected: <b style="color:var(--text)">฿${fmtNum(p.expected)}</b></span>
+                      <span style="color:var(--success)">Paid: <b>฿${fmtNum(p.paid)}</b></span>
+                      <span style="color:var(--danger)">เหลือ: <b>฿${fmtNum(p.remaining)}</b></span>
+                      <span style="flex:1;max-width:200px;height:6px;background:var(--surface2);border-radius:3px;overflow:hidden">
+                        <span style="display:block;height:100%;width:${pctBar}%;background:${barColor};transition:width .3s"></span>
+                      </span>
+                      <span class="text-xs" style="color:var(--text2);min-width:40px;text-align:right">${p.pct}%</span>
+                    </div>
+                  </div>
+                  <div class="flex gap-1">
+                    ${t.status === 'complete' ? `<button class="btn btn-success btn-sm btn-graduate-temp" data-no="${t.no}" style="padding:4px 10px;font-size:.75rem" title="Graduate → SP จริง">🎓 Graduate</button>` : ''}
+                    <button class="btn btn-primary btn-sm btn-add-partial" data-no="${t.no}" style="padding:4px 10px;font-size:.75rem" title="เพิ่ม partial">+ Partial</button>
+                    <button class="btn btn-ghost btn-sm btn-del-temp" data-no="${t.no}" style="padding:4px 8px;font-size:.75rem;color:var(--danger)" title="ลบ">🗑</button>
+                  </div>
+                </div>
+                ${isOpen && (t.partials||[]).length ? `
+                  <div style="padding:8px 42px 0 42px">
+                    <table style="width:100%;font-size:.8rem">
+                      <thead>
+                        <tr style="color:var(--text2);border-bottom:1px solid var(--border)">
+                          <th style="text-align:left;padding:4px">#</th>
+                          <th style="text-align:left;padding:4px">วันที่</th>
+                          <th style="text-align:right;padding:4px">จำนวน</th>
+                          <th style="text-align:left;padding:4px">วิธี</th>
+                          <th style="text-align:left;padding:4px">ธนาคาร</th>
+                          <th style="text-align:left;padding:4px">หมายเหตุ</th>
+                          <th style="width:40px"></th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        ${(t.partials||[]).map((pr, i) => `
+                          <tr>
+                            <td style="padding:4px;color:var(--text3)">${i+1}</td>
+                            <td style="padding:4px">${fmtDate(pr.date)}</td>
+                            <td style="padding:4px;text-align:right;font-weight:600;color:var(--success)">฿${fmtNum(pr.amount)}</td>
+                            <td style="padding:4px">${pr.method||'-'}</td>
+                            <td style="padding:4px">${pr.bank||'-'}</td>
+                            <td style="padding:4px;color:var(--text2)">${pr.notes||pr.stmt_ref||''}${pr._auto_split?' <span class="badge badge-info" style="font-size:.65rem">auto-split</span>':''}</td>
+                            <td style="padding:4px;text-align:right">
+                              <button class="btn-del-partial" data-no="${t.no}" data-idx="${i}" style="background:none;border:none;color:var(--danger);cursor:pointer;font-size:.9rem" title="ลบ partial">✕</button>
+                            </td>
+                          </tr>
+                        `).join('')}
+                      </tbody>
+                    </table>
+                  </div>
+                ` : ''}
+              </div>
+            `;
+          }).join('')}
+          </div>
+        </div>
+        `;
+      })()}
 
       <div class="card-flat">
         <div class="table-wrap" style="max-height:600px;overflow-y:auto">
@@ -5947,6 +6210,28 @@ async function renderPayments(el) {
         e.stopPropagation();
         const tempNo = btn.dataset.no;
         openPartialModal(tempNo);
+      });
+    });
+    
+    // Toggle expanded SP-TEMP (show partials)
+    el.querySelectorAll('.btn-toggle-temp').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const no = btn.dataset.no;
+        if (expandedTemp.has(no)) expandedTemp.delete(no);
+        else expandedTemp.add(no);
+        render();
+      });
+    });
+    
+    // Graduate SP-TEMP → real SP (prompt for real SP number)
+    el.querySelectorAll('.btn-graduate-temp').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const tempNo = btn.dataset.no;
+        const t = spTempList.find(x => x.no === tempNo);
+        if (!t) return;
+        openGraduateTempModal(t);
       });
     });
     
@@ -12455,6 +12740,7 @@ function renderData(el) {
         exported_by: currentUser?.display_name || 'Admin',
         billList: billList,
         paymentList: paymentList,
+        spTempList: spTempList,
         cashflowList: cashflowList,
         statementsByBank: statementsByBank,
         mainSummary: mainSummary,
@@ -12488,6 +12774,7 @@ function renderData(el) {
           
           if (backup.billList) billList = backup.billList;
           if (backup.paymentList) paymentList = backup.paymentList;
+          if (backup.spTempList) spTempList = backup.spTempList;
           if (backup.cashflowList) cashflowList = backup.cashflowList;
           if (backup.statementsByBank) statementsByBank = backup.statementsByBank;
           if (backup.mainSummary) mainSummary = backup.mainSummary;
@@ -12729,10 +13016,11 @@ function renderData(el) {
       if (!confirm('⚠️⚠️ ยืนยันครั้งสุดท้าย! Backup แล้วหรือยัง?')) return;
       billList = [];
       paymentList = [];
+      spTempList = [];
       cashflowList = [];
       statementsByBank = { KTB: [], KBANK: [], 'BBL NW': [], BBL: [], TTB: [], UNKNOWN: [] };
       try {
-        ['sf_billList','sf_paymentList','sf_cashflowList','sf_mainSummary','sf_cashCount','sf_statementsByBank'].forEach(k => safeStorage.del?.(k));
+        ['sf_billList','sf_paymentList','sf_spTempList','sf_cashflowList','sf_mainSummary','sf_cashCount','sf_statementsByBank'].forEach(k => safeStorage.del?.(k));
       } catch(e) {}
       persistMainState();
       toast('ล้างข้อมูลทั้งหมดแล้ว', 'success');
@@ -14302,7 +14590,7 @@ async function renderSpRecon(el) {
       <div class="flex gap-2 flex-wrap items-center" style="margin-bottom:12px">
         <div class="flex gap-1">
           <button class="pill ${view==='main'?'active':''}" data-view="main">📋 Main</button>
-          <button class="pill ${view==='report'?'active':''}" data-view="report">📊 Report (VAT)</button>
+          <button class="pill ${view==='report'?'active':''}" data-view="report">📊 Report</button>
           <button class="pill ${view==='sellbills'?'active':''}" data-view="sellbills">📑 Sell Bills</button>
         </div>
         
@@ -14572,24 +14860,23 @@ function spV2RenderMainTable(rows) {
   return `<table style="width:100%;border-collapse:collapse;min-width:1700px">${thead}<tbody>${tbody}</tbody></table>`;
 }
 
-// Render Report view (grouped, VAT only by default)
+// Render Report view (grouped, honors filterVat)
 function spV2RenderReportView(rows) {
-  // Group by sp_number (only VAT groups)
+  // Group by sp_number (filter pills already applied via spV2FilterRows)
   const groups = {};
   rows.forEach(r => {
-    if (r.vat_flag !== 'Y') return;
     (groups[r._group_id] = groups[r._group_id] || []).push(r);
   });
   
   if (Object.keys(groups).length === 0) {
-    return '<div style="padding:40px;text-align:center;color:var(--text3)">ไม่มี VAT records ใน filter ปัจจุบัน</div>';
+    return '<div style="padding:40px;text-align:center;color:var(--text3)">ไม่มีข้อมูลใน filter ปัจจุบัน</div>';
   }
   
   const fmt = v => v == null || v === '' || v === 0 ? '' : (typeof v === 'number' ? fmtNum(v) : String(v));
   const fmtD = v => v ? String(v).substring(0, 10) : '';
   
   let html = `<div style="padding:16px">
-    <div style="text-align:center;font-weight:700;margin-bottom:4px">รายงาน - การชำระเงิน (VAT)</div>
+    <div style="text-align:center;font-weight:700;margin-bottom:4px">รายงาน - การชำระเงิน</div>
     <div style="text-align:center;font-size:.85rem;color:var(--text2);margin-bottom:16px">บริษัท จงกลณีการไฟฟ้า จำกัด</div>
     
     <table style="width:100%;border-collapse:collapse;font-size:.8rem">
@@ -14664,10 +14951,9 @@ function spV2RenderReportView(rows) {
 // XLSX export
 function spV2DownloadXlsx() {
   const rows = spV2FilterRows();
-  const vatGroups = {};
+  const groupsByGid = {};
   rows.forEach(r => {
-    if (r.vat_flag !== 'Y') return;
-    (vatGroups[r._group_id] = vatGroups[r._group_id] || []).push(r);
+    (groupsByGid[r._group_id] = groupsByGid[r._group_id] || []).push(r);
   });
   
   // Build aoa (array of arrays)
@@ -14681,7 +14967,7 @@ function spV2DownloadXlsx() {
   
   const fmtD = v => v ? String(v).substring(0, 10) : '';
   
-  Object.entries(vatGroups).forEach(([gid, grp]) => {
+  Object.entries(groupsByGid).forEach(([gid, grp]) => {
     const header = grp.find(r => r._is_header);
     const children = grp.filter(r => !r._is_header);
     if (!header) return;
