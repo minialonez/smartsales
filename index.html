@@ -293,15 +293,22 @@ async function api(action, params = {}) {
     }
 
     // URL < 4000 chars → GET (Apps Script limit ~8KB, ใช้ 4K เพื่อความปลอดภัย)
-    // URL ≥ 4000 chars → POST with text/plain (ไม่เกิด CORS preflight)
+    // URL ≥ 4000 chars → POST with URLSearchParams (form-encoded, simple request)
+    // เหตุผลที่ใช้ URLSearchParams แทน text/plain:
+    // - text/plain ยัง trigger CORS ใน browser ที่มี Tracking Prevention (Edge/Brave/Safari ใหม่)
+    // - URLSearchParams auto-set Content-Type: application/x-www-form-urlencoded
+    //   → เป็น "simple request" ตาม CORS spec → ไม่มี preflight + ไม่ต้องการ CORS header
+    // - GAS รับได้ผ่าน e.parameter.payload (parse JSON เอง)
     if (url.length < 4000) {
       res = await fetch(url, { redirect: 'follow' });
     } else {
+      const formData = new URLSearchParams();
+      formData.append('action', action);
+      formData.append('payload', JSON.stringify(params));
       res = await fetch(API_URL, {
         method: 'POST',
         redirect: 'follow',
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify(Object.assign({ action }, params)),
+        body: formData,
       });
     }
 
