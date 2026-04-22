@@ -14432,10 +14432,10 @@ function spV2BuildRows(payMain, payType, taxSales) {
         seq: seq, vat_flag: 'N',
         bill_no: sp.no, ref_doc: sp.date, sale_date: sp.customer,
         note1: '', amount: null, pay_total: novatTotal,
-        cash_date: methodInfo.cash.d, cash_amt: methodInfo.cash.a,
-        transfer_date: methodInfo.transfer.d, transfer_amt: methodInfo.transfer.a,
-        cheque_date: methodInfo.cheque.d, cheque_amt: methodInfo.cheque.a,
-        credit_date: sp.date, credit_amt: creditAmt,
+        cash_date: methodInfo.cash.a > 0 ? methodInfo.cash.d : '', cash_amt: methodInfo.cash.a,
+        transfer_date: methodInfo.transfer.a > 0 ? methodInfo.transfer.d : '', transfer_amt: methodInfo.transfer.a,
+        cheque_date: methodInfo.cheque.a > 0 ? methodInfo.cheque.d : '', cheque_amt: methodInfo.cheque.a,
+        credit_date: creditAmt > 0 ? sp.date : '', credit_amt: creditAmt,
         note2: '', sp_number: sp.no, pay_date: sp.date,
         _is_header: true, _group_id: sp.no,
       };
@@ -14480,11 +14480,11 @@ function spV2BuildRows(payMain, payType, taxSales) {
       };
       // If VAT only (no NOVAT) — full payment here
       if (novatBills.length === 0) {
-        vatHeader.cash_date = methodInfo.cash.d; vatHeader.cash_amt = methodInfo.cash.a;
-        vatHeader.transfer_date = methodInfo.transfer.d; vatHeader.transfer_amt = methodInfo.transfer.a;
-        vatHeader.cheque_date = methodInfo.cheque.d; vatHeader.cheque_amt = methodInfo.cheque.a;
-      } else {
-        // Mixed — VAT total as separate transfer payment
+        vatHeader.cash_date = methodInfo.cash.a > 0 ? methodInfo.cash.d : ''; vatHeader.cash_amt = methodInfo.cash.a;
+        vatHeader.transfer_date = methodInfo.transfer.a > 0 ? methodInfo.transfer.d : ''; vatHeader.transfer_amt = methodInfo.transfer.a;
+        vatHeader.cheque_date = methodInfo.cheque.a > 0 ? methodInfo.cheque.d : ''; vatHeader.cheque_amt = methodInfo.cheque.a;
+      } else if (vatTotal > 0) {
+        // Mixed — VAT total as separate transfer payment (เฉพาะเมื่อมียอดจริง)
         vatHeader.transfer_date = sp.date;
         vatHeader.transfer_amt = vatTotal;
       }
@@ -14770,7 +14770,13 @@ async function renderSpRecon(el) {
       if (!row) return;
       
       if (field.endsWith('_amt')) {
-        row[field] = Number(inp.value) || 0;
+        const newAmt = Number(inp.value) || 0;
+        row[field] = newAmt;
+        // Sync: ถ้ายอด = 0 → clear date ของ method เดียวกันด้วย (ข้อมูล consistent)
+        if (newAmt === 0) {
+          const prefix = field.replace('_amt', '');
+          row[prefix + '_date'] = '';
+        }
       } else {
         row[field] = inp.value;
       }
@@ -14865,16 +14871,23 @@ function spV2RenderMainTable(rows) {
         <td style="text-align:right;padding:4px 6px">${fmt(r.amount)}</td>
         <td style="text-align:right;padding:4px 6px;color:var(--success)">${isHdr?fmt(r.pay_total):''}</td>
         
-        ${isHdr ? `
-          <td style="padding:2px 4px">${editDate(origIdx, 'cash_date', r.cash_date)}</td>
+        ${isHdr ? (() => {
+          // แสดง date เฉพาะเมื่อมียอด — ถ้ายอด=0 ให้ว่างไว้ (user เข้าไปกรอก amt ก่อนแล้ว date จึงจะมีผล)
+          const cashHasAmt = Number(r.cash_amt) > 0;
+          const trfHasAmt = Number(r.transfer_amt) > 0;
+          const chqHasAmt = Number(r.cheque_amt) > 0;
+          const crdHasAmt = Number(r.credit_amt) > 0;
+          return `
+          <td style="padding:2px 4px">${editDate(origIdx, 'cash_date', cashHasAmt ? r.cash_date : '')}</td>
           <td style="padding:2px 4px">${editAmt(origIdx, 'cash_amt', r.cash_amt)}</td>
-          <td style="padding:2px 4px">${editDate(origIdx, 'transfer_date', r.transfer_date)}</td>
+          <td style="padding:2px 4px">${editDate(origIdx, 'transfer_date', trfHasAmt ? r.transfer_date : '')}</td>
           <td style="padding:2px 4px">${editAmt(origIdx, 'transfer_amt', r.transfer_amt)}</td>
-          <td style="padding:2px 4px">${editDate(origIdx, 'cheque_date', r.cheque_date)}</td>
+          <td style="padding:2px 4px">${editDate(origIdx, 'cheque_date', chqHasAmt ? r.cheque_date : '')}</td>
           <td style="padding:2px 4px">${editAmt(origIdx, 'cheque_amt', r.cheque_amt)}</td>
-          <td style="padding:2px 4px">${editDate(origIdx, 'credit_date', r.credit_date)}</td>
+          <td style="padding:2px 4px">${editDate(origIdx, 'credit_date', crdHasAmt ? r.credit_date : '')}</td>
           <td style="padding:2px 4px">${editAmt(origIdx, 'credit_amt', r.credit_amt)}</td>
-        ` : `
+          `;
+        })() : `
           <td colspan="8"></td>
         `}
         
