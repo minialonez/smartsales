@@ -10710,13 +10710,15 @@ async function renderMatching(el) {
           </div>
         `);
         
-        const selectedIdxs = new Set(); // indices into `displayList` (multi-select)
+        // ใช้ Set ของ bill reference (ไม่ใช่ index) — persist ได้ข้าม search/filter
+        // เพราะ reference ของ bill object ยังเดิมเสมอ (อ้างอิง billList/cashflowCandidates/spCandidates)
+        const selectedBills = new Set();
         let displayList = [];
         
         // Update sum bar + enable/disable confirm based on selection
         function updateSumBar() {
           const bar = document.getElementById('mm-sum-bar');
-          const cnt = selectedIdxs.size;
+          const cnt = selectedBills.size;
           if (cnt === 0) {
             if (bar) bar.style.display = 'none';
             // ให้ confirm เปิดได้ถ้ากรอก manual bill
@@ -10727,15 +10729,11 @@ async function renderMatching(el) {
           if (bar) bar.style.display = 'block';
           // รวมยอด (ใช้ mmBillMatchAmt เหมือนตอน match)
           let sum = 0;
-          selectedIdxs.forEach(i => {
-            const b = displayList[i];
+          selectedBills.forEach(b => {
             if (!b) return;
-            // สำหรับบิลที่ติ๊กรวม: SC (credit note) amount เป็นลบอยู่แล้วในระบบ ใช้ Number ตรงๆ
-            // (ไม่ใช้ abs เพราะต้องการ offset)
-            const isSC = String(b.bill_no||'').substring(0,2).toUpperCase() === 'SC' || 
-                         String(b.bill_no||'').substring(0,2).toUpperCase() === 'JS' || 
-                         String(b.bill_no||'').substring(0,2).toUpperCase() === 'JR';
-            const val = mmBillMatchAmt(b); // positive
+            // SC/JS/JR (ลดหนี้) → offset เป็นลบ
+            const isSC = ['SC','JS','JR'].includes(String(b.bill_no||'').substring(0,2).toUpperCase());
+            const val = mmBillMatchAmt(b);
             sum += isSC ? -val : val;
           });
           const stmtAbs = Math.abs(stmtAmt);
@@ -10814,15 +10812,15 @@ async function renderMatching(el) {
             `;
           }).join('') : '<div style="padding:20px;text-align:center;color:var(--text3)">ไม่พบบิล / รายการ / เช็ค</div>';
           
-          // Toggle ด้วยคลิกที่แถวหรือ checkbox
-          const toggleSelect = (idx, item) => {
-            if (selectedIdxs.has(idx)) {
-              selectedIdxs.delete(idx);
+          // Toggle ด้วย bill reference (ไม่ใช่ index) — persist ข้าม search
+          const toggleSelect = (bill, item) => {
+            if (selectedBills.has(bill)) {
+              selectedBills.delete(bill);
               item.style.background = '';
               const chk = item.querySelector('.mm-chk');
               if (chk) chk.checked = false;
             } else {
-              selectedIdxs.add(idx);
+              selectedBills.add(bill);
               item.style.background = 'rgba(79,156,249,.15)';
               const chk = item.querySelector('.mm-chk');
               if (chk) chk.checked = true;
@@ -10830,22 +10828,24 @@ async function renderMatching(el) {
             updateSumBar();
           };
           bc.querySelectorAll('.mm-item').forEach(item => {
+            const bill = displayList[Number(item.dataset.di)];
+            if (!bill) return;
             item.addEventListener('click', (e) => {
               if (e.target.classList.contains('mm-chk')) return; // checkbox ดูแลเอง
-              toggleSelect(Number(item.dataset.di), item);
+              toggleSelect(bill, item);
             });
+            const chk = item.querySelector('.mm-chk');
+            if (chk) {
+              chk.addEventListener('click', (e) => {
+                e.stopPropagation();
+                toggleSelect(bill, item);
+              });
+            }
           });
-          bc.querySelectorAll('.mm-chk').forEach(chk => {
-            chk.addEventListener('click', (e) => {
-              e.stopPropagation();
-              const item = chk.closest('.mm-item');
-              toggleSelect(Number(chk.dataset.di), item);
-            });
-          });
-          // restore visual state เมื่อ re-render
-          selectedIdxs.forEach(idx => {
-            const item = bc.querySelector(`.mm-item[data-di="${idx}"]`);
-            if (item) {
+          // restore visual state เมื่อ re-render (ติ๊กบิลที่เคยเลือก แม้ search เปลี่ยน)
+          bc.querySelectorAll('.mm-item').forEach(item => {
+            const bill = displayList[Number(item.dataset.di)];
+            if (bill && selectedBills.has(bill)) {
               item.style.background = 'rgba(79,156,249,.15)';
               const chk = item.querySelector('.mm-chk');
               if (chk) chk.checked = true;
@@ -10859,13 +10859,13 @@ async function renderMatching(el) {
         
         // ── Enable confirm เมื่อกรอกเลขบิลเอง (เฉพาะกรณีไม่มี bill ที่เลือก) ──
         document.getElementById('mm-manual-bill')?.addEventListener('input', (e) => {
-          if (e.target.value.trim() && selectedIdxs.size === 0) {
+          if (e.target.value.trim() && selectedBills.size === 0) {
             document.getElementById('mm-confirm').disabled = false;
-          } else if (selectedIdxs.size === 0) {
+          } else if (selectedBills.size === 0) {
             document.getElementById('mm-confirm').disabled = true;
           }
           // ถ้ามี bill selected อยู่แล้ว → ให้ updateSumBar เป็นคนตัดสิน
-          if (selectedIdxs.size > 0) updateSumBar();
+          if (selectedBills.size > 0) updateSumBar();
         });
         
         document.getElementById('mm-confirm')?.addEventListener('click', () => {
@@ -10880,11 +10880,10 @@ async function renderMatching(el) {
           let targetLabel = '';
           const matchedBills = []; // สำหรับ multi: เก็บเลขบิลทั้งหมด
           
-          if (selectedIdxs.size > 0) {
-            // อัปเดตทุกบิลที่ติ๊ก
-            const idxArr = Array.from(selectedIdxs);
-            idxArr.forEach(di => {
-              const match = displayList[di];
+          if (selectedBills.size > 0) {
+            // อัปเดตทุกบิลที่ติ๊ก — iterate bill objects ตรงๆ
+            const billArr = Array.from(selectedBills);
+            billArr.forEach(match => {
               if (!match) return;
               matchedBills.push(match.bill_no || '(no#)');
               if (match._supplierPayment) {
@@ -10907,8 +10906,8 @@ async function renderMatching(el) {
                 match.matched_at = new Date().toISOString();
               }
             });
-            // ใช้บิลแรกเป็น primary reference, ที่เหลือ append
-            const first = displayList[idxArr[0]];
+            // ใช้บิลแรกเป็น primary reference
+            const first = billArr[0];
             matchBillNo = matchedBills.length > 1 
               ? matchedBills.join(' + ') 
               : (first?.bill_no || '');
