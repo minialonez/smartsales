@@ -1224,6 +1224,10 @@ function clearStatementsByBank(bank) {
 // ── Sales Import Handler ──
 let uploadedSales = [];
 let billList = []; // ศูนย์กลางข้อมูล: Smart bills + POS + Change
+
+// Global stub — จะถูก override เมื่อ renderMain() โหลด
+// กัน TypeError เมื่อ syncManager เรียกก่อนที่หน้า Main จะ render
+window.invalidateBillsCache = window.invalidateBillsCache || function() {};
 let paymentList = []; // SP List พร้อม Parent-Child
 let cashflowList = []; // เงินเข้า-ออก: Deposit, Withdrawal, Transfer, Misc
 let supplierList = []; // Master Supplier data (ชื่อ, เลขบัญชี, ธนาคาร)
@@ -2796,6 +2800,8 @@ async function renderMain(el) {
     _billsForSelectedDateCache = null;
     _billsForSelectedDateCacheKey = null;
   }
+  // Expose เป็น global เพื่อให้ syncManager + other handlers นอก renderMain scope เรียกได้
+  window.invalidateBillsCache = invalidateBillsCache;
 
   // ══════════════════════════════════════════════════════════════
   // Business Rule: บิลที่ "ใช้ลิ้นชักเงินสดร่วมกัน" (ชำระเป็นเงินสด แล้วเงินเข้าลิ้นชัก)
@@ -11934,7 +11940,7 @@ function renderData(el) {
         
         // Persist + refresh
         persistMainState();
-        invalidateBillsCache();
+        if (typeof invalidateBillsCache === 'function') invalidateBillsCache();
         
         const errMsg = stats.errors.length ? `\n\n⚠️ ข้อผิดพลาด:\n${stats.errors.slice(0,3).join('\n')}` : '';
         const summary = 
@@ -14017,6 +14023,18 @@ function exportReconReport(data, kind) {
 async function renderUsers(el) {
   const res = await api('getUsers');
   const users = res.data || [];
+  
+  // Normalize permissions เป็น array เสมอ (backend อาจส่งเป็น string "read,write")
+  users.forEach(u => {
+    if (typeof u.permissions === 'string') {
+      u.permissions = u.permissions.split(',').map(p => p.trim()).filter(Boolean);
+    } else if (!Array.isArray(u.permissions)) {
+      u.permissions = [];
+    }
+  });
+  
+  // Store users in global Map — safer than serializing to data-attribute
+  window._usersMap = new Map(users.map(u => [u.user_id, u]));
 
   el.innerHTML = `
     <div class="flex justify-between items-center mb-4">
@@ -14033,7 +14051,7 @@ async function renderUsers(el) {
             <td><span class="badge ${u.role==='admin'?'badge-purple':'badge-info'}">${u.role}</span></td>
             <td>${(u.permissions||[]).map(p=>`<span class="badge badge-muted">${p}</span>`).join(' ')}</td>
             <td><span class="badge badge-success">${u.status}</span></td>
-            <td><button class="btn btn-ghost btn-icon btn-edit-user" data-user='${JSON.stringify(u).replace(/'/g,"&#39;")}' title="แก้ไข">${ICONS.edit}</button></td>
+            <td><button class="btn btn-ghost btn-icon btn-edit-user" data-uid="${u.user_id}" title="แก้ไข">${ICONS.edit}</button></td>
           </tr>`).join('')}
         </tbody>
       </table>
@@ -14179,12 +14197,10 @@ async function renderUsers(el) {
   document.getElementById('btn-add-user')?.addEventListener('click', () => openUserModal(null));
   el.querySelectorAll('.btn-edit-user').forEach(btn => {
     btn.addEventListener('click', () => {
-      try {
-        const u = JSON.parse(btn.dataset.user.replace(/&#39;/g, "'"));
-        openUserModal(u);
-      } catch(err) {
-        toast('ข้อมูลผู้ใช้ไม่ถูกต้อง', 'error');
-      }
+      const uid = btn.dataset.uid;
+      const u = window._usersMap?.get(uid);
+      if (!u) { toast('ไม่พบข้อมูลผู้ใช้', 'error'); return; }
+      openUserModal(u);
     });
   });
 }
