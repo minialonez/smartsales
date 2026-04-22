@@ -1278,10 +1278,28 @@ const syncManager = {
   _emit() { this.listeners.forEach(fn => { try { fn(this); } catch(_){} }); },
   
   // Called จาก persistMainState → mark type ว่า dirty แล้ว schedule push
+  //
+  // ⚠️ สำคัญ: auto-push เฉพาะ type ที่ backend REPLACE (ไม่ append)
+  //   - payments (savePayments): replace by sp_no ✓
+  //   - cashflow (saveCashflow): replace by id ✓
+  //   - suppliers (saveSuppliers): replace ✓
+  //   - meta (saveDailyMeta): replace by (date|meta_type) ✓
+  //
+  // ❌ ห้าม auto-push:
+  //   - bills (saveDailySales): APPEND ล้วน → sheet บวม 2x 3x
+  //   - stmts (saveStatements): APPEND ล้วน → เหมือนกัน
+  // → Bills/Stmts ใช้ pullFromCloud ดึงจาก cloud ได้ + push ผ่าน
+  //   ปุ่ม "save daily" manual (หน้า Main) ที่มี logic replace-safe
   markDirty(type) {
     if (!this.enabled) return;
-    if (type) this.dirty.add(type);
-    else ['bills','stmts','payments','cashflow','suppliers','meta'].forEach(t => this.dirty.add(t));
+    const SAFE_AUTO_TYPES = ['payments', 'cashflow', 'suppliers', 'meta'];
+    if (type) {
+      // Only auto-push if type is in safe list
+      if (SAFE_AUTO_TYPES.includes(type)) this.dirty.add(type);
+    } else {
+      // no arg → dirty ALL safe types (ข้าม bills, stmts)
+      SAFE_AUTO_TYPES.forEach(t => this.dirty.add(t));
+    }
     this._schedulePush();
   },
   
