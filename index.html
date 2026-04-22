@@ -14348,6 +14348,7 @@ let spV2State = {
   nextCounter: 1,        // SP counter (global, no reset)
   filterVat: 'ALL',      // ALL | Y | N
   filterPaid: 'ALL',     // ALL | paid | unpaid
+  filterPrefixes: new Set(), // multi-select bill prefixes (SR/SS/SC/OR/OS/JR/JS) — empty = ALL
   view: 'main',          // main | report | sellbills
   groupByCustomer: false, // ← Sell Bills: group by customer
   expandedCustomers: new Set(), // ← which customers are expanded
@@ -14658,6 +14659,26 @@ async function renderSpRecon(el) {
         ${view === 'report' ? `<button class="btn btn-success btn-sm" id="spv2-btn-download">⬇️ Download Report</button>` : ''}
       </div>
       
+      <!-- Prefix filter (multi-select) — only in Sell Bills view -->
+      ${view === 'sellbills' ? `
+      <div class="flex gap-2 flex-wrap items-center" style="margin-bottom:12px">
+        <button class="pill ${spV2State.filterPrefixes.size===0?'active':''}" data-fprefix="ALL" title="แสดงทั้งหมด">ALL</button>
+        <div style="width:1px;height:20px;background:var(--border)"></div>
+        <span class="text-xs" style="color:var(--info);font-weight:600">VAT:</span>
+        ${['SS','SR','SC'].map(p => `
+          <button class="pill ${spV2State.filterPrefixes.has(p)?'active':''}" data-fprefix="${p}" 
+            style="${spV2State.filterPrefixes.has(p)?'background:var(--info-bg);border-color:var(--info);color:var(--info)':''}">${p}</button>
+        `).join('')}
+        <div style="width:1px;height:20px;background:var(--border)"></div>
+        <span class="text-xs" style="color:var(--warn);font-weight:600">NOVAT:</span>
+        ${['OR','OS','JR','JS'].map(p => `
+          <button class="pill ${spV2State.filterPrefixes.has(p)?'active':''}" data-fprefix="${p}" 
+            style="${spV2State.filterPrefixes.has(p)?'background:rgba(245,158,11,.15);border-color:var(--warn);color:var(--warn)':''}">${p}</button>
+        `).join('')}
+        ${spV2State.filterPrefixes.size > 0 ? `<span class="text-xs" style="color:var(--info);margin-left:4px">· เลือก ${spV2State.filterPrefixes.size} prefix</span>` : ''}
+      </div>
+      ` : ''}
+      
       <!-- Table -->
       <div class="card" style="padding:0;overflow:auto;max-height:70vh">
         ${view === 'main' ? spV2RenderMainTable(rows) 
@@ -14802,6 +14823,17 @@ async function renderSpRecon(el) {
   }));
   el.querySelectorAll('[data-fpaid]').forEach(b => b.addEventListener('click', () => {
     spV2State.filterPaid = b.dataset.fpaid; renderSpRecon(el);
+  }));
+  el.querySelectorAll('[data-fprefix]').forEach(b => b.addEventListener('click', () => {
+    const p = b.dataset.fprefix;
+    if (p === 'ALL') {
+      spV2State.filterPrefixes.clear();
+    } else {
+      // toggle
+      if (spV2State.filterPrefixes.has(p)) spV2State.filterPrefixes.delete(p);
+      else spV2State.filterPrefixes.add(p);
+    }
+    renderSpRecon(el);
   }));
   
   // Click to toggle Y/N on B column
@@ -15149,15 +15181,35 @@ function spV2RenderSellBillsView() {
   let bills = spV2GenerateSellBills();
   
   // ── Filters ──
-  const { filterVat, filterPaid, groupByCustomer } = spV2State;
+  const { filterVat, filterPaid, filterPrefixes, groupByCustomer } = spV2State;
   if (filterVat === 'Y') bills = bills.filter(b => b._vat_flag === 'Y');
   else if (filterVat === 'N') bills = bills.filter(b => b._vat_flag === 'N');
   
   if (filterPaid === 'paid') bills = bills.filter(b => b.pay_status && b.pay_status !== 'ยกเลิก');
   else if (filterPaid === 'unpaid') bills = bills.filter(b => !b.pay_status);
   
-  // ── Sort: bill_no ascending always ──
-  bills.sort((a, b) => String(a.bill_no).localeCompare(String(b.bill_no)));
+  // Prefix filter (multi-select) — empty Set = ALL
+  if (filterPrefixes && filterPrefixes.size > 0) {
+    bills = bills.filter(b => {
+      const p = String(b.bill_no).substring(0,2).toUpperCase();
+      return filterPrefixes.has(p);
+    });
+  }
+  
+  // ── Sort by custom order: SR → SS → SC → OR → OS → JR → JS, then bill_no ascending (numeric-aware) ──
+  const PREFIX_ORDER = ['SR','SS','SC','OR','OS','JR','JS'];
+  const getOrder = (billNo) => {
+    const p = String(billNo).substring(0,2).toUpperCase();
+    const i = PREFIX_ORDER.indexOf(p);
+    return i >= 0 ? i : 99;
+  };
+  bills.sort((a, b) => {
+    const oa = getOrder(a.bill_no);
+    const ob = getOrder(b.bill_no);
+    if (oa !== ob) return oa - ob;
+    // Same prefix → bill_no ascending (numeric-aware, handles embedded numbers correctly)
+    return String(a.bill_no).localeCompare(String(b.bill_no), undefined, { numeric: true });
+  });
   
   // Re-index seq for current display
   bills.forEach((b, i) => b.seq = i + 1);
@@ -15352,14 +15404,30 @@ function spV2RenderSellBillsView() {
 function spV2DownloadSellBills() {
   let bills = spV2GenerateSellBills();
   
-  const { filterVat, filterPaid } = spV2State;
+  const { filterVat, filterPaid, filterPrefixes } = spV2State;
   if (filterVat === 'Y') bills = bills.filter(b => b._vat_flag === 'Y');
   else if (filterVat === 'N') bills = bills.filter(b => b._vat_flag === 'N');
   if (filterPaid === 'paid') bills = bills.filter(b => b.pay_status && b.pay_status !== 'ยกเลิก');
   else if (filterPaid === 'unpaid') bills = bills.filter(b => !b.pay_status);
   
-  // Sort by bill_no ascending (consistent with UI)
-  bills.sort((a, b) => String(a.bill_no).localeCompare(String(b.bill_no)));
+  // Prefix filter (multi-select)
+  if (filterPrefixes && filterPrefixes.size > 0) {
+    bills = bills.filter(b => filterPrefixes.has(String(b.bill_no).substring(0,2).toUpperCase()));
+  }
+  
+  // Sort by custom order: SR → SS → SC → OR → OS → JR → JS, then bill_no ascending (numeric-aware)
+  const PREFIX_ORDER = ['SR','SS','SC','OR','OS','JR','JS'];
+  const getOrder = (billNo) => {
+    const p = String(billNo).substring(0,2).toUpperCase();
+    const i = PREFIX_ORDER.indexOf(p);
+    return i >= 0 ? i : 99;
+  };
+  bills.sort((a, b) => {
+    const oa = getOrder(a.bill_no);
+    const ob = getOrder(b.bill_no);
+    if (oa !== ob) return oa - ob;
+    return String(a.bill_no).localeCompare(String(b.bill_no), undefined, { numeric: true });
+  });
   bills.forEach((b, i) => b.seq = i + 1);
   
   const fmtD = v => v ? String(v).substring(0, 10) : '';
