@@ -1291,6 +1291,14 @@ const syncManager = {
   },
   
   // Push dirty data to backend (ส่งเป็น batch)
+  // ใช้ fingerprint กัน push ซ้ำของที่ไม่เปลี่ยน (ข้อมูลเดิม → sheet บวม ไม่ต้อง roundtrip)
+  _fp(obj) {
+    const s = JSON.stringify(obj || {});
+    let h = 0;
+    for (let i = 0; i < s.length; i++) { h = ((h << 5) - h + s.charCodeAt(i)) | 0; }
+    return s.length + ':' + h;
+  },
+  
   async _flushPush() {
     if (!this.enabled || this.dirty.size === 0) return;
     if (this.status === 'pushing') return; // อย่า concurrent push
@@ -1300,29 +1308,46 @@ const syncManager = {
     this.status = 'pushing';
     this._emit();
     
-    const results = { ok: 0, fail: 0, errors: [] };
+    const results = { ok: 0, fail: 0, errors: [], skipped: 0 };
     const by = window.currentUser?.display_name || 'Admin';
+    
+    // last fingerprints per type — persist ใน memory (ถ้า refresh หน้า จะ push ครั้งแรกเต็ม)
+    this._fpCache = this._fpCache || {};
     
     for (const type of types) {
       try {
         if (type === 'bills') {
-          if (billList.length === 0) { continue; } // ไม่ push array ว่าง
+          if (billList.length === 0) continue;
+          const fp = this._fp({n: billList.length, first: billList[0]?.bill_no, last: billList[billList.length-1]?.bill_no, total: billList.reduce((s,b)=>s+Number(b.amount||0),0)});
+          if (fp === this._fpCache.bills) { results.skipped++; continue; }
           const r = await api('saveDailySales', { rows: billList, created_by: by });
           if (r?.success === false) throw new Error(r.error || 'API error');
+          this._fpCache.bills = fp;
         } else if (type === 'stmts') {
           const allStmts = getAllStatements();
-          if (allStmts.length === 0) { continue; }
+          if (allStmts.length === 0) continue;
+          const fp = this._fp({n: allStmts.length, first: allStmts[0]?.ref_no, last: allStmts[allStmts.length-1]?.ref_no});
+          if (fp === this._fpCache.stmts) { results.skipped++; continue; }
           const r = await api('saveStatements', { rows: allStmts, created_by: by });
           if (r?.success === false) throw new Error(r.error || 'API error');
+          this._fpCache.stmts = fp;
         } else if (type === 'payments') {
-          if (paymentList.length === 0) { continue; }
+          if (paymentList.length === 0) continue;
+          const fp = this._fp({n: paymentList.length, first: paymentList[0]?.sp_no, last: paymentList[paymentList.length-1]?.sp_no});
+          if (fp === this._fpCache.payments) { results.skipped++; continue; }
           const r = await api('savePayments', { payments: paymentList, created_by: by });
           if (r?.success === false) throw new Error(r.error || 'API error');
+          this._fpCache.payments = fp;
         } else if (type === 'cashflow') {
-          if (cashflowList.length === 0) { continue; }
+          if (cashflowList.length === 0) continue;
+          const fp = this._fp({n: cashflowList.length, first: cashflowList[0]?.id, last: cashflowList[cashflowList.length-1]?.id});
+          if (fp === this._fpCache.cashflow) { results.skipped++; continue; }
           const r = await api('saveCashflow', { records: cashflowList, created_by: by });
           if (r?.success === false) throw new Error(r.error || 'API error');
+          this._fpCache.cashflow = fp;
         } else if (type === 'suppliers') {
+          const fp = this._fp({sup: supplierList.length, pay: supplierPayments.length});
+          if (fp === this._fpCache.suppliers) { results.skipped++; continue; }
           if (supplierList.length > 0) {
             const r = await api('saveSuppliers', { records: supplierList, created_by: by });
             if (r?.success === false) throw new Error(r.error || 'API error');
@@ -1331,9 +1356,14 @@ const syncManager = {
             const r2 = await api('saveSupplierPayments', { records: supplierPayments, created_by: by });
             if (r2?.success === false) throw new Error(r2.error || 'API error');
           }
+          this._fpCache.suppliers = fp;
         } else if (type === 'meta') {
+          // Meta สำคัญมาก — ใช้ full JSON fingerprint (หนักแต่คุ้ม กันบวม sheet)
+          const fp = this._fp({summary: mainSummary, cash_count: cashCount});
+          if (fp === this._fpCache.meta) { results.skipped++; continue; }
           const r = await api('saveDailyMeta', { summary: mainSummary, cash_count: cashCount });
           if (r?.success === false) throw new Error(r.error || 'API error');
+          this._fpCache.meta = fp;
         }
         results.ok++;
       } catch(err) {
@@ -1343,6 +1373,8 @@ const syncManager = {
         console.warn('[sync] push fail', type, err);
       }
     }
+    
+    if (results.skipped > 0) console.log(`[sync] skipped ${results.skipped} unchanged types`);
     
     this.lastPushAt = Date.now();
     this.stats.pushed += results.ok;
