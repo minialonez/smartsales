@@ -13641,9 +13641,954 @@ async function importDailyXlsm(file) {
   return { dateISO, billsImported, summaryRows: 9, deleted };
 }
 
+// ════════════════════════════════════════════════════════════════════
+// SP Recon V2 — Upload 3 files → 20-col Main sheet + Report export
+// ════════════════════════════════════════════════════════════════════
+// Replaces old sp_recon. Features:
+//   • Upload: การชำระเงิน.xls + ตามประเภท.xls + ภาษีขาย.xls
+//   • Classify VAT:  SS/SR/SC = Y (VAT), OR/OS/JS/JR = N (NOVAT)
+//   • SP Number:
+//      - N rows → use parent SP from file
+//      - Y rows → generate SPYYYYMM-XXXX (counter never resets)
+//   • Paid/Unpaid auto (based on payment amounts)
+//   • Filter: VAT / NOVAT / Paid / Unpaid
+//   • Report view + XLSX download
+// ════════════════════════════════════════════════════════════════════
+
+let spV2State = {
+  mainRows: [],          // 20-col rows
+  nextCounter: 1,        // SP counter (global, no reset)
+  filterVat: 'ALL',      // ALL | Y | N
+  filterPaid: 'ALL',     // ALL | paid | unpaid
+  view: 'main',          // main | report
+  rawPayMain: [],        // parsed file 1
+  rawPayType: [],        // parsed file 2
+  rawTaxSales: [],       // parsed file 3
+};
+
+// Load persisted counter
+try {
+  const saved = JSON.parse(localStorage.getItem('sf_spV2') || '{}');
+  if (saved.nextCounter) spV2State.nextCounter = saved.nextCounter;
+  if (saved.mainRows) spV2State.mainRows = saved.mainRows;
+} catch(e) {}
+
+function persistSpV2() {
+  try {
+    localStorage.setItem('sf_spV2', JSON.stringify({
+      nextCounter: spV2State.nextCounter,
+      mainRows: spV2State.mainRows,
+    }));
+  } catch(e) { console.warn('persistSpV2 failed', e); }
+}
+
+// Classify VAT by bill prefix
+function spV2ClassifyVat(billNo) {
+  const p = String(billNo || '').substring(0, 2).toUpperCase();
+  if (['SS','SR','SC'].includes(p)) return 'Y';   // VAT
+  if (['OR','OS','JS','JR'].includes(p)) return 'N'; // NOVAT
+  return '';
+}
+
+// Generate SP number for VAT group — SPYYYYMM-XXXX (counter never resets)
+function spV2GenNumber(payDate) {
+  const d = payDate ? new Date(payDate) : new Date();
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const n = spV2State.nextCounter++;
+  persistSpV2();
+  return `SP${yyyy}${mm}-${String(n).padStart(4, '0')}`;
+}
+
+// Build 20-col rows from 3 parsed files
+function spV2BuildRows(payMain, payType, taxSales) {
+  // Index for lookups
+  const payTypeMap = {};
+  payType.forEach(p => { payTypeMap[p.no] = p; });
+  const taxMap = {};
+  taxSales.forEach(t => { taxMap[t.bill_no] = t; });
+  
+  const rows = [];
+  let seq = 0;
+  
+  payMain.forEach(sp => {
+    const ptEntry = payTypeMap[sp.no] || { methods: [] };
+    
+    // Separate children by VAT class
+    const vatBills = [];
+    const novatBills = [];
+    sp.bills.forEach(b => {
+      const c = spV2ClassifyVat(b.bill_no);
+      if (c === 'Y') vatBills.push(b);
+      else novatBills.push(b);
+    });
+    
+    // ── Calculate payment method distribution ──
+    const methodInfo = { cash: {d:'', a:0}, transfer: {d:'', a:0}, cheque: {d:'', a:0} };
+    ptEntry.methods.forEach(m => {
+      if (/เงินสด/.test(m.type))              { methodInfo.cash.d = m.date; methodInfo.cash.a += m.amount; }
+      else if (/โอนเงิน|เงินโอน/.test(m.type)) { methodInfo.transfer.d = m.date; methodInfo.transfer.a += m.amount; }
+      else if (/เช็ค/.test(m.type))            { methodInfo.cheque.d = m.date; methodInfo.cheque.a += m.amount; }
+    });
+    // Credit notes (JR/SC/JS amount negative)
+    const creditAmt = sp.bills.filter(b => b.amount < 0).reduce((s,b) => s + Math.abs(b.amount), 0);
+    
+    // ── NOVAT group: use original SP number ──
+    if (novatBills.length > 0) {
+      seq++;
+      const novatTotal = novatBills.reduce((s,b) => s + b.amount, 0);
+      // SP header (original)
+      const headerRow = {
+        seq: seq, vat_flag: 'N',
+        bill_no: sp.no, ref_doc: sp.date, sale_date: sp.customer,
+        note1: '', amount: null, pay_total: novatTotal,
+        cash_date: methodInfo.cash.d, cash_amt: methodInfo.cash.a,
+        transfer_date: methodInfo.transfer.d, transfer_amt: methodInfo.transfer.a,
+        cheque_date: methodInfo.cheque.d, cheque_amt: methodInfo.cheque.a,
+        credit_date: sp.date, credit_amt: creditAmt,
+        note2: '', sp_number: sp.no, pay_date: sp.date,
+        _is_header: true, _group_id: sp.no,
+      };
+      // If mixed (also has VAT), split the payment between groups? → for now, put all in NOVAT header
+      if (vatBills.length === 0) {
+        // all NOVAT — full payment here
+      } else {
+        // mixed — keep payment in NOVAT header (dominant group)
+      }
+      rows.push(headerRow);
+      
+      novatBills.forEach(b => {
+        seq++;
+        rows.push({
+          seq: seq, vat_flag: 'N',
+          bill_no: b.bill_no, ref_doc: b.ref_no || '', sale_date: b.bill_date || '',
+          note1: b.type_desc || '', amount: b.amount, pay_total: 0,
+          cash_date: '', cash_amt: 0, transfer_date: '', transfer_amt: 0,
+          cheque_date: '', cheque_amt: 0, credit_date: '', credit_amt: 0,
+          note2: '', sp_number: sp.no, pay_date: sp.date,
+          _is_header: false, _group_id: sp.no,
+        });
+      });
+    }
+    
+    // ── VAT group: generate new SP number ──
+    if (vatBills.length > 0) {
+      const vatSp = spV2GenNumber(sp.date);
+      const vatTotal = vatBills.reduce((s,b) => s + b.amount, 0);
+      seq++;
+      // VAT header (generated)
+      const vatHeader = {
+        seq: seq, vat_flag: 'Y',
+        bill_no: vatSp, ref_doc: sp.date, sale_date: sp.customer,
+        note1: '', amount: null, pay_total: vatTotal,
+        cash_date: '', cash_amt: 0,
+        transfer_date: '', transfer_amt: 0,
+        cheque_date: '', cheque_amt: 0,
+        credit_date: '', credit_amt: 0,
+        note2: '', sp_number: vatSp, pay_date: sp.date,
+        _is_header: true, _is_generated: true, _group_id: vatSp,
+      };
+      // If VAT only (no NOVAT) — full payment here
+      if (novatBills.length === 0) {
+        vatHeader.cash_date = methodInfo.cash.d; vatHeader.cash_amt = methodInfo.cash.a;
+        vatHeader.transfer_date = methodInfo.transfer.d; vatHeader.transfer_amt = methodInfo.transfer.a;
+        vatHeader.cheque_date = methodInfo.cheque.d; vatHeader.cheque_amt = methodInfo.cheque.a;
+      } else {
+        // Mixed — VAT total as separate transfer payment
+        vatHeader.transfer_date = sp.date;
+        vatHeader.transfer_amt = vatTotal;
+      }
+      rows.push(vatHeader);
+      
+      vatBills.forEach(b => {
+        seq++;
+        rows.push({
+          seq: seq, vat_flag: 'Y',
+          bill_no: b.bill_no, ref_doc: b.ref_no || '', sale_date: b.bill_date || '',
+          note1: b.type_desc || '', amount: b.amount, pay_total: 0,
+          cash_date: '', cash_amt: 0, transfer_date: '', transfer_amt: 0,
+          cheque_date: '', cheque_amt: 0, credit_date: '', credit_amt: 0,
+          note2: '', sp_number: vatSp, pay_date: sp.date,
+          _is_header: false, _group_id: vatSp,
+        });
+      });
+    }
+  });
+  
+  return rows;
+}
+
+// Paid/Unpaid — only headers have status; children inherit
+function spV2IsPaid(row) {
+  if (!row._is_header) return null;
+  const total = (Number(row.cash_amt)||0) + (Number(row.transfer_amt)||0) + 
+                (Number(row.cheque_amt)||0) + (Number(row.credit_amt)||0);
+  return total > 0;
+}
+
+// Filter rows by current filters
+function spV2FilterRows() {
+  const { filterVat, filterPaid } = spV2State;
+  // First pass: collect group_ids that match
+  const groupsMatch = new Set();
+  const headerMap = {};
+  spV2State.mainRows.forEach(r => {
+    if (r._is_header) {
+      headerMap[r._group_id] = r;
+      let keep = true;
+      if (filterVat !== 'ALL' && r.vat_flag !== filterVat) keep = false;
+      if (filterPaid !== 'ALL') {
+        const paid = spV2IsPaid(r);
+        if (filterPaid === 'paid' && !paid) keep = false;
+        if (filterPaid === 'unpaid' && paid) keep = false;
+      }
+      if (keep) groupsMatch.add(r._group_id);
+    }
+  });
+  return spV2State.mainRows.filter(r => groupsMatch.has(r._group_id));
+}
+
+// ════════════════════════════════════════
+// UI: Main SP Recon V2
+// ════════════════════════════════════════
 async function renderSpRecon(el) {
-  if (!spReconData) spReconData = await loadReconData('sp');
-  renderReconPage(el, 'sp', spReconData);
+  const rows = spV2State.mainRows.length > 0 ? spV2FilterRows() : [];
+  
+  // Stats
+  const headers = spV2State.mainRows.filter(r => r._is_header);
+  const vatHeaders = headers.filter(r => r.vat_flag === 'Y');
+  const novatHeaders = headers.filter(r => r.vat_flag === 'N');
+  const paidCount = headers.filter(r => spV2IsPaid(r)).length;
+  const unpaidCount = headers.length - paidCount;
+  const vatTotal = vatHeaders.reduce((s,r) => s + (Number(r.pay_total)||0), 0);
+  const novatTotal = novatHeaders.reduce((s,r) => s + (Number(r.pay_total)||0), 0);
+  
+  const { filterVat, filterPaid, view } = spV2State;
+  
+  el.innerHTML = `
+    <div class="page-title">📥 ตรวจ SP (ลูกหนี้) — V2</div>
+    
+    <div class="card" style="margin-bottom:16px">
+      <div style="font-weight:600;margin-bottom:10px">📂 อัปโหลดไฟล์ Crystal Reports</div>
+      <div class="flex gap-2 flex-wrap items-center">
+        <input type="file" id="spv2-file-main" accept=".xls,.xlsx" style="display:none">
+        <input type="file" id="spv2-file-type" accept=".xls,.xlsx" style="display:none">
+        <input type="file" id="spv2-file-tax" accept=".xls,.xlsx" style="display:none">
+        
+        <button class="btn btn-outline btn-sm" id="spv2-btn-main">
+          📄 1. การชำระเงิน.xls ${spV2State.rawPayMain.length ? '<span class="badge badge-success">'+spV2State.rawPayMain.length+'</span>' : ''}
+        </button>
+        <button class="btn btn-outline btn-sm" id="spv2-btn-type">
+          📄 2. ตามประเภท.xls ${spV2State.rawPayType.length ? '<span class="badge badge-success">'+spV2State.rawPayType.length+'</span>' : ''}
+        </button>
+        <button class="btn btn-outline btn-sm" id="spv2-btn-tax">
+          📄 3. ภาษีขาย.xls ${spV2State.rawTaxSales.length ? '<span class="badge badge-success">'+spV2State.rawTaxSales.length+'</span>' : ''}
+        </button>
+        
+        <button class="btn btn-primary btn-sm" id="spv2-btn-merge" 
+          ${spV2State.rawPayMain.length && spV2State.rawPayType.length ? '' : 'disabled'}>
+          🔗 รวม 3 ไฟล์ → สร้าง Main
+        </button>
+        
+        ${spV2State.mainRows.length > 0 ? `
+          <button class="btn btn-ghost btn-sm" id="spv2-btn-clear" style="color:var(--danger)">🗑 ล้างข้อมูล</button>
+        ` : ''}
+      </div>
+    </div>
+    
+    ${spV2State.mainRows.length > 0 ? `
+      <!-- Stats cards -->
+      <div class="flex gap-2 flex-wrap" style="margin-bottom:12px">
+        <div class="card" style="flex:1;min-width:150px;padding:12px">
+          <div class="text-xs text-dim">SP ทั้งหมด</div>
+          <div style="font-size:1.4rem;font-weight:700">${headers.length}</div>
+        </div>
+        <div class="card" style="flex:1;min-width:150px;padding:12px">
+          <div class="text-xs text-dim">VAT</div>
+          <div style="font-size:1.4rem;font-weight:700;color:var(--info)">${vatHeaders.length}</div>
+          <div class="text-xs text-dim">${fmtNum(vatTotal)} บ.</div>
+        </div>
+        <div class="card" style="flex:1;min-width:150px;padding:12px">
+          <div class="text-xs text-dim">NOVAT</div>
+          <div style="font-size:1.4rem;font-weight:700;color:var(--warn)">${novatHeaders.length}</div>
+          <div class="text-xs text-dim">${fmtNum(novatTotal)} บ.</div>
+        </div>
+        <div class="card" style="flex:1;min-width:150px;padding:12px">
+          <div class="text-xs text-dim">Paid</div>
+          <div style="font-size:1.4rem;font-weight:700;color:var(--success)">${paidCount}</div>
+        </div>
+        <div class="card" style="flex:1;min-width:150px;padding:12px">
+          <div class="text-xs text-dim">Unpaid</div>
+          <div style="font-size:1.4rem;font-weight:700;color:var(--danger)">${unpaidCount}</div>
+        </div>
+      </div>
+      
+      <!-- View toggle + filters -->
+      <div class="flex gap-2 flex-wrap items-center" style="margin-bottom:12px">
+        <div class="flex gap-1">
+          <button class="pill ${view==='main'?'active':''}" data-view="main">📋 Main</button>
+          <button class="pill ${view==='report'?'active':''}" data-view="report">📊 Report (VAT)</button>
+          <button class="pill ${view==='sellbills'?'active':''}" data-view="sellbills">📑 Sell Bills</button>
+        </div>
+        
+        <div style="width:1px;height:24px;background:var(--border)"></div>
+        
+        <span class="text-xs text-dim">Type:</span>
+        <button class="pill ${filterVat==='ALL'?'active':''}" data-fvat="ALL">ALL</button>
+        <button class="pill ${filterVat==='Y'?'active':''}" data-fvat="Y">VAT (SS/SR/SC)</button>
+        <button class="pill ${filterVat==='N'?'active':''}" data-fvat="N">NV (OR/OS/JR/JS)</button>
+        
+        <span class="text-xs text-dim" style="margin-left:10px">Status:</span>
+        <button class="pill ${filterPaid==='ALL'?'active':''}" data-fpaid="ALL">ALL</button>
+        <button class="pill ${filterPaid==='paid'?'active':''}" data-fpaid="paid" style="color:var(--success)">Paid</button>
+        <button class="pill ${filterPaid==='unpaid'?'active':''}" data-fpaid="unpaid" style="color:var(--danger)">Unpaid</button>
+        
+        <div style="flex:1"></div>
+        
+        ${view === 'report' ? `<button class="btn btn-success btn-sm" id="spv2-btn-download">⬇️ Download Report</button>` : ''}
+      </div>
+      
+      <!-- Table -->
+      <div class="card" style="padding:0;overflow:auto;max-height:70vh">
+        ${view === 'main' ? spV2RenderMainTable(rows) 
+        : view === 'report' ? spV2RenderReportView(rows) 
+        : spV2RenderSellBillsView()}
+      </div>
+    ` : `
+      <div class="card" style="text-align:center;padding:40px;color:var(--text3)">
+        ยังไม่มีข้อมูล — อัปโหลดไฟล์ 3 ตัว แล้วกด "รวม 3 ไฟล์"
+      </div>
+    `}
+  `;
+  
+  // ── Wire up ──
+  document.getElementById('spv2-btn-main')?.addEventListener('click', () => 
+    document.getElementById('spv2-file-main').click());
+  document.getElementById('spv2-btn-type')?.addEventListener('click', () => 
+    document.getElementById('spv2-file-type').click());
+  document.getElementById('spv2-btn-tax')?.addEventListener('click', () => 
+    document.getElementById('spv2-file-tax').click());
+  
+  document.getElementById('spv2-file-main')?.addEventListener('change', async e => {
+    const f = e.target.files[0]; if (!f) return;
+    const r = await parseExcelFile(f);
+    const sheet = r.sheets[r.sheetNames[0]];
+    spV2State.rawPayMain = parseReconPaymentMain(sheet, 'sp');
+    toast(`อ่าน "การชำระเงิน" — ${spV2State.rawPayMain.length} SP`, 'success');
+    renderSpRecon(el);
+  });
+  
+  document.getElementById('spv2-file-type')?.addEventListener('change', async e => {
+    const f = e.target.files[0]; if (!f) return;
+    const r = await parseExcelFile(f);
+    const sheet = r.sheets[r.sheetNames[0]];
+    spV2State.rawPayType = parseReconPaymentType(sheet, 'sp');
+    toast(`อ่าน "ตามประเภท" — ${spV2State.rawPayType.length} SP`, 'success');
+    renderSpRecon(el);
+  });
+  
+  document.getElementById('spv2-file-tax')?.addEventListener('change', async e => {
+    const f = e.target.files[0]; if (!f) return;
+    const r = await parseExcelFile(f);
+    const sheet = r.sheets[r.sheetNames[0]];
+    spV2State.rawTaxSales = parseReconTax(sheet);
+    toast(`อ่าน "ภาษีขาย" — ${spV2State.rawTaxSales.length} records`, 'success');
+    renderSpRecon(el);
+  });
+  
+  document.getElementById('spv2-btn-merge')?.addEventListener('click', () => {
+    if (!confirm(`รวมข้อมูล 3 ไฟล์?\n\n• การชำระเงิน: ${spV2State.rawPayMain.length} SP\n• ตามประเภท: ${spV2State.rawPayType.length} SP\n• ภาษีขาย: ${spV2State.rawTaxSales.length} records\n\n⚠️ จะ reset counter ไหม?`)) return;
+    // Save counter if continuing, else reset
+    const resetCounter = confirm('Reset counter SP (เริ่ม 0001 ใหม่)?\n\nYes = Reset\nNo = ต่อจากของเดิม');
+    if (resetCounter) spV2State.nextCounter = 1;
+    spV2State.mainRows = spV2BuildRows(spV2State.rawPayMain, spV2State.rawPayType, spV2State.rawTaxSales);
+    persistSpV2();
+    toast(`สร้าง Main — ${spV2State.mainRows.length} rows`, 'success');
+    renderSpRecon(el);
+  });
+  
+  document.getElementById('spv2-btn-clear')?.addEventListener('click', () => {
+    if (!confirm('ล้างข้อมูล Main ทั้งหมด? (ไฟล์ที่ upload ยังอยู่)')) return;
+    spV2State.mainRows = [];
+    persistSpV2();
+    renderSpRecon(el);
+  });
+  
+  document.getElementById('spv2-btn-download')?.addEventListener('click', () => {
+    spV2DownloadXlsx();
+  });
+  
+  document.getElementById('spv2-btn-download-sellbills')?.addEventListener('click', () => {
+    spV2DownloadSellBills();
+  });
+  
+  // Wire edit buttons in Report view
+  el.querySelectorAll('.spv2-edit-pay').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      spV2OpenEditModal(btn.dataset.gid);
+    });
+  });
+  
+  el.querySelectorAll('[data-view]').forEach(b => b.addEventListener('click', () => {
+    spV2State.view = b.dataset.view; renderSpRecon(el);
+  }));
+  el.querySelectorAll('[data-fvat]').forEach(b => b.addEventListener('click', () => {
+    spV2State.filterVat = b.dataset.fvat; renderSpRecon(el);
+  }));
+  el.querySelectorAll('[data-fpaid]').forEach(b => b.addEventListener('click', () => {
+    spV2State.filterPaid = b.dataset.fpaid; renderSpRecon(el);
+  }));
+  
+  // Click to toggle Y/N on B column
+  el.querySelectorAll('.spv2-vat-cell').forEach(cell => {
+    cell.addEventListener('click', () => {
+      const idx = Number(cell.dataset.idx);
+      const row = spV2State.mainRows[idx];
+      if (!row) return;
+      row.vat_flag = row.vat_flag === 'Y' ? 'N' : 'Y';
+      persistSpV2();
+      renderSpRecon(el);
+    });
+  });
+}
+
+// Render Main table (20 cols)
+function spV2RenderMainTable(rows) {
+  const fmt = v => v == null || v === '' || v === 0 ? '' : (typeof v === 'number' ? fmtNum(v) : String(v));
+  const fmtD = v => v ? String(v).substring(0, 10) : '';
+  
+  const thead = `
+    <thead style="position:sticky;top:0;background:var(--card);z-index:1;border-bottom:2px solid var(--border)">
+      <tr style="font-size:.7rem">
+        <th style="text-align:center;padding:6px">#</th>
+        <th style="text-align:center;padding:6px">B<br>Y/N</th>
+        <th style="text-align:left;padding:6px">C: เลขเอกสาร</th>
+        <th style="text-align:left;padding:6px">D: อ้างอิง</th>
+        <th style="text-align:left;padding:6px">E: วันขาย/ลูกค้า</th>
+        <th style="text-align:left;padding:6px">G: หมายเหตุ</th>
+        <th style="text-align:right;padding:6px">H: ยอด</th>
+        <th style="text-align:right;padding:6px">I: รวมชำระ</th>
+        <th style="text-align:center;padding:6px">J: วันสด</th>
+        <th style="text-align:right;padding:6px">K: สด</th>
+        <th style="text-align:center;padding:6px">L: วันโอน</th>
+        <th style="text-align:right;padding:6px">M: โอน</th>
+        <th style="text-align:center;padding:6px">N: วันเช็ค</th>
+        <th style="text-align:right;padding:6px">O: เช็ค</th>
+        <th style="text-align:center;padding:6px">P: วันลด</th>
+        <th style="text-align:right;padding:6px">Q: ลด</th>
+        <th style="text-align:left;padding:6px">S: SP Number</th>
+        <th style="text-align:center;padding:6px">T: Pay Date</th>
+      </tr>
+    </thead>
+  `;
+  
+  const tbody = rows.map(r => {
+    const origIdx = spV2State.mainRows.indexOf(r);
+    const isHdr = r._is_header;
+    const paid = spV2IsPaid(r);
+    const rowBg = isHdr 
+      ? (paid === true ? 'background:rgba(63,196,143,.08)' : paid === false ? 'background:rgba(239,87,87,.08)' : '')
+      : '';
+    const vatColor = r.vat_flag === 'Y' ? 'var(--info)' : 'var(--warn)';
+    return `
+      <tr style="font-size:.75rem;${rowBg};${isHdr?'font-weight:600':''}">
+        <td style="text-align:center;padding:4px 6px">${r.seq}</td>
+        <td style="text-align:center;padding:4px 6px">
+          <span class="spv2-vat-cell" data-idx="${origIdx}" 
+                style="cursor:pointer;color:${vatColor};font-weight:700;padding:2px 8px;border:1px solid ${vatColor};border-radius:3px">
+            ${r.vat_flag || '-'}
+          </span>
+        </td>
+        <td style="padding:4px 6px;font-family:monospace">${r.bill_no}</td>
+        <td style="padding:4px 6px;font-size:.7rem">${fmtD(r.ref_doc)}</td>
+        <td style="padding:4px 6px">${String(r.sale_date || '').substring(0, 40)}</td>
+        <td style="padding:4px 6px;font-size:.7rem">${r.note1 || ''}</td>
+        <td style="text-align:right;padding:4px 6px">${fmt(r.amount)}</td>
+        <td style="text-align:right;padding:4px 6px;color:var(--success)">${isHdr?fmt(r.pay_total):''}</td>
+        <td style="text-align:center;padding:4px 6px;font-size:.7rem">${fmtD(r.cash_date)}</td>
+        <td style="text-align:right;padding:4px 6px">${fmt(r.cash_amt)}</td>
+        <td style="text-align:center;padding:4px 6px;font-size:.7rem">${fmtD(r.transfer_date)}</td>
+        <td style="text-align:right;padding:4px 6px">${fmt(r.transfer_amt)}</td>
+        <td style="text-align:center;padding:4px 6px;font-size:.7rem">${fmtD(r.cheque_date)}</td>
+        <td style="text-align:right;padding:4px 6px">${fmt(r.cheque_amt)}</td>
+        <td style="text-align:center;padding:4px 6px;font-size:.7rem">${fmtD(r.credit_date)}</td>
+        <td style="text-align:right;padding:4px 6px">${fmt(r.credit_amt)}</td>
+        <td style="padding:4px 6px;font-family:monospace;color:${r._is_generated?'var(--info)':''}">${r.sp_number}</td>
+        <td style="text-align:center;padding:4px 6px;font-size:.7rem">${fmtD(r.pay_date)}</td>
+      </tr>
+    `;
+  }).join('');
+  
+  return `<table style="width:100%;border-collapse:collapse;min-width:1600px">${thead}<tbody>${tbody}</tbody></table>`;
+}
+
+// Render Report view (grouped, VAT only by default)
+function spV2RenderReportView(rows) {
+  // Group by sp_number (only VAT groups)
+  const groups = {};
+  rows.forEach(r => {
+    if (r.vat_flag !== 'Y') return;
+    (groups[r._group_id] = groups[r._group_id] || []).push(r);
+  });
+  
+  if (Object.keys(groups).length === 0) {
+    return '<div style="padding:40px;text-align:center;color:var(--text3)">ไม่มี VAT records ใน filter ปัจจุบัน</div>';
+  }
+  
+  const fmt = v => v == null || v === '' || v === 0 ? '' : (typeof v === 'number' ? fmtNum(v) : String(v));
+  const fmtD = v => v ? String(v).substring(0, 10) : '';
+  
+  let html = `<div style="padding:16px">
+    <div style="text-align:center;font-weight:700;margin-bottom:4px">รายงาน - การชำระเงิน (VAT)</div>
+    <div style="text-align:center;font-size:.85rem;color:var(--text2);margin-bottom:16px">บริษัท จงกลณีการไฟฟ้า จำกัด</div>
+    
+    <table style="width:100%;border-collapse:collapse;font-size:.8rem">
+      <thead>
+        <tr style="background:var(--bg2);border-bottom:2px solid var(--border)">
+          <th colspan="3" style="padding:8px;text-align:left">เลขเอกสารชำระ / ลูกค้า</th>
+          <th style="padding:8px;text-align:right">รวมชำระจริง</th>
+          <th colspan="2" style="padding:8px;text-align:center">เงินสด</th>
+          <th colspan="2" style="padding:8px;text-align:center">โอนเงิน</th>
+          <th colspan="2" style="padding:8px;text-align:center">เช็ค</th>
+          <th style="padding:8px;text-align:center">Status</th>
+        </tr>
+        <tr style="background:var(--bg2);border-bottom:1px solid var(--border);font-size:.7rem">
+          <th style="padding:4px">เลขเอกสาร</th>
+          <th style="padding:4px">วันขาย</th>
+          <th style="padding:4px">หมายเหตุ</th>
+          <th style="padding:4px;text-align:right">จำนวน</th>
+          <th style="padding:4px">วันรับ</th>
+          <th style="padding:4px;text-align:right">ยอด</th>
+          <th style="padding:4px">วันรับ</th>
+          <th style="padding:4px;text-align:right">ยอด</th>
+          <th style="padding:4px">วันรับ</th>
+          <th style="padding:4px;text-align:right">ยอด</th>
+          <th style="padding:4px">-</th>
+        </tr>
+      </thead>
+      <tbody>`;
+  
+  Object.entries(groups).forEach(([gid, grp]) => {
+    const header = grp.find(r => r._is_header);
+    const children = grp.filter(r => !r._is_header);
+    if (!header) return;
+    const paid = spV2IsPaid(header);
+    const rowColor = paid ? 'background:rgba(63,196,143,.15)' : 'background:rgba(239,87,87,.15)';
+    const statusBadge = paid ? '<span style="color:var(--success);font-weight:700">✓ Paid</span>' : '<span style="color:var(--danger);font-weight:700">✗ Unpaid</span>';
+    
+    html += `
+      <tr style="${rowColor};font-weight:600;border-top:2px solid var(--border)">
+        <td style="padding:6px;font-family:monospace">${header.bill_no}</td>
+        <td style="padding:6px">${fmtD(header.ref_doc)}</td>
+        <td style="padding:6px">${String(header.sale_date||'').substring(0,35)}</td>
+        <td style="padding:6px;text-align:right">${fmt(header.pay_total)}</td>
+        <td style="padding:6px">${fmtD(header.cash_date)}</td>
+        <td style="padding:6px;text-align:right">${fmt(header.cash_amt)}</td>
+        <td style="padding:6px">${fmtD(header.transfer_date)}</td>
+        <td style="padding:6px;text-align:right">${fmt(header.transfer_amt)}</td>
+        <td style="padding:6px">${fmtD(header.cheque_date)}</td>
+        <td style="padding:6px;text-align:right">${fmt(header.cheque_amt)}</td>
+        <td style="padding:6px;text-align:center">
+          ${statusBadge}
+          <button class="spv2-edit-pay" data-gid="${header._group_id}" 
+                  title="แก้ไขวิธีจ่าย"
+                  style="margin-left:4px;background:none;border:none;cursor:pointer;color:var(--info);padding:2px 6px;border-radius:3px">✏️</button>
+        </td>
+      </tr>`;
+    children.forEach(c => {
+      html += `
+        <tr style="font-size:.75rem;color:var(--text2)">
+          <td style="padding:4px 6px;padding-left:18px;font-family:monospace">${c.bill_no}</td>
+          <td style="padding:4px 6px">${fmtD(c.sale_date)}</td>
+          <td style="padding:4px 6px">${c.note1 || ''}</td>
+          <td style="padding:4px 6px;text-align:right">${fmt(c.amount)}</td>
+          <td colspan="7"></td>
+        </tr>`;
+    });
+  });
+  
+  html += `</tbody></table></div>`;
+  return html;
+}
+
+// XLSX export
+function spV2DownloadXlsx() {
+  const rows = spV2FilterRows();
+  const vatGroups = {};
+  rows.forEach(r => {
+    if (r.vat_flag !== 'Y') return;
+    (vatGroups[r._group_id] = vatGroups[r._group_id] || []).push(r);
+  });
+  
+  // Build aoa (array of arrays)
+  const aoa = [
+    ['รายงาน - การชำระเงิน', '', '', '', '', '', '', '', '', '', ''],
+    ['บริษัท จงกลณีการไฟฟ้า จำกัด', '', '', '', '', '', '', '', '', '', ''],
+    ['เลขเอกสารชำระ', 'วันที่ชำระ', 'ลูกค้า', '', 'รวมชำระจริง', 'เงินสด', '', 'โอนเงิน', '', 'เช็ค', 'Status'],
+    ['เลขเอกสาร', 'เอกสารอ้างอิง', 'วันเอกสารขาย', 'หมายเหตุ', 'จำนวนเงิน', 'วันรับ', 'ยอด', 'วันรับ', 'ยอด', 'วันรับ', 'ยอด'],
+    [],
+  ];
+  
+  const fmtD = v => v ? String(v).substring(0, 10) : '';
+  
+  Object.entries(vatGroups).forEach(([gid, grp]) => {
+    const header = grp.find(r => r._is_header);
+    const children = grp.filter(r => !r._is_header);
+    if (!header) return;
+    const paid = spV2IsPaid(header);
+    
+    aoa.push([
+      header.bill_no, fmtD(header.ref_doc), header.sale_date, '',
+      Number(header.pay_total)||0, fmtD(header.cash_date), Number(header.cash_amt)||0,
+      fmtD(header.transfer_date), Number(header.transfer_amt)||0,
+      fmtD(header.cheque_date), paid ? 'Paid' : 'Unpaid'
+    ]);
+    
+    children.forEach(c => {
+      aoa.push([c.bill_no, '', fmtD(c.sale_date), c.note1, Number(c.amount)||0, '', 0, '', 0, '', '']);
+    });
+    aoa.push([]);
+  });
+  
+  // Build workbook with SheetJS
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
+  // Color paid/unpaid rows (SheetJS Community doesn't support colors without plugin)
+  // Set column widths
+  ws['!cols'] = [
+    {wch:20},{wch:14},{wch:35},{wch:22},{wch:14},{wch:14},{wch:12},{wch:14},{wch:12},{wch:14},{wch:10}
+  ];
+  
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Report');
+  const fn = `SP_Report_${todayISO()}.xlsx`;
+  XLSX.writeFile(wb, fn);
+  toast(`Download ${fn}`, 'success');
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Sell Bills — Generate จาก Main V2 + lookup ภาษีขาย
+// ════════════════════════════════════════════════════════════════════
+
+// Lookup: bill_no → Main row (child)
+function spV2GetMainBillMap() {
+  const map = {};
+  spV2State.mainRows.forEach(r => {
+    if (!r._is_header && r.bill_no) {
+      map[r.bill_no] = r;
+    }
+  });
+  return map;
+}
+
+// Lookup: group_id → header row
+function spV2GetHeaderMap() {
+  const map = {};
+  spV2State.mainRows.forEach(r => {
+    if (r._is_header) map[r._group_id] = r;
+  });
+  return map;
+}
+
+// Format Thai tax ID: 13 digits → "x xxxx xxxxx xx x"
+function spV2FormatTaxId(taxId) {
+  const digits = String(taxId || '').replace(/\D/g, '');
+  if (digits.length !== 13) return String(taxId || '').trim();
+  return `${digits[0]} ${digits.slice(1,5)} ${digits.slice(5,10)} ${digits.slice(10,12)} ${digits[12]}`;
+}
+
+// Generate Sell Bills from ภาษีขาย (primary source) + Main lookup for payment status
+function spV2GenerateSellBills() {
+  const mainBillMap = spV2GetMainBillMap();
+  const headerMap = spV2GetHeaderMap();
+  const sellBills = [];
+  
+  // Primary source = ภาษีขาย.xls (one row per tax record)
+  const source = spV2State.rawTaxSales || [];
+  
+  source.forEach((tax, idx) => {
+    const prefix = String(tax.bill_no).substring(0, 2).toUpperCase();
+    const isVat = ['SS','SR','SC'].includes(prefix);
+    const isNv = ['OR','OS','JR','JS'].includes(prefix);
+    const vatFlag = isVat ? 'Y' : (isNv ? 'N' : '');
+    
+    // Lookup payment status from Main
+    const mainRow = mainBillMap[tax.bill_no];
+    let payStatus = '';
+    let payDate = '';
+    let note = '';
+    
+    if (mainRow) {
+      const header = headerMap[mainRow._group_id];
+      const paid = header ? spV2IsPaid(header) : false;
+      
+      if (paid) {
+        payStatus = mainRow.sp_number || '';  // Main Col.S
+        payDate = mainRow.pay_date || '';     // Main Col.T
+      }
+      note = mainRow.note1 || '';              // Main Col.R (note/type_desc)
+    }
+    // ยกเลิก (SC/JR/JS — ใบลดหนี้)
+    const isVoid = ['SC','JR','JS'].includes(prefix);
+    if (isVoid && !payStatus) payStatus = 'ยกเลิก';
+    
+    sellBills.push({
+      seq: idx + 1,
+      doc_date: tax.bill_date || '',
+      bill_no: tax.bill_no || '',
+      ref_doc: tax.ref_doc || '',
+      customer: tax.customer || '',
+      tax_id: spV2FormatTaxId(tax.tax_id),
+      branch: tax.branch || '',
+      value: Number(tax.amount) || 0,
+      vat: Number(tax.vat) || 0,
+      novat: Number(tax.novat) || 0,
+      total: Number(tax.total) || 0,
+      pay_status: payStatus,
+      pay_date: payDate,
+      note: note,
+      _vat_flag: vatFlag,
+      _is_void: isVoid,
+    });
+  });
+  
+  return sellBills;
+}
+
+// Render Sell Bills table
+function spV2RenderSellBillsView() {
+  let bills = spV2GenerateSellBills();
+  
+  // ── Filters ──
+  const { filterVat, filterPaid } = spV2State;
+  if (filterVat === 'Y') bills = bills.filter(b => b._vat_flag === 'Y');
+  else if (filterVat === 'N') bills = bills.filter(b => b._vat_flag === 'N');
+  
+  if (filterPaid === 'paid') bills = bills.filter(b => b.pay_status && b.pay_status !== 'ยกเลิก');
+  else if (filterPaid === 'unpaid') bills = bills.filter(b => !b.pay_status);
+  
+  // ── Sort: unpaid first, then customer A→Z ──
+  bills.sort((a, b) => {
+    const aUnpaid = !a.pay_status ? 0 : 1;
+    const bUnpaid = !b.pay_status ? 0 : 1;
+    if (aUnpaid !== bUnpaid) return aUnpaid - bUnpaid;
+    return String(a.customer).localeCompare(String(b.customer), 'th');
+  });
+  
+  // Re-index seq for current display
+  bills.forEach((b, i) => b.seq = i + 1);
+  
+  // Totals
+  const totalValue = bills.reduce((s,b) => s + b.value, 0);
+  const totalVat = bills.reduce((s,b) => s + b.vat, 0);
+  const totalNovat = bills.reduce((s,b) => s + b.novat, 0);
+  const totalAll = bills.reduce((s,b) => s + b.total, 0);
+  const unpaidTotal = bills.filter(b => !b.pay_status).reduce((s,b) => s + b.total, 0);
+  
+  const fmt = v => v == null || v === 0 ? '' : fmtNum(v);
+  const fmtD = v => v ? String(v).substring(0, 10) : '';
+  
+  let html = `<div style="padding:12px">
+    <div class="flex gap-2 items-center flex-wrap" style="margin-bottom:12px">
+      <div style="font-weight:700">📊 Sell Bills — ${bills.length} รายการ</div>
+      ${unpaidTotal > 0 ? `<span style="color:var(--danger);font-weight:600">ค้างชำระรวม: ${fmtNum(unpaidTotal)}</span>` : ''}
+      <div style="flex:1"></div>
+      <button class="btn btn-success btn-sm" id="spv2-btn-download-sellbills">⬇️ Download XLSX</button>
+    </div>
+    
+    <table style="width:100%;border-collapse:collapse;font-size:.75rem;min-width:1400px">
+      <thead style="position:sticky;top:0;background:var(--card);z-index:1">
+        <tr style="background:var(--bg2);border-bottom:2px solid var(--border)">
+          <th style="padding:6px;text-align:center">#</th>
+          <th style="padding:6px;text-align:center">วันที่เอกสาร</th>
+          <th style="padding:6px;text-align:left">เลขที่เอกสาร</th>
+          <th style="padding:6px;text-align:left">อ้างอิง</th>
+          <th style="padding:6px;text-align:left">ชื่อลูกค้า</th>
+          <th style="padding:6px;text-align:left">เลขผู้เสียภาษี</th>
+          <th style="padding:6px;text-align:left">สำนักงาน</th>
+          <th style="padding:6px;text-align:right">มูลค่า</th>
+          <th style="padding:6px;text-align:right">ภาษี</th>
+          <th style="padding:6px;text-align:right">ยกเว้น</th>
+          <th style="padding:6px;text-align:right">รวม</th>
+          <th style="padding:6px;text-align:center">สถานะชำระ</th>
+          <th style="padding:6px;text-align:center">วันที่ชำระ</th>
+          <th style="padding:6px;text-align:left">หมายเหตุ</th>
+        </tr>
+      </thead>
+      <tbody>`;
+  
+  bills.forEach(b => {
+    const isVoid = b.pay_status === 'ยกเลิก';
+    const isPaid = b.pay_status && !isVoid;
+    const bg = isVoid ? 'background:rgba(128,128,128,.12);color:var(--text3)' 
+             : isPaid ? 'background:rgba(63,196,143,.06)' 
+             : 'background:rgba(239,87,87,.06)';
+    const statusColor = isVoid ? 'var(--text3)' : isPaid ? 'var(--success)' : 'var(--danger)';
+    const statusText = isPaid ? b.pay_status : (isVoid ? 'ยกเลิก' : 'ค้างชำระ');
+    html += `
+      <tr style="${bg};border-bottom:1px solid var(--border)">
+        <td style="padding:4px 6px;text-align:center">${b.seq}</td>
+        <td style="padding:4px 6px;text-align:center">${fmtD(b.doc_date)}</td>
+        <td style="padding:4px 6px;font-family:monospace">${b.bill_no}</td>
+        <td style="padding:4px 6px;font-family:monospace;font-size:.7rem">${b.ref_doc}</td>
+        <td style="padding:4px 6px">${String(b.customer||'').substring(0, 45)}</td>
+        <td style="padding:4px 6px;font-size:.7rem;font-family:monospace">${b.tax_id}</td>
+        <td style="padding:4px 6px;font-size:.7rem">${b.branch}</td>
+        <td style="padding:4px 6px;text-align:right">${fmt(b.value)}</td>
+        <td style="padding:4px 6px;text-align:right">${fmt(b.vat)}</td>
+        <td style="padding:4px 6px;text-align:right">${fmt(b.novat)}</td>
+        <td style="padding:4px 6px;text-align:right;font-weight:600">${fmt(b.total)}</td>
+        <td style="padding:4px 6px;text-align:center;color:${statusColor};font-weight:600;font-size:.7rem">${statusText}</td>
+        <td style="padding:4px 6px;text-align:center">${fmtD(b.pay_date)}</td>
+        <td style="padding:4px 6px;font-size:.7rem">${b.note || ''}</td>
+      </tr>`;
+  });
+  
+  html += `
+      </tbody>
+      <tfoot style="position:sticky;bottom:0;background:var(--card);z-index:1">
+        <tr style="background:var(--bg2);font-weight:700;border-top:2px solid var(--border)">
+          <td colspan="7" style="padding:8px;text-align:right">รวม:</td>
+          <td style="padding:8px;text-align:right">${fmtNum(totalValue)}</td>
+          <td style="padding:8px;text-align:right">${fmtNum(totalVat)}</td>
+          <td style="padding:8px;text-align:right">${fmtNum(totalNovat)}</td>
+          <td style="padding:8px;text-align:right;color:var(--info)">${fmtNum(totalAll)}</td>
+          <td colspan="3"></td>
+        </tr>
+      </tfoot>
+    </table>
+  </div>`;
+  
+  return html;
+}
+
+// Download Sell Bills XLSX
+function spV2DownloadSellBills() {
+  let bills = spV2GenerateSellBills();
+  
+  const { filterVat, filterPaid } = spV2State;
+  if (filterVat === 'Y') bills = bills.filter(b => b._vat_flag === 'Y');
+  else if (filterVat === 'N') bills = bills.filter(b => b._vat_flag === 'N');
+  if (filterPaid === 'paid') bills = bills.filter(b => b.pay_status && b.pay_status !== 'ยกเลิก');
+  else if (filterPaid === 'unpaid') bills = bills.filter(b => !b.pay_status);
+  
+  // Sort same as UI
+  bills.sort((a, b) => {
+    const aUnpaid = !a.pay_status ? 0 : 1;
+    const bUnpaid = !b.pay_status ? 0 : 1;
+    if (aUnpaid !== bUnpaid) return aUnpaid - bUnpaid;
+    return String(a.customer).localeCompare(String(b.customer), 'th');
+  });
+  bills.forEach((b, i) => b.seq = i + 1);
+  
+  const fmtD = v => v ? String(v).substring(0, 10) : '';
+  
+  // Unpaid totals (for row 1 like sample)
+  const unpaidBills = bills.filter(b => !b.pay_status);
+  const unpaidValue = unpaidBills.reduce((s,b) => s + b.value, 0);
+  const unpaidVat = unpaidBills.reduce((s,b) => s + b.vat, 0);
+  const unpaidNovat = unpaidBills.reduce((s,b) => s + b.novat, 0);
+  const unpaidTotal = unpaidBills.reduce((s,b) => s + b.total, 0);
+  
+  const aoa = [
+    ['', '', '', '', '', '', 'ค้างชำระรวม', unpaidValue, unpaidVat, unpaidNovat, unpaidTotal, '', '', ''],
+    ['ลำดับ', 'วันที่เอกสาร', 'เลขที่เอกสาร', 'อ้างถึง', 'ชื่อลูกค้า', 'เลขเสียภาษี', 'สำนักงาน',
+     'มูลค่า', 'ภาษี', 'ยกเว้นภาษี', 'รวม', 'สถานะการชำระ', 'วันที่ชำระ', 'หมายเหตุ'],
+  ];
+  
+  bills.forEach(b => {
+    const statusText = b.pay_status || '';
+    aoa.push([
+      b.seq, fmtD(b.doc_date), b.bill_no, b.ref_doc, b.customer,
+      b.tax_id, b.branch,
+      b.value, b.vat, b.novat, b.total,
+      statusText, fmtD(b.pay_date), b.note
+    ]);
+  });
+  
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
+  ws['!cols'] = [
+    {wch:6},{wch:14},{wch:18},{wch:18},{wch:30},{wch:18},{wch:18},
+    {wch:12},{wch:12},{wch:12},{wch:12},{wch:18},{wch:14},{wch:22}
+  ];
+  
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Sell Bills');
+  const fn = `SellBills_${todayISO()}.xlsx`;
+  XLSX.writeFile(wb, fn);
+  toast(`Download ${fn} — ${bills.length} rows`, 'success');
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Edit payment method for a specific SP group (fix mistakes in Report)
+// ════════════════════════════════════════════════════════════════════
+function spV2OpenEditModal(groupId) {
+  const headerRow = spV2State.mainRows.find(r => r._is_header && r._group_id === groupId);
+  if (!headerRow) return;
+  
+  const html = `
+    <div style="max-width:500px">
+      <div style="font-weight:700;margin-bottom:12px">✏️ แก้ไขวิธีการจ่าย: ${headerRow.bill_no}</div>
+      <div style="font-size:.85rem;color:var(--text2);margin-bottom:16px">
+        ลูกค้า: ${String(headerRow.sale_date||'').substring(0, 60)}<br>
+        ยอดรวม: ${fmtNum(headerRow.pay_total)} บาท
+      </div>
+      
+      <div class="flex flex-col gap-2">
+        <div>
+          <label class="text-xs text-dim">💵 เงินสด</label>
+          <div class="flex gap-2">
+            <input type="date" class="input" id="edit-cash-date" value="${String(headerRow.cash_date||'').substring(0,10)}" style="flex:1">
+            <input type="number" class="input" id="edit-cash-amt" value="${Number(headerRow.cash_amt)||0}" step="0.01" style="width:140px;text-align:right">
+          </div>
+        </div>
+        <div>
+          <label class="text-xs text-dim">🏦 โอนเงิน</label>
+          <div class="flex gap-2">
+            <input type="date" class="input" id="edit-transfer-date" value="${String(headerRow.transfer_date||'').substring(0,10)}" style="flex:1">
+            <input type="number" class="input" id="edit-transfer-amt" value="${Number(headerRow.transfer_amt)||0}" step="0.01" style="width:140px;text-align:right">
+          </div>
+        </div>
+        <div>
+          <label class="text-xs text-dim">📋 เช็ค</label>
+          <div class="flex gap-2">
+            <input type="date" class="input" id="edit-cheque-date" value="${String(headerRow.cheque_date||'').substring(0,10)}" style="flex:1">
+            <input type="number" class="input" id="edit-cheque-amt" value="${Number(headerRow.cheque_amt)||0}" step="0.01" style="width:140px;text-align:right">
+          </div>
+        </div>
+        <div>
+          <label class="text-xs text-dim">💸 ใบลดหนี้</label>
+          <div class="flex gap-2">
+            <input type="date" class="input" id="edit-credit-date" value="${String(headerRow.credit_date||'').substring(0,10)}" style="flex:1">
+            <input type="number" class="input" id="edit-credit-amt" value="${Number(headerRow.credit_amt)||0}" step="0.01" style="width:140px;text-align:right">
+          </div>
+        </div>
+      </div>
+      
+      <div class="flex gap-2" style="margin-top:16px;justify-content:flex-end">
+        <button class="btn btn-ghost btn-sm" onclick="closeModal()">ยกเลิก</button>
+        <button class="btn btn-primary btn-sm" id="edit-save-btn">💾 บันทึก</button>
+      </div>
+    </div>
+  `;
+  openModal('แก้ไขวิธีการจ่าย', html);
+  
+  document.getElementById('edit-save-btn').addEventListener('click', () => {
+    headerRow.cash_date = document.getElementById('edit-cash-date').value;
+    headerRow.cash_amt = Number(document.getElementById('edit-cash-amt').value) || 0;
+    headerRow.transfer_date = document.getElementById('edit-transfer-date').value;
+    headerRow.transfer_amt = Number(document.getElementById('edit-transfer-amt').value) || 0;
+    headerRow.cheque_date = document.getElementById('edit-cheque-date').value;
+    headerRow.cheque_amt = Number(document.getElementById('edit-cheque-amt').value) || 0;
+    headerRow.credit_date = document.getElementById('edit-credit-date').value;
+    headerRow.credit_amt = Number(document.getElementById('edit-credit-amt').value) || 0;
+    
+    persistSpV2();
+    closeModal();
+    toast('บันทึกแล้ว', 'success');
+    const mainEl = document.getElementById('main');
+    if (mainEl) renderSpRecon(mainEl);
+  });
 }
 
 async function renderPpRecon(el) {
