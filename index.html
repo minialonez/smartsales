@@ -14420,9 +14420,17 @@ function spV2BuildRows(payMain, payType, taxSales) {
       else if (/โอนเงิน|เงินโอน/.test(m.type)) { methodInfo.transfer.d = m.date; methodInfo.transfer.a += m.amount; }
       else if (/เช็ค/.test(m.type))            { methodInfo.cheque.d = m.date; methodInfo.cheque.a += m.amount; }
     });
-    // Credit notes (JR/SC/JS amount negative)
-    // creditAmt = net ของ credit ใช้จริง = totalBills - cash - transfer - cheque
-    // สำหรับ case OR+JR offset กันพอดี → creditAmt = 0 (แต่ hasCreditActivity ยังเป็น true)
+    // Credit notes (JR/SC/JS) — credit_amt คำนวณจาก "residual ของ pay_total หลังหักวิธีจ่าย"
+    //   formula: creditAmt = allBillsTotal - cash - transfer - cheque
+    //
+    // Cases ที่ offset กันพอดี (positive บิล = |negative บิล|, ไม่มี methods) → creditAmt = 0:
+    //   • OR + JR ตัดกันพอดี (NOVAT)
+    //   • OS + JS ตัดกันพอดี (NOVAT)
+    //   • SS + SC ตัดกันพอดี (VAT)
+    //   • SR + SC ตัดกันพอดี (VAT)
+    // ทุก case ใช้ formula เดียวกัน เพราะ allBillsTotal รวมทั้ง VAT+NOVAT
+    // → allBillsTotal = 0 (offset), methods = 0 (ไม่มีจ่าย) → creditAmt = 0 ✓
+    // hasCreditActivity ยังเป็น true เพื่อแสดง credit_date
     const hasCreditActivity = sp.bills.some(b => b.amount < 0);
     const allBillsTotal = sp.bills.reduce((s,b) => s + b.amount, 0);
     const creditAmt = allBillsTotal - methodInfo.cash.a - methodInfo.transfer.a - methodInfo.cheque.a;
@@ -14765,41 +14773,6 @@ async function renderSpRecon(el) {
       renderSpRecon(el);
     });
   });
-  
-  // Inline edit for payment method fields (date + amount)
-  el.querySelectorAll('.spv2-edit-cell').forEach(inp => {
-    inp.addEventListener('change', () => {
-      const idx = Number(inp.dataset.idx);
-      const field = inp.dataset.field;
-      const row = spV2State.mainRows[idx];
-      if (!row) return;
-      
-      if (field.endsWith('_amt')) {
-        const newAmt = Number(inp.value) || 0;
-        row[field] = newAmt;
-        // Sync: ถ้ายอด = 0 → clear date ของ method เดียวกันด้วย (ข้อมูล consistent)
-        if (newAmt === 0) {
-          const prefix = field.replace('_amt', '');
-          row[prefix + '_date'] = '';
-        }
-      } else {
-        row[field] = inp.value;
-      }
-      
-      // Recompute pay_total from all method amounts
-      row.pay_total = (Number(row.cash_amt)||0) 
-                    + (Number(row.transfer_amt)||0) 
-                    + (Number(row.cheque_amt)||0) 
-                    + (Number(row.credit_amt)||0);
-      
-      persistSpV2();
-      // Re-render only if stats need update — use light refresh
-      renderSpRecon(el);
-    });
-    
-    // Prevent row click propagation
-    inp.addEventListener('click', e => e.stopPropagation());
-  });
 }
 
 // Render Main table (20 cols)
@@ -14824,7 +14797,8 @@ function spV2RenderMainTable(rows) {
         <th colspan="2" style="text-align:center;padding:6px;background:rgba(150,180,240,.15);border-right:1px solid var(--border)">📋 เช็ค</th>
         <th colspan="2" style="text-align:center;padding:6px;background:rgba(240,150,150,.15);border-right:2px solid var(--border)">💸 ใบลดหนี้</th>
         <th rowspan="2" style="text-align:left;padding:6px;border-right:1px solid var(--border)">SP Number</th>
-        <th rowspan="2" style="text-align:center;padding:6px">Pay Date</th>
+        <th rowspan="2" style="text-align:center;padding:6px;border-right:1px solid var(--border)">Pay Date</th>
+        <th rowspan="2" style="text-align:center;padding:6px">Action</th>
       </tr>
       <tr style="font-size:.68rem;background:var(--bg2);color:var(--text2)">
         <th style="text-align:center;padding:4px">วันที่รับ</th>
@@ -14837,26 +14811,6 @@ function spV2RenderMainTable(rows) {
         <th style="text-align:right;padding:4px;border-right:2px solid var(--border)">ยอด</th>
       </tr>
     </thead>
-  `;
-  
-  // Editable date/amount cell for headers
-  // editDate: รองรับ disabled flag — readonly+grey เมื่อยังไม่มียอด (กันการใส่ date โดดๆ)
-  const editDate = (origIdx, field, val, disabled) => `
-    <input type="date" class="spv2-edit-cell" data-idx="${origIdx}" data-field="${field}" 
-           value="${String(val||'').substring(0,10)}" 
-           ${disabled ? 'readonly title="กรอกยอดก่อน date จึงจะใช้ได้"' : ''}
-           style="width:100%;min-width:85px;background:transparent;border:none;color:var(--text);padding:1px 2px;font-size:.65rem;text-align:center${disabled ? ';opacity:.35;cursor:not-allowed' : ''}">
-  `;
-  const editAmt = (origIdx, field, val) => `
-    <input type="number" step="0.01" class="spv2-edit-cell" data-idx="${origIdx}" data-field="${field}" 
-           value="${val ? Number(val) : ''}" placeholder=""
-           style="width:100%;background:transparent;border:none;color:var(--text);padding:2px 4px;font-size:.72rem;text-align:right">
-  `;
-  // editAmt variant: shows 0 (not blank) — for cases where corresponding date is set
-  const editAmtShowZero = (origIdx, field, val) => `
-    <input type="number" step="0.01" class="spv2-edit-cell" data-idx="${origIdx}" data-field="${field}" 
-           value="${Number(val) || 0}" placeholder=""
-           style="width:100%;background:transparent;color:var(--text);padding:2px 4px;font-size:.72rem;text-align:right;border:none">
   `;
   
   const tbody = rows.map(r => {
@@ -14889,16 +14843,20 @@ function spV2RenderMainTable(rows) {
           const trfAmt = Number(r.transfer_amt) || 0;
           const chqAmt = Number(r.cheque_amt) || 0;
           const crdAmt = Number(r.credit_amt) || 0;
-          const hasCreditActivity = !!r.credit_date; // OR+JR offset case: credit_date set even if amt=0
+          // credit_date จะแสดง ถ้ามี credit_date ใน data (แม้ amt=0 เช่น OR+JR offset)
+          const showCrdDate = !!r.credit_date;
+          // Read-only display: เว้นว่างเมื่อ amt=0 (ยกเว้น credit ที่ดู credit_date)
+          const cellStyle = 'padding:4px 6px;font-size:.7rem;text-align:center';
+          const amtStyle = 'padding:4px 6px;font-size:.72rem;text-align:right';
           return `
-          <td style="padding:2px 4px">${editDate(origIdx, 'cash_date', cashAmt !== 0 ? r.cash_date : '', cashAmt === 0)}</td>
-          <td style="padding:2px 4px">${editAmt(origIdx, 'cash_amt', r.cash_amt)}</td>
-          <td style="padding:2px 4px">${editDate(origIdx, 'transfer_date', trfAmt !== 0 ? r.transfer_date : '', trfAmt === 0)}</td>
-          <td style="padding:2px 4px">${editAmt(origIdx, 'transfer_amt', r.transfer_amt)}</td>
-          <td style="padding:2px 4px">${editDate(origIdx, 'cheque_date', chqAmt !== 0 ? r.cheque_date : '', chqAmt === 0)}</td>
-          <td style="padding:2px 4px">${editAmt(origIdx, 'cheque_amt', r.cheque_amt)}</td>
-          <td style="padding:2px 4px">${editDate(origIdx, 'credit_date', r.credit_date, !hasCreditActivity && crdAmt === 0)}</td>
-          <td style="padding:2px 4px">${hasCreditActivity ? editAmtShowZero(origIdx, 'credit_amt', r.credit_amt) : editAmt(origIdx, 'credit_amt', r.credit_amt)}</td>
+          <td style="${cellStyle}">${cashAmt > 0 ? fmtD(r.cash_date) : ''}</td>
+          <td style="${amtStyle}">${cashAmt > 0 ? fmtNum(cashAmt) : ''}</td>
+          <td style="${cellStyle}">${trfAmt > 0 ? fmtD(r.transfer_date) : ''}</td>
+          <td style="${amtStyle}">${trfAmt > 0 ? fmtNum(trfAmt) : ''}</td>
+          <td style="${cellStyle}">${chqAmt > 0 ? fmtD(r.cheque_date) : ''}</td>
+          <td style="${amtStyle}">${chqAmt > 0 ? fmtNum(chqAmt) : ''}</td>
+          <td style="${cellStyle}">${showCrdDate ? fmtD(r.credit_date) : ''}</td>
+          <td style="${amtStyle}">${showCrdDate ? fmtNum(crdAmt) : ''}</td>
           `;
         })() : `
           <td colspan="8"></td>
@@ -14906,6 +14864,7 @@ function spV2RenderMainTable(rows) {
         
         <td style="padding:4px 6px;font-family:monospace;color:${r._is_generated?'var(--info)':''}">${r.sp_number}</td>
         <td style="text-align:center;padding:4px 6px;font-size:.7rem">${fmtD(r.pay_date)}</td>
+        <td style="text-align:center;padding:2px 4px">${isHdr ? `<button class="spv2-edit-pay" data-gid="${r._group_id}" title="แก้วิธีชำระ" style="background:var(--info-bg);border:1px solid var(--info);color:var(--info);padding:3px 8px;border-radius:4px;cursor:pointer;font-size:.75rem">✏️</button>` : ''}</td>
       </tr>
     `;
   }).join('');
@@ -15454,14 +15413,29 @@ function spV2OpenEditModal(groupId) {
   openModal('แก้ไขวิธีการจ่าย', html);
   
   document.getElementById('edit-save-btn').addEventListener('click', () => {
-    headerRow.cash_date = document.getElementById('edit-cash-date').value;
-    headerRow.cash_amt = Number(document.getElementById('edit-cash-amt').value) || 0;
-    headerRow.transfer_date = document.getElementById('edit-transfer-date').value;
-    headerRow.transfer_amt = Number(document.getElementById('edit-transfer-amt').value) || 0;
-    headerRow.cheque_date = document.getElementById('edit-cheque-date').value;
-    headerRow.cheque_amt = Number(document.getElementById('edit-cheque-amt').value) || 0;
-    headerRow.credit_date = document.getElementById('edit-credit-date').value;
-    headerRow.credit_amt = Number(document.getElementById('edit-credit-amt').value) || 0;
+    // Read amounts first
+    const cashAmt = Number(document.getElementById('edit-cash-amt').value) || 0;
+    const trfAmt  = Number(document.getElementById('edit-transfer-amt').value) || 0;
+    const chqAmt  = Number(document.getElementById('edit-cheque-amt').value) || 0;
+    const crdAmt  = Number(document.getElementById('edit-credit-amt').value) || 0;
+    const cashDate = document.getElementById('edit-cash-date').value;
+    const trfDate  = document.getElementById('edit-transfer-date').value;
+    const chqDate  = document.getElementById('edit-cheque-date').value;
+    const crdDate  = document.getElementById('edit-credit-date').value;
+    
+    // Save: clear date if amt=0 (data consistency)
+    headerRow.cash_amt = cashAmt;
+    headerRow.cash_date = cashAmt > 0 ? cashDate : '';
+    headerRow.transfer_amt = trfAmt;
+    headerRow.transfer_date = trfAmt > 0 ? trfDate : '';
+    headerRow.cheque_amt = chqAmt;
+    headerRow.cheque_date = chqAmt > 0 ? chqDate : '';
+    headerRow.credit_amt = crdAmt;
+    // credit_date: allow even when amt=0 (OR+JR offset case)
+    headerRow.credit_date = crdDate;
+    
+    // Recompute pay_total
+    headerRow.pay_total = cashAmt + trfAmt + chqAmt + crdAmt;
     
     persistSpV2();
     closeModal();
