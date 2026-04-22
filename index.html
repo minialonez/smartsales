@@ -10233,6 +10233,7 @@ async function renderMatching(el) {
   let bankFilter = 'ALL', matchFilter = 'ALL';
   let dirFilter = 'ALL'; // 'ALL' | 'in' | 'out'
   let dateFrom = '', dateTo = '';
+  let amountSearch = ''; // ค้นหายอดเงิน (partial match)
   const bankColors = { KTB:'#00a4e4', KBANK:'#138f2d', 'BBL NW':'#ff7b00', BBL:'#1e3a7b', TTB:'#ff0066' };
 
   function render() {
@@ -10257,6 +10258,19 @@ async function renderMatching(el) {
         if (dateFrom && d < dateFrom) return false;
         if (dateTo && d > dateTo) return false;
         return true;
+      });
+    }
+    
+    // Filter by amount search (substring match ทศนิยม flex)
+    if (amountSearch.trim()) {
+      const needle = amountSearch.trim().replace(/,/g, '');
+      data = data.filter(s => {
+        const amt = Number(s.amount || 0);
+        const abs = Math.abs(amt);
+        // ลอง match ทั้งแบบมี/ไม่มีทศนิยม
+        const s1 = String(abs);
+        const s2 = abs.toFixed(2);
+        return s1.includes(needle) || s2.includes(needle);
       });
     }
     
@@ -10340,10 +10354,17 @@ async function renderMatching(el) {
         <button class="pill ${dirFilter==='in'?'active':''}" data-dir="in" style="--pill-color:var(--success)" title="฿${fmtNum(sumIn)}">💰 เข้า (${countIn})</button>
         <button class="pill ${dirFilter==='out'?'active':''}" data-dir="out" style="--pill-color:var(--danger)" title="฿${fmtNum(Math.abs(sumOut))}">💸 ออก (${countOut})</button>
         <span style="margin-left:16px" class="text-xs text-dim">ช่วงวันที่:</span>
-        <input type="date" class="input" id="match-date-from" value="${dateFrom}" style="width:145px;padding:3px 6px;font-size:.78rem" title="จาก">
+        <button class="btn btn-outline btn-sm" id="match-date-prev" title="เลื่อนย้อนหลัง 1 วัน" style="padding:3px 8px;font-weight:700">◀</button>
+        <input type="date" class="input" id="match-date-from" value="${dateFrom}" style="width:135px;padding:3px 6px;font-size:.78rem" title="จาก">
         <span class="text-xs">→</span>
-        <input type="date" class="input" id="match-date-to" value="${dateTo}" style="width:145px;padding:3px 6px;font-size:.78rem" title="ถึง">
+        <input type="date" class="input" id="match-date-to" value="${dateTo}" style="width:135px;padding:3px 6px;font-size:.78rem" title="ถึง">
+        <button class="btn btn-outline btn-sm" id="match-date-next" title="เลื่อนไปข้างหน้า 1 วัน" style="padding:3px 8px;font-weight:700">▶</button>
         ${dateFrom||dateTo?'<button class="btn btn-ghost btn-sm" id="match-date-clear" style="color:var(--danger);padding:2px 6px">✕</button>':''}
+        <span style="margin-left:12px;padding-left:12px;border-left:1px solid var(--border);display:inline-flex;align-items:center;gap:6px">
+          <span class="text-xs text-dim">🔍 ยอด:</span>
+          <input type="text" class="input" id="match-amount-search" value="${amountSearch}" placeholder="เช่น 978.65 หรือ 978" style="width:130px;padding:3px 6px;font-size:.78rem" title="ค้นหาในยอดเงิน (partial match)">
+          ${amountSearch?'<button class="btn btn-ghost btn-sm" id="match-amount-clear" style="color:var(--danger);padding:2px 6px">✕</button>':''}
+        </span>
         <span style="margin-left:auto"></span>
         ${sortToggleBtn('statement')}
       </div>
@@ -10407,6 +10428,50 @@ async function renderMatching(el) {
     document.getElementById('match-date-from')?.addEventListener('change', e => { dateFrom = e.target.value; render(); });
     document.getElementById('match-date-to')?.addEventListener('change', e => { dateTo = e.target.value; render(); });
     document.getElementById('match-date-clear')?.addEventListener('click', () => { dateFrom = ''; dateTo = ''; render(); });
+    
+    // Date nav arrows: shift ทั้ง from+to พร้อมกัน (ถ้าเท่ากัน = single day)
+    // ถ้ายังไม่ตั้ง — เริ่มที่วันนี้
+    const _shiftMatchDate = (days) => {
+      const today = todayISO();
+      let from = dateFrom || today;
+      let to = dateTo || from;
+      const shift = (iso) => {
+        const d = new Date(iso + 'T00:00:00');
+        if (isNaN(d)) return iso;
+        d.setDate(d.getDate() + days);
+        return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+      };
+      dateFrom = shift(from);
+      dateTo = shift(to);
+      render();
+    };
+    document.getElementById('match-date-prev')?.addEventListener('click', () => _shiftMatchDate(-1));
+    document.getElementById('match-date-next')?.addEventListener('click', () => _shiftMatchDate(+1));
+    
+    // Amount search: debounce 200ms + preserve focus/cursor
+    let _amtSearchTimer = null;
+    const amtInput = document.getElementById('match-amount-search');
+    if (amtInput) {
+      amtInput.addEventListener('input', e => {
+        const val = e.target.value;
+        clearTimeout(_amtSearchTimer);
+        _amtSearchTimer = setTimeout(() => {
+          amountSearch = val;
+          render();
+          const fresh = document.getElementById('match-amount-search');
+          if (fresh) {
+            fresh.focus();
+            const pos = fresh.value.length;
+            try { fresh.setSelectionRange(pos, pos); } catch(_) {}
+          }
+        }, 200);
+      });
+      amtInput.addEventListener('keydown', e => {
+        if (e.key === 'Enter') { clearTimeout(_amtSearchTimer); amountSearch = e.target.value; render(); }
+        else if (e.key === 'Escape') { clearTimeout(_amtSearchTimer); amountSearch = ''; render(); }
+      });
+    }
+    document.getElementById('match-amount-clear')?.addEventListener('click', () => { amountSearch = ''; render(); });
     // Sort toggle button (reusable — ใช้ใน el scope)
     el.querySelectorAll('.sort-toggle').forEach(btn => {
       btn.addEventListener('click', () => {
