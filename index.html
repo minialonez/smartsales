@@ -1406,8 +1406,16 @@ const syncManager = {
         results.ok++;
       } catch(err) {
         results.fail++;
-        results.errors.push(`${type}: ${err.message}`);
-        this.dirty.add(type); // re-queue for next cycle
+        const errMsg = err?.message || String(err);
+        results.errors.push(`${type}: ${errMsg}`);
+        // Smart re-queue: ถ้า error บอกว่า backend ไม่รู้จัก action → อย่า re-queue (ไร้ประโยชน์)
+        // Patterns: "unknown action", "not found", "ไม่พบ", "action not supported"
+        const isBackendMissing = /unknown action|not found|not supported|ไม่พบ|ไม่รู้จัก|action.*invalid/i.test(errMsg);
+        if (!isBackendMissing) {
+          this.dirty.add(type); // re-queue for next cycle
+        } else {
+          console.warn(`[sync] ${type} — backend not ready, skip re-queue:`, errMsg);
+        }
         console.warn('[sync] push fail', type, err);
       }
     }
@@ -2987,19 +2995,20 @@ function openQuickMatchModal(b) {
       const isSelected = selectedBills.has(x);
       const xAmt = Math.abs(Number(x.amount)||0);
       const isOpener = x === b;
+      const bg = isSelected ? 'background:rgba(79,156,249,.18);border-color:var(--info)' : 'background:transparent;border-color:var(--border)';
       return `
         <label class="qm-bill-item" data-idx="${i}" 
-               style="display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid var(--border);cursor:pointer;${isSelected?'background:rgba(79,156,249,.12)':''}">
-          <input type="checkbox" class="qm-bill-check" ${isSelected?'checked':''} ${isOpener?'disabled':''} style="cursor:pointer;accent-color:var(--info);width:16px;height:16px">
+               style="display:flex;align-items:center;gap:10px;padding:8px 10px;border-bottom:1px solid var(--border);cursor:pointer;${bg};border-left:3px solid ${isSelected?'var(--info)':'transparent'};transition:all .15s">
+          <input type="checkbox" class="qm-bill-check" ${isSelected?'checked':''} ${isOpener?'disabled':''} style="cursor:pointer;accent-color:var(--info);width:18px;height:18px;flex-shrink:0">
           <div style="flex:1;min-width:0;font-size:.82rem">
-            <div class="flex items-center gap-2">
+            <div class="flex items-center gap-2" style="flex-wrap:wrap">
               <span style="font-weight:600">${x.bill_no || '(ไม่มีเลข)'}</span>
               <span class="badge" style="background:var(--surface2);font-size:.65rem">${x.type||'-'}</span>
               ${isOpener ? '<span class="badge badge-info" style="font-size:.65rem">⭐ บิลแรก</span>' : ''}
             </div>
             <div class="text-xs text-muted">${fmtDate(x.date)} · ${x.station||'-'}${x.bank?` · ${x.bank}`:''}</div>
           </div>
-          <div style="font-weight:700;color:var(--success);font-size:.88rem">฿${fmtNum(xAmt)}</div>
+          <div style="font-weight:700;color:var(--success);font-size:.88rem;white-space:nowrap">฿${fmtNum(xAmt)}</div>
         </label>
       `;
     }).join('');
@@ -3047,27 +3056,42 @@ function openQuickMatchModal(b) {
       const isSelected = s.ref_no === selectedStmtRef;
       const dir = Number(s.amount) >= 0 ? '+' : '−';
       const dirColor = Number(s.amount) >= 0 ? 'var(--success)' : 'var(--danger)';
-      // Highlight: เลือก → border ฟ้า, ยอดตรง → border เขียว
-      const border = isSelected 
-        ? 'border:2px solid var(--info);box-shadow:0 0 0 2px rgba(79,156,249,.25)' 
-        : isExact ? 'border:1px solid var(--success);border-left:4px solid var(--success)'
-        : 'border:1px solid transparent;border-bottom:1px solid var(--border)';
+      
+      // ── Clear visual hierarchy: selection > exact match > normal ──
+      let bg, border, extraStyle = '';
+      if (isSelected) {
+        // เลือกอยู่: พื้นฟ้าเข้ม + border ฟ้าหนา + outline เรืองแสง
+        bg = 'background:rgba(79,156,249,.28)';
+        border = 'border:2px solid var(--info)';
+        extraStyle = 'box-shadow:0 0 0 3px rgba(79,156,249,.35), inset 0 0 0 1px rgba(255,255,255,.1);transform:scale(1.01)';
+      } else if (isExact) {
+        // ยอดตรงแต่ยังไม่เลือก: แค่ border เขียวบางๆ — ให้ user รู้ว่าตรง
+        bg = 'background:rgba(63,196,143,.05)';
+        border = 'border:1px solid rgba(63,196,143,.5)';
+      } else {
+        bg = '';
+        border = 'border:1px solid var(--border)';
+      }
+      
       return `
         <div class="qm-item" data-ref="${s.ref_no||''}" 
-             style="padding:10px 12px;cursor:pointer;transition:all .15s;${isSelected?'background:rgba(79,156,249,.18)':''};${border};border-radius:4px;margin-bottom:2px">
+             style="padding:10px 12px;cursor:pointer;transition:all .15s;${bg};${border};${extraStyle};border-radius:6px;margin-bottom:4px;position:relative">
+          ${isSelected ? '<div style="position:absolute;top:-8px;right:8px;background:var(--info);color:#fff;padding:2px 8px;border-radius:10px;font-size:.7rem;font-weight:700">✓ เลือกแล้ว</div>' : ''}
           <div class="flex justify-between items-center">
             <div style="flex:1;min-width:0">
-              <div style="font-weight:700;color:${dirColor};font-size:.9rem">
-                ${isSelected ? '✓ ' : ''}${dir}฿${fmtNum(absAmt)}
+              <div style="font-weight:700;color:${dirColor};font-size:.95rem">
+                ${dir}฿${fmtNum(absAmt)}
               </div>
               <div class="text-xs text-muted" style="margin-top:2px">
-                ${fmtDate(s.date)} · ${s.bank||'?'} · ref: ${s.ref_no||'-'}
+                ${fmtDate(s.date)} · ${s.bank||'?'} · ref: <span style="font-family:monospace">${s.ref_no||'-'}</span>
               </div>
               ${s.description?`<div class="text-xs" style="color:var(--text2);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${String(s.description).substring(0,80)}</div>`:''}
             </div>
-            ${isExact
-              ? '<span class="badge badge-success" style="font-size:.7rem;white-space:nowrap">ยอดตรง ✓</span>'
-              : `<span class="text-xs" style="color:var(--text3);white-space:nowrap">ต่าง ฿${fmtNum(diff)}</span>`}
+            <div style="text-align:right;white-space:nowrap">
+              ${isExact
+                ? '<span class="badge badge-success" style="font-size:.7rem">ยอดตรง</span>'
+                : `<span class="text-xs" style="color:var(--text3)">ต่าง ฿${fmtNum(diff)}</span>`}
+            </div>
           </div>
         </div>
       `;
@@ -3075,7 +3099,9 @@ function openQuickMatchModal(b) {
     
     container.querySelectorAll('.qm-item').forEach(el => {
       el.addEventListener('click', () => {
-        selectedStmtRef = el.dataset.ref;
+        // Toggle: คลิกซ้ำ → ยกเลิก
+        const newRef = el.dataset.ref;
+        selectedStmtRef = (selectedStmtRef === newRef) ? '' : newRef;
         updateUI();
       });
     });
@@ -3175,7 +3201,13 @@ function openQuickMatchModal(b) {
     if (!stmt) { toast('ไม่พบ statement', 'error'); return; }
     
     const billArr = Array.from(selectedBills);
-    const billNos = billArr.map(x => x.bill_no || '(no#)');
+    // Format: "OS00126-002795 (฿10,654.00)" per bill
+    const billLabels = billArr.map(x => {
+      const no = x.bill_no || '(ไม่มีเลข)';
+      const amt = fmtNum(Math.abs(Number(x.amount)||0));
+      return `${no} (฿${amt})`;
+    });
+    const billNos = billArr.map(x => x.bill_no || '(no#)'); // เลขบิลเท่านั้น (สำหรับ traceability)
     const now = new Date().toISOString();
     const stmtDateISO = toISODate(stmt.date) || toISODate(b.date);
     
@@ -3188,12 +3220,12 @@ function openQuickMatchModal(b) {
       x.matched_at = now;
     });
     
-    // Update statement
+    // Update statement — match_bill แสดงเลขบิล+ยอด ให้ user อ่านง่าย
     stmt.match_status = 'matched';
     stmt.match_method = billArr.length > 1 ? 'quick_multi' : 'quick_manual';
     stmt.match_station = billArr[0].station || '';
-    stmt.match_bill = billArr.length > 1 ? billNos.join(' + ') : billNos[0];
-    if (billArr.length > 1) stmt.matched_bills = billNos;
+    stmt.match_bill = billArr.length > 1 ? billLabels.join(' + ') : billLabels[0];
+    if (billArr.length > 1) stmt.matched_bills = billNos; // เลขบิลล้วน (ใช้ใน unmatch lookup)
     else delete stmt.matched_bills;
     stmt.matched_at = now;
     stmt.matched_by = currentUser?.display_name || 'Admin';
@@ -3207,8 +3239,8 @@ function openQuickMatchModal(b) {
     closeModal();
     toast(
       billArr.length > 1
-        ? `Match ${billArr.length} บิลสำเร็จ: ${billNos.join(' + ')} ↔ ${stmt.bank} ฿${fmtNum(Math.abs(Number(stmt.amount)||0))}`
-        : `Match สำเร็จ: ${billNos[0]} ↔ ${stmt.bank} ฿${fmtNum(Math.abs(Number(stmt.amount)||0))}`,
+        ? `Match ${billArr.length} บิลสำเร็จ: ${billLabels.join(' + ')} ↔ ${stmt.bank} ฿${fmtNum(Math.abs(Number(stmt.amount)||0))}`
+        : `Match สำเร็จ: ${billLabels[0]} ↔ ${stmt.bank} ฿${fmtNum(Math.abs(Number(stmt.amount)||0))}`,
       'success', 4000
     );
     
@@ -4817,9 +4849,17 @@ async function renderMain(el) {
           var pivotDate = year + '0101';
           for (var ci = 0; ci < billsOfYear.length; ci += CHUNK_SIZE) {
             var chunk = billsOfYear.slice(ci, ci + CHUNK_SIZE);
+            // ⚠️ Normalize date to ISO ก่อน push — ป้องกัน backend dedup key mismatch
+            // Backend composite key = bill_no|date|amount|pay_method
+            // ถ้า local เก็บ dd/mm/yyyy แต่ cloud เก็บ ISO → dedup ไม่ match → append double
+            var normalizedChunk = chunk.map(function(b) {
+              var isoDate = toISODate(b.date);
+              if (!isoDate || isoDate === b.date) return b;
+              return Object.assign({}, b, { date: isoDate });
+            });
             var res = await api('saveDailySales', {
               date: pivotDate,
-              rows: chunk,
+              rows: normalizedChunk,
               created_by: currentUser?.display_name || 'Admin',
             });
             if (!res || !res.success) {
@@ -4916,9 +4956,15 @@ async function renderMain(el) {
             var sPivot = sYear + '0101';
             for (var i = 0; i < stmtsOfYear.length; i += CHUNK_SIZE) {
               var sChunk = stmtsOfYear.slice(i, i + CHUNK_SIZE);
+              // ⚠️ Normalize date → ISO เพื่อให้ backend dedup key match
+              var sChunkNormalized = sChunk.map(function(s) {
+                var isoDate = toISODate(s.date || s.trans_date);
+                if (!isoDate || isoDate === s.date) return s;
+                return Object.assign({}, s, { date: isoDate });
+              });
               var sRes = await api('saveStatements', {
                 date: sPivot,
-                rows: sChunk,
+                rows: sChunkNormalized,
               });
               if (!sRes || !sRes.success) {
                 toast('บันทึก Statement ปี ' + sYear + ' ล้มเหลว: ' + (sRes?.error||''), 'error');
