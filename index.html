@@ -12783,6 +12783,23 @@ function renderData(el) {
         <div id="sync-status" class="text-xs text-muted mt-2" style="display:none"></div>
       </div>
       
+      <!-- Rebuild Local from Cloud — กรณีข้อมูล local ซ้ำแต่ cloud ถูกต้อง -->
+      <div class="card mb-3" style="border:1.5px solid var(--danger);background:rgba(239,87,87,.04)">
+        <div class="flex justify-between items-center">
+          <div>
+            <div class="font-semi" style="color:var(--danger)">🔄 Rebuild Local จาก Cloud (ล้าง local → pull ใหม่)</div>
+            <div class="text-xs text-muted mt-1">
+              ใช้เมื่อ <strong>ข้อมูลใน Sheet (cloud) ถูกต้อง</strong> แต่ <strong>local ซ้ำกันเยอะ</strong> — ระบบจะล้าง billList + statements ของ local ทิ้ง แล้ว pull มาจาก Sheet ใหม่<br>
+              <strong style="color:var(--warn)">⚠️ ข้อมูลที่ยังไม่ได้ sync จะหาย — Backup JSON ก่อนทำ</strong>
+            </div>
+          </div>
+          <div class="flex gap-2 items-center">
+            <button class="btn btn-sm" id="btn-rebuild-local" style="background:var(--danger);color:#fff;border:none">🔄 Rebuild Local</button>
+          </div>
+        </div>
+        <div id="rebuild-status" class="text-xs text-muted mt-2" style="display:none;font-family:monospace;max-height:250px;overflow-y:auto;padding:10px;background:var(--surface2);border-radius:6px;white-space:pre-wrap"></div>
+      </div>
+      
       <!-- Sheet Health Check -->
       <div class="card mb-3" style="border:1.5px solid var(--info);background:rgba(79,156,249,.04)">
         <div class="flex justify-between items-center">
@@ -12947,6 +12964,97 @@ function renderData(el) {
         btn.disabled = false;
         btn.textContent = '🔍 ลองใหม่';
       }
+    });
+    
+    // ── Rebuild Local from Cloud (nuclear option: ล้าง local → pull fresh) ──
+    document.getElementById('btn-rebuild-local')?.addEventListener('click', async () => {
+      const statusEl = document.getElementById('rebuild-status');
+      const btn = document.getElementById('btn-rebuild-local');
+      
+      const beforeBills = billList.length;
+      const beforeStmts = getAllStatements().length;
+      const beforePayments = paymentList.length;
+      
+      if (!confirm(
+        `🔄 Rebuild Local จาก Cloud\n\n` +
+        `Local ตอนนี้:\n` +
+        `  • Bills: ${beforeBills}\n` +
+        `  • Statements: ${beforeStmts}\n` +
+        `  • SP Payments: ${beforePayments}\n\n` +
+        `จะล้าง local ทิ้ง แล้ว pull จาก Google Sheet ทั้งหมด\n\n` +
+        `⚠️ Backup JSON แล้วหรือยัง?\nทำต่อ?`
+      )) return;
+      
+      if (!confirm(`⚠️⚠️ ยืนยันครั้งสุดท้าย — ล้าง local แล้ว rebuild ใหม่?`)) return;
+      
+      btn.disabled = true;
+      btn.textContent = '⏳ กำลัง...';
+      statusEl.style.display = 'block';
+      statusEl.style.color = 'var(--info)';
+      const tsLog = (msg) => {
+        const t = new Date().toLocaleTimeString('th-TH');
+        statusEl.textContent += `[${t}] ${msg}\n`;
+        statusEl.scrollTop = statusEl.scrollHeight;
+      };
+      statusEl.textContent = '';
+      
+      // Pause sync to prevent auto-push during rebuild
+      const wasEnabled = syncManager.enabled;
+      if (wasEnabled) {
+        syncManager.setEnabled(false);
+        tsLog('⏸ หยุด auto-sync ชั่วคราว');
+      }
+      
+      try {
+        tsLog(`🗑 ล้าง local: bills=${beforeBills}, stmts=${beforeStmts}, payments=${beforePayments}`);
+        billList = [];
+        statementsByBank = { KTB: [], KBANK: [], 'BBL NW': [], BBL: [], TTB: [], UNKNOWN: [] };
+        paymentList = [];
+        uploadedStatements = [];
+        
+        // Clear fingerprints so next push won't skip
+        if (syncManager._fpCache) {
+          syncManager._fpCache = {};
+        }
+        
+        tsLog('☁️ กำลัง pull จาก cloud...');
+        
+        // Use pullFromCloud with force (3 years coverage)
+        const stats = await syncManager.pullFromCloud(3, 'force');
+        
+        tsLog(`\n✅ Pull สำเร็จ:`);
+        tsLog(`   Bills: ${billList.length} rows (pulled ${stats.bills || 0})`);
+        tsLog(`   Stmts: ${getAllStatements().length} rows (pulled ${stats.stmts || 0})`);
+        tsLog(`   SP: ${paymentList.length} rows (pulled ${stats.payments || 0})`);
+        if (stats.errors && stats.errors.length > 0) {
+          tsLog(`\n⚠️ Errors: ${stats.errors.length}`);
+          stats.errors.slice(0, 5).forEach(e => tsLog(`   - ${e}`));
+        }
+        
+        persistMainState();
+        tsLog('\n💾 บันทึกลง localStorage แล้ว');
+        
+        statusEl.style.color = 'var(--success)';
+        tsLog(`\n🎉 Rebuild สำเร็จ!`);
+        tsLog(`   ก่อน: ${beforeBills} bills, ${beforeStmts} stmts`);
+        tsLog(`   หลัง: ${billList.length} bills, ${getAllStatements().length} stmts`);
+        
+        toast(`Rebuild สำเร็จ — ${billList.length} bills, ${getAllStatements().length} stmts`, 'success', 5000);
+        
+      } catch (err) {
+        statusEl.style.color = 'var(--danger)';
+        tsLog(`\n❌ Error: ${err.message}`);
+        toast('Rebuild ล้มเหลว — ดู log', 'error');
+      }
+      
+      // Resume sync
+      if (wasEnabled) {
+        syncManager.setEnabled(true);
+        tsLog('\n▶ เปิด auto-sync กลับ');
+      }
+      
+      btn.disabled = false;
+      btn.textContent = '🔄 Rebuild Local';
     });
     
     document.getElementById('btn-sync-cloud')?.addEventListener('click', async () => {
