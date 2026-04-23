@@ -1408,8 +1408,30 @@ const syncManager = {
           // Meta สำคัญมาก — ใช้ full JSON fingerprint (หนักแต่คุ้ม กันบวม sheet)
           const fp = this._fp({summary: mainSummary, cash_count: cashCount});
           if (fp === this._fpCache.meta) { results.skipped++; continue; }
-          const r = await api('saveDailyMeta', { summary: mainSummary, cash_count: cashCount });
-          if (r?.success === false) throw new Error(r.error || 'API error');
+          
+          // ── Push via compact upsertMeta (1 row per day per meta_type) ──
+          // meta_uuid = dateISO + '|' + meta_type → stable key → upsert แทน append
+          if (typeof window.buildCompactMetaRows === 'function') {
+            const metaRows = window.buildCompactMetaRows();
+            // Group by year
+            const byYear = {};
+            metaRows.forEach(function(row) {
+              const parts = String(row.date).split('/');
+              let y = parts.length === 3 ? parts[2] : String(new Date().getFullYear());
+              if (Number(y) > 2400) y = String(Number(y) - 543);
+              if (!byYear[y]) byYear[y] = [];
+              byYear[y].push(row);
+            });
+            // Push each year
+            for (const y of Object.keys(byYear)) {
+              const r = await api('upsertMeta', { year: y, records: byYear[y], deletes: [] });
+              if (r?.success === false) throw new Error(r.error || 'API error');
+            }
+          } else {
+            // Fallback ถ้า helper ยังไม่ load (เข้าหน้าจัดการข้อมูลแล้ว helpers จะ load)
+            const r = await api('saveDailyMeta', { summary: mainSummary, cash_count: cashCount });
+            if (r?.success === false) throw new Error(r.error || 'API error');
+          }
           this._fpCache.meta = fp;
         }
         results.ok++;
@@ -12734,6 +12756,21 @@ function renderData(el) {
         <div id="uuid-progress" style="display:none;margin-top:8px;padding:10px;background:var(--surface2);border-radius:6px;font-family:monospace;font-size:.78rem;white-space:pre-wrap;max-height:300px;overflow-y:auto"></div>
       </div>
       
+      <!-- Meta Pull (summary + cash_count + change) -->
+      <div class="card" style="border-left:3px solid #8b5cf6;margin-bottom:12px;background:rgba(139,92,246,.04)">
+        <div class="font-semi mb-2" style="color:#8b5cf6">🔄 ดึง Meta จาก Cloud (summary/cash_count/change)</div>
+        <p class="text-xs text-muted mb-3">
+          Meta = ข้อมูลส่วนบนของหน้า Main (นำเงินเข้า, ยอดขาย, Cash Drawer, Transfer/Card/Cheque, นับธนบัตร, เงินทอน)<br>
+          ใช้กรณี: restore backup แล้ว meta หาย / เปลี่ยนเครื่อง / อยากเอาเวอร์ชัน cloud ลงมา
+        </p>
+        <div class="flex gap-2 flex-wrap items-center mb-2">
+          <button class="btn btn-sm" id="btn-meta-pull-merge" style="background:#8b5cf6;color:#fff;border:none">🔄 ดึง + Merge (ของ local ชนะถ้ามี)</button>
+          <button class="btn btn-outline btn-sm" id="btn-meta-pull-override" style="color:var(--danger);border-color:var(--danger)">⚠️ Override ทั้งหมดจาก Cloud</button>
+          <span id="meta-result" class="text-xs text-dim"></span>
+        </div>
+        <div id="meta-progress" style="display:none;margin-top:8px;padding:10px;background:var(--surface2);border-radius:6px;font-family:monospace;font-size:.78rem;white-space:pre-wrap;max-height:250px;overflow-y:auto"></div>
+      </div>
+      
       <!-- Dedup Tool (fix double-sync issue) -->
       <div class="card" style="border-left:3px solid var(--warn);margin-bottom:12px">
         <div class="font-semi mb-2" style="color:var(--warn)">🔧 แก้ปัญหา Bill/Stmt ซ้ำจาก Sync</div>
@@ -13403,6 +13440,122 @@ function renderData(el) {
       return byYear;
     }
     
+    // ── Build COMPACT meta rows (1 row = 1 meta_type per day) ──
+    // จาก mainSummary.__byDate + cashCount.__byDate → array ของ rows พร้อม push
+    function buildCompactMetaRows() {
+      const LABEL_TO_KEY = {
+        'นำเงินเข้า': 'cashIn', 'ยอดขาย': 'sales', 'นำเงินออก': 'cashOut',
+        'ยอดคืนสินค้า': 'returns', 'Cash Drawer': 'cashDrawer',
+        'Transfer': 'transfer', 'Card': 'card', 'Cheque': 'cheque', 'Refund': 'refund',
+      };
+      const nowStr = (typeof nowDisplay === 'function') ? nowDisplay() : new Date().toLocaleString('th-TH');
+      const user = (window.currentUser && window.currentUser.display_name) || 'Admin';
+      const rows = [];
+      
+      // Summary: 1 row ต่อวัน (รวมทุก station + meta key ใน data_json)
+      if (mainSummary && mainSummary.__byDate) {
+        Object.keys(mainSummary.__byDate).forEach(function(dateISO) {
+          const dayLabels = mainSummary.__byDate[dateISO] || {};
+          const flat = {};
+          Object.keys(dayLabels).forEach(function(label) {
+            const prefix = LABEL_TO_KEY[label] || label;
+            const stations = dayLabels[label] || {};
+            Object.keys(stations).forEach(function(station) {
+              const v = Number(stations[station]);
+              if (!isNaN(v) && v !== 0) {
+                flat[prefix + '_' + station] = v;
+              }
+            });
+          });
+          if (Object.keys(flat).length > 0) {
+            const dateDisplay = typeof fmtDate === 'function' ? fmtDate(dateISO) : dateISO;
+            rows.push({
+              meta_uuid: dateISO + '|summary',
+              date: dateDisplay,
+              meta_type: 'summary',
+              data_json: JSON.stringify(flat),
+              updated_at: nowStr,
+              updated_by: user,
+            });
+          }
+        });
+      }
+      
+      // Cash Count: 1 row ต่อวัน
+      if (cashCount && cashCount.__byDate) {
+        Object.keys(cashCount.__byDate).forEach(function(dateISO) {
+          const dayCash = cashCount.__byDate[dateISO] || {};
+          const filtered = {};
+          Object.keys(dayCash).forEach(function(k) {
+            const v = Number(dayCash[k]);
+            if (!isNaN(v) && v !== 0) filtered[k] = v;
+          });
+          if (Object.keys(filtered).length > 0) {
+            const dateDisplay = typeof fmtDate === 'function' ? fmtDate(dateISO) : dateISO;
+            rows.push({
+              meta_uuid: dateISO + '|cash_count',
+              date: dateDisplay,
+              meta_type: 'cash_count',
+              data_json: JSON.stringify(filtered),
+              updated_at: nowStr,
+              updated_by: user,
+            });
+          }
+        });
+      }
+      
+      return rows;
+    }
+    
+    // Parse compact meta rows → merge into mainSummary/cashCount
+    function parseCompactMetaRows(rows) {
+      const KEY_TO_LABEL = {
+        'cashIn': 'นำเงินเข้า', 'sales': 'ยอดขาย', 'cashOut': 'นำเงินออก',
+        'returns': 'ยอดคืนสินค้า', 'cashDrawer': 'Cash Drawer',
+        'transfer': 'Transfer', 'card': 'Card', 'cheque': 'Cheque', 'refund': 'Refund',
+      };
+      const summary = { __byDate: {} };
+      const cash = { __byDate: {} };
+      
+      rows.forEach(function(r) {
+        // date: dd/mm/yyyy → dateISO yyyy-mm-dd
+        let dateISO = r.date;
+        if (/^\d{1,2}\/\d{1,2}\/\d{4}/.test(String(r.date))) {
+          const parts = String(r.date).split('/');
+          let y = Number(parts[2]); if (y > 2400) y -= 543;
+          dateISO = y + '-' + String(parts[1]).padStart(2,'0') + '-' + String(parts[0]).padStart(2,'0');
+        }
+        
+        let data;
+        try {
+          data = typeof r.data_json === 'string' ? JSON.parse(r.data_json) : (r.data_json || {});
+        } catch (e) { data = {}; }
+        
+        if (r.meta_type === 'summary') {
+          if (!summary.__byDate[dateISO]) summary.__byDate[dateISO] = {};
+          Object.keys(data).forEach(function(key) {
+            // key = "cashIn_Front1" → prefix=cashIn, station=Front1
+            const idx = key.indexOf('_');
+            if (idx < 0) return;
+            const prefix = key.substring(0, idx);
+            const station = key.substring(idx + 1);
+            const label = KEY_TO_LABEL[prefix] || prefix;
+            if (!summary.__byDate[dateISO][label]) summary.__byDate[dateISO][label] = {};
+            summary.__byDate[dateISO][label][station] = Number(data[key]) || 0;
+          });
+        } else if (r.meta_type === 'cash_count') {
+          cash.__byDate[dateISO] = data;
+        }
+      });
+      
+      return { summary: summary, cashCount: cash };
+    }
+    
+    // Expose to window scope so syncManager (global) + other code can access
+    window.buildCompactMetaRows = buildCompactMetaRows;
+    window.parseCompactMetaRows = parseCompactMetaRows;
+    window.groupByYear = groupByYear;
+    
     // ── Verify UUID Status ──
     document.getElementById('btn-uuid-verify')?.addEventListener('click', async () => {
       const btn = document.getElementById('btn-uuid-verify');
@@ -13457,12 +13610,13 @@ function renderData(el) {
       // Multiple confirmations
       if (!confirm(
         `🚀 Migrate ข้อมูลเก่าสู่ UUID\n\n` +
-        `จะทำ 5 ขั้นตอน:\n` +
+        `จะทำ 6 ขั้นตอน:\n` +
         `1. Generate UUID ให้บิลทุกตัว (${billList.length} บิล, ${getAllStatements().length} stmts)\n` +
         `2. Prepare Sheet — เพิ่ม column bill_uuid/stmt_uuid\n` +
         `3. Clear Sheet — ล้าง bills_YYYY / stmts_YYYY ทั้งหมด\n` +
         `4. Push ทั้งหมดด้วย UUID\n` +
-        `5. Verify row count\n\n` +
+        `5. ดึง Meta จาก Cloud → merge ใน local (summary/cash/change)\n` +
+        `6. Verify row count\n\n` +
         `⚠️ จะใช้เวลาประมาณ 1-2 นาที\n` +
         `⚠️ Backup JSON แล้วหรือยัง?\n\nยืนยัน?`
       )) return;
@@ -13485,8 +13639,8 @@ function renderData(el) {
       let success = true;
       
       try {
-        // ── Step 1: Generate UUIDs for all bills/stmts ──
-        uuidLog('\n━━━ [1/5] Generate UUIDs ━━━');
+        // ── Step 1: Generate UUIDs for all bills/stmts + build meta rows ──
+        uuidLog('\n━━━ [1/5] Generate UUIDs + Build Meta ━━━');
         let billsGenerated = 0;
         billList.forEach(b => {
           if (!b.bill_uuid) {
@@ -13505,6 +13659,10 @@ function renderData(el) {
         });
         uuidLog(`   ✓ Generated ${billsGenerated} bill uuids, ${stmtsGenerated} stmt uuids`);
         
+        // Build compact meta rows (meta_uuid = composite key → stable)
+        const metaRows = buildCompactMetaRows();
+        uuidLog(`   ✓ Built ${metaRows.length} meta rows (compact format)`);
+        
         // Save to localStorage ทันที (กันกรณีพลาดไม่ได้สูญข้อมูล uuid)
         persistMainState();
         if (typeof flushPersistState === 'function') flushPersistState();
@@ -13514,7 +13672,12 @@ function renderData(el) {
         uuidLog('\n━━━ [2/5] Prepare Sheets ━━━');
         const billsByYear = groupByYear(billList, 'date');
         const stmtsByYear = groupByYear(getAllStatements(), 'date');
-        const allYears = [...new Set([...Object.keys(billsByYear), ...Object.keys(stmtsByYear)])].sort();
+        const metaByYear = groupByYear(metaRows, 'date');
+        const allYears = [...new Set([
+          ...Object.keys(billsByYear),
+          ...Object.keys(stmtsByYear),
+          ...Object.keys(metaByYear),
+        ])].sort();
         
         uuidLog(`   ปีที่พบ: ${allYears.join(', ')}`);
         
@@ -13533,6 +13696,13 @@ function renderData(el) {
             uuidLog(`   ❌ stmts_${year}: ${r2?.error || 'error'}`);
             throw new Error(`prepareSheet stmts_${year} failed`);
           }
+          const r3 = await api('prepareSheet', { kind: 'meta', year });
+          if (r3?.success) {
+            uuidLog(`   ✓ meta_${year}: ${r3.data.added ? 'added column' : 'already has uuid'}`);
+          } else {
+            uuidLog(`   ❌ meta_${year}: ${r3?.error || 'error'}`);
+            throw new Error(`prepareSheet meta_${year} failed`);
+          }
         }
         
         // ── Step 3: Clear sheets ──
@@ -13549,6 +13719,11 @@ function renderData(el) {
             if (r?.success) uuidLog(`   ✓ stmts_${year}: cleared ${r.data.cleared} rows`);
             else { uuidLog(`   ❌ stmts_${year}: ${r?.error || 'error'}`); clearFailed = true; }
           }
+          if (metaByYear[year]?.length > 0) {
+            const r = await api('clearSheetData', { sheet: `meta_${year}` });
+            if (r?.success) uuidLog(`   ✓ meta_${year}: cleared ${r.data.cleared} rows`);
+            else { uuidLog(`   ❌ meta_${year}: ${r?.error || 'error'}`); clearFailed = true; }
+          }
         }
         
         // 🛑 Abort migration ถ้า clear fail — ไม่งั้น push จะ append บน data เก่า → บวม
@@ -13561,6 +13736,7 @@ function renderData(el) {
         const CHUNK_SIZE = 500;
         let totalBillsPushed = 0;
         let totalStmtsPushed = 0;
+        let totalMetaPushed = 0;
         
         for (const year of allYears) {
           // Bills for this year
@@ -13613,9 +13789,30 @@ function renderData(el) {
               }
             }
           }
+          
+          // Meta for this year (compact format: ~3 rows/day)
+          const yearMeta = metaByYear[year] || [];
+          if (yearMeta.length > 0) {
+            uuidLog(`   📤 meta_${year}: ${yearMeta.length} rows → chunk ${CHUNK_SIZE}`);
+            for (let i = 0; i < yearMeta.length; i += CHUNK_SIZE) {
+              const chunk = yearMeta.slice(i, i + CHUNK_SIZE);
+              const r = await api('upsertMeta', {
+                year,
+                records: chunk,
+                deletes: [],
+              });
+              if (r?.success) {
+                totalMetaPushed += r.data.inserted + r.data.updated;
+                uuidLog(`      chunk ${Math.floor(i/CHUNK_SIZE)+1}: inserted=${r.data.inserted} updated=${r.data.updated}`);
+              } else {
+                uuidLog(`      ❌ chunk ${Math.floor(i/CHUNK_SIZE)+1}: ${r?.error || 'error'}`);
+                throw new Error(`upsertMeta failed at chunk ${Math.floor(i/CHUNK_SIZE)+1}`);
+              }
+            }
+          }
         }
         
-        uuidLog(`\n   ✓ Total pushed: ${totalBillsPushed} bills, ${totalStmtsPushed} stmts`);
+        uuidLog(`\n   ✓ Total pushed: ${totalBillsPushed} bills, ${totalStmtsPushed} stmts, ${totalMetaPushed} meta`);
         
         // ── Step 5: Verify ──
         uuidLog('\n━━━ [5/5] Verify ━━━');
@@ -13625,13 +13822,17 @@ function renderData(el) {
           if (r?.success) {
             const localBills = (billsByYear[year] || []).length;
             const localStmts = (stmtsByYear[year] || []).length;
+            const localMeta = (metaByYear[year] || []).length;
             const cloudBills = r.data.counts[`bills_${year}`] || 0;
             const cloudStmts = r.data.counts[`stmts_${year}`] || 0;
+            const cloudMeta = r.data.counts[`meta_${year}`] || 0;
             const billMatch = localBills === cloudBills;
             const stmtMatch = localStmts === cloudStmts;
+            const metaMatch = localMeta === cloudMeta;
             uuidLog(`   ${billMatch?'✓':'⚠️'} bills_${year}: local=${localBills} cloud=${cloudBills} ${billMatch?'MATCH':'MISMATCH'}`);
             uuidLog(`   ${stmtMatch?'✓':'⚠️'} stmts_${year}: local=${localStmts} cloud=${cloudStmts} ${stmtMatch?'MATCH':'MISMATCH'}`);
-            if (!billMatch || !stmtMatch) allMatch = false;
+            uuidLog(`   ${metaMatch?'✓':'⚠️'} meta_${year}: local=${localMeta} cloud=${cloudMeta} ${metaMatch?'MATCH':'MISMATCH'}`);
+            if (!billMatch || !stmtMatch || !metaMatch) allMatch = false;
           }
         }
         
@@ -13640,7 +13841,7 @@ function renderData(el) {
           uuidLog(`\n🎉 Migration สำเร็จ! (${duration}s)`);
           uuidLog('   ข้อมูลใน Sheet ตรงกับ local ทุกปี');
           uuidLog('   ตอนนี้ระบบพร้อมใช้ UUID-based sync แล้ว');
-          document.getElementById('uuid-result').textContent = `✅ สำเร็จ (${duration}s) — ${totalBillsPushed} bills · ${totalStmtsPushed} stmts`;
+          document.getElementById('uuid-result').textContent = `✅ สำเร็จ (${duration}s) — ${totalBillsPushed} bills · ${totalStmtsPushed} stmts · ${totalMetaPushed} meta`;
           document.getElementById('uuid-result').style.color = 'var(--success)';
           toast(`Migration สำเร็จ! (${duration}s)`, 'success', 5000);
         } else {
@@ -13663,6 +13864,225 @@ function renderData(el) {
         uuidLog('\n▶ เปิด auto-sync กลับ');
       }
       
+      btn.disabled = false;
+    });
+    
+    // ══════════════════════════════════════════════════════
+    // META PULL — ดึง summary + cash_count + change จาก Cloud
+    // ══════════════════════════════════════════════════════
+    
+    function metaLog(msg) {
+      const el = document.getElementById('meta-progress');
+      if (!el) return;
+      el.style.display = 'block';
+      const ts = new Date().toLocaleTimeString('th-TH');
+      el.textContent += `[${ts}] ${msg}\n`;
+      el.scrollTop = el.scrollHeight;
+    }
+    function metaClearLog() {
+      const el = document.getElementById('meta-progress');
+      if (el) el.textContent = '';
+    }
+    
+    // Core pull function — return { summary, cashCount, daysCount, error }
+    // Uses getMetaWithUuid (compact format) — falls back to getDailyMeta if endpoint missing
+    async function _pullMetaFromCloud() {
+      var years = ['2024', '2025', '2026']; // ดึงครอบคลุม 3 ปี
+      var combined = {
+        summary: { __byDate: {} },
+        cashCount: { __byDate: {} },
+        changeData: {},
+        days: new Set(),
+      };
+      
+      for (const y of years) {
+        metaLog(`📥 ดึง meta_${y}...`);
+        
+        // Try compact format first
+        const compactRes = await api('getMetaWithUuid', { year: y });
+        
+        if (compactRes?.success && Array.isArray(compactRes.data?.rows) && compactRes.data.rows.length > 0) {
+          // Compact format found → parse
+          const parsed = parseCompactMetaRows(compactRes.data.rows);
+          Object.keys(parsed.summary.__byDate).forEach(function(dateISO) {
+            combined.summary.__byDate[dateISO] = parsed.summary.__byDate[dateISO];
+            combined.days.add(dateISO);
+          });
+          Object.keys(parsed.cashCount.__byDate).forEach(function(dateISO) {
+            combined.cashCount.__byDate[dateISO] = parsed.cashCount.__byDate[dateISO];
+            combined.days.add(dateISO);
+          });
+          metaLog(`   ✓ ${y}: compact format — ${compactRes.data.rows.length} rows (${Object.keys(parsed.summary.__byDate).length} days summary, ${Object.keys(parsed.cashCount.__byDate).length} days cash)`);
+        } else {
+          // Fallback to old verbose format
+          metaLog(`   ℹ ${y}: compact ว่าง → ลอง format เดิม`);
+          const res = await api('getDailyMeta', { year: y });
+          if (!res?.success) {
+            metaLog(`   ⚠️ ${y}: ${res?.error || 'no data'}`);
+            continue;
+          }
+          const d = res.data || {};
+          if (d.summary?.__byDate) {
+            Object.keys(d.summary.__byDate).forEach(function(dateISO) {
+              combined.summary.__byDate[dateISO] = d.summary.__byDate[dateISO];
+              combined.days.add(dateISO);
+            });
+          }
+          if (d.cash_count?.__byDate) {
+            Object.keys(d.cash_count.__byDate).forEach(function(dateISO) {
+              combined.cashCount.__byDate[dateISO] = d.cash_count.__byDate[dateISO];
+              combined.days.add(dateISO);
+            });
+          }
+          if (d.change_data) {
+            Object.assign(combined.changeData, d.change_data);
+          }
+          metaLog(`   ✓ ${y}: ${Object.keys(d.summary?.__byDate||{}).length} วัน summary, ${Object.keys(d.cash_count?.__byDate||{}).length} วัน cash`);
+        }
+      }
+      
+      return combined;
+    }
+    
+    // ── MERGE MODE: ของ local ชนะถ้ามี, copy cloud เฉพาะที่ local ว่าง ──
+    document.getElementById('btn-meta-pull-merge')?.addEventListener('click', async () => {
+      const btn = document.getElementById('btn-meta-pull-merge');
+      btn.disabled = true;
+      metaClearLog();
+      document.getElementById('meta-result').textContent = '⏳ กำลังดึง...';
+      document.getElementById('meta-result').style.color = 'var(--info)';
+      
+      try {
+        const cloud = await _pullMetaFromCloud();
+        
+        metaLog(`\n🔀 กำลัง Merge (local ชนะถ้ามี)...`);
+        let merged = { summary: 0, cash: 0, change: 0 };
+        
+        // Summary: copy เฉพาะที่ local ไม่มี
+        if (!mainSummary.__byDate) mainSummary.__byDate = {};
+        Object.keys(cloud.summary.__byDate).forEach(function(dateISO) {
+          if (!mainSummary.__byDate[dateISO]) {
+            mainSummary.__byDate[dateISO] = cloud.summary.__byDate[dateISO];
+            merged.summary++;
+          }
+        });
+        
+        // CashCount: merge per-key
+        if (!cashCount.__byDate) cashCount.__byDate = {};
+        Object.keys(cloud.cashCount.__byDate).forEach(function(dateISO) {
+          if (!cashCount.__byDate[dateISO]) {
+            cashCount.__byDate[dateISO] = cloud.cashCount.__byDate[dateISO];
+            merged.cash++;
+          } else {
+            Object.keys(cloud.cashCount.__byDate[dateISO]).forEach(function(k) {
+              if (cashCount.__byDate[dateISO][k] == null) {
+                cashCount.__byDate[dateISO][k] = cloud.cashCount.__byDate[dateISO][k];
+              }
+            });
+          }
+        });
+        
+        // Change data
+        Object.entries(cloud.changeData).forEach(function([dateISO, stationData]) {
+          if (!cashCount.__byDate[dateISO]) cashCount.__byDate[dateISO] = {};
+          Object.entries(stationData||{}).forEach(function([station, denoms]) {
+            Object.entries(denoms||{}).forEach(function([denom, count]) {
+              const key = denom + '_' + station;
+              if (cashCount.__byDate[dateISO][key] == null) {
+                cashCount.__byDate[dateISO][key] = Number(count) || 0;
+                merged.change++;
+              }
+            });
+          });
+        });
+        
+        persistMainState();
+        
+        metaLog(`\n✅ Merge สำเร็จ!`);
+        metaLog(`   Summary: เพิ่ม ${merged.summary} วัน`);
+        metaLog(`   CashCount: เพิ่ม ${merged.cash} วัน`);
+        metaLog(`   Change entries: เพิ่ม ${merged.change} entries`);
+        metaLog(`\n💡 ถ้าอยู่หน้า Main → refresh หรือเปลี่ยนวัน เพื่อเห็นข้อมูลใหม่`);
+        
+        document.getElementById('meta-result').textContent = `✅ +${merged.summary} summary, +${merged.cash} cash`;
+        document.getElementById('meta-result').style.color = 'var(--success)';
+        toast(`Merge meta สำเร็จ: +${merged.summary} วัน summary, +${merged.cash} วัน cash`, 'success', 4000);
+        
+        // Refresh main page ถ้าอยู่
+        if (typeof currentPage !== 'undefined' && currentPage === 'main') {
+          navigateTo('main');
+        }
+      } catch (err) {
+        metaLog(`\n❌ Error: ${err.message}`);
+        document.getElementById('meta-result').textContent = `❌ ${err.message}`;
+        document.getElementById('meta-result').style.color = 'var(--danger)';
+      }
+      btn.disabled = false;
+    });
+    
+    // ── OVERRIDE MODE: ลบ local + copy cloud ทั้งหมด ──
+    document.getElementById('btn-meta-pull-override')?.addEventListener('click', async () => {
+      if (!confirm(
+        `⚠️ Override Meta ทั้งหมดจาก Cloud\n\n` +
+        `จะลบข้อมูล summary + cash_count + change ใน local ทิ้ง\n` +
+        `แล้ว copy ของ cloud ลงมาแทน\n\n` +
+        `⚠️ ข้อมูลที่ local มีแต่ cloud ไม่มี จะหายถาวร\n` +
+        `Backup JSON ก่อนแล้วหรือยัง?\n\nทำต่อ?`
+      )) return;
+      
+      if (!confirm(`⚠️⚠️ ยืนยันอีกครั้ง — Override Meta จริงๆ?`)) return;
+      
+      const btn = document.getElementById('btn-meta-pull-override');
+      btn.disabled = true;
+      metaClearLog();
+      document.getElementById('meta-result').textContent = '⏳ กำลัง override...';
+      document.getElementById('meta-result').style.color = 'var(--warn)';
+      
+      try {
+        const cloud = await _pullMetaFromCloud();
+        
+        metaLog(`\n🔄 Override local ด้วย cloud ทั้งหมด...`);
+        
+        // Override ทั้งหมด
+        const oldSummaryDays = Object.keys(mainSummary.__byDate || {}).length;
+        const oldCashDays = Object.keys(cashCount.__byDate || {}).length;
+        
+        mainSummary = { __byDate: cloud.summary.__byDate };
+        cashCount = { __byDate: cloud.cashCount.__byDate };
+        
+        // Merge change data into cashCount
+        Object.entries(cloud.changeData).forEach(function([dateISO, stationData]) {
+          if (!cashCount.__byDate[dateISO]) cashCount.__byDate[dateISO] = {};
+          Object.entries(stationData||{}).forEach(function([station, denoms]) {
+            Object.entries(denoms||{}).forEach(function([denom, count]) {
+              const key = denom + '_' + station;
+              cashCount.__byDate[dateISO][key] = Number(count) || 0;
+            });
+          });
+        });
+        
+        const newSummaryDays = Object.keys(mainSummary.__byDate).length;
+        const newCashDays = Object.keys(cashCount.__byDate).length;
+        
+        persistMainState();
+        
+        metaLog(`\n✅ Override สำเร็จ!`);
+        metaLog(`   Summary: ${oldSummaryDays} → ${newSummaryDays} วัน`);
+        metaLog(`   CashCount: ${oldCashDays} → ${newCashDays} วัน`);
+        metaLog(`\n💡 Refresh หน้า Main เพื่อเห็นข้อมูลใหม่`);
+        
+        document.getElementById('meta-result').textContent = `✅ ${newSummaryDays} summary, ${newCashDays} cash`;
+        document.getElementById('meta-result').style.color = 'var(--success)';
+        toast(`Override meta สำเร็จ: ${newSummaryDays} วัน summary, ${newCashDays} วัน cash`, 'success', 4000);
+        
+        if (typeof currentPage !== 'undefined' && currentPage === 'main') {
+          navigateTo('main');
+        }
+      } catch (err) {
+        metaLog(`\n❌ Error: ${err.message}`);
+        document.getElementById('meta-result').textContent = `❌ ${err.message}`;
+        document.getElementById('meta-result').style.color = 'var(--danger)';
+      }
       btn.disabled = false;
     });
     
