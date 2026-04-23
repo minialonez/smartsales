@@ -3823,7 +3823,15 @@ async function renderMain(el) {
       const sa = stationRank(a.station);
       const sb = stationRank(b.station);
       if (sa !== sb) return sa - sb;
-      // 3) station เดียวกัน → เรียงตาม bill_no
+      // 3) station เดียวกัน → บิลที่มี created_at (เพิ่งเพิ่มใหม่) อยู่บนสุด
+      //    - บิลใหม่มี created_at (ISO timestamp), บิลเก่ามักไม่มี → ใหม่ก่อนเก่าเสมอ
+      //    - บิลใหม่หลายใบ → newer-first (descending timestamp)
+      const ca = a.created_at || '';
+      const cb = b.created_at || '';
+      if (ca && cb) return cb.localeCompare(ca);   // ใหม่ทั้งคู่ → ใหม่กว่าขึ้นก่อน
+      if (ca) return -1;                            // a ใหม่, b เก่า → a ขึ้นก่อน
+      if (cb) return 1;                             // b ใหม่, a เก่า → b ขึ้นก่อน
+      // 4) ทั้งคู่ไม่มี created_at → เรียงตาม bill_no
       const cmp = String(a.bill_no || '').localeCompare(String(b.bill_no || ''));
       return _billOrder === 'asc' ? cmp : -cmp;
     });
@@ -4862,6 +4870,7 @@ async function renderMain(el) {
           station: document.getElementById('ab-station').value,
           type: type,
           amount: amount,
+          created_at: new Date().toISOString(),  // ใช้ sort บิลใหม่อยู่บนสุดของ station
           // Fee fields
           wht_enabled: whtAmount > 0,
           wht_amount: whtAmount,
