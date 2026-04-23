@@ -10027,20 +10027,54 @@ function showApp() {
   // Wire up sync status badge (refresh ทุก 5s หรือเมื่อ syncManager emit)
   const badge = document.getElementById('sync-status-badge');
   if (badge) {
+    badge.style.cursor = 'pointer';
+    badge.title = 'คลิกซ้าย: sync ทันที · คลิกขวา: เปิด/ปิด sync';
     const update = () => {
       const s = syncManager.statusText();
       badge.textContent = s.text;
       badge.style.color = s.color;
+      // เพิ่ม opacity ลดลง + ข้อความเมื่อปิด sync
+      badge.style.opacity = syncManager.enabled ? '1' : '0.6';
     };
     update();
     syncManager.onChange(update);
     setInterval(update, 5000); // refresh "X s ago" text
-    // Click to force push now
+    // Left click: force push now
     badge.onclick = async () => {
+      if (!syncManager.enabled) {
+        // Badge ถูกปิดอยู่ → ถามว่าจะเปิดมั้ย
+        if (confirm('Sync ถูกปิดอยู่ — ต้องการเปิดใช้งาน Sync ไหม?')) {
+          syncManager.setEnabled(true);
+          toast('เปิด Sync แล้ว', 'success', 2000);
+        }
+        return;
+      }
       if (syncManager.status !== 'idle' && syncManager.status !== 'error') return;
       syncManager.dirty.add('meta'); // ensure something to push
       await syncManager._flushPush();
       toast('Sync สำเร็จ', 'success', 1500);
+    };
+    // Right click: toggle on/off
+    badge.oncontextmenu = (e) => {
+      e.preventDefault();
+      const nextState = !syncManager.enabled;
+      const msg = nextState 
+        ? 'เปิด Sync กลับมา?\n\nข้อมูลจะถูก push ขึ้น cloud และ pull จาก cloud อัตโนมัติ'
+        : '⏸ ปิด Sync?\n\n• จะหยุด push/pull ทั้งหมด\n• ข้อมูลจะเก็บเฉพาะใน browser (local)\n• กันข้อมูลบวมใน Sheet ถ้ามีปัญหา\n• คลิกขวาที่ปุ่มนี้อีกครั้งเพื่อเปิด';
+      if (!confirm(msg)) return;
+      
+      if (!nextState) {
+        // ปิด: ยกเลิก pending push + clear dirty queue ทันที
+        if (syncManager.pushTimer) {
+          clearTimeout(syncManager.pushTimer);
+          syncManager.pushTimer = null;
+        }
+        syncManager.dirty.clear();
+      }
+      
+      syncManager.setEnabled(nextState);
+      toast(nextState ? '✅ เปิด Sync แล้ว' : '⏸ ปิด Sync แล้ว (ข้อมูลอยู่ใน browser เท่านั้น)', 
+            nextState ? 'success' : 'warn', 3000);
     };
   }
 }
