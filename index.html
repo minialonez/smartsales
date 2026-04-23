@@ -1360,16 +1360,77 @@ const syncManager = {
           if (billList.length === 0) continue;
           const fp = this._fp({n: billList.length, first: billList[0]?.bill_no, last: billList[billList.length-1]?.bill_no, total: billList.reduce((s,b)=>s+Number(b.amount||0),0)});
           if (fp === this._fpCache.bills) { results.skipped++; continue; }
-          const r = await api('saveDailySales', { rows: billList, created_by: by });
-          if (r?.success === false) throw new Error(r.error || 'API error');
+          
+          // ── UUID-based upsert (ไม่ทำให้ sheet บวม) ──
+          // Gen uuid ให้บิลที่ยังไม่มี (บิลใหม่ที่เพิ่งเพิ่ม)
+          billList.forEach(b => {
+            if (!b.bill_uuid) {
+              b.bill_uuid = (typeof crypto !== 'undefined' && crypto.randomUUID) 
+                ? crypto.randomUUID() 
+                : 'b-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
+            }
+          });
+          // Group by year (bills ของปีไหนไปปีนั้น)
+          const billsByYr = {};
+          billList.forEach(b => {
+            const d = String(b.date || '').trim();
+            let m = d.match(/^\d{1,2}\/\d{1,2}\/(\d{4})/) || d.match(/^(\d{4})-\d{2}-\d{2}/);
+            let y = m ? m[1] : String(new Date().getFullYear());
+            if (Number(y) > 2400) y = String(Number(y) - 543);
+            if (!billsByYr[y]) billsByYr[y] = [];
+            // Normalize date to ISO for consistent upsert
+            const isoDate = typeof toISODate === 'function' ? (toISODate(b.date) || b.date) : b.date;
+            billsByYr[y].push({ ...b, date: isoDate });
+          });
+          // Push ต่อปี
+          for (const yr of Object.keys(billsByYr)) {
+            // Chunk 500 ต่อ request
+            const chunks = billsByYr[yr];
+            for (let i = 0; i < chunks.length; i += 500) {
+              const r = await api('upsertBills', {
+                year: yr,
+                records: chunks.slice(i, i + 500),
+                deletes: [],
+              });
+              if (r?.success === false) throw new Error(r.error || 'upsertBills API error');
+            }
+          }
           this._fpCache.bills = fp;
         } else if (type === 'stmts') {
           const allStmts = getAllStatements();
           if (allStmts.length === 0) continue;
           const fp = this._fp({n: allStmts.length, first: allStmts[0]?.ref_no, last: allStmts[allStmts.length-1]?.ref_no});
           if (fp === this._fpCache.stmts) { results.skipped++; continue; }
-          const r = await api('saveStatements', { rows: allStmts, created_by: by });
-          if (r?.success === false) throw new Error(r.error || 'API error');
+          
+          // ── UUID-based upsert ──
+          allStmts.forEach(s => {
+            if (!s.stmt_uuid) {
+              s.stmt_uuid = (typeof crypto !== 'undefined' && crypto.randomUUID) 
+                ? crypto.randomUUID() 
+                : 's-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
+            }
+          });
+          const stmtsByYr = {};
+          allStmts.forEach(s => {
+            const d = String(s.date || s.trans_date || '').trim();
+            let m = d.match(/^\d{1,2}\/\d{1,2}\/(\d{4})/) || d.match(/^(\d{4})-\d{2}-\d{2}/);
+            let y = m ? m[1] : String(new Date().getFullYear());
+            if (Number(y) > 2400) y = String(Number(y) - 543);
+            if (!stmtsByYr[y]) stmtsByYr[y] = [];
+            const isoDate = typeof toISODate === 'function' ? (toISODate(s.date || s.trans_date) || s.date) : s.date;
+            stmtsByYr[y].push({ ...s, date: isoDate });
+          });
+          for (const yr of Object.keys(stmtsByYr)) {
+            const chunks = stmtsByYr[yr];
+            for (let i = 0; i < chunks.length; i += 500) {
+              const r = await api('upsertStatements', {
+                year: yr,
+                records: chunks.slice(i, i + 500),
+                deletes: [],
+              });
+              if (r?.success === false) throw new Error(r.error || 'upsertStatements API error');
+            }
+          }
           this._fpCache.stmts = fp;
         } else if (type === 'payments') {
           if (paymentList.length === 0) continue;
@@ -1506,54 +1567,109 @@ const syncManager = {
     };
     
     try {
-      // Bills — normalize date to ISO for dedup (local uses dd/mm/yyyy, cloud uses yyyy-mm-dd)
-      const billKey = (b) => {
+      // ── Bills: UUID-based pull (stable key = bill_uuid) ──
+      // Fallback: ถ้า cloud ยังไม่มี uuid column → ใช้ composite key
+      const seenBillUuids = new Set(billList.map(b => b.bill_uuid).filter(Boolean));
+      const billCompositeKey = (b) => {
         const d = toISODate(b.date) || '';
         return `${b.bill_no||''}|${d}|${Number(b.amount)||0}|${b.station||''}|${b.type||''}`;
       };
-      const seenBillKeys = new Set(billList.map(billKey));
+      const seenBillCompositeKeys = new Set(billList.map(billCompositeKey));
+      
       for (const y of years) {
         try {
-          const r = await api('getDailySales', { year: y });
-          if (r?.success === false) throw new Error(r.error || 'API returned error');
-          const items = (r?.data?.data) || (Array.isArray(r?.data) ? r.data : []) || [];
-          if (!Array.isArray(items)) throw new Error(`Bills ${y}: unexpected response format`);
-          if (isDemoResponse(items)) throw new Error(`Bills ${y}: Backend offline (ได้ demo data) — ตรวจ deployment`);
-          items.forEach(b => {
-            const key = billKey(b);
-            if (!seenBillKeys.has(key)) {
-              billList.push(b);
-              seenBillKeys.add(key);
-              stats.bills++;
-            }
-          });
+          // Try UUID-based first (post-migrate)
+          const r = await api('getBillsWithUuid', { year: y });
+          if (r?.success && Array.isArray(r.data?.rows) && r.data.rows.length > 0) {
+            r.data.rows.forEach(b => {
+              const uuid = b.bill_uuid;
+              if (uuid) {
+                // UUID-based dedup (stable)
+                if (!seenBillUuids.has(uuid)) {
+                  billList.push(b);
+                  seenBillUuids.add(uuid);
+                  stats.bills++;
+                }
+              } else {
+                // Fallback: row ไม่มี uuid → ใช้ composite
+                const key = billCompositeKey(b);
+                if (!seenBillCompositeKeys.has(key)) {
+                  billList.push(b);
+                  seenBillCompositeKeys.add(key);
+                  stats.bills++;
+                }
+              }
+            });
+          } else {
+            // Fallback to old endpoint
+            const r2 = await api('getDailySales', { year: y });
+            if (r2?.success === false) throw new Error(r2.error || 'API error');
+            const items = (r2?.data?.data) || (Array.isArray(r2?.data) ? r2.data : []) || [];
+            if (!Array.isArray(items)) throw new Error(`Bills ${y}: unexpected format`);
+            items.forEach(b => {
+              const key = billCompositeKey(b);
+              if (!seenBillCompositeKeys.has(key)) {
+                billList.push(b);
+                seenBillCompositeKeys.add(key);
+                stats.bills++;
+              }
+            });
+          }
         } catch(err) { stats.errors.push(`Bills ${y}: ${err.message}`); console.warn('[sync] Bills', y, err); }
       }
       
-      // Stmts — normalize date for dedup
-      const stmtKey = (s) => {
+      // ── Stmts: UUID-based pull ──
+      const seenStmtUuids = new Set();
+      Object.values(statementsByBank).forEach(arr => {
+        (arr||[]).forEach(s => { if (s.stmt_uuid) seenStmtUuids.add(s.stmt_uuid); });
+      });
+      const stmtCompositeKey = (s) => {
         const d = toISODate(s.date || s.trans_date) || '';
         return `${s.bank||''}|${d}|${s.time||''}|${Number(s.amount)||0}|${s.ref_no||''}`;
       };
-      const seenStmtKeys = new Set();
+      const seenStmtCompositeKeys = new Set();
       Object.values(statementsByBank).forEach(arr => {
-        (arr||[]).forEach(s => seenStmtKeys.add(stmtKey(s)));
+        (arr||[]).forEach(s => seenStmtCompositeKeys.add(stmtCompositeKey(s)));
       });
+      
       for (const y of years) {
         try {
-          const r = await api('getStatements', { year: y });
-          if (r?.success === false) throw new Error(r.error || 'API error');
-          const items = (r?.data?.data) || (Array.isArray(r?.data) ? r.data : []) || [];
-          if (!Array.isArray(items)) throw new Error(`Stmts ${y}: unexpected format`);
-          items.forEach(s => {
-            const key = stmtKey(s);
-            if (!seenStmtKeys.has(key)) {
+          const r = await api('getStatementsWithUuid', { year: y });
+          if (r?.success && Array.isArray(r.data?.rows) && r.data.rows.length > 0) {
+            r.data.rows.forEach(s => {
+              const uuid = s.stmt_uuid;
               if (!statementsByBank[s.bank]) statementsByBank[s.bank] = [];
-              statementsByBank[s.bank].push(s);
-              seenStmtKeys.add(key);
-              stats.stmts++;
-            }
-          });
+              if (uuid) {
+                if (!seenStmtUuids.has(uuid)) {
+                  statementsByBank[s.bank].push(s);
+                  seenStmtUuids.add(uuid);
+                  stats.stmts++;
+                }
+              } else {
+                const key = stmtCompositeKey(s);
+                if (!seenStmtCompositeKeys.has(key)) {
+                  statementsByBank[s.bank].push(s);
+                  seenStmtCompositeKeys.add(key);
+                  stats.stmts++;
+                }
+              }
+            });
+          } else {
+            // Fallback
+            const r2 = await api('getStatements', { year: y });
+            if (r2?.success === false) throw new Error(r2.error || 'API error');
+            const items = (r2?.data?.data) || (Array.isArray(r2?.data) ? r2.data : []) || [];
+            if (!Array.isArray(items)) throw new Error(`Stmts ${y}: unexpected format`);
+            items.forEach(s => {
+              const key = stmtCompositeKey(s);
+              if (!seenStmtCompositeKeys.has(key)) {
+                if (!statementsByBank[s.bank]) statementsByBank[s.bank] = [];
+                statementsByBank[s.bank].push(s);
+                seenStmtCompositeKeys.add(key);
+                stats.stmts++;
+              }
+            });
+          }
         } catch(err) { stats.errors.push(`Stmts ${y}: ${err.message}`); console.warn('[sync] Stmts', y, err); }
       }
       uploadedStatements = getAllStatements();
