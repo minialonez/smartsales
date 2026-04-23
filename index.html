@@ -1467,8 +1467,12 @@ const syncManager = {
     };
     
     try {
-      // Bills
-      const seenBillKeys = new Set(billList.map(b => `${b.bill_no||''}|${b.date||''}|${b.amount||0}|${b.station||''}`));
+      // Bills — normalize date to ISO for dedup (local uses dd/mm/yyyy, cloud uses yyyy-mm-dd)
+      const billKey = (b) => {
+        const d = toISODate(b.date) || '';
+        return `${b.bill_no||''}|${d}|${Number(b.amount)||0}|${b.station||''}|${b.type||''}`;
+      };
+      const seenBillKeys = new Set(billList.map(billKey));
       for (const y of years) {
         try {
           const r = await api('getDailySales', { year: y });
@@ -1477,7 +1481,7 @@ const syncManager = {
           if (!Array.isArray(items)) throw new Error(`Bills ${y}: unexpected response format`);
           if (isDemoResponse(items)) throw new Error(`Bills ${y}: Backend offline (ได้ demo data) — ตรวจ deployment`);
           items.forEach(b => {
-            const key = `${b.bill_no||''}|${b.date||''}|${b.amount||0}|${b.station||''}`;
+            const key = billKey(b);
             if (!seenBillKeys.has(key)) {
               billList.push(b);
               seenBillKeys.add(key);
@@ -1487,10 +1491,14 @@ const syncManager = {
         } catch(err) { stats.errors.push(`Bills ${y}: ${err.message}`); console.warn('[sync] Bills', y, err); }
       }
       
-      // Stmts
+      // Stmts — normalize date for dedup
+      const stmtKey = (s) => {
+        const d = toISODate(s.date || s.trans_date) || '';
+        return `${s.bank||''}|${d}|${s.time||''}|${Number(s.amount)||0}|${s.ref_no||''}`;
+      };
       const seenStmtKeys = new Set();
       Object.values(statementsByBank).forEach(arr => {
-        (arr||[]).forEach(s => seenStmtKeys.add(`${s.bank}|${s.date}|${s.time}|${s.amount}|${s.ref_no||''}`));
+        (arr||[]).forEach(s => seenStmtKeys.add(stmtKey(s)));
       });
       for (const y of years) {
         try {
@@ -1499,7 +1507,7 @@ const syncManager = {
           const items = (r?.data?.data) || (Array.isArray(r?.data) ? r.data : []) || [];
           if (!Array.isArray(items)) throw new Error(`Stmts ${y}: unexpected format`);
           items.forEach(s => {
-            const key = `${s.bank}|${s.date}|${s.time}|${s.amount}|${s.ref_no||''}`;
+            const key = stmtKey(s);
             if (!seenStmtKeys.has(key)) {
               if (!statementsByBank[s.bank]) statementsByBank[s.bank] = [];
               statementsByBank[s.bank].push(s);
@@ -12419,6 +12427,17 @@ function renderData(el) {
         </div>
       </div>
       
+      <!-- Dedup Tool (fix double-sync issue) -->
+      <div class="card" style="border-left:3px solid var(--warn);margin-bottom:12px">
+        <div class="font-semi mb-2" style="color:var(--warn)">🔧 แก้ปัญหา Bill/Stmt ซ้ำจาก Sync</div>
+        <p class="text-xs text-muted mb-3">ถ้าจำนวนบิลเพิ่มเท่าตัวหลัง sync จาก cloud กดปุ่มนี้เพื่อลบรายการซ้ำ (เก็บรายการแรกไว้)</p>
+        <div class="flex gap-2 flex-wrap items-center">
+          <button class="btn btn-warn btn-sm" id="btn-dedup-bills" style="background:var(--warn);color:#fff">🧹 ลบบิลซ้ำ</button>
+          <button class="btn btn-warn btn-sm" id="btn-dedup-stmts" style="background:var(--warn);color:#fff">🧹 ลบ Statement ซ้ำ</button>
+          <span id="dedup-result" class="text-xs text-dim"></span>
+        </div>
+      </div>
+      
       <!-- Clear Section (Danger zone) -->
       <div class="card" style="border-left:3px solid var(--danger)">
         <div class="font-semi mb-3" style="color:var(--danger)">⚠️ Danger Zone — ล้างข้อมูล</div>
@@ -12525,16 +12544,20 @@ function renderData(el) {
       const stats = { bills: 0, stmts: 0, payments: 0, cashflow: 0, suppliers: 0, meta: 0, errors: [] };
       
       try {
-        // 1) Bills (per year)
+        // 1) Bills (per year) — normalize date for dedup
         const mergedBills = [];
-        const seenBillKeys = new Set(billList.map(b => `${b.bill_no||''}|${b.date||''}|${b.amount||0}|${b.station||''}`));
+        const billKey = (b) => {
+          const d = toISODate(b.date) || '';
+          return `${b.bill_no||''}|${d}|${Number(b.amount)||0}|${b.station||''}|${b.type||''}`;
+        };
+        const seenBillKeys = new Set(billList.map(billKey));
         for (const y of years) {
           try {
             statusEl.textContent = `กำลังดึง Bills ปี ${y}...`;
             const r = await api('getDailySales', { year: y });
             const items = (r?.data?.data) || r?.data || [];
             items.forEach(b => {
-              const key = `${b.bill_no||''}|${b.date||''}|${b.amount||0}|${b.station||''}`;
+              const key = billKey(b);
               if (!seenBillKeys.has(key)) {
                 mergedBills.push(b);
                 seenBillKeys.add(key);
@@ -13024,6 +13047,97 @@ function renderData(el) {
       toast('ล้าง Bill List แล้ว', 'success');
       render();
     });
+    // ── Dedup tools ──
+    document.getElementById('btn-dedup-bills')?.addEventListener('click', () => {
+      const before = billList.length;
+      // Key เดียวกับ pullFromCloud — normalize date ป้องกัน format ต่างกัน
+      const keyOf = (b) => {
+        const d = toISODate(b.date) || '';
+        return `${b.bill_no||''}|${d}|${Number(b.amount)||0}|${b.station||''}|${b.type||''}`;
+      };
+      
+      // นับ duplicates ก่อน
+      const counts = {};
+      billList.forEach(b => {
+        const k = keyOf(b);
+        counts[k] = (counts[k] || 0) + 1;
+      });
+      const dupKeys = Object.keys(counts).filter(k => counts[k] > 1);
+      const extras = dupKeys.reduce((s,k) => s + (counts[k] - 1), 0);
+      
+      if (extras === 0) {
+        toast('ไม่พบบิลซ้ำ', 'info');
+        document.getElementById('dedup-result').textContent = `✓ ตรวจแล้ว ${before} รายการ · ไม่มี duplicate`;
+        return;
+      }
+      
+      if (!confirm(`พบบิลซ้ำ ${extras} รายการ (จาก ${dupKeys.length} keys ที่ซ้ำ)\n\nลบออก? — เก็บรายการแรกของแต่ละ key ไว้\n\nก่อนลบ: ${before} บิล\nหลังลบ: ${before - extras} บิล\n\n⚠️ ควร Backup ก่อน`)) return;
+      
+      const seen = new Set();
+      billList = billList.filter(b => {
+        const k = keyOf(b);
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      });
+      
+      persistMainState();
+      invalidateBillsCache();
+      const removed = before - billList.length;
+      toast(`ลบบิลซ้ำ ${removed} รายการ — คงเหลือ ${billList.length} บิล`, 'success');
+      document.getElementById('dedup-result').textContent = `✓ ลบแล้ว ${removed} · คงเหลือ ${billList.length}`;
+      render();
+    });
+    
+    document.getElementById('btn-dedup-stmts')?.addEventListener('click', () => {
+      const allStmts = getAllStatements();
+      const before = allStmts.length;
+      const keyOf = (s) => {
+        const d = toISODate(s.date || s.trans_date) || '';
+        return `${s.bank||''}|${d}|${s.time||''}|${Number(s.amount)||0}|${s.ref_no||''}`;
+      };
+      
+      // Count dups
+      const counts = {};
+      allStmts.forEach(s => {
+        const k = keyOf(s);
+        counts[k] = (counts[k] || 0) + 1;
+      });
+      const dupKeys = Object.keys(counts).filter(k => counts[k] > 1);
+      const extras = dupKeys.reduce((s,k) => s + (counts[k] - 1), 0);
+      
+      if (extras === 0) {
+        toast('ไม่พบ statement ซ้ำ', 'info');
+        document.getElementById('dedup-result').textContent = `✓ ตรวจแล้ว ${before} รายการ · ไม่มี duplicate`;
+        return;
+      }
+      
+      if (!confirm(`พบ statement ซ้ำ ${extras} รายการ (จาก ${dupKeys.length} keys ที่ซ้ำ)\n\nลบออก? — เก็บรายการแรกของแต่ละ key ไว้\n\nก่อนลบ: ${before}\nหลังลบ: ${before - extras}\n\n⚠️ ควร Backup ก่อน`)) return;
+      
+      // Dedup per bank (แต่ละ bank array แยกกัน)
+      let totalRemoved = 0;
+      Object.keys(statementsByBank).forEach(bank => {
+        const arr = statementsByBank[bank] || [];
+        const seen = new Set();
+        const kept = arr.filter(s => {
+          const k = keyOf(s);
+          if (seen.has(k)) return false;
+          seen.add(k);
+          return true;
+        });
+        totalRemoved += (arr.length - kept.length);
+        statementsByBank[bank] = kept;
+      });
+      uploadedStatements = getAllStatements();
+      
+      try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(_){}
+      persistMainState();
+      const after = uploadedStatements.length;
+      toast(`ลบ statement ซ้ำ ${totalRemoved} รายการ — คงเหลือ ${after}`, 'success');
+      document.getElementById('dedup-result').textContent = `✓ ลบแล้ว ${totalRemoved} · คงเหลือ ${after}`;
+      render();
+    });
+    
     document.getElementById('btn-clear-sp')?.addEventListener('click', () => {
       if (!confirm(`⚠️ ล้าง SP Payments ทั้งหมด (${paymentList.length} รายการ)?`)) return;
       paymentList = [];
