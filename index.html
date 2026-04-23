@@ -299,7 +299,19 @@ async function api(action, params = {}) {
     // - URLSearchParams auto-set Content-Type: application/x-www-form-urlencoded
     //   → เป็น "simple request" ตาม CORS spec → ไม่มี preflight + ไม่ต้องการ CORS header
     // - GAS รับได้ผ่าน e.parameter.payload (parse JSON เอง)
-    if (url.length < 4000) {
+    //
+    // ⚠️ FORCE POST: action ที่มี payload เป็น array/object → ต้อง POST เสมอ
+    // เพราะ GET path stringify array แล้ว backend ได้ string (Array.isArray = false → error)
+    // ต่อให้ payload เล็ก URL ก็ไม่เกิน 4000 chars แต่ backend ยังรับเป็น array ไม่ได้
+    const FORCE_POST_ACTIONS = [
+      'saveSpTemps', 'saveCashflow', 'savePayments', 'saveSuppliers',
+      'saveDailySales', 'saveStatements', 'saveDailyMeta', 'savePPReport',
+      'upsertBills', 'upsertStatements', 'upsertMeta',
+      'saveSupplierPayments',
+    ];
+    const forcePost = FORCE_POST_ACTIONS.indexOf(action) !== -1;
+    
+    if (url.length < 4000 && !forcePost) {
       res = await fetch(url, { redirect: 'follow' });
     } else {
       const formData = new URLSearchParams();
