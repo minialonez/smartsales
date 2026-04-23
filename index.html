@@ -13537,17 +13537,23 @@ function renderData(el) {
         
         // ── Step 3: Clear sheets ──
         uuidLog('\n━━━ [3/5] Clear Sheets ━━━');
+        let clearFailed = false;
         for (const year of allYears) {
           if (billsByYear[year]?.length > 0) {
             const r = await api('clearSheetData', { sheet: `bills_${year}` });
             if (r?.success) uuidLog(`   ✓ bills_${year}: cleared ${r.data.cleared} rows`);
-            else uuidLog(`   ⚠️ bills_${year}: ${r?.error || 'error'}`);
+            else { uuidLog(`   ❌ bills_${year}: ${r?.error || 'error'}`); clearFailed = true; }
           }
           if (stmtsByYear[year]?.length > 0) {
             const r = await api('clearSheetData', { sheet: `stmts_${year}` });
             if (r?.success) uuidLog(`   ✓ stmts_${year}: cleared ${r.data.cleared} rows`);
-            else uuidLog(`   ⚠️ stmts_${year}: ${r?.error || 'error'}`);
+            else { uuidLog(`   ❌ stmts_${year}: ${r?.error || 'error'}`); clearFailed = true; }
           }
+        }
+        
+        // 🛑 Abort migration ถ้า clear fail — ไม่งั้น push จะ append บน data เก่า → บวม
+        if (clearFailed) {
+          throw new Error('Clear Sheet fail — หยุด migration เพื่อกัน sheet บวม กรุณา redeploy backend (code.gs uuid_sync มี fix แล้ว) แล้วรัน migrate ใหม่');
         }
         
         // ── Step 4: Push in chunks ──
