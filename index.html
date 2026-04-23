@@ -3375,10 +3375,11 @@ function openQuickMatchModal(b) {
     const stmtDateISO = toISODate(stmt.date) || toISODate(b.date);
     
     // Update bills (ทุกตัวที่ติ๊ก)
+    // pay_date = วันที่โอนจริงตาม statement (ไม่ใช่วันออกบิล) — match event คือ payment event
     billArr.forEach(x => {
       x.match_status = 'matched';
       x.confirmation = stmt.bank || '';
-      if (!x.pay_date) x.pay_date = stmtDateISO;
+      x.pay_date = stmtDateISO;  // overwrite always (เดิม: if (!x.pay_date) ทำให้บิลที่มี pay_date เดิมอยู่แล้วไม่อัปเดตเป็นวันโอน)
       x.matched_stmt_ref = stmt.ref_no || '';
       x.matched_at = now;
     });
@@ -3422,7 +3423,10 @@ async function renderMain(el) {
   let filterDateTo = '';
   let hidePaid = false;
   let showChange = false;
-  let selectedDate = todayISO();
+  // Preserve selectedDate across re-entries to main (เช่น หลัง quick match/unmatch ที่เรียก navigateTo('main'))
+  // ถ้าไม่เก็บ → selectedDate reset เป็น todayISO() ทุกครั้ง → หน้าจอเด้งไปวันปัจจุบัน
+  let selectedDate = window.__mainSelectedDate || todayISO();
+  window.__mainSelectedDate = selectedDate;
 
   const TYPE_OPTIONS = ['', 'Cash', 'Transfer', 'Card', 'Cheque', 'Other', 'Unknown', 'Refund'];
   const STATION_OPTIONS = ['', 'Front1', 'Front2', 'Front3', 'Front4', 'Invoice', 'Invoice Credit', 'Order', 'Order Credit', 'Payment'];
@@ -5155,6 +5159,7 @@ async function renderMain(el) {
     function _changeDateTo(newISO) {
       if (!newISO || newISO === selectedDate) return;
       selectedDate = newISO;
+      window.__mainSelectedDate = newISO;  // persist สำหรับกรณี re-navigate เข้าหน้า main
       invalidateBillsCache();
       
       // Clear flat summary keys (ค่าจากวันก่อนจะค้างถ้าไม่ล้าง)
