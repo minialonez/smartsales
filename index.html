@@ -3103,21 +3103,49 @@ function openQuickMatchModal(b) {
     const winDays = dateWindow === 'day' ? 0 : dateWindow === 'day3' ? 1 : 3;
     const refDate = new Date(billDate);
     
+    // ── Direction filter (เหมือนใน Matching page / runAutoMatchRange) ──
+    // บิลที่จะผูก (selectedBills + opener b) ทั้งหมดเป็น income หรือ expense?
+    // ถ้ามีบิลแรก b เป็นตัวตัดสิน direction (บิลหลักของ modal นี้)
+    const INCOME_PREFIXES = ['SS','OS','SP','S2','BS','PC'];
+    const EXPENSE_PREFIXES = ['PP','PS','MS','PX','SC','JS','JR'];
+    const prefix = String(b.bill_no || '').substring(0, 2).toUpperCase();
+    const isFront = String(b.station || '').startsWith('Front');
+    let billDir = 'unknown';
+    if (isFront || INCOME_PREFIXES.includes(prefix)) billDir = 'income';
+    else if (EXPENSE_PREFIXES.includes(prefix)) billDir = 'expense';
+    
     return all.filter(s => {
-      // Match status: check both explicit 'matched' AND presence of match_bill (บาง flow set bill แต่ลืม status)
+      // Match status: check both explicit 'matched' AND presence of match_bill
       if (s.match_status === 'matched' || s.match_bill) return false;
       
+      // Date window
       const sDate = toISODate(s.date || s.trans_date);
       if (!sDate) return false;
       const diff = Math.abs((new Date(sDate) - refDate) / dayMs);
       if (diff > winDays) return false;
       
+      // Bank filter
       if (selectedBank !== 'ALL' && String(s.bank||'').toUpperCase() !== selectedBank) return false;
+      
+      // Direction filter: income bill → +stmt, expense bill → −stmt (unknown = ทั้ง 2)
+      const stmtAmt = Number(s.amount) || 0;
+      if (billDir === 'income' && stmtAmt < 0) return false;
+      if (billDir === 'expense' && stmtAmt > 0) return false;
+      
+      // Amount tolerance: ยอดตรงเป๊ะ หรือใกล้ ±5% / ±1 บาท (เหมือน Matching page)
+      const absStmt = Math.abs(stmtAmt);
+      const amtDiff = Math.abs(absStmt - targetSum);
+      if (amtDiff >= 1 && amtDiff >= targetSum * 0.05) return false;
+      
       return true;
     }).sort((x, y) => {
-      // ยอดตรงเป๊ะกับ targetSum ขึ้นก่อน, รองคือ amount ใกล้ target
+      // ยอดตรงเป๊ะ (<0.01) ขึ้นก่อน, รองคือ วันที่ใกล้
       const dx = Math.abs(Math.abs(Number(x.amount)||0) - targetSum);
       const dy = Math.abs(Math.abs(Number(y.amount)||0) - targetSum);
+      const xExact = dx < 0.01 ? 0 : 1;
+      const yExact = dy < 0.01 ? 0 : 1;
+      if (xExact !== yExact) return xExact - yExact;
+      // รองลงไปเรียงตาม diff น้อยก่อน
       return dx - dy;
     });
   }
@@ -3217,9 +3245,11 @@ function openQuickMatchModal(b) {
     const targetSum = getSelectedSum();
     
     if (list.length === 0) {
+      const targetLabel = fmtNum(targetSum);
       container.innerHTML = `<div style="padding:20px;text-align:center;color:var(--text3);font-size:.85rem">
-        ไม่พบ statement ${selectedBank!=='ALL'?`ของ ${selectedBank} `:''}${dateWindow==='day'?`วันที่ ${fmtDate(billDate)}`:`ใน ±${dateWindow==='day3'?1:3} วันจาก ${fmtDate(billDate)}`} ที่ยังไม่ถูก match
-        <div style="margin-top:8px">💡 ลองขยายช่วงวันที่ด้านบน หรือเปลี่ยนธนาคาร</div>
+        ไม่พบ statement ยอด <b style="color:var(--warn)">฿${targetLabel}</b> ${selectedBank!=='ALL'?`ใน ${selectedBank} `:''}${dateWindow==='day'?`วันที่ ${fmtDate(billDate)}`:`ใน ±${dateWindow==='day3'?1:3} วันจาก ${fmtDate(billDate)}`} ที่ยังไม่ถูก match
+        <div style="margin-top:8px">💡 ลองขยายช่วงวันที่ด้านบน หรือเปลี่ยนธนาคารเป็น "ทั้งหมด"</div>
+        <div style="margin-top:4px;color:var(--text2);font-size:.78rem">กรอง: ยอดตรง ±5% · ทิศทาง (รับ/จ่าย) · วันที่</div>
       </div>`;
       return;
     }
