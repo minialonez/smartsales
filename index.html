@@ -12966,7 +12966,7 @@ function renderData(el) {
       }
     });
     
-    // ── Rebuild Local from Cloud (nuclear option: ล้าง local → pull fresh) ──
+    // ── Rebuild Local from Cloud (SAFE: pull-first, validate, then swap) ──
     document.getElementById('btn-rebuild-local')?.addEventListener('click', async () => {
       const statusEl = document.getElementById('rebuild-status');
       const btn = document.getElementById('btn-rebuild-local');
@@ -12981,11 +12981,10 @@ function renderData(el) {
         `  • Bills: ${beforeBills}\n` +
         `  • Statements: ${beforeStmts}\n` +
         `  • SP Payments: ${beforePayments}\n\n` +
-        `จะล้าง local ทิ้ง แล้ว pull จาก Google Sheet ทั้งหมด\n\n` +
-        `⚠️ Backup JSON แล้วหรือยัง?\nทำต่อ?`
+        `ระบบจะ pull จาก cloud ก่อน → validate → ถ้า OK ค่อยแทนที่ local\n` +
+        `(ถ้า pull ได้น้อยผิดปกติ จะ abort + เก็บ local เดิมไว้)\n\n` +
+        `⚠️ ควร Backup JSON ไว้ก่อน\nทำต่อ?`
       )) return;
-      
-      if (!confirm(`⚠️⚠️ ยืนยันครั้งสุดท้าย — ล้าง local แล้ว rebuild ใหม่?`)) return;
       
       btn.disabled = true;
       btn.textContent = '⏳ กำลัง...';
@@ -12998,7 +12997,7 @@ function renderData(el) {
       };
       statusEl.textContent = '';
       
-      // Pause sync to prevent auto-push during rebuild
+      // Pause sync to prevent push during rebuild
       const wasEnabled = syncManager.enabled;
       if (wasEnabled) {
         syncManager.setEnabled(false);
@@ -13006,45 +13005,187 @@ function renderData(el) {
       }
       
       try {
-        tsLog(`🗑 ล้าง local: bills=${beforeBills}, stmts=${beforeStmts}, payments=${beforePayments}`);
-        billList = [];
+        // ── Step 1: Pull to TEMP variables (ไม่แตะ local) ──
+        tsLog('☁️ [1/3] Pull จาก cloud (ยังไม่แตะ local)...');
+        const now = new Date();
+        const years = [];
+        for (let i = 0; i < 3; i++) years.push(String(now.getFullYear() - i));
+        
+        const tempBills = [];
+        const tempStmts = {};
+        const tempPayments = [];
+        const tempSpTemps = [];
+        const tempCashflow = [];
+        const tempSuppliers = [];
+        const tempSupplierPayments = [];
+        let pullErrors = [];
+        
+        // Pull bills per year
+        for (const y of years) {
+          try {
+            const r = await api('getBillsWithUuid', { year: y });
+            if (r?.success && Array.isArray(r.data?.rows)) {
+              r.data.rows.forEach(b => tempBills.push(b));
+              tsLog(`   ✓ Bills ${y}: ${r.data.rows.length} rows`);
+            } else if (r?.success === false) {
+              // Fallback to old endpoint
+              const r2 = await api('getDailySales', { year: y });
+              if (r2?.success !== false) {
+                const items = (r2?.data?.data) || (Array.isArray(r2?.data) ? r2.data : []) || [];
+                items.forEach(b => tempBills.push(b));
+                tsLog(`   ✓ Bills ${y}: ${items.length} rows (fallback)`);
+              } else {
+                tsLog(`   ⚠️ Bills ${y}: ${r.error || r2.error}`);
+                pullErrors.push(`Bills ${y}`);
+              }
+            }
+          } catch(err) {
+            tsLog(`   ❌ Bills ${y}: ${err.message}`);
+            pullErrors.push(`Bills ${y}: ${err.message}`);
+          }
+        }
+        
+        // Pull stmts per year
+        for (const y of years) {
+          try {
+            const r = await api('getStatementsWithUuid', { year: y });
+            if (r?.success && Array.isArray(r.data?.rows)) {
+              r.data.rows.forEach(s => {
+                if (!tempStmts[s.bank]) tempStmts[s.bank] = [];
+                tempStmts[s.bank].push(s);
+              });
+              tsLog(`   ✓ Stmts ${y}: ${r.data.rows.length} rows`);
+            } else {
+              const r2 = await api('getStatements', { year: y });
+              if (r2?.success !== false) {
+                const items = (r2?.data?.data) || (Array.isArray(r2?.data) ? r2.data : []) || [];
+                items.forEach(s => {
+                  if (!tempStmts[s.bank]) tempStmts[s.bank] = [];
+                  tempStmts[s.bank].push(s);
+                });
+                tsLog(`   ✓ Stmts ${y}: ${items.length} rows (fallback)`);
+              }
+            }
+          } catch(err) {
+            tsLog(`   ❌ Stmts ${y}: ${err.message}`);
+            pullErrors.push(`Stmts ${y}`);
+          }
+        }
+        
+        // Pull SP
+        try {
+          const r = await api('getPayments');
+          const items = (r?.data?.data) || (Array.isArray(r?.data) ? r.data : []) || [];
+          if (Array.isArray(items)) {
+            items.forEach(p => tempPayments.push(p));
+            tsLog(`   ✓ SP: ${items.length} rows`);
+          }
+        } catch(err) { tsLog(`   ⚠️ SP: ${err.message}`); }
+        
+        // Pull SP-TEMP
+        try {
+          const r = await api('getSpTemps');
+          const items = (r?.data?.data) || (Array.isArray(r?.data) ? r.data : []) || [];
+          if (Array.isArray(items)) {
+            items.forEach(t => tempSpTemps.push(t));
+            tsLog(`   ✓ SP-TEMP: ${items.length} rows`);
+          }
+        } catch(err) { tsLog(`   ⚠️ SP-TEMP: ${err.message}`); }
+        
+        // Pull Cashflow
+        try {
+          const r = await api('getCashflow');
+          const items = (r?.data?.data) || (Array.isArray(r?.data) ? r.data : []) || [];
+          if (Array.isArray(items)) {
+            items.forEach(c => tempCashflow.push(c));
+            tsLog(`   ✓ Cashflow: ${items.length} rows`);
+          }
+        } catch(err) { tsLog(`   ⚠️ Cashflow: ${err.message}`); }
+        
+        // Pull Suppliers
+        try {
+          const r = await api('getSuppliers');
+          const items = (r?.data?.data) || (Array.isArray(r?.data) ? r.data : []) || [];
+          if (Array.isArray(items)) {
+            items.forEach(s => tempSuppliers.push(s));
+            tsLog(`   ✓ Suppliers: ${items.length} rows`);
+          }
+        } catch(err) { tsLog(`   ⚠️ Suppliers: ${err.message}`); }
+        
+        try {
+          const r = await api('getSupplierPayments');
+          const items = (r?.data?.data) || (Array.isArray(r?.data) ? r.data : []) || [];
+          if (Array.isArray(items)) {
+            items.forEach(p => tempSupplierPayments.push(p));
+            tsLog(`   ✓ Supplier Payments: ${items.length} rows`);
+          }
+        } catch(err) { tsLog(`   ⚠️ Supplier Payments: ${err.message}`); }
+        
+        // ── Step 2: VALIDATE pulled data ──
+        tsLog(`\n🔍 [2/3] Validate ข้อมูลที่ดึงมา...`);
+        const totalStmts = Object.values(tempStmts).reduce((s,arr) => s + arr.length, 0);
+        tsLog(`   Bills: ${tempBills.length} / Stmts: ${totalStmts}`);
+        
+        // Safety threshold: ถ้า local มีเยอะอยู่แล้ว แต่ pull ได้น้อยผิดปกติ → abort
+        const MIN_BILLS_THRESHOLD = Math.min(100, Math.floor(beforeBills * 0.1));
+        const MIN_STMTS_THRESHOLD = Math.min(50, Math.floor(beforeStmts * 0.1));
+        
+        if (beforeBills > 0 && tempBills.length < MIN_BILLS_THRESHOLD) {
+          throw new Error(`ABORT: Pull ได้ ${tempBills.length} bills (คาดหวัง > ${MIN_BILLS_THRESHOLD})\n` +
+            `Local มี ${beforeBills} bills — ไม่ควร rebuild เพราะอาจเสียข้อมูล\n\n` +
+            `สาเหตุที่เป็นไปได้:\n` +
+            `1. Endpoint getBillsWithUuid ยังไม่ deploy ใน backend\n` +
+            `2. Sheet bills_2026 ถูกล้างใน Google Sheets\n` +
+            `3. Response format ผิด\n\n` +
+            `Local ไม่ถูกแตะต้อง — ข้อมูลเดิมยังอยู่ครบ`);
+        }
+        
+        if (beforeStmts > 0 && totalStmts < MIN_STMTS_THRESHOLD) {
+          throw new Error(`ABORT: Pull ได้ ${totalStmts} stmts (คาดหวัง > ${MIN_STMTS_THRESHOLD})\n` +
+            `Local มี ${beforeStmts} stmts — ไม่ควร rebuild\n\n` +
+            `Local ไม่ถูกแตะต้อง`);
+        }
+        
+        tsLog(`   ✅ Validate ผ่าน — ปลอดภัยที่จะ swap`);
+        
+        // ── Step 3: SWAP (ปลอดภัยตรงนี้ เพราะ pull + validate ผ่านแล้ว) ──
+        tsLog(`\n🔄 [3/3] Swap local ← temp...`);
+        billList = tempBills;
         statementsByBank = { KTB: [], KBANK: [], 'BBL NW': [], BBL: [], TTB: [], UNKNOWN: [] };
-        paymentList = [];
-        uploadedStatements = [];
+        Object.keys(tempStmts).forEach(bank => {
+          statementsByBank[bank] = tempStmts[bank];
+        });
+        uploadedStatements = getAllStatements();
+        paymentList = tempPayments;
+        spTempList = tempSpTemps;
+        cashflowList = tempCashflow;
+        supplierList = tempSuppliers;
+        supplierPayments = tempSupplierPayments;
         
-        // Clear fingerprints so next push won't skip
-        if (syncManager._fpCache) {
-          syncManager._fpCache = {};
-        }
-        
-        tsLog('☁️ กำลัง pull จาก cloud...');
-        
-        // Use pullFromCloud with force (3 years coverage)
-        const stats = await syncManager.pullFromCloud(3, 'force');
-        
-        tsLog(`\n✅ Pull สำเร็จ:`);
-        tsLog(`   Bills: ${billList.length} rows (pulled ${stats.bills || 0})`);
-        tsLog(`   Stmts: ${getAllStatements().length} rows (pulled ${stats.stmts || 0})`);
-        tsLog(`   SP: ${paymentList.length} rows (pulled ${stats.payments || 0})`);
-        if (stats.errors && stats.errors.length > 0) {
-          tsLog(`\n⚠️ Errors: ${stats.errors.length}`);
-          stats.errors.slice(0, 5).forEach(e => tsLog(`   - ${e}`));
-        }
+        // Reset fingerprints so next push compares fresh
+        if (syncManager._fpCache) syncManager._fpCache = {};
         
         persistMainState();
-        tsLog('\n💾 บันทึกลง localStorage แล้ว');
+        safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank));
+        safeStorage.set('sf_spTempList', JSON.stringify(spTempList));
         
         statusEl.style.color = 'var(--success)';
         tsLog(`\n🎉 Rebuild สำเร็จ!`);
         tsLog(`   ก่อน: ${beforeBills} bills, ${beforeStmts} stmts`);
         tsLog(`   หลัง: ${billList.length} bills, ${getAllStatements().length} stmts`);
+        if (pullErrors.length > 0) {
+          tsLog(`   ⚠️ มี error บางอย่าง: ${pullErrors.join(', ')}`);
+        }
         
         toast(`Rebuild สำเร็จ — ${billList.length} bills, ${getAllStatements().length} stmts`, 'success', 5000);
         
+        // Refresh current view
+        if (typeof render === 'function') render();
+        
       } catch (err) {
         statusEl.style.color = 'var(--danger)';
-        tsLog(`\n❌ Error: ${err.message}`);
-        toast('Rebuild ล้มเหลว — ดู log', 'error');
+        tsLog(`\n❌ ${err.message}`);
+        toast('Rebuild ยกเลิก — ดู log (local ไม่ถูกแตะ)', 'warn', 6000);
       }
       
       // Resume sync
