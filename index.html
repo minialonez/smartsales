@@ -12755,44 +12755,6 @@ function renderData(el) {
         </div>
         <div id="uuid-progress" style="display:none;margin-top:8px;padding:10px;background:var(--surface2);border-radius:6px;font-family:monospace;font-size:.78rem;white-space:pre-wrap;max-height:300px;overflow-y:auto"></div>
       </div>
-      
-      <!-- Meta Pull (summary + cash_count + change) -->
-      <div class="card" style="border-left:3px solid #8b5cf6;margin-bottom:12px;background:rgba(139,92,246,.04)">
-        <div class="font-semi mb-2" style="color:#8b5cf6">🔄 ดึง Meta จาก Cloud (summary/cash_count/change)</div>
-        <p class="text-xs text-muted mb-3">
-          Meta = ข้อมูลส่วนบนของหน้า Main (นำเงินเข้า, ยอดขาย, Cash Drawer, Transfer/Card/Cheque, นับธนบัตร, เงินทอน)<br>
-          ใช้กรณี: restore backup แล้ว meta หาย / เปลี่ยนเครื่อง / อยากเอาเวอร์ชัน cloud ลงมา
-        </p>
-        <div class="flex gap-2 flex-wrap items-center mb-2">
-          <button class="btn btn-sm" id="btn-meta-pull-merge" style="background:#8b5cf6;color:#fff;border:none">🔄 ดึง + Merge (ของ local ชนะถ้ามี)</button>
-          <button class="btn btn-outline btn-sm" id="btn-meta-pull-override" style="color:var(--danger);border-color:var(--danger)">⚠️ Override ทั้งหมดจาก Cloud</button>
-          <span id="meta-result" class="text-xs text-dim"></span>
-        </div>
-        <div id="meta-progress" style="display:none;margin-top:8px;padding:10px;background:var(--surface2);border-radius:6px;font-family:monospace;font-size:.78rem;white-space:pre-wrap;max-height:250px;overflow-y:auto"></div>
-      </div>
-      
-      <!-- Dedup Tool (fix double-sync issue) -->
-      <div class="card" style="border-left:3px solid var(--warn);margin-bottom:12px">
-        <div class="font-semi mb-2" style="color:var(--warn)">🔧 แก้ปัญหา Bill/Stmt ซ้ำจาก Sync</div>
-        <p class="text-xs text-muted mb-3">ถ้าจำนวนบิลเพิ่มเท่าตัวหลัง sync จาก cloud กดปุ่มนี้เพื่อลบรายการซ้ำ (เก็บรายการแรกไว้)</p>
-        <div class="flex gap-2 flex-wrap items-center">
-          <button class="btn btn-warn btn-sm" id="btn-dedup-bills" style="background:var(--warn);color:#fff">🧹 ลบบิลซ้ำ</button>
-          <button class="btn btn-warn btn-sm" id="btn-dedup-stmts" style="background:var(--warn);color:#fff">🧹 ลบ Statement ซ้ำ</button>
-          <span id="dedup-result" class="text-xs text-dim"></span>
-        </div>
-      </div>
-      
-      <!-- Clear Section (Danger zone) -->
-      <div class="card" style="border-left:3px solid var(--danger)">
-        <div class="font-semi mb-3" style="color:var(--danger)">⚠️ Danger Zone — ล้างข้อมูล</div>
-        <p class="text-xs text-muted mb-3">การล้างข้อมูลเหล่านี้ <strong>ไม่สามารถกู้คืนได้</strong> — ต้อง Backup ก่อนล้าง</p>
-        <div class="flex gap-2 flex-wrap">
-          <button class="btn btn-outline btn-sm" id="btn-clear-bills" style="color:var(--danger);border-color:var(--danger)">ล้าง Bill List</button>
-          <button class="btn btn-outline btn-sm" id="btn-clear-sp" style="color:var(--danger);border-color:var(--danger)">ล้าง SP Payments</button>
-          <button class="btn btn-outline btn-sm" id="btn-clear-cashflow" style="color:var(--danger);border-color:var(--danger)">ล้าง Cashflow</button>
-          <button class="btn btn-outline btn-sm" id="btn-clear-all-local" style="background:rgba(239,87,87,.12);color:var(--danger);border-color:var(--danger)">🗑️ ล้างทั้งหมด (localStorage)</button>
-        </div>
-      </div>
     `;
     
     // ── Sync from Cloud ──
@@ -13382,15 +13344,6 @@ function renderData(el) {
       toast('Export ทั้งหมดเป็น Excel สำเร็จ', 'success');
     });
     
-    // ── Clear handlers ──
-    document.getElementById('btn-clear-bills')?.addEventListener('click', () => {
-      if (!confirm(`⚠️ ล้าง Bill List ทั้งหมด (${billList.length} รายการ)?\n\nคุณ Backup แล้วหรือยัง?`)) return;
-      if (!confirm('ยืนยันอีกครั้ง — ล้างแล้วกู้คืนไม่ได้!')) return;
-      billList = [];
-      persistMainState();
-      toast('ล้าง Bill List แล้ว', 'success');
-      render();
-    });
     // ══════════════════════════════════════════════════════
     // UUID MIGRATION (v1.0) — one-time migrate to UUID sync
     // ══════════════════════════════════════════════════════
@@ -13607,16 +13560,29 @@ function renderData(el) {
     document.getElementById('btn-uuid-migrate')?.addEventListener('click', async () => {
       const btn = document.getElementById('btn-uuid-migrate');
       
+      // 🔒 Lock: ป้องกัน migrate วิ่งพร้อมกัน (double-click, 2 tabs, F5 mid-migrate)
+      const LOCK_KEY = 'sf_migrating';
+      const LOCK_TTL = 10 * 60 * 1000; // 10 นาที expiry
+      try {
+        const lockStr = localStorage.getItem(LOCK_KEY);
+        if (lockStr) {
+          const lockTs = Number(lockStr);
+          if (Date.now() - lockTs < LOCK_TTL) {
+            if (!confirm(`⚠️ มี migrate กำลังวิ่งอยู่ (เริ่มเมื่อ ${new Date(lockTs).toLocaleTimeString('th-TH')})\n\nอาจเป็นเพราะ:\n• เปิด app อีก tab แล้วกด migrate ที่นั่น\n• ปิด browser ระหว่าง migrate\n\nกดตกลง = ลบ lock แล้วรัน migrate ใหม่\nกดยกเลิก = หยุด`)) return;
+          }
+        }
+        localStorage.setItem(LOCK_KEY, String(Date.now()));
+      } catch (e) {}
+      
       // Multiple confirmations
       if (!confirm(
         `🚀 Migrate ข้อมูลเก่าสู่ UUID\n\n` +
-        `จะทำ 6 ขั้นตอน:\n` +
-        `1. Generate UUID ให้บิลทุกตัว (${billList.length} บิล, ${getAllStatements().length} stmts)\n` +
-        `2. Prepare Sheet — เพิ่ม column bill_uuid/stmt_uuid\n` +
-        `3. Clear Sheet — ล้าง bills_YYYY / stmts_YYYY ทั้งหมด\n` +
+        `จะทำ 5 ขั้นตอน:\n` +
+        `1. Generate UUID + Build Meta (${billList.length} บิล, ${getAllStatements().length} stmts)\n` +
+        `2. Prepare Sheet — เพิ่ม column uuid (bills/stmts/meta)\n` +
+        `3. Clear Sheet — ล้าง bills_YYYY / stmts_YYYY / meta_YYYY\n` +
         `4. Push ทั้งหมดด้วย UUID\n` +
-        `5. ดึง Meta จาก Cloud → merge ใน local (summary/cash/change)\n` +
-        `6. Verify row count\n\n` +
+        `5. Verify row count\n\n` +
         `⚠️ จะใช้เวลาประมาณ 1-2 นาที\n` +
         `⚠️ Backup JSON แล้วหรือยัง?\n\nยืนยัน?`
       )) return;
@@ -13864,348 +13830,13 @@ function renderData(el) {
         uuidLog('\n▶ เปิด auto-sync กลับ');
       }
       
+      // 🔓 Release lock
+      try { localStorage.removeItem('sf_migrating'); } catch (e) {}
+      
       btn.disabled = false;
     });
     
-    // ══════════════════════════════════════════════════════
-    // META PULL — ดึง summary + cash_count + change จาก Cloud
-    // ══════════════════════════════════════════════════════
     
-    function metaLog(msg) {
-      const el = document.getElementById('meta-progress');
-      if (!el) return;
-      el.style.display = 'block';
-      const ts = new Date().toLocaleTimeString('th-TH');
-      el.textContent += `[${ts}] ${msg}\n`;
-      el.scrollTop = el.scrollHeight;
-    }
-    function metaClearLog() {
-      const el = document.getElementById('meta-progress');
-      if (el) el.textContent = '';
-    }
-    
-    // Core pull function — return { summary, cashCount, daysCount, error }
-    // Uses getMetaWithUuid (compact format) — falls back to getDailyMeta if endpoint missing
-    async function _pullMetaFromCloud() {
-      var years = ['2024', '2025', '2026']; // ดึงครอบคลุม 3 ปี
-      var combined = {
-        summary: { __byDate: {} },
-        cashCount: { __byDate: {} },
-        changeData: {},
-        days: new Set(),
-      };
-      
-      for (const y of years) {
-        metaLog(`📥 ดึง meta_${y}...`);
-        
-        // Try compact format first
-        const compactRes = await api('getMetaWithUuid', { year: y });
-        
-        if (compactRes?.success && Array.isArray(compactRes.data?.rows) && compactRes.data.rows.length > 0) {
-          // Compact format found → parse
-          const parsed = parseCompactMetaRows(compactRes.data.rows);
-          Object.keys(parsed.summary.__byDate).forEach(function(dateISO) {
-            combined.summary.__byDate[dateISO] = parsed.summary.__byDate[dateISO];
-            combined.days.add(dateISO);
-          });
-          Object.keys(parsed.cashCount.__byDate).forEach(function(dateISO) {
-            combined.cashCount.__byDate[dateISO] = parsed.cashCount.__byDate[dateISO];
-            combined.days.add(dateISO);
-          });
-          metaLog(`   ✓ ${y}: compact format — ${compactRes.data.rows.length} rows (${Object.keys(parsed.summary.__byDate).length} days summary, ${Object.keys(parsed.cashCount.__byDate).length} days cash)`);
-        } else {
-          // Fallback to old verbose format
-          metaLog(`   ℹ ${y}: compact ว่าง → ลอง format เดิม`);
-          const res = await api('getDailyMeta', { year: y });
-          if (!res?.success) {
-            metaLog(`   ⚠️ ${y}: ${res?.error || 'no data'}`);
-            continue;
-          }
-          const d = res.data || {};
-          if (d.summary?.__byDate) {
-            Object.keys(d.summary.__byDate).forEach(function(dateISO) {
-              combined.summary.__byDate[dateISO] = d.summary.__byDate[dateISO];
-              combined.days.add(dateISO);
-            });
-          }
-          if (d.cash_count?.__byDate) {
-            Object.keys(d.cash_count.__byDate).forEach(function(dateISO) {
-              combined.cashCount.__byDate[dateISO] = d.cash_count.__byDate[dateISO];
-              combined.days.add(dateISO);
-            });
-          }
-          if (d.change_data) {
-            Object.assign(combined.changeData, d.change_data);
-          }
-          metaLog(`   ✓ ${y}: ${Object.keys(d.summary?.__byDate||{}).length} วัน summary, ${Object.keys(d.cash_count?.__byDate||{}).length} วัน cash`);
-        }
-      }
-      
-      return combined;
-    }
-    
-    // ── MERGE MODE: ของ local ชนะถ้ามี, copy cloud เฉพาะที่ local ว่าง ──
-    document.getElementById('btn-meta-pull-merge')?.addEventListener('click', async () => {
-      const btn = document.getElementById('btn-meta-pull-merge');
-      btn.disabled = true;
-      metaClearLog();
-      document.getElementById('meta-result').textContent = '⏳ กำลังดึง...';
-      document.getElementById('meta-result').style.color = 'var(--info)';
-      
-      try {
-        const cloud = await _pullMetaFromCloud();
-        
-        metaLog(`\n🔀 กำลัง Merge (local ชนะถ้ามี)...`);
-        let merged = { summary: 0, cash: 0, change: 0 };
-        
-        // Summary: copy เฉพาะที่ local ไม่มี
-        if (!mainSummary.__byDate) mainSummary.__byDate = {};
-        Object.keys(cloud.summary.__byDate).forEach(function(dateISO) {
-          if (!mainSummary.__byDate[dateISO]) {
-            mainSummary.__byDate[dateISO] = cloud.summary.__byDate[dateISO];
-            merged.summary++;
-          }
-        });
-        
-        // CashCount: merge per-key
-        if (!cashCount.__byDate) cashCount.__byDate = {};
-        Object.keys(cloud.cashCount.__byDate).forEach(function(dateISO) {
-          if (!cashCount.__byDate[dateISO]) {
-            cashCount.__byDate[dateISO] = cloud.cashCount.__byDate[dateISO];
-            merged.cash++;
-          } else {
-            Object.keys(cloud.cashCount.__byDate[dateISO]).forEach(function(k) {
-              if (cashCount.__byDate[dateISO][k] == null) {
-                cashCount.__byDate[dateISO][k] = cloud.cashCount.__byDate[dateISO][k];
-              }
-            });
-          }
-        });
-        
-        // Change data
-        Object.entries(cloud.changeData).forEach(function([dateISO, stationData]) {
-          if (!cashCount.__byDate[dateISO]) cashCount.__byDate[dateISO] = {};
-          Object.entries(stationData||{}).forEach(function([station, denoms]) {
-            Object.entries(denoms||{}).forEach(function([denom, count]) {
-              const key = denom + '_' + station;
-              if (cashCount.__byDate[dateISO][key] == null) {
-                cashCount.__byDate[dateISO][key] = Number(count) || 0;
-                merged.change++;
-              }
-            });
-          });
-        });
-        
-        persistMainState();
-        
-        metaLog(`\n✅ Merge สำเร็จ!`);
-        metaLog(`   Summary: เพิ่ม ${merged.summary} วัน`);
-        metaLog(`   CashCount: เพิ่ม ${merged.cash} วัน`);
-        metaLog(`   Change entries: เพิ่ม ${merged.change} entries`);
-        metaLog(`\n💡 ถ้าอยู่หน้า Main → refresh หรือเปลี่ยนวัน เพื่อเห็นข้อมูลใหม่`);
-        
-        document.getElementById('meta-result').textContent = `✅ +${merged.summary} summary, +${merged.cash} cash`;
-        document.getElementById('meta-result').style.color = 'var(--success)';
-        toast(`Merge meta สำเร็จ: +${merged.summary} วัน summary, +${merged.cash} วัน cash`, 'success', 4000);
-        
-        // Refresh main page ถ้าอยู่
-        if (typeof currentPage !== 'undefined' && currentPage === 'main') {
-          navigateTo('main');
-        }
-      } catch (err) {
-        metaLog(`\n❌ Error: ${err.message}`);
-        document.getElementById('meta-result').textContent = `❌ ${err.message}`;
-        document.getElementById('meta-result').style.color = 'var(--danger)';
-      }
-      btn.disabled = false;
-    });
-    
-    // ── OVERRIDE MODE: ลบ local + copy cloud ทั้งหมด ──
-    document.getElementById('btn-meta-pull-override')?.addEventListener('click', async () => {
-      if (!confirm(
-        `⚠️ Override Meta ทั้งหมดจาก Cloud\n\n` +
-        `จะลบข้อมูล summary + cash_count + change ใน local ทิ้ง\n` +
-        `แล้ว copy ของ cloud ลงมาแทน\n\n` +
-        `⚠️ ข้อมูลที่ local มีแต่ cloud ไม่มี จะหายถาวร\n` +
-        `Backup JSON ก่อนแล้วหรือยัง?\n\nทำต่อ?`
-      )) return;
-      
-      if (!confirm(`⚠️⚠️ ยืนยันอีกครั้ง — Override Meta จริงๆ?`)) return;
-      
-      const btn = document.getElementById('btn-meta-pull-override');
-      btn.disabled = true;
-      metaClearLog();
-      document.getElementById('meta-result').textContent = '⏳ กำลัง override...';
-      document.getElementById('meta-result').style.color = 'var(--warn)';
-      
-      try {
-        const cloud = await _pullMetaFromCloud();
-        
-        metaLog(`\n🔄 Override local ด้วย cloud ทั้งหมด...`);
-        
-        // Override ทั้งหมด
-        const oldSummaryDays = Object.keys(mainSummary.__byDate || {}).length;
-        const oldCashDays = Object.keys(cashCount.__byDate || {}).length;
-        
-        mainSummary = { __byDate: cloud.summary.__byDate };
-        cashCount = { __byDate: cloud.cashCount.__byDate };
-        
-        // Merge change data into cashCount
-        Object.entries(cloud.changeData).forEach(function([dateISO, stationData]) {
-          if (!cashCount.__byDate[dateISO]) cashCount.__byDate[dateISO] = {};
-          Object.entries(stationData||{}).forEach(function([station, denoms]) {
-            Object.entries(denoms||{}).forEach(function([denom, count]) {
-              const key = denom + '_' + station;
-              cashCount.__byDate[dateISO][key] = Number(count) || 0;
-            });
-          });
-        });
-        
-        const newSummaryDays = Object.keys(mainSummary.__byDate).length;
-        const newCashDays = Object.keys(cashCount.__byDate).length;
-        
-        persistMainState();
-        
-        metaLog(`\n✅ Override สำเร็จ!`);
-        metaLog(`   Summary: ${oldSummaryDays} → ${newSummaryDays} วัน`);
-        metaLog(`   CashCount: ${oldCashDays} → ${newCashDays} วัน`);
-        metaLog(`\n💡 Refresh หน้า Main เพื่อเห็นข้อมูลใหม่`);
-        
-        document.getElementById('meta-result').textContent = `✅ ${newSummaryDays} summary, ${newCashDays} cash`;
-        document.getElementById('meta-result').style.color = 'var(--success)';
-        toast(`Override meta สำเร็จ: ${newSummaryDays} วัน summary, ${newCashDays} วัน cash`, 'success', 4000);
-        
-        if (typeof currentPage !== 'undefined' && currentPage === 'main') {
-          navigateTo('main');
-        }
-      } catch (err) {
-        metaLog(`\n❌ Error: ${err.message}`);
-        document.getElementById('meta-result').textContent = `❌ ${err.message}`;
-        document.getElementById('meta-result').style.color = 'var(--danger)';
-      }
-      btn.disabled = false;
-    });
-    
-    // ── Dedup tools ──
-    document.getElementById('btn-dedup-bills')?.addEventListener('click', () => {
-      const before = billList.length;
-      // Key เดียวกับ pullFromCloud — normalize date ป้องกัน format ต่างกัน
-      const keyOf = (b) => {
-        const d = toISODate(b.date) || '';
-        return `${b.bill_no||''}|${d}|${Number(b.amount)||0}|${b.station||''}|${b.type||''}`;
-      };
-      
-      // นับ duplicates ก่อน
-      const counts = {};
-      billList.forEach(b => {
-        const k = keyOf(b);
-        counts[k] = (counts[k] || 0) + 1;
-      });
-      const dupKeys = Object.keys(counts).filter(k => counts[k] > 1);
-      const extras = dupKeys.reduce((s,k) => s + (counts[k] - 1), 0);
-      
-      if (extras === 0) {
-        toast('ไม่พบบิลซ้ำ', 'info');
-        document.getElementById('dedup-result').textContent = `✓ ตรวจแล้ว ${before} รายการ · ไม่มี duplicate`;
-        return;
-      }
-      
-      if (!confirm(`พบบิลซ้ำ ${extras} รายการ (จาก ${dupKeys.length} keys ที่ซ้ำ)\n\nลบออก? — เก็บรายการแรกของแต่ละ key ไว้\n\nก่อนลบ: ${before} บิล\nหลังลบ: ${before - extras} บิล\n\n⚠️ ควร Backup ก่อน`)) return;
-      
-      const seen = new Set();
-      billList = billList.filter(b => {
-        const k = keyOf(b);
-        if (seen.has(k)) return false;
-        seen.add(k);
-        return true;
-      });
-      
-      persistMainState();
-      invalidateBillsCache();
-      const removed = before - billList.length;
-      toast(`ลบบิลซ้ำ ${removed} รายการ — คงเหลือ ${billList.length} บิล`, 'success');
-      document.getElementById('dedup-result').textContent = `✓ ลบแล้ว ${removed} · คงเหลือ ${billList.length}`;
-      render();
-    });
-    
-    document.getElementById('btn-dedup-stmts')?.addEventListener('click', () => {
-      const allStmts = getAllStatements();
-      const before = allStmts.length;
-      const keyOf = (s) => {
-        const d = toISODate(s.date || s.trans_date) || '';
-        return `${s.bank||''}|${d}|${s.time||''}|${Number(s.amount)||0}|${s.ref_no||''}`;
-      };
-      
-      // Count dups
-      const counts = {};
-      allStmts.forEach(s => {
-        const k = keyOf(s);
-        counts[k] = (counts[k] || 0) + 1;
-      });
-      const dupKeys = Object.keys(counts).filter(k => counts[k] > 1);
-      const extras = dupKeys.reduce((s,k) => s + (counts[k] - 1), 0);
-      
-      if (extras === 0) {
-        toast('ไม่พบ statement ซ้ำ', 'info');
-        document.getElementById('dedup-result').textContent = `✓ ตรวจแล้ว ${before} รายการ · ไม่มี duplicate`;
-        return;
-      }
-      
-      if (!confirm(`พบ statement ซ้ำ ${extras} รายการ (จาก ${dupKeys.length} keys ที่ซ้ำ)\n\nลบออก? — เก็บรายการแรกของแต่ละ key ไว้\n\nก่อนลบ: ${before}\nหลังลบ: ${before - extras}\n\n⚠️ ควร Backup ก่อน`)) return;
-      
-      // Dedup per bank (แต่ละ bank array แยกกัน)
-      let totalRemoved = 0;
-      Object.keys(statementsByBank).forEach(bank => {
-        const arr = statementsByBank[bank] || [];
-        const seen = new Set();
-        const kept = arr.filter(s => {
-          const k = keyOf(s);
-          if (seen.has(k)) return false;
-          seen.add(k);
-          return true;
-        });
-        totalRemoved += (arr.length - kept.length);
-        statementsByBank[bank] = kept;
-      });
-      uploadedStatements = getAllStatements();
-      
-      try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(_){}
-      persistMainState();
-      const after = uploadedStatements.length;
-      toast(`ลบ statement ซ้ำ ${totalRemoved} รายการ — คงเหลือ ${after}`, 'success');
-      document.getElementById('dedup-result').textContent = `✓ ลบแล้ว ${totalRemoved} · คงเหลือ ${after}`;
-      render();
-    });
-    
-    document.getElementById('btn-clear-sp')?.addEventListener('click', () => {
-      if (!confirm(`⚠️ ล้าง SP Payments ทั้งหมด (${paymentList.length} รายการ)?`)) return;
-      paymentList = [];
-      persistMainState();
-      toast('ล้าง SP แล้ว', 'success');
-      render();
-    });
-    document.getElementById('btn-clear-cashflow')?.addEventListener('click', () => {
-      if (!confirm(`⚠️ ล้าง Cashflow ทั้งหมด (${cashflowList.length} รายการ)?`)) return;
-      cashflowList = [];
-      persistMainState();
-      toast('ล้าง Cashflow แล้ว', 'success');
-      render();
-    });
-    document.getElementById('btn-clear-all-local')?.addEventListener('click', () => {
-      if (!confirm(`🗑️ ล้างข้อมูลทั้งหมดใน localStorage?\n\n• บิล: ${billList.length}\n• SP: ${paymentList.length}\n• Cashflow: ${cashflowList.length}\n• Statement: ${getAllStatements().length}`)) return;
-      if (!confirm('⚠️⚠️ ยืนยันครั้งสุดท้าย! Backup แล้วหรือยัง?')) return;
-      billList = [];
-      paymentList = [];
-      spTempList = [];
-      cashflowList = [];
-      statementsByBank = { KTB: [], KBANK: [], 'BBL NW': [], BBL: [], TTB: [], UNKNOWN: [] };
-      try {
-        ['sf_billList','sf_paymentList','sf_spTempList','sf_cashflowList','sf_mainSummary','sf_cashCount','sf_statementsByBank'].forEach(k => safeStorage.del?.(k));
-      } catch(e) {}
-      persistMainState();
-      toast('ล้างข้อมูลทั้งหมดแล้ว', 'success');
-      render();
-    });
   }
   
   render();
