@@ -1326,13 +1326,17 @@ const syncManager = {
   //   ปุ่ม "save daily" manual (หน้า Main) ที่มี logic replace-safe
   markDirty(type) {
     if (!this.enabled) return;
-    const SAFE_AUTO_TYPES = ['payments', 'sp_temps', 'cashflow', 'suppliers', 'meta'];
+    // NO_ARG_TYPES = types ที่จะ dirty อัตโนมัติเมื่อเรียก markDirty() ไม่มี arg
+    //   (ไม่รวม bills/stmts เพราะ volume ใหญ่ — ต้องเรียก markDirty('bills') ชัดเจน)
+    const NO_ARG_TYPES = ['payments', 'sp_temps', 'cashflow', 'suppliers', 'meta'];
+    // ALL_TYPES = types ที่ยอมรับถ้าเรียก markDirty(type) ชัดเจน
+    const ALL_TYPES = [...NO_ARG_TYPES, 'bills', 'stmts'];
     if (type) {
-      // Only auto-push if type is in safe list
-      if (SAFE_AUTO_TYPES.includes(type)) this.dirty.add(type);
+      // Explicit type → allow if in ALL_TYPES (รวม bills/stmts)
+      if (ALL_TYPES.includes(type)) this.dirty.add(type);
     } else {
-      // no arg → dirty ALL safe types (ข้าม bills, stmts)
-      SAFE_AUTO_TYPES.forEach(t => this.dirty.add(t));
+      // No arg → dirty เฉพาะ NO_ARG_TYPES (ข้าม bills/stmts เพื่อกัน push ทุก tick)
+      NO_ARG_TYPES.forEach(t => this.dirty.add(t));
     }
     this._schedulePush();
   },
@@ -1370,7 +1374,25 @@ const syncManager = {
       try {
         if (type === 'bills') {
           if (billList.length === 0) continue;
-          const fp = this._fp({n: billList.length, first: billList[0]?.bill_no, last: billList[billList.length-1]?.bill_no, total: billList.reduce((s,b)=>s+Number(b.amount||0),0)});
+          // Deep fingerprint — include ทุก mutable field per bill (uuid + key edit fields)
+          // เพื่อ detect user edit: remarks, match_status, confirmation, pay_date, amount
+          // ถ้าฟิลด์ที่ user แก้บ่อยเปลี่ยน → fp ต่าง → push ไป cloud
+          const fpParts = new Array(billList.length);
+          for (let i = 0; i < billList.length; i++) {
+            const b = billList[i];
+            // ลำดับสำคัญ — ถ้าเพิ่ม field ใหม่ต้องเพิ่มที่นี่ด้วย
+            fpParts[i] = (b.bill_uuid || b.bill_no || i) + '|' +
+                        (b.amount || 0) + '|' +
+                        (b.match_status || '') + '|' +
+                        (b.confirmation || '') + '|' +
+                        (b.pay_date || '') + '|' +
+                        (b.remarks1 || '') + '|' +
+                        (b.remarks2 || '') + '|' +
+                        (b.matched_stmt_ref || '') + '|' +
+                        (b.paid_by_sp || '') + '|' +
+                        (b.due_date || '');
+          }
+          const fp = this._fp(billList.length + ':' + fpParts.join(';'));
           if (fp === this._fpCache.bills) { results.skipped++; continue; }
           
           // ── UUID-based upsert (ไม่ทำให้ sheet บวม) ──
@@ -1411,7 +1433,20 @@ const syncManager = {
         } else if (type === 'stmts') {
           const allStmts = getAllStatements();
           if (allStmts.length === 0) continue;
-          const fp = this._fp({n: allStmts.length, first: allStmts[0]?.ref_no, last: allStmts[allStmts.length-1]?.ref_no});
+          // Deep fingerprint — detect match_status / match_bill / confirmation changes
+          const fpParts = new Array(allStmts.length);
+          for (let i = 0; i < allStmts.length; i++) {
+            const s = allStmts[i];
+            fpParts[i] = (s.stmt_uuid || s.ref_no || i) + '|' +
+                        (s.amount || 0) + '|' +
+                        (s.match_status || '') + '|' +
+                        (s.match_bill || '') + '|' +
+                        (s.match_station || '') + '|' +
+                        (s.match_sp || '') + '|' +
+                        (s.matched_bills ? s.matched_bills.join(',') : '') + '|' +
+                        (s.match_method || '');
+          }
+          const fp = this._fp(allStmts.length + ':' + fpParts.join(';'));
           if (fp === this._fpCache.stmts) { results.skipped++; continue; }
           
           // ── UUID-based upsert ──
@@ -1822,7 +1857,14 @@ function persistMainState() {
   
   // Hybrid: mark ทุกอย่าง dirty → syncManager จะ debounce push backend
   // (ไม่ block UI — เป็น fire-and-forget)
-  try { syncManager.markDirty(); } catch(_) {}
+  // ─ no-arg: mark NO_ARG_TYPES (payments, sp_temps, cashflow, suppliers, meta)
+  // ─ explicit 'bills' + 'stmts' เสมอ — persistMainState ถูกเรียกหลังแก้ข้อมูล
+  //   ถ้าไม่มีการเปลี่ยนจริง → fingerprint detect → push skip อยู่แล้ว
+  try {
+    syncManager.markDirty();           // NO_ARG_TYPES
+    syncManager.markDirty('bills');    // bills explicit
+    syncManager.markDirty('stmts');    // stmts explicit
+  } catch(_) {}
 }
 
 // Flush pending writes ทันที (เรียกก่อน save หรือปิดหน้า)
@@ -3313,7 +3355,25 @@ function openQuickMatchModal(b) {
   }
   
   const bankCounts = computeBankCounts();
-  const allBanks = ['KTB','KBANK','BBL','BBL NW'];
+  // สร้าง list ของ banks แบบ dynamic จากข้อมูลจริงใน statements (ไม่ hardcode)
+  // + ลำดับ priority: banks ที่รู้จัก (KTB, KBANK, BBL, BBL NW, TTB, SCB, ...) ขึ้นก่อน, 
+  //   ที่เหลือเรียง alphabetical — ป้องกันตกธนาคารในอนาคต
+  const BANK_ORDER = ['KTB','KBANK','BBL','BBL NW','TTB','SCB','KKP','UOB','CIMB','LH'];
+  const bankSet = new Set();
+  getAllStatements().forEach(s => {
+    const bk = String(s.bank || '').trim().toUpperCase();
+    if (bk) bankSet.add(bk);
+  });
+  // Also include known priority banks even if 0 stmts (so user sees them if data arrives)
+  BANK_ORDER.forEach(bk => bankSet.add(bk));
+  const allBanks = [...bankSet].sort((a, b) => {
+    const ia = BANK_ORDER.indexOf(a);
+    const ib = BANK_ORDER.indexOf(b);
+    if (ia !== -1 && ib !== -1) return ia - ib;
+    if (ia !== -1) return -1;
+    if (ib !== -1) return 1;
+    return a.localeCompare(b);
+  });
   const billAmt0 = Math.abs(Number(b.amount)||0);
   
   openModal(`🔗 Match Bill → Statement`, `
