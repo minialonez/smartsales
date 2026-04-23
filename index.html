@@ -3065,6 +3065,7 @@ function quickUnmatchBill(b) {
       delete stmt.matched_at;
       delete stmt.matched_by;
       delete stmt.match_reason;
+      delete stmt.overpay_amount;
       stmtCleared = true;
     }
   }
@@ -3198,10 +3199,11 @@ function openQuickMatchModal(b) {
       if (billDir === 'income' && stmtAmt < 0) return false;
       if (billDir === 'expense' && stmtAmt > 0) return false;
       
-      // Amount tolerance: ยอดตรงเป๊ะ หรือใกล้ ±5% / ±1 บาท (เหมือน Matching page)
+      // Amount tolerance: ยอดใกล้ ±20% หรือ ≤1 บาท 
+      // (เดิม 5% — แคบไปสำหรับ case ลูกค้าโอนเกิน, แต่ 20% ยังกรอง junk ออกได้)
       const absStmt = Math.abs(stmtAmt);
       const amtDiff = Math.abs(absStmt - targetSum);
-      if (amtDiff >= 1 && amtDiff >= targetSum * 0.05) return false;
+      if (amtDiff >= 1 && amtDiff >= targetSum * 0.20) return false;
       
       return true;
     }).sort((x, y) => {
@@ -3246,9 +3248,50 @@ function openQuickMatchModal(b) {
     renderBillChecklist();
     renderStatementList();
     
-    // Enable confirm เฉพาะเมื่อมีทั้ง bills + stmt
+    // ── Confirm enable logic ──
+    // เงื่อนไข: (1) เลือกบิลอย่างน้อย 1 (2) เลือก stmt (3) ถ้ามี diff → reason ต้องไม่ว่าง
     const confirmBtn = document.getElementById('qm-confirm');
-    if (confirmBtn) confirmBtn.disabled = !(selectedStmtRef && selectedBills.size > 0);
+    if (confirmBtn) {
+      const hasBasics = selectedStmtRef && selectedBills.size > 0;
+      let diff = 0;
+      if (hasBasics) {
+        const stmt = getAllStatements().find(s => s.ref_no === selectedStmtRef);
+        if (stmt) {
+          const stmtAbs = Math.abs(Number(stmt.amount)||0);
+          diff = stmtAbs - targetSum;  // + = ลูกค้าโอนเกิน (stmt > bills)
+        }
+      }
+      const hasDiff = Math.abs(diff) >= 0.01;
+      const reasonEl = document.getElementById('qm-reason');
+      const reasonFilled = (reasonEl?.value || '').trim().length > 0;
+      
+      // Update reason label + border — ให้ user เห็นชัดว่าต้องกรอก
+      const reasonLabel = document.getElementById('qm-reason-label');
+      const reasonGroup = document.getElementById('qm-reason-group');
+      if (hasDiff) {
+        if (reasonLabel) reasonLabel.innerHTML = `<span style="color:var(--danger)">* หมายเหตุ (บังคับเมื่อยอดต่าง)</span> — <span style="color:var(--warn)">diff ${diff > 0 ? '+' : ''}${fmtNum(diff)} (${diff > 0 ? 'ลูกค้าโอนเกิน' : 'ลูกค้าโอนขาด'})</span>`;
+        if (reasonEl && !reasonFilled) reasonEl.style.borderColor = 'var(--danger)';
+        else if (reasonEl) reasonEl.style.borderColor = '';
+        if (reasonGroup) reasonGroup.style.background = 'rgba(244,180,26,.05)';
+      } else {
+        if (reasonLabel) reasonLabel.innerHTML = `หมายเหตุ (optional) — เหตุผลการ match`;
+        if (reasonEl) reasonEl.style.borderColor = '';
+        if (reasonGroup) reasonGroup.style.background = '';
+      }
+      
+      confirmBtn.disabled = !hasBasics || (hasDiff && !reasonFilled);
+      
+      // Update label ของปุ่ม
+      if (hasDiff) {
+        confirmBtn.innerHTML = `⚠️ Match ยอดต่าง ${diff > 0 ? '+' : ''}฿${fmtNum(Math.abs(diff))}`;
+        confirmBtn.style.background = 'var(--warn)';
+        confirmBtn.style.borderColor = 'var(--warn)';
+      } else {
+        confirmBtn.innerHTML = `${ICONS.check} ผูกเข้ากัน`;
+        confirmBtn.style.background = '';
+        confirmBtn.style.borderColor = '';
+      }
+    }
   }
   
   function renderBillChecklist() {
@@ -3487,10 +3530,10 @@ function openQuickMatchModal(b) {
         <div id="qm-stmt-list" style="max-height:260px;overflow-y:auto;padding:4px;border:1px solid var(--border);border-radius:6px;background:var(--card)"></div>
       </div>
       
-      <!-- ⭐ Reason field (optional, เหมือน Matching page) -->
-      <div class="input-group" style="margin-top:4px">
-        <label style="font-size:.78rem;color:var(--text2)">หมายเหตุ (optional) — เหตุผลการ match</label>
-        <input class="input" id="qm-reason" placeholder="เช่น ลูกค้าโอนรวม 2 บิล, ยอดต่างเพราะ WHT..." style="font-size:.8rem;padding:6px 10px">
+      <!-- ⭐ Reason field — บังคับเมื่อยอดต่าง, แสดง diff ด้วย -->
+      <div class="input-group" id="qm-reason-group" style="margin-top:4px;padding:6px 8px;border-radius:6px;transition:background .15s">
+        <label id="qm-reason-label" style="font-size:.78rem;color:var(--text2)">หมายเหตุ (optional) — เหตุผลการ match</label>
+        <input class="input" id="qm-reason" placeholder="เช่น ลูกค้าโอนเกิน 575 คืนเงินสด / ปัดเศษ / หัก WHT..." style="font-size:.8rem;padding:6px 10px;transition:border-color .15s">
       </div>
       
       <div class="flex gap-2 mt-2">
@@ -3544,6 +3587,9 @@ function openQuickMatchModal(b) {
     });
   }
   
+  // ⭐ Wire reason input — trigger updateUI so confirm button re-evaluates enable state
+  document.getElementById('qm-reason')?.addEventListener('input', () => updateUI());
+  
   // Initial render
   updateUI();
   
@@ -3578,18 +3624,33 @@ function openQuickMatchModal(b) {
     });
     
     // Update statement — match_bill แสดงเลขบิล+ยอด ให้ user อ่านง่าย
+    // ── คำนวณ diff: stmt เทียบกับยอดรวมบิล ──
+    const stmtAbs = Math.abs(Number(stmt.amount)||0);
+    const selectedSum = getSelectedSum();
+    const diff = stmtAbs - selectedSum;  // + = ลูกค้าโอนเกิน (stmt > bills)
+    const hasDiff = Math.abs(diff) >= 0.01;
+    
     stmt.match_status = 'matched';
-    stmt.match_method = billArr.length > 1 ? 'quick_multi' : 'quick_manual';
+    // match_method: ถ้ายอดต่าง → 'manual_diff', ไม่ต่าง → multi/manual ตามปกติ
+    stmt.match_method = hasDiff ? 'manual_diff' 
+                      : (billArr.length > 1 ? 'quick_multi' : 'quick_manual');
     stmt.match_station = billArr[0].station || '';
     stmt.match_bill = billArr.length > 1 ? billLabels.join(' + ') : billLabels[0];
     if (billArr.length > 1) stmt.matched_bills = billNos; // เลขบิลล้วน (ใช้ใน unmatch lookup)
     else delete stmt.matched_bills;
     stmt.matched_at = now;
     stmt.matched_by = currentUser?.display_name || 'Admin';
-    // ⭐ User reason ชนะ auto-reason (เหมือน Matching page)
+    // ⭐ Overpay amount: + = โอนเกิน (ลูกค้าจ่ายเกินยอดบิล), − = โอนขาด
+    if (hasDiff) stmt.overpay_amount = diff;
+    else delete stmt.overpay_amount;
+    // ⭐ User reason — บังคับเมื่อ diff, optional เมื่อไม่ต่าง
     const userReason = (document.getElementById('qm-reason')?.value || '').trim();
+    if (hasDiff && !userReason) {
+      toast('ยอดต่าง ' + (diff > 0 ? '+' : '') + fmtNum(diff) + ' — ต้องกรอกหมายเหตุ', 'warn');
+      return;
+    }
     stmt.match_reason = userReason || (billArr.length > 1 
-      ? `Quick match ${billArr.length} บิล รวม ฿${fmtNum(getSelectedSum())}` 
+      ? `Quick match ${billArr.length} บิล รวม ฿${fmtNum(selectedSum)}` 
       : 'Quick match จากหน้า Main');
     
     try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(_){}
@@ -4240,7 +4301,7 @@ async function renderMain(el) {
       ` : ''}
       
       <div class="flex justify-between items-center mb-2">
-        <div class="font-semi">📋 Bill List (${billList.length} รายการ${paidCount?` · <span style="color:var(--success)">จ่ายแล้ว ${paidCount}</span>`:''}${filterDateFrom||filterDateTo?` · กรอง ${filterDateFrom||'…'} → ${filterDateTo||'…'}`:''}${filterBillSearch?` · <span style="color:var(--info)">🔍 ค้น "${filterBillSearch}" = ${data.length}</span>`:''})</div>
+        <div class="font-semi">📋 Bill List (${billList.length} รายการ${filterDateFrom||filterDateTo?` · กรอง ${filterDateFrom||'…'} → ${filterDateTo||'…'}`:''}${filterBillSearch?` · <span style="color:var(--info)">🔍 ค้น "${filterBillSearch}" = ${data.length}</span>`:''})</div>
         <div class="flex gap-2 flex-wrap">
           <div style="position:relative">
             <input type="text" class="input" id="filter-bill-search" value="${filterBillSearch.replace(/"/g,'&quot;')}" placeholder="🔍 ค้นเลขบิล / confirmation / remarks / ยอด..." style="width:280px;font-size:.8rem;padding-right:28px">
@@ -4249,7 +4310,6 @@ async function renderMain(el) {
           <input type="date" class="input" id="filter-date-from" value="${filterDateFrom}" placeholder="จาก" title="วันที่เริ่ม" style="width:140px;font-size:.8rem">
           <input type="date" class="input" id="filter-date-to" value="${filterDateTo}" placeholder="ถึง" title="วันที่สิ้นสุด" style="width:140px;font-size:.8rem">
           ${filterDateFrom||filterDateTo?'<button class="btn btn-ghost btn-sm" id="btn-clear-date">✕ ล้างวันที่</button>':''}
-          ${paidCount?`<button class="btn ${hidePaid?'btn-primary':'btn-outline'} btn-sm" id="btn-hide-paid">${hidePaid?'👁️ แสดงบิลที่จ่ายแล้ว':'🚫 ซ่อนบิลที่จ่ายแล้ว'}</button>`:''}
           <button class="btn btn-primary btn-sm" id="btn-add-bill">${ICONS.plus} เพิ่มบิล</button>
           <button class="btn btn-outline btn-sm" id="btn-bulk-date">📅 Bulk</button>
           <button class="btn btn-outline btn-sm" id="btn-auto-duedate">⚡ Auto Due</button>
@@ -12221,9 +12281,12 @@ async function renderMatching(el) {
                     </span>` : ''}
                   </td>
                   <td>${s.match_station?`<span class="badge badge-info">${s.match_station}</span>`:'-'}</td>
-                  <td class="text-xs">${s.match_bill||'-'}</td>
+                  <td class="text-xs">
+                    ${s.match_bill||'-'}
+                    ${s.overpay_amount ? `<br><span class="badge" style="background:rgba(244,180,26,.15);color:var(--warn);font-size:.65rem;margin-top:2px" title="${(s.match_reason||'').replace(/"/g,'&quot;')}">⚠️ ${Number(s.overpay_amount) > 0 ? '+' : ''}${fmtNum(Number(s.overpay_amount))} ${Number(s.overpay_amount) > 0 ? 'โอนเกิน' : 'โอนขาด'}</span>` : ''}
+                  </td>
                   <td>${isMatched
-                    ? `<span class="badge badge-success">✓ ${isManual?'Manual':'Auto'}</span> <button class="btn btn-ghost btn-sm btn-unmatch" data-stmt-idx="${i}" title="ยกเลิก match">${ICONS.edit}</button>`
+                    ? `<span class="badge badge-success">✓ ${isManual?'Manual':'Auto'}${s.match_method === 'manual_diff' ? ' · diff' : ''}</span> <button class="btn btn-ghost btn-sm btn-unmatch" data-stmt-idx="${i}" title="ยกเลิก match">${ICONS.edit}</button>`
                     : `<span class="badge badge-danger">✗ ไม่พบ</span> <button class="btn btn-primary btn-sm btn-manual-match" data-stmt-idx="${i}">${ICONS.search} Match เอง</button>`
                   }</td>
                 </tr>
@@ -12623,7 +12686,8 @@ async function renderMatching(el) {
             sum += isSC ? -val : val;
           });
           const stmtAbs = Math.abs(stmtAmt);
-          const diff = Math.abs(sum - stmtAbs);
+          const signedDiff = sum - stmtAbs;  // + = bills เกิน stmt, − = bills ขาด stmt
+          const diff = Math.abs(signedDiff);
           const isMatch = diff < 0.01;
           document.getElementById('mm-sum-count').textContent = cnt;
           document.getElementById('mm-sum-amount').textContent = '฿' + fmtNum(sum);
@@ -12631,9 +12695,30 @@ async function renderMatching(el) {
           if (isMatch) {
             diffEl.innerHTML = '<span style="color:var(--success);font-weight:600">✓ ตรงเป๊ะ</span>';
           } else {
-            diffEl.innerHTML = `<span style="color:var(--warn)">ต่าง ${fmtNum(sum - stmtAbs)}</span>`;
+            // overpay_amount เป็น "stmt - bills sum" → positive = ลูกค้าโอนเกิน
+            const overpay = stmtAbs - sum;
+            diffEl.innerHTML = `<span style="color:var(--warn)">ต่าง ${fmtNum(signedDiff)} — ${overpay > 0 ? 'ลูกค้าโอนเกิน' : 'ลูกค้าโอนขาด'} ${fmtNum(Math.abs(overpay))}</span>`;
           }
-          document.getElementById('mm-confirm').disabled = !isMatch;
+          
+          // ⭐ Enable diff-match: ถ้ายอดต่าง → ต้องกรอก reason
+          const reasonEl = document.getElementById('mm-reason');
+          const reasonFilled = (reasonEl?.value || '').trim().length > 0;
+          const confirmBtn = document.getElementById('mm-confirm');
+          if (confirmBtn) {
+            if (isMatch) {
+              confirmBtn.disabled = false;
+              confirmBtn.innerHTML = ICONS.check + ' ยืนยัน Match';
+              confirmBtn.style.background = '';
+              if (reasonEl) reasonEl.style.borderColor = '';
+            } else {
+              confirmBtn.disabled = !reasonFilled;
+              const overpay = stmtAbs - sum;
+              confirmBtn.innerHTML = `⚠️ Match ยอดต่าง ${overpay > 0 ? '+' : ''}฿${fmtNum(Math.abs(overpay))}`;
+              confirmBtn.style.background = 'var(--warn)';
+              // Red border ถ้ายังไม่กรอก reason
+              if (reasonEl) reasonEl.style.borderColor = reasonFilled ? '' : 'var(--danger)';
+            }
+          }
         }
         
         function renderBillList(searchText) {
@@ -12743,6 +12828,9 @@ async function renderMatching(el) {
         renderBillList('');
         document.getElementById('mm-search')?.addEventListener('input', debounce(e => renderBillList(e.target.value), 200));
         
+        // ⭐ Wire mm-reason → trigger updateSumBar so Confirm button re-evaluates (บังคับ reason เมื่อ diff)
+        document.getElementById('mm-reason')?.addEventListener('input', () => updateSumBar());
+        
         // ── Enable confirm เมื่อกรอกเลขบิลเอง (เฉพาะกรณีไม่มี bill ที่เลือก) ──
         document.getElementById('mm-manual-bill')?.addEventListener('input', (e) => {
           if (e.target.value.trim() && selectedBills.size === 0) {
@@ -12812,14 +12900,38 @@ async function renderMatching(el) {
           }
           
           // อัปเดต Statement
+          // ── คำนวณ diff: stmt vs ยอดรวมบิลที่เลือก ──
+          let selectedBillSum = 0;
+          if (selectedBills.size > 0) {
+            selectedBills.forEach(bi => {
+              if (!bi) return;
+              const isSC = ['SC','JS','JR'].includes(String(bi.bill_no||'').substring(0,2).toUpperCase());
+              const val = mmBillMatchAmt(bi);
+              selectedBillSum += isSC ? -val : val;
+            });
+          }
+          const stmtAbsForDiff = Math.abs(Number(stmt.amount)||0);
+          const diff = stmtAbsForDiff - selectedBillSum;  // + = ลูกค้าโอนเกิน
+          const hasDiff = selectedBills.size > 0 && Math.abs(diff) >= 0.01;
+          
+          // ⭐ ถ้ายอดต่าง → reason บังคับ
+          if (hasDiff && !reason.trim()) {
+            toast('ยอดต่าง ' + (diff > 0 ? '+' : '') + fmtNum(diff) + ' — ต้องกรอกหมายเหตุ', 'warn');
+            return;
+          }
+          
           stmt.match_status = 'matched';
-          stmt.match_method = matchedBills.length > 1 ? 'manual_multi' : 'manual';
+          stmt.match_method = hasDiff ? 'manual_diff' 
+                            : (matchedBills.length > 1 ? 'manual_multi' : 'manual');
           stmt.match_station = matchStation;
           stmt.match_bill = matchBillNo;
           if (matchedBills.length > 1) stmt.matched_bills = matchedBills;  // traceability
           else delete stmt.matched_bills;
           stmt.matched_at = new Date().toISOString();
           stmt.matched_by = currentUser?.display_name || 'Admin';
+          // ⭐ Overpay amount
+          if (hasDiff) stmt.overpay_amount = diff;
+          else delete stmt.overpay_amount;
           stmt.match_reason = reason || (manualBill ? 'กรอกเลขบิลเอง' : (matchedBills.length > 1 ? `รวม ${matchedBills.length} บิล` : ''));
           
           // Persist
@@ -12867,6 +12979,7 @@ async function renderMatching(el) {
         delete stmt.matched_at;
         delete stmt.matched_by;
         delete stmt.match_reason;
+        delete stmt.overpay_amount;
         
         try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(e) {}
         persistMainState();
