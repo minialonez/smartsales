@@ -2863,107 +2863,252 @@ function quickUnmatchBill(b) {
 }
 
 // Open Quick Match modal: เลือก statement วันเดียวกัน + ธนาคารเดียวกัน
+// รองรับ multi-bill selection (ผูกหลายบิล → statement เดียวที่ยอดรวมตรงกัน)
 function openQuickMatchModal(b) {
   if (!b) return;
   const billDate = toISODate(b.date);
-  const billAmt = Math.abs(Number(b.amount)||0);
   const billBank = String(b.bank||'').trim().toUpperCase();
   
   // State ของ modal
-  let selectedBank = billBank || 'ALL'; // default = bank ของ bill
+  let selectedBank = billBank || 'ALL';
   let selectedStmtRef = '';
+  let dateWindow = 'day';           // day | day3 | day7 (เดิม = day, ขยายได้ถ้าไม่เจอ)
+  // Multi-bill: Set ของ bill references (ใช้ object ref แทน bill_no เพื่อกัน bill_no ว่างหรือซ้ำ)
+  const selectedBills = new Set();
+  selectedBills.add(b); // บิลที่เปิด modal มา = ติ๊กอัตโนมัติ
   
-  function computeCandidates() {
-    const all = getAllStatements();
-    return all.filter(s => {
-      if (s.match_status === 'matched') return false;
-      const sDate = toISODate(s.date || s.trans_date);
-      if (sDate !== billDate) return false;
-      if (selectedBank !== 'ALL' && String(s.bank||'').toUpperCase() !== selectedBank) return false;
-      // ทิศทาง: bill type Transfer/Cheque/Card = receive → statement amount > 0
-      // (ยกเว้น Refund แต่ quick-match ไม่เปิดให้ Refund อยู่แล้ว)
-      // default: match ทั้งทิศทางไปก่อน เพื่อ flexibility
+  // หาบิลอื่นที่ใกล้เคียงเพื่อเสนอให้ผูกร่วม:
+  //   - วันเดียวกัน (หรือ ±window)
+  //   - Type Transfer/Cheque/Card เหมือนกัน
+  //   - ยังไม่ matched / paid / void
+  //   - ยังไม่ถูก SP ตัด (ไม่มี paid_by_sp)
+  function getEligibleBills() {
+    const dayMs = 24*60*60*1000;
+    const winDays = dateWindow === 'day' ? 0 : dateWindow === 'day3' ? 1 : 3;
+    const refDate = new Date(billDate);
+    
+    return billList.filter(x => {
+      if (!x) return false;
+      // อย่าซ้ำตัวเอง
+      if (x === b) return false;
+      // Status: เอาเฉพาะที่ match ได้
+      if (['matched','paid','void','bounced'].includes(x.match_status)) return false;
+      if (x.paid_by_sp) return false;
+      // Type ต้อง match ได้ (Transfer/Cheque/Card)
+      if (!['Transfer','Cheque','Card'].includes(x.type)) return false;
+      // Date window
+      const xDate = toISODate(x.date);
+      if (!xDate) return false;
+      const diff = Math.abs((new Date(xDate) - refDate) / dayMs);
+      if (diff > winDays) return false;
+      // ถ้า bank ระบุไว้ → ต้องตรงกับ bank ของบิลแรก หรือว่างก็ได้ (user จะกรอกทีหลัง)
       return true;
-    }).sort((a,c) => {
-      // ยอดตรงเป๊ะขึ้นก่อน
-      const da = Math.abs(Math.abs(Number(a.amount)||0) - billAmt);
-      const dc = Math.abs(Math.abs(Number(c.amount)||0) - billAmt);
-      return da - dc;
     });
   }
   
-  // นับ statement แต่ละธนาคาร (เฉพาะวันนั้น + unmatched)
+  // Sum ของบิลที่เลือก (absolute value — direction บน statement จะดูแยก)
+  function getSelectedSum() {
+    let sum = 0;
+    selectedBills.forEach(x => { sum += Math.abs(Number(x.amount)||0); });
+    return sum;
+  }
+  
+  function computeCandidates() {
+    const targetSum = getSelectedSum();
+    const all = getAllStatements();
+    const dayMs = 24*60*60*1000;
+    const winDays = dateWindow === 'day' ? 0 : dateWindow === 'day3' ? 1 : 3;
+    const refDate = new Date(billDate);
+    
+    return all.filter(s => {
+      // Match status: check both explicit 'matched' AND presence of match_bill (บาง flow set bill แต่ลืม status)
+      if (s.match_status === 'matched' || s.match_bill) return false;
+      
+      const sDate = toISODate(s.date || s.trans_date);
+      if (!sDate) return false;
+      const diff = Math.abs((new Date(sDate) - refDate) / dayMs);
+      if (diff > winDays) return false;
+      
+      if (selectedBank !== 'ALL' && String(s.bank||'').toUpperCase() !== selectedBank) return false;
+      return true;
+    }).sort((x, y) => {
+      // ยอดตรงเป๊ะกับ targetSum ขึ้นก่อน, รองคือ amount ใกล้ target
+      const dx = Math.abs(Math.abs(Number(x.amount)||0) - targetSum);
+      const dy = Math.abs(Math.abs(Number(y.amount)||0) - targetSum);
+      return dx - dy;
+    });
+  }
+  
   function computeBankCounts() {
     const counts = {};
+    const dayMs = 24*60*60*1000;
+    const winDays = dateWindow === 'day' ? 0 : dateWindow === 'day3' ? 1 : 3;
+    const refDate = new Date(billDate);
+    
     getAllStatements().forEach(s => {
-      if (s.match_status === 'matched') return;
+      if (s.match_status === 'matched' || s.match_bill) return;
       const sDate = toISODate(s.date || s.trans_date);
-      if (sDate !== billDate) return;
+      if (!sDate) return;
+      const diff = Math.abs((new Date(sDate) - refDate) / dayMs);
+      if (diff > winDays) return;
       const bk = String(s.bank||'UNKNOWN').toUpperCase();
       counts[bk] = (counts[bk]||0) + 1;
     });
     return counts;
   }
   
-  function renderList() {
+  // Re-render sum bar + candidate list based on current selection
+  function updateUI() {
+    const targetSum = getSelectedSum();
+    // Update header sum
+    const sumEl = document.getElementById('qm-target-sum');
+    if (sumEl) sumEl.textContent = `฿${fmtNum(targetSum)}`;
+    const countEl = document.getElementById('qm-bill-count');
+    if (countEl) countEl.textContent = selectedBills.size;
+    
+    renderBillChecklist();
+    renderStatementList();
+    
+    // Enable confirm เฉพาะเมื่อมีทั้ง bills + stmt
+    const confirmBtn = document.getElementById('qm-confirm');
+    if (confirmBtn) confirmBtn.disabled = !(selectedStmtRef && selectedBills.size > 0);
+  }
+  
+  function renderBillChecklist() {
+    const container = document.getElementById('qm-bill-list');
+    if (!container) return;
+    const targetSum = getSelectedSum();
+    
+    // รวมบิลเปิด + eligible (แยกเปิด modal vs อื่นๆ)
+    const others = getEligibleBills();
+    const allBills = [b, ...others];
+    
+    container.innerHTML = allBills.map((x, i) => {
+      const isSelected = selectedBills.has(x);
+      const xAmt = Math.abs(Number(x.amount)||0);
+      const isOpener = x === b;
+      return `
+        <label class="qm-bill-item" data-idx="${i}" 
+               style="display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid var(--border);cursor:pointer;${isSelected?'background:rgba(79,156,249,.12)':''}">
+          <input type="checkbox" class="qm-bill-check" ${isSelected?'checked':''} ${isOpener?'disabled':''} style="cursor:pointer;accent-color:var(--info);width:16px;height:16px">
+          <div style="flex:1;min-width:0;font-size:.82rem">
+            <div class="flex items-center gap-2">
+              <span style="font-weight:600">${x.bill_no || '(ไม่มีเลข)'}</span>
+              <span class="badge" style="background:var(--surface2);font-size:.65rem">${x.type||'-'}</span>
+              ${isOpener ? '<span class="badge badge-info" style="font-size:.65rem">⭐ บิลแรก</span>' : ''}
+            </div>
+            <div class="text-xs text-muted">${fmtDate(x.date)} · ${x.station||'-'}${x.bank?` · ${x.bank}`:''}</div>
+          </div>
+          <div style="font-weight:700;color:var(--success);font-size:.88rem">฿${fmtNum(xAmt)}</div>
+        </label>
+      `;
+    }).join('');
+    
+    // Store refs for click handling
+    container._bills = allBills;
+    
+    container.querySelectorAll('.qm-bill-item').forEach((item, idx) => {
+      const bill = allBills[idx];
+      const chk = item.querySelector('.qm-bill-check');
+      if (!chk || chk.disabled) return;
+      item.addEventListener('click', (e) => {
+        if (e.target.tagName === 'INPUT') return; // checkbox ดูแลเอง
+        chk.checked = !chk.checked;
+        if (chk.checked) selectedBills.add(bill);
+        else selectedBills.delete(bill);
+        updateUI();
+      });
+      chk.addEventListener('change', () => {
+        if (chk.checked) selectedBills.add(bill);
+        else selectedBills.delete(bill);
+        updateUI();
+      });
+    });
+  }
+  
+  function renderStatementList() {
     const list = computeCandidates();
     const container = document.getElementById('qm-stmt-list');
     if (!container) return;
+    const targetSum = getSelectedSum();
     
     if (list.length === 0) {
       container.innerHTML = `<div style="padding:20px;text-align:center;color:var(--text3);font-size:.85rem">
-        ไม่พบ statement ${selectedBank!=='ALL'?`ของ ${selectedBank} `:''}วันที่ ${fmtDate(billDate)} ที่ยังไม่ถูก match
+        ไม่พบ statement ${selectedBank!=='ALL'?`ของ ${selectedBank} `:''}${dateWindow==='day'?`วันที่ ${fmtDate(billDate)}`:`ใน ±${dateWindow==='day3'?1:3} วันจาก ${fmtDate(billDate)}`} ที่ยังไม่ถูก match
+        <div style="margin-top:8px">💡 ลองขยายช่วงวันที่ด้านบน หรือเปลี่ยนธนาคาร</div>
       </div>`;
       return;
     }
     
     container.innerHTML = list.map(s => {
       const absAmt = Math.abs(Number(s.amount)||0);
-      const isExact = Math.abs(absAmt - billAmt) < 0.01;
+      const diff = Math.abs(absAmt - targetSum);
+      const isExact = diff < 0.01;
       const isSelected = s.ref_no === selectedStmtRef;
       const dir = Number(s.amount) >= 0 ? '+' : '−';
       const dirColor = Number(s.amount) >= 0 ? 'var(--success)' : 'var(--danger)';
+      // Highlight: เลือก → border ฟ้า, ยอดตรง → border เขียว
+      const border = isSelected 
+        ? 'border:2px solid var(--info);box-shadow:0 0 0 2px rgba(79,156,249,.25)' 
+        : isExact ? 'border:1px solid var(--success);border-left:4px solid var(--success)'
+        : 'border:1px solid transparent;border-bottom:1px solid var(--border)';
       return `
         <div class="qm-item" data-ref="${s.ref_no||''}" 
-             style="padding:10px 12px;border-bottom:1px solid var(--border);cursor:pointer;${isSelected?'background:rgba(79,156,249,.12)':''};${isExact?'border-left:3px solid var(--success)':''}">
+             style="padding:10px 12px;cursor:pointer;transition:all .15s;${isSelected?'background:rgba(79,156,249,.18)':''};${border};border-radius:4px;margin-bottom:2px">
           <div class="flex justify-between items-center">
             <div style="flex:1;min-width:0">
-              <div style="font-weight:700;color:${dirColor};font-size:.9rem">${dir}฿${fmtNum(absAmt)}</div>
+              <div style="font-weight:700;color:${dirColor};font-size:.9rem">
+                ${isSelected ? '✓ ' : ''}${dir}฿${fmtNum(absAmt)}
+              </div>
               <div class="text-xs text-muted" style="margin-top:2px">
                 ${fmtDate(s.date)} · ${s.bank||'?'} · ref: ${s.ref_no||'-'}
               </div>
               ${s.description?`<div class="text-xs" style="color:var(--text2);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${String(s.description).substring(0,80)}</div>`:''}
             </div>
-            ${isExact?'<span class="badge badge-success" style="font-size:.7rem">ยอดตรง ✓</span>':`<span class="text-xs" style="color:var(--text3)">ต่าง ฿${fmtNum(Math.abs(absAmt-billAmt))}</span>`}
+            ${isExact
+              ? '<span class="badge badge-success" style="font-size:.7rem;white-space:nowrap">ยอดตรง ✓</span>'
+              : `<span class="text-xs" style="color:var(--text3);white-space:nowrap">ต่าง ฿${fmtNum(diff)}</span>`}
           </div>
         </div>
       `;
     }).join('');
     
-    // Wire click
     container.querySelectorAll('.qm-item').forEach(el => {
       el.addEventListener('click', () => {
         selectedStmtRef = el.dataset.ref;
-        renderList();
-        document.getElementById('qm-confirm').disabled = !selectedStmtRef;
+        updateUI();
       });
     });
   }
   
   const bankCounts = computeBankCounts();
   const allBanks = ['KTB','KBANK','BBL','BBL NW'];
+  const billAmt0 = Math.abs(Number(b.amount)||0);
   
   openModal(`🔗 Match Bill → Statement`, `
-    <div class="flex-col gap-3" style="min-width:500px">
+    <div class="flex-col gap-3" style="min-width:600px;max-width:700px">
       <div style="padding:10px;background:var(--bg2);border-radius:6px;font-size:.85rem">
-        Bill: <b>${b.bill_no||'(ไม่มีเลข)'}</b> · ${b.type||'-'} · <b style="color:var(--success)">฿${fmtNum(billAmt)}</b> · ${fmtDate(billDate)}
-        ${b.station?`<br><span class="text-xs text-muted">Station: ${b.station}</span>`:''}
-        ${billBank?`<br><span class="text-xs text-muted">Bank ที่ระบุ: ${billBank}</span>`:''}
+        <div>
+          <b>บิลแรก:</b> ${b.bill_no||'(ไม่มีเลข)'} · ${b.type||'-'} · <b style="color:var(--success)">฿${fmtNum(billAmt0)}</b> · ${fmtDate(billDate)}
+        </div>
+        ${b.station?`<div class="text-xs text-muted" style="margin-top:2px">Station: ${b.station}${b.bank?` · Bank: ${b.bank}`:''}</div>`:''}
       </div>
       
+      <!-- Bills selector -->
       <div>
-        <div class="text-xs text-dim" style="margin-bottom:6px">เลือกธนาคาร:</div>
-        <div class="flex gap-1 flex-wrap" id="qm-bank-pills">
+        <div class="flex justify-between items-center" style="margin-bottom:6px">
+          <div class="text-xs text-dim">เลือกบิลที่จะผูกพร้อมกัน (ยอดรวม → statement เดียว):</div>
+          <div class="text-xs" style="color:var(--info)">
+            เลือก <b id="qm-bill-count">1</b> บิล · รวม: <b id="qm-target-sum" style="color:var(--success)">฿${fmtNum(billAmt0)}</b>
+          </div>
+        </div>
+        <div id="qm-bill-list" style="max-height:180px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;background:var(--card)"></div>
+      </div>
+      
+      <!-- Bank + Date window filter -->
+      <div class="flex gap-2 flex-wrap items-center">
+        <div class="text-xs text-dim">ธนาคาร:</div>
+        <div class="flex gap-1 flex-wrap" id="qm-bank-pills" style="flex:1">
           ${allBanks.map(bk => {
             const c = bankCounts[bk]||0;
             const active = selectedBank === bk;
@@ -2973,9 +3118,21 @@ function openQuickMatchModal(b) {
         </div>
       </div>
       
+      <div class="flex gap-2 flex-wrap items-center">
+        <div class="text-xs text-dim">ช่วงวันที่:</div>
+        <div class="flex gap-1" id="qm-date-pills">
+          <button class="pill ${dateWindow==='day'?'active':''}" data-dw="day">วันนี้ (${fmtDate(billDate)})</button>
+          <button class="pill ${dateWindow==='day3'?'active':''}" data-dw="day3">±1 วัน</button>
+          <button class="pill ${dateWindow==='day7'?'active':''}" data-dw="day7">±3 วัน</button>
+        </div>
+        <div style="flex:1"></div>
+        <div class="text-xs text-muted">💡 ขยายช่วงถ้าไม่เจอ statement</div>
+      </div>
+      
+      <!-- Statement list -->
       <div>
-        <div class="text-xs text-dim" style="margin-bottom:6px">Statement วันเดียวกันที่ยังไม่ match:</div>
-        <div id="qm-stmt-list" style="max-height:280px;overflow-y:auto;border:1px solid var(--border);border-radius:6px"></div>
+        <div class="text-xs text-dim" style="margin-bottom:6px">Statement ที่ยังไม่ match (เรียงยอดใกล้รวมที่สุดก่อน):</div>
+        <div id="qm-stmt-list" style="max-height:260px;overflow-y:auto;padding:4px;border:1px solid var(--border);border-radius:6px;background:var(--card)"></div>
       </div>
       
       <div class="flex gap-2 mt-2">
@@ -2991,40 +3148,69 @@ function openQuickMatchModal(b) {
       selectedBank = p.dataset.bank;
       document.querySelectorAll('#qm-bank-pills .pill').forEach(x => x.classList.toggle('active', x.dataset.bank === selectedBank));
       selectedStmtRef = '';
-      document.getElementById('qm-confirm').disabled = true;
-      renderList();
+      updateUI();
     });
   });
   
-  renderList();
+  // Wire date window pills
+  document.querySelectorAll('#qm-date-pills [data-dw]').forEach(p => {
+    p.addEventListener('click', () => {
+      dateWindow = p.dataset.dw;
+      document.querySelectorAll('#qm-date-pills .pill').forEach(x => x.classList.toggle('active', x.dataset.dw === dateWindow));
+      selectedStmtRef = '';
+      updateUI();
+    });
+  });
   
+  // Initial render
+  updateUI();
+  
+  // Confirm: ผูก statement เดียว ↔ หลาย bills
   document.getElementById('qm-confirm')?.addEventListener('click', () => {
+    if (selectedBills.size === 0) { toast('ต้องเลือกอย่างน้อย 1 บิล', 'warn'); return; }
+    if (!selectedStmtRef) { toast('ต้องเลือก statement', 'warn'); return; }
+    
     const allStmts = getAllStatements();
     const stmt = allStmts.find(s => s.ref_no === selectedStmtRef);
     if (!stmt) { toast('ไม่พบ statement', 'error'); return; }
     
-    // Update bill
-    b.match_status = 'matched';
-    b.confirmation = stmt.bank || '';
-    if (!b.pay_date) b.pay_date = toISODate(stmt.date) || toISODate(b.date);
-    b.matched_stmt_ref = stmt.ref_no || '';
-    b.matched_at = new Date().toISOString();
+    const billArr = Array.from(selectedBills);
+    const billNos = billArr.map(x => x.bill_no || '(no#)');
+    const now = new Date().toISOString();
+    const stmtDateISO = toISODate(stmt.date) || toISODate(b.date);
+    
+    // Update bills (ทุกตัวที่ติ๊ก)
+    billArr.forEach(x => {
+      x.match_status = 'matched';
+      x.confirmation = stmt.bank || '';
+      if (!x.pay_date) x.pay_date = stmtDateISO;
+      x.matched_stmt_ref = stmt.ref_no || '';
+      x.matched_at = now;
+    });
     
     // Update statement
     stmt.match_status = 'matched';
-    stmt.match_method = 'quick_manual';
-    stmt.match_station = b.station || '';
-    stmt.match_bill = b.bill_no || '';
-    stmt.matched_at = new Date().toISOString();
+    stmt.match_method = billArr.length > 1 ? 'quick_multi' : 'quick_manual';
+    stmt.match_station = billArr[0].station || '';
+    stmt.match_bill = billArr.length > 1 ? billNos.join(' + ') : billNos[0];
+    if (billArr.length > 1) stmt.matched_bills = billNos;
+    else delete stmt.matched_bills;
+    stmt.matched_at = now;
     stmt.matched_by = currentUser?.display_name || 'Admin';
-    stmt.match_reason = 'Quick match จากหน้า Main';
-    delete stmt.matched_bills; // single-bill match
+    stmt.match_reason = billArr.length > 1 
+      ? `Quick match ${billArr.length} บิล รวม ฿${fmtNum(getSelectedSum())}` 
+      : 'Quick match จากหน้า Main';
     
     try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(_){}
     persistMainState();
     invalidateBillsCache();
     closeModal();
-    toast(`Match สำเร็จ: ${b.bill_no||'(bill)'} ↔ ${stmt.bank} ฿${fmtNum(Math.abs(Number(stmt.amount)||0))}`, 'success');
+    toast(
+      billArr.length > 1
+        ? `Match ${billArr.length} บิลสำเร็จ: ${billNos.join(' + ')} ↔ ${stmt.bank} ฿${fmtNum(Math.abs(Number(stmt.amount)||0))}`
+        : `Match สำเร็จ: ${billNos[0]} ↔ ${stmt.bank} ฿${fmtNum(Math.abs(Number(stmt.amount)||0))}`,
+      'success', 4000
+    );
     
     // Re-render
     if (typeof currentPage !== 'undefined' && currentPage === 'main') navigateTo('main');
