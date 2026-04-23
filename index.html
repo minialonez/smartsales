@@ -3439,6 +3439,9 @@ async function renderMain(el) {
   // ถ้าไม่เก็บ → selectedDate reset เป็น todayISO() ทุกครั้ง → หน้าจอเด้งไปวันปัจจุบัน
   let selectedDate = window.__mainSelectedDate || todayISO();
   window.__mainSelectedDate = selectedDate;
+  // SP section (merged from Payments page) — preserve expand state across re-renders
+  const expandedSpMain = new Set();
+  const expandedTempMain = new Set();
 
   const TYPE_OPTIONS = ['', 'Cash', 'Transfer', 'Card', 'Cheque', 'Other', 'Unknown', 'Refund'];
   const STATION_OPTIONS = ['', 'Front1', 'Front2', 'Front3', 'Front4', 'Invoice', 'Invoice Credit', 'Order', 'Order Credit', 'Payment'];
@@ -4281,9 +4284,21 @@ async function renderMain(el) {
           })()}">รวม (${data.length} บิล): ฿${fmtNum(totalAmount)}</span>
         </div>
       </div>
+
+      <!-- ═══════ SECTION 4: SP Payments (merged from Payments page) ═══════ -->
+      <div id="main-sp-section" style="margin-top:16px"></div>
     `;
 
     bindMainEvents();
+
+    // Mount SP section (SP-TEMP + SP table filtered by selectedDate)
+    renderSpSectionsForDate({
+      container: document.getElementById('main-sp-section'),
+      dateFilter: selectedDate,
+      expandedTempSet: expandedTempMain,
+      expandedSpSet: expandedSpMain,
+      onChange: () => { renderKeepScroll(); },
+    });
   }
   
   // ── renderKeepScroll: re-render หน้าโดย preserve scroll position ──
@@ -6375,6 +6390,297 @@ function spTempAutoGraduateDialog(newRealSPs) {
     closeModal();
     toast(`Graduate ${graduated} SP-TEMP สำเร็จ`, 'success');
     if (currentPage === 'payments') navigateTo('payments');
+  });
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// renderSpSectionsForDate — reusable SP section สำหรับฝังในหน้า Main
+// ══════════════════════════════════════════════════════════════════════════
+// ใช้ render SP-TEMP box + SP table ภายใน container ที่ระบุ กรองตามวันที่ (หรือไม่กรอง)
+// opts: {
+//   container: HTMLElement | null,  // ที่ฝัง HTML
+//   dateFilter: ISO date string | null,  // null = all dates
+//   expandedTempSet: Set,  // สำหรับ preserve expand state across re-renders
+//   expandedSpSet: Set,
+//   onChange: function,  // เรียกหลังแก้ข้อมูล (เช่น ลบ partial) → caller จะ re-render
+// }
+function renderSpSectionsForDate(opts) {
+  const { container, dateFilter, expandedTempSet, expandedSpSet, onChange } = opts;
+  if (!container) return;
+
+  // ── Filter data by date ──
+  // SP-TEMP: filter ตาม t.date (วันที่สร้าง) OR บาง partial ตกวันนั้น
+  // SP (payment): filter ตาม p.date
+  const matchDate = (d) => !dateFilter || toISODate(d) === dateFilter;
+  const temps = spTempList.filter(t => {
+    if (t.status === 'graduated' || t.status === 'cancelled') return false;
+    if (matchDate(t.date)) return true;
+    // เผื่อ partials ตกในวันที่เลือก → ยังแสดง (เข้าจัดการได้)
+    return (t.partials || []).some(pr => matchDate(pr.date));
+  });
+  const pays = paymentList.filter(p => matchDate(p.date));
+
+  const dateLabel = dateFilter ? fmtDate(dateFilter) : 'ทั้งหมด';
+
+  // ── Build SP-TEMP box HTML (ถ้ามี) ──
+  let spTempBoxHtml = '';
+  if (temps.length > 0) {
+    const totalPaid = temps.reduce((s, t) => s + spTempPaidTotal(t), 0);
+    const totalRemain = temps.reduce((s, t) => {
+      const exp = Number(t.expected_total) || 0;
+      return s + Math.max(0, exp - spTempPaidTotal(t));
+    }, 0);
+    spTempBoxHtml = `
+      <div class="card-flat" style="margin-bottom:12px;border-left:4px solid var(--warn)">
+        <div style="padding:10px 14px;background:rgba(245,158,11,.08);border-bottom:1px solid var(--border)">
+          <div class="flex justify-between items-center">
+            <div>
+              <span style="font-weight:700;color:var(--warn)">⚡ SP ชั่วคราว (SP-TEMP)</span>
+              <span class="text-xs text-dim" style="margin-left:8px">
+                ${temps.length} รายการ · ชำระแล้ว ฿${fmtNum(totalPaid)} · คงเหลือ ฿${fmtNum(totalRemain)}
+              </span>
+            </div>
+            <button class="btn btn-warn btn-sm" id="main-sp-add-temp" style="padding:4px 10px;font-size:.75rem">
+              ${ICONS.plus} สร้าง SP-TEMP
+            </button>
+          </div>
+        </div>
+        <div style="max-height:320px;overflow-y:auto">
+        ${temps.map(t => {
+          const p = spTempProgress(t);
+          const isOpen = expandedTempSet.has(t.no);
+          const pctBar = Math.min(100, p.pct);
+          const barColor = p.pct >= 100 ? 'var(--success)' : p.pct > 0 ? 'var(--warn)' : 'var(--text3)';
+          const statusBadge = t.status === 'complete'
+            ? '<span class="badge badge-success" style="font-size:.65rem">✓ พร้อม Graduate</span>'
+            : p.paid > 0 ? '<span class="badge badge-warn" style="font-size:.65rem">⏳ กำลังรับ</span>'
+            : '<span class="badge" style="background:var(--surface2);color:var(--text2);font-size:.65rem">Open</span>';
+          return `
+            <div style="padding:8px 14px;border-bottom:1px solid var(--border)">
+              <div class="flex items-center gap-3">
+                <button class="btn btn-ghost btn-sm main-sp-toggle-temp" data-no="${t.no}" style="padding:2px 6px;min-width:26px">${isOpen ? '▼' : '▶'}</button>
+                <div style="flex:1;min-width:0">
+                  <div class="flex items-center gap-2" style="flex-wrap:wrap">
+                    <span style="font-weight:700;color:var(--warn);font-family:monospace;font-size:.82rem">${t.no}</span>
+                    ${statusBadge}
+                    <span class="text-xs" style="color:var(--text)">${t.cust_code ? `(${t.cust_code})` : ''} ${t.cust_name || '-'}</span>
+                  </div>
+                  <div class="flex items-center gap-3" style="margin-top:4px;font-size:.75rem">
+                    <span style="color:var(--text2)">Expected: <b style="color:var(--text)">฿${fmtNum(p.expected)}</b></span>
+                    <span style="color:var(--success)">Paid: <b>฿${fmtNum(p.paid)}</b></span>
+                    <span style="color:var(--danger)">เหลือ: <b>฿${fmtNum(p.remaining)}</b></span>
+                    <span style="flex:1;max-width:180px;height:5px;background:var(--surface2);border-radius:3px;overflow:hidden">
+                      <span style="display:block;height:100%;width:${pctBar}%;background:${barColor};transition:width .3s"></span>
+                    </span>
+                    <span class="text-xs" style="color:var(--text2);min-width:36px;text-align:right">${p.pct}%</span>
+                  </div>
+                </div>
+                <div class="flex gap-1">
+                  ${t.status === 'complete' ? `<button class="btn btn-success btn-sm main-sp-graduate" data-no="${t.no}" style="padding:3px 8px;font-size:.7rem">🎓 Graduate</button>` : ''}
+                  <button class="btn btn-primary btn-sm main-sp-add-partial" data-no="${t.no}" style="padding:3px 8px;font-size:.7rem">+ Partial</button>
+                  <button class="btn btn-ghost btn-sm main-sp-del-temp" data-no="${t.no}" style="padding:3px 6px;font-size:.7rem;color:var(--danger)">🗑</button>
+                </div>
+              </div>
+              ${isOpen && (t.partials || []).length ? `
+                <div style="padding:6px 38px 0 38px">
+                  <table style="width:100%;font-size:.75rem">
+                    <thead><tr style="color:var(--text2);border-bottom:1px solid var(--border)">
+                      <th style="text-align:left;padding:3px">#</th>
+                      <th style="text-align:left;padding:3px">วันที่</th>
+                      <th style="text-align:right;padding:3px">จำนวน</th>
+                      <th style="text-align:left;padding:3px">วิธี</th>
+                      <th style="text-align:left;padding:3px">ธนาคาร</th>
+                      <th style="width:30px"></th>
+                    </tr></thead>
+                    <tbody>${(t.partials || []).map((pr, i) => `
+                      <tr>
+                        <td style="padding:3px;color:var(--text3)">${i + 1}</td>
+                        <td style="padding:3px">${fmtDate(pr.date)}</td>
+                        <td style="padding:3px;text-align:right;font-weight:600;color:var(--success)">฿${fmtNum(pr.amount)}</td>
+                        <td style="padding:3px">${pr.method || '-'}</td>
+                        <td style="padding:3px">${pr.bank || '-'}</td>
+                        <td style="padding:3px;text-align:right"><button class="main-sp-del-partial" data-no="${t.no}" data-idx="${i}" style="background:none;border:none;color:var(--danger);cursor:pointer">✕</button></td>
+                      </tr>
+                    `).join('')}</tbody>
+                  </table>
+                </div>
+              ` : ''}
+            </div>
+          `;
+        }).join('')}
+        </div>
+      </div>
+    `;
+  }
+
+  // ── Build SP table HTML (simpler than renderPayments — no filter/search) ──
+  let spTableHtml = '';
+  if (pays.length > 0) {
+    const totalSp = pays.reduce((s, p) => s + (Number(p.total) || 0), 0);
+    const totalChildBills = pays.reduce((s, p) => s + (p.bills?.length || 0), 0);
+    spTableHtml = `
+      <div class="card-flat">
+        <div class="flex justify-between items-center" style="padding:8px 14px;border-bottom:1px solid var(--border);background:var(--surface2)">
+          <div>
+            <span style="font-weight:700;color:var(--primary)">Payments (SP) ของวัน ${dateLabel}</span>
+            <span class="text-xs text-dim" style="margin-left:8px">${pays.length} รายการ · รวม ฿${fmtNum(totalSp)} · ${totalChildBills} บิล</span>
+          </div>
+          <span class="text-xs text-muted">คลิกแถวเพื่อ expand</span>
+        </div>
+        <div class="table-wrap" style="max-height:400px;overflow-y:auto">
+          <table>
+            <thead><tr>
+              <th style="width:30px"></th>
+              <th>SP Number</th>
+              <th>ลูกค้า</th>
+              <th style="text-align:right">ยอด</th>
+              <th style="text-align:center">บิล</th>
+              <th>สถานะ</th>
+            </tr></thead>
+            <tbody>${pays.map(p => {
+              const isOpen = expandedSpSet.has(p.sp_no);
+              const statusCls = p.match_status === 'matched' ? 'badge-success' : 'badge-warn';
+              const statusLabel = p.match_status === 'matched' ? '✓ Matched' : '⏳ รอ';
+              const isTemp = /^SP-TEMP-/.test(p.sp_no);
+              return `
+                <tr class="main-sp-row" data-sp="${p.sp_no}" style="cursor:pointer;${isOpen ? 'background:var(--surface2)' : ''}${isTemp ? ';border-left:3px solid var(--warn)' : ''}">
+                  <td style="text-align:center">${isOpen ? '▼' : '▶'}</td>
+                  <td style="font-weight:700;color:${isTemp ? 'var(--warn)' : 'var(--primary)'};font-family:monospace;font-size:.82rem">
+                    ${p.sp_no}${isTemp ? '<span class="badge badge-warn" style="margin-left:4px;font-size:.65rem">ชั่วคราว</span>' : ''}
+                  </td>
+                  <td><div class="text-sm">${p.cust_name || '-'}</div><div class="text-xs text-muted">${p.cust_id || ''}</div></td>
+                  <td style="text-align:right;font-weight:700;color:var(--success)">฿${fmtNum(p.total || 0)}</td>
+                  <td style="text-align:center">${p.bills?.length || 0}</td>
+                  <td><span class="badge ${statusCls}" style="font-size:.7rem">${statusLabel}</span></td>
+                </tr>
+                ${isOpen && p.bills?.length ? `
+                  <tr><td colspan="6" style="padding:0">
+                    <div style="padding:8px 16px;background:var(--surface2);border-top:2px solid var(--primary)">
+                      <div class="text-xs text-dim mb-2">📎 บิลที่ตัด:</div>
+                      <table style="width:100%;font-size:.8rem">
+                        <thead><tr style="color:var(--text2)">
+                          <th style="text-align:left">Bill No</th>
+                          <th style="text-align:left">วันที่</th>
+                          <th style="text-align:left">ครบกำหนด</th>
+                          <th style="text-align:right">ยอด</th>
+                        </tr></thead>
+                        <tbody>${p.bills.map(b => `
+                          <tr>
+                            <td style="font-weight:600">${b.bill_no}</td>
+                            <td class="text-xs">${fmtDate(b.bill_date)}</td>
+                            <td class="text-xs">${fmtDate(b.due_date)}</td>
+                            <td style="text-align:right;font-weight:600;color:${Number(b.amount) < 0 ? 'var(--danger)' : 'var(--text)'}">฿${fmtNum(b.amount)}</td>
+                          </tr>
+                        `).join('')}</tbody>
+                      </table>
+                    </div>
+                  </td></tr>
+                ` : ''}
+              `;
+            }).join('')}</tbody>
+          </table>
+        </div>
+      </div>
+    `;
+  }
+
+  // ── Fallback: ถ้าทั้ง 2 ส่วนว่าง แสดงปุ่ม "สร้าง SP-TEMP" อย่างเดียว ──
+  let emptyStateHtml = '';
+  if (!spTempBoxHtml && !spTableHtml) {
+    emptyStateHtml = `
+      <div class="card-flat" style="padding:16px;text-align:center;color:var(--text3)">
+        <div class="text-sm" style="margin-bottom:8px">ยังไม่มี SP หรือ SP-TEMP สำหรับวัน ${dateLabel}</div>
+        <button class="btn btn-warn btn-sm" id="main-sp-add-temp" style="padding:4px 10px;font-size:.8rem">
+          ${ICONS.plus} สร้าง SP ชั่วคราว
+        </button>
+      </div>
+    `;
+  }
+
+  // ── Mount ──
+  container.innerHTML = spTempBoxHtml + spTableHtml + emptyStateHtml;
+
+  // ── Attach handlers ──
+  // Create SP-TEMP button (มีได้ 2 ที่ — บน SP-TEMP box หรือใน empty state)
+  container.querySelectorAll('#main-sp-add-temp').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      if (customerList.length === 0) {
+        try {
+          const res = await api('getCustomers', {});
+          if (res.success && Array.isArray(res.data)) customerList = res.data;
+        } catch (e) { console.warn('getCustomers failed', e); }
+      }
+      openSpTempModal();
+      // Note: openSpTempModal doesn't auto-call onChange; user needs to refresh manually
+      // หรือถ้า openSpTempModal มี callback ก็ใช้ที่นั่น — สำหรับ Main render() จะ trigger ผ่าน persistMainState hook
+    });
+  });
+
+  // SP-TEMP: toggle expand
+  container.querySelectorAll('.main-sp-toggle-temp').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const no = btn.dataset.no;
+      if (expandedTempSet.has(no)) expandedTempSet.delete(no);
+      else expandedTempSet.add(no);
+      if (onChange) onChange();
+    });
+  });
+
+  // SP-TEMP: add partial
+  container.querySelectorAll('.main-sp-add-partial').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      openPartialModal(btn.dataset.no);
+    });
+  });
+
+  // SP-TEMP: graduate
+  container.querySelectorAll('.main-sp-graduate').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const t = spTempList.find(x => x.no === btn.dataset.no);
+      if (t) openGraduateTempModal(t);
+    });
+  });
+
+  // SP-TEMP: delete whole temp
+  container.querySelectorAll('.main-sp-del-temp').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const no = btn.dataset.no;
+      if (!confirm(`ลบ ${no} ทั้งหมด?`)) return;
+      spTempList = spTempList.filter(x => x.no !== no);
+      markDirtySpTemps();
+      if (onChange) onChange();
+    });
+  });
+
+  // SP-TEMP: delete partial
+  container.querySelectorAll('.main-sp-del-partial').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const no = btn.dataset.no;
+      const idx = Number(btn.dataset.idx);
+      const t = spTempList.find(x => x.no === no);
+      if (!t) return;
+      if (!confirm(`ลบ partial #${idx + 1} ของ ${no}?`)) return;
+      t.partials.splice(idx, 1);
+      t.updated_at = new Date().toISOString();
+      recomputeSpTempStatus(t);
+      markDirtySpTemps();
+      if (onChange) onChange();
+    });
+  });
+
+  // SP table: toggle expand
+  container.querySelectorAll('.main-sp-row').forEach(row => {
+    row.addEventListener('click', () => {
+      const spNo = row.dataset.sp;
+      if (expandedSpSet.has(spNo)) expandedSpSet.delete(spNo);
+      else expandedSpSet.add(spNo);
+      if (onChange) onChange();
+    });
   });
 }
 
