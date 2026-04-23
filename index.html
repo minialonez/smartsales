@@ -1150,6 +1150,15 @@ function addStatementRows(bank, rows) {
   const existingKeys = new Set(statementsByBank[bank].map(makeKey));
   const uniqueRows = rows.filter(r => !existingKeys.has(makeKey(r)));
   
+  // Generate uuid for any imported statements missing one
+  uniqueRows.forEach(r => {
+    if (!r.stmt_uuid) {
+      r.stmt_uuid = (typeof crypto !== 'undefined' && crypto.randomUUID) 
+        ? crypto.randomUUID() 
+        : 's-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
+    }
+  });
+  
   statementsByBank[bank] = statementsByBank[bank].concat(uniqueRows);
   
   statementsByBank[bank].sort((a, b) => {
@@ -2385,6 +2394,14 @@ function parseFrontPosReport(result, fileName) {
   // รวมเข้า billList
   const existingKeys = new Set(billList.map(b => b.bill_no).filter(Boolean));
   const uniqueNewBills = newBills.filter(b => !b.bill_no || !existingKeys.has(b.bill_no));
+  // Generate uuid for any imported bills missing one
+  uniqueNewBills.forEach(b => {
+    if (!b.bill_uuid) {
+      b.bill_uuid = (typeof crypto !== 'undefined' && crypto.randomUUID) 
+        ? crypto.randomUUID() 
+        : 'b-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
+    }
+  });
   const dup = newBills.length - uniqueNewBills.length;
   billList = billList.concat(uniqueNewBills);
   persistMainState();
@@ -2698,6 +2715,14 @@ function generateBillList(result, fileName) {
   // รวมกับของเดิม (ไม่ทับ) — รองรับดึงหลายวัน
   const existingKeys = new Set(billList.map(b => b.bill_no).filter(Boolean));
   const uniqueNewBills = newBills.filter(b => !b.bill_no || !existingKeys.has(b.bill_no));
+  // Generate uuid for any imported bills missing one
+  uniqueNewBills.forEach(b => {
+    if (!b.bill_uuid) {
+      b.bill_uuid = (typeof crypto !== 'undefined' && crypto.randomUUID) 
+        ? crypto.randomUUID() 
+        : 'b-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
+    }
+  });
   const duplicateCount = newBills.length - uniqueNewBills.length;
   billList = billList.concat(uniqueNewBills);
   persistMainState();
@@ -4662,6 +4687,7 @@ async function renderMain(el) {
         const confirmation = document.getElementById('ab-confirmation').value.trim();
         
         const newBill = {
+          bill_uuid: (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : 'b-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10),
           bill_no: document.getElementById('ab-bill').value.trim() || 'MANUAL-' + Date.now(),
           date: document.getElementById('ab-date').value,
           station: document.getElementById('ab-station').value,
@@ -12693,6 +12719,21 @@ function renderData(el) {
         </div>
       </div>
       
+      <!-- UUID Migration (v1.0) — One-time migrate to UUID-based sync -->
+      <div class="card" style="border-left:3px solid var(--info);margin-bottom:12px;background:rgba(79,156,249,.04)">
+        <div class="font-semi mb-2" style="color:var(--info)">🚀 Migrate to UUID Sync (ครั้งเดียวจบ)</div>
+        <p class="text-xs text-muted mb-3">
+          แก้ปัญหา sync บวมถาวรด้วย UUID-based upsert — backend จะ UPDATE ถ้า uuid มี, INSERT ถ้าไม่มี → <strong>ไม่มีทาง double อีก</strong><br>
+          <strong style="color:var(--warn)">⚠️ จะล้าง Sheet bills_YYYY / stmts_YYYY ทั้งหมดแล้ว push ใหม่</strong> — backup JSON ก่อนทำ
+        </p>
+        <div class="flex gap-2 flex-wrap items-center mb-2">
+          <button class="btn btn-info btn-sm" id="btn-uuid-migrate" style="background:var(--info);color:#fff">🚀 Migrate ข้อมูลเก่าสู่ UUID</button>
+          <button class="btn btn-outline btn-sm" id="btn-uuid-verify">🔍 Verify UUID Status</button>
+          <span id="uuid-result" class="text-xs text-dim"></span>
+        </div>
+        <div id="uuid-progress" style="display:none;margin-top:8px;padding:10px;background:var(--surface2);border-radius:6px;font-family:monospace;font-size:.78rem;white-space:pre-wrap;max-height:300px;overflow-y:auto"></div>
+      </div>
+      
       <!-- Dedup Tool (fix double-sync issue) -->
       <div class="card" style="border-left:3px solid var(--warn);margin-bottom:12px">
         <div class="font-semi mb-2" style="color:var(--warn)">🔧 แก้ปัญหา Bill/Stmt ซ้ำจาก Sync</div>
@@ -13313,6 +13354,312 @@ function renderData(el) {
       toast('ล้าง Bill List แล้ว', 'success');
       render();
     });
+    // ══════════════════════════════════════════════════════
+    // UUID MIGRATION (v1.0) — one-time migrate to UUID sync
+    // ══════════════════════════════════════════════════════
+    
+    // Generate UUID v4 (works on all browsers)
+    function genUuid() {
+      if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
+      // Fallback
+      return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+        const r = Math.random() * 16 | 0;
+        const v = c === 'x' ? r : (r & 0x3 | 0x8);
+        return v.toString(16);
+      });
+    }
+    
+    // Append line to progress log
+    function uuidLog(msg) {
+      const el = document.getElementById('uuid-progress');
+      if (!el) return;
+      el.style.display = 'block';
+      const ts = new Date().toLocaleTimeString('th-TH');
+      el.textContent += `[${ts}] ${msg}\n`;
+      el.scrollTop = el.scrollHeight;
+    }
+    function uuidClearLog() {
+      const el = document.getElementById('uuid-progress');
+      if (el) el.textContent = '';
+    }
+    
+    // Group bills/stmts by year (for per-year sheets)
+    function groupByYear(items, dateField) {
+      const byYear = {};
+      items.forEach(item => {
+        const d = String(item[dateField] || item.date || '').trim();
+        // Extract year from dd/mm/yyyy or yyyy-mm-dd or ISO
+        let year = null;
+        let m = d.match(/^\d{1,2}\/\d{1,2}\/(\d{4})/);
+        if (m) year = m[1];
+        else if ((m = d.match(/^(\d{4})-\d{2}-\d{2}/))) year = m[1];
+        else if (d instanceof Date) year = String(d.getFullYear());
+        // พ.ศ. → ค.ศ.
+        if (year && Number(year) > 2400) year = String(Number(year) - 543);
+        if (!year) year = String(new Date().getFullYear()); // fallback current year
+        if (!byYear[year]) byYear[year] = [];
+        byYear[year].push(item);
+      });
+      return byYear;
+    }
+    
+    // ── Verify UUID Status ──
+    document.getElementById('btn-uuid-verify')?.addEventListener('click', async () => {
+      const btn = document.getElementById('btn-uuid-verify');
+      btn.disabled = true;
+      uuidClearLog();
+      uuidLog('🔍 ตรวจสถานะ UUID...');
+      
+      try {
+        // Count local bills with/without uuid
+        const withUuid = billList.filter(b => b.bill_uuid).length;
+        const withoutUuid = billList.length - withUuid;
+        const allStmts = getAllStatements();
+        const stmtWithUuid = allStmts.filter(s => s.stmt_uuid).length;
+        const stmtWithoutUuid = allStmts.length - stmtWithUuid;
+        
+        uuidLog(`\n📊 Local Data:`);
+        uuidLog(`   Bills: ${billList.length} (มี uuid: ${withUuid}, ไม่มี: ${withoutUuid})`);
+        uuidLog(`   Stmts: ${allStmts.length} (มี uuid: ${stmtWithUuid}, ไม่มี: ${stmtWithoutUuid})`);
+        
+        // Check backend year sheets
+        const years = [...new Set([
+          ...billList.map(b => {
+            const m = String(b.date||'').match(/\/(\d{4})$/);
+            let y = m ? m[1] : String(new Date().getFullYear());
+            if (Number(y) > 2400) y = String(Number(y) - 543);
+            return y;
+          })
+        ])];
+        
+        uuidLog(`\n☁️ Backend Sheets:`);
+        for (const y of years) {
+          const r = await api('verifySheetCount', { year: y });
+          if (r?.success && r.data?.counts) {
+            uuidLog(`   ปี ${y}: ${JSON.stringify(r.data.counts)}`);
+          } else {
+            uuidLog(`   ปี ${y}: error - ${r?.error || 'unknown'}`);
+          }
+        }
+        
+        uuidLog('\n✅ ตรวจเสร็จแล้ว');
+        document.getElementById('uuid-result').textContent = `Local: ${billList.length} bills · ${allStmts.length} stmts`;
+      } catch (err) {
+        uuidLog(`\n❌ Error: ${err.message}`);
+      }
+      btn.disabled = false;
+    });
+    
+    // ── Migrate: Generate UUIDs → Clear Sheets → Push all ──
+    document.getElementById('btn-uuid-migrate')?.addEventListener('click', async () => {
+      const btn = document.getElementById('btn-uuid-migrate');
+      
+      // Multiple confirmations
+      if (!confirm(
+        `🚀 Migrate ข้อมูลเก่าสู่ UUID\n\n` +
+        `จะทำ 5 ขั้นตอน:\n` +
+        `1. Generate UUID ให้บิลทุกตัว (${billList.length} บิล, ${getAllStatements().length} stmts)\n` +
+        `2. Prepare Sheet — เพิ่ม column bill_uuid/stmt_uuid\n` +
+        `3. Clear Sheet — ล้าง bills_YYYY / stmts_YYYY ทั้งหมด\n` +
+        `4. Push ทั้งหมดด้วย UUID\n` +
+        `5. Verify row count\n\n` +
+        `⚠️ จะใช้เวลาประมาณ 1-2 นาที\n` +
+        `⚠️ Backup JSON แล้วหรือยัง?\n\nยืนยัน?`
+      )) return;
+      
+      if (!confirm(`⚠️⚠️ ยืนยันครั้งสุดท้าย — Sheet ข้อมูลทั้งหมดจะถูก clear แล้ว push ใหม่\n\nข้อมูล local จะไม่หาย แต่ถ้า push fail จะต้อง migrate ใหม่\n\nทำต่อ?`)) return;
+      
+      btn.disabled = true;
+      uuidClearLog();
+      document.getElementById('uuid-result').textContent = '⏳ กำลัง migrate...';
+      document.getElementById('uuid-result').style.color = 'var(--info)';
+      
+      // ⏸ Pause sync เพื่อกัน auto-push ระหว่าง migrate
+      const wasEnabled = syncManager.enabled;
+      if (wasEnabled) {
+        syncManager.setEnabled(false);
+        uuidLog('⏸ หยุด auto-sync ชั่วคราว');
+      }
+      
+      const startTime = Date.now();
+      let success = true;
+      
+      try {
+        // ── Step 1: Generate UUIDs for all bills/stmts ──
+        uuidLog('\n━━━ [1/5] Generate UUIDs ━━━');
+        let billsGenerated = 0;
+        billList.forEach(b => {
+          if (!b.bill_uuid) {
+            b.bill_uuid = genUuid();
+            billsGenerated++;
+          }
+        });
+        let stmtsGenerated = 0;
+        Object.keys(statementsByBank).forEach(bank => {
+          (statementsByBank[bank] || []).forEach(s => {
+            if (!s.stmt_uuid) {
+              s.stmt_uuid = genUuid();
+              stmtsGenerated++;
+            }
+          });
+        });
+        uuidLog(`   ✓ Generated ${billsGenerated} bill uuids, ${stmtsGenerated} stmt uuids`);
+        
+        // Save to localStorage ทันที (กันกรณีพลาดไม่ได้สูญข้อมูล uuid)
+        persistMainState();
+        if (typeof flushPersistState === 'function') flushPersistState();
+        uuidLog('   ✓ บันทึก UUIDs ใน localStorage แล้ว');
+        
+        // ── Step 2: Group by year + Prepare sheets ──
+        uuidLog('\n━━━ [2/5] Prepare Sheets ━━━');
+        const billsByYear = groupByYear(billList, 'date');
+        const stmtsByYear = groupByYear(getAllStatements(), 'date');
+        const allYears = [...new Set([...Object.keys(billsByYear), ...Object.keys(stmtsByYear)])].sort();
+        
+        uuidLog(`   ปีที่พบ: ${allYears.join(', ')}`);
+        
+        for (const year of allYears) {
+          const r1 = await api('prepareSheet', { kind: 'bills', year });
+          if (r1?.success) {
+            uuidLog(`   ✓ bills_${year}: ${r1.data.added ? 'added column' : 'already has uuid'}`);
+          } else {
+            uuidLog(`   ❌ bills_${year}: ${r1?.error || 'error'}`);
+            throw new Error(`prepareSheet bills_${year} failed`);
+          }
+          const r2 = await api('prepareSheet', { kind: 'stmts', year });
+          if (r2?.success) {
+            uuidLog(`   ✓ stmts_${year}: ${r2.data.added ? 'added column' : 'already has uuid'}`);
+          } else {
+            uuidLog(`   ❌ stmts_${year}: ${r2?.error || 'error'}`);
+            throw new Error(`prepareSheet stmts_${year} failed`);
+          }
+        }
+        
+        // ── Step 3: Clear sheets ──
+        uuidLog('\n━━━ [3/5] Clear Sheets ━━━');
+        for (const year of allYears) {
+          if (billsByYear[year]?.length > 0) {
+            const r = await api('clearSheetData', { sheet: `bills_${year}` });
+            if (r?.success) uuidLog(`   ✓ bills_${year}: cleared ${r.data.cleared} rows`);
+            else uuidLog(`   ⚠️ bills_${year}: ${r?.error || 'error'}`);
+          }
+          if (stmtsByYear[year]?.length > 0) {
+            const r = await api('clearSheetData', { sheet: `stmts_${year}` });
+            if (r?.success) uuidLog(`   ✓ stmts_${year}: cleared ${r.data.cleared} rows`);
+            else uuidLog(`   ⚠️ stmts_${year}: ${r?.error || 'error'}`);
+          }
+        }
+        
+        // ── Step 4: Push in chunks ──
+        uuidLog('\n━━━ [4/5] Push ด้วย UUID ━━━');
+        const CHUNK_SIZE = 500;
+        let totalBillsPushed = 0;
+        let totalStmtsPushed = 0;
+        
+        for (const year of allYears) {
+          // Bills for this year
+          const yearBills = billsByYear[year] || [];
+          if (yearBills.length > 0) {
+            uuidLog(`   📤 bills_${year}: ${yearBills.length} rows → chunk ${CHUNK_SIZE}`);
+            for (let i = 0; i < yearBills.length; i += CHUNK_SIZE) {
+              const chunk = yearBills.slice(i, i + CHUNK_SIZE);
+              // Normalize date to ISO for consistency
+              const normalized = chunk.map(b => {
+                const isoDate = typeof toISODate === 'function' ? toISODate(b.date) : b.date;
+                return { ...b, date: isoDate || b.date };
+              });
+              const r = await api('upsertBills', {
+                year,
+                records: normalized,
+                deletes: [],
+              });
+              if (r?.success) {
+                totalBillsPushed += r.data.inserted + r.data.updated;
+                uuidLog(`      chunk ${Math.floor(i/CHUNK_SIZE)+1}: inserted=${r.data.inserted} updated=${r.data.updated}`);
+              } else {
+                uuidLog(`      ❌ chunk ${Math.floor(i/CHUNK_SIZE)+1}: ${r?.error || 'error'}`);
+                throw new Error(`upsertBills failed at chunk ${Math.floor(i/CHUNK_SIZE)+1}`);
+              }
+            }
+          }
+          
+          // Stmts for this year
+          const yearStmts = stmtsByYear[year] || [];
+          if (yearStmts.length > 0) {
+            uuidLog(`   📤 stmts_${year}: ${yearStmts.length} rows → chunk ${CHUNK_SIZE}`);
+            for (let i = 0; i < yearStmts.length; i += CHUNK_SIZE) {
+              const chunk = yearStmts.slice(i, i + CHUNK_SIZE);
+              const normalized = chunk.map(s => {
+                const isoDate = typeof toISODate === 'function' ? toISODate(s.date || s.trans_date) : s.date;
+                return { ...s, date: isoDate || s.date };
+              });
+              const r = await api('upsertStatements', {
+                year,
+                records: normalized,
+                deletes: [],
+              });
+              if (r?.success) {
+                totalStmtsPushed += r.data.inserted + r.data.updated;
+                uuidLog(`      chunk ${Math.floor(i/CHUNK_SIZE)+1}: inserted=${r.data.inserted} updated=${r.data.updated}`);
+              } else {
+                uuidLog(`      ❌ chunk ${Math.floor(i/CHUNK_SIZE)+1}: ${r?.error || 'error'}`);
+                throw new Error(`upsertStatements failed at chunk ${Math.floor(i/CHUNK_SIZE)+1}`);
+              }
+            }
+          }
+        }
+        
+        uuidLog(`\n   ✓ Total pushed: ${totalBillsPushed} bills, ${totalStmtsPushed} stmts`);
+        
+        // ── Step 5: Verify ──
+        uuidLog('\n━━━ [5/5] Verify ━━━');
+        let allMatch = true;
+        for (const year of allYears) {
+          const r = await api('verifySheetCount', { year });
+          if (r?.success) {
+            const localBills = (billsByYear[year] || []).length;
+            const localStmts = (stmtsByYear[year] || []).length;
+            const cloudBills = r.data.counts[`bills_${year}`] || 0;
+            const cloudStmts = r.data.counts[`stmts_${year}`] || 0;
+            const billMatch = localBills === cloudBills;
+            const stmtMatch = localStmts === cloudStmts;
+            uuidLog(`   ${billMatch?'✓':'⚠️'} bills_${year}: local=${localBills} cloud=${cloudBills} ${billMatch?'MATCH':'MISMATCH'}`);
+            uuidLog(`   ${stmtMatch?'✓':'⚠️'} stmts_${year}: local=${localStmts} cloud=${cloudStmts} ${stmtMatch?'MATCH':'MISMATCH'}`);
+            if (!billMatch || !stmtMatch) allMatch = false;
+          }
+        }
+        
+        const duration = Math.round((Date.now() - startTime) / 1000);
+        if (allMatch) {
+          uuidLog(`\n🎉 Migration สำเร็จ! (${duration}s)`);
+          uuidLog('   ข้อมูลใน Sheet ตรงกับ local ทุกปี');
+          uuidLog('   ตอนนี้ระบบพร้อมใช้ UUID-based sync แล้ว');
+          document.getElementById('uuid-result').textContent = `✅ สำเร็จ (${duration}s) — ${totalBillsPushed} bills · ${totalStmtsPushed} stmts`;
+          document.getElementById('uuid-result').style.color = 'var(--success)';
+          toast(`Migration สำเร็จ! (${duration}s)`, 'success', 5000);
+        } else {
+          uuidLog(`\n⚠️ Migration เสร็จแต่ count ไม่ตรง — ตรวจ log ด้านบน`);
+          document.getElementById('uuid-result').textContent = `⚠️ count mismatch`;
+          document.getElementById('uuid-result').style.color = 'var(--warn)';
+        }
+        
+      } catch (err) {
+        success = false;
+        uuidLog(`\n❌ Migration Failed: ${err.message}`);
+        document.getElementById('uuid-result').textContent = `❌ ${err.message}`;
+        document.getElementById('uuid-result').style.color = 'var(--danger)';
+        toast('Migration ล้มเหลว — ดู log', 'error', 4000);
+      }
+      
+      // Resume sync if was enabled
+      if (wasEnabled) {
+        syncManager.setEnabled(true);
+        uuidLog('\n▶ เปิด auto-sync กลับ');
+      }
+      
+      btn.disabled = false;
+    });
+    
     // ── Dedup tools ──
     document.getElementById('btn-dedup-bills')?.addEventListener('click', () => {
       const before = billList.length;
