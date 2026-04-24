@@ -3878,6 +3878,9 @@ async function renderMain(el) {
   function invalidateBillsCache() {
     _billsForSelectedDateCache = null;
     _billsForSelectedDateCacheKey = null;
+    // ⭐ Invalidate date strip cache เมื่อ bills/stmts เปลี่ยน
+    window._datesWithDataCache = null;
+    window._datesWithDataCacheVer = -1;
   }
   // Expose เป็น global เพื่อให้ syncManager + other handlers นอก renderMain scope เรียกได้
   window.invalidateBillsCache = invalidateBillsCache;
@@ -4283,6 +4286,65 @@ async function renderMain(el) {
           <button class="btn btn-success btn-sm" id="btn-save-main">${ICONS.check} บันทึก</button>
         </div>
       </div>
+      
+      <!-- ⭐ Date strip: 14 days back — dot = มีข้อมูล, คลิกไปวันนั้น -->
+      ${(() => {
+        // Build set of dates with data (bills or stmts) — cached via _datesWithDataCache
+        if (!window._datesWithDataCache || window._datesWithDataCacheVer !== billList.length + getAllStatements().length) {
+          const dates = new Set();
+          billList.forEach(b => { const d = toISODate(b.date); if (d) dates.add(d); });
+          Object.values(statementsByBank).forEach(arr => {
+            (arr||[]).forEach(s => { const d = toISODate(s.date); if (d) dates.add(d); });
+          });
+          // Also include meta dates (cashIn/cashOut etc.)
+          if (mainSummary.__byDate) {
+            Object.keys(mainSummary.__byDate).forEach(d => {
+              const v = mainSummary.__byDate[d];
+              if (v && Object.keys(v).length > 0) dates.add(d);
+            });
+          }
+          window._datesWithDataCache = dates;
+          window._datesWithDataCacheVer = billList.length + getAllStatements().length;
+        }
+        const datesSet = window._datesWithDataCache;
+        
+        // Render 14 days ending at selectedDate
+        const cells = [];
+        const baseDate = new Date(selectedDate);
+        if (isNaN(baseDate)) return '';
+        for (let i = 13; i >= 0; i--) {
+          const d = new Date(baseDate);
+          d.setDate(d.getDate() - i);
+          const iso = d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+          const dayNum = d.getDate();
+          const isSelected = iso === selectedDate;
+          const hasData = datesSet.has(iso);
+          const isSunday = d.getDay() === 0;
+          const thMonths = ['ม.ค.','ก.พ.','มี.ค.','เม.ย.','พ.ค.','มิ.ย.','ก.ค.','ส.ค.','ก.ย.','ต.ค.','พ.ย.','ธ.ค.'];
+          const tooltipDate = `${dayNum} ${thMonths[d.getMonth()]}`;
+          const tooltip = hasData ? `${tooltipDate} — มีข้อมูล` : (isSunday ? `${tooltipDate} — อาทิตย์ (ปิดร้าน)` : `${tooltipDate} — ไม่มีข้อมูล`);
+          
+          const bg = isSelected ? 'var(--primary)' : (hasData ? 'rgba(45,212,160,.08)' : 'transparent');
+          const color = isSelected ? '#fff' : (hasData ? 'var(--text)' : 'var(--text3)');
+          const border = isSelected ? '2px solid var(--primary)' : (hasData ? '1px solid rgba(45,212,160,.3)' : '1px solid var(--border)');
+          const dotColor = isSelected ? '#fff' : (hasData ? 'var(--success)' : (isSunday ? '#777' : 'transparent'));
+          
+          cells.push(`<button class="date-strip-cell" data-iso="${iso}" title="${tooltip}" style="
+            min-width:42px;padding:6px 4px;background:${bg};color:${color};border:${border};
+            border-radius:6px;cursor:pointer;display:flex;flex-direction:column;align-items:center;
+            gap:3px;font-size:.78rem;line-height:1;transition:all .15s">
+            <span style="font-weight:${isSelected?'800':'600'}">${dayNum}</span>
+            <span style="width:5px;height:5px;border-radius:50%;background:${dotColor}"></span>
+          </button>`);
+        }
+        return `<div class="flex items-center flex-wrap mb-3" style="gap:4px;padding:8px 10px;background:var(--surface);border-radius:8px;border:1px solid var(--border)">
+          <span style="font-size:.75rem;color:var(--text3);margin-right:6px">14 วันล่าสุด:</span>
+          ${cells.join('')}
+          <span style="font-size:.7rem;color:var(--text3);margin-left:auto">
+            <span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--success);margin-right:3px"></span>มีข้อมูล
+          </span>
+        </div>`;
+      })()}
       
       ${(() => {
         const v = validateAll();
@@ -5650,6 +5712,14 @@ async function renderMain(el) {
     });
     document.getElementById('main-date-prev')?.addEventListener('click', () => _shiftDate(-1));
     document.getElementById('main-date-next')?.addEventListener('click', () => _shiftDate(+1));
+    
+    // ⭐ Date strip cells — click → navigate to that date
+    el.querySelectorAll('.date-strip-cell').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const iso = btn.dataset.iso;
+        if (iso && iso !== selectedDate) _changeDateTo(iso);
+      });
+    });
 
     // Filter pills
     el.querySelectorAll('.pill[data-fs]').forEach(btn => {
@@ -10938,11 +11008,23 @@ function showApp() {
   setTimeout(() => {
     if (!syncManager.enabled) return;
     syncManager.pullFromCloud(2, 'auto')
-      .then(r => {
+      .then(async r => {
         if (r?.skipped) {
           console.log('[sync] auto-pull skipped:', r.skipped);
+          // ⭐ Even if skipped, force-reload meta ในเครื่องใหม่ที่ local summary ว่าง
+          //    (pullFromCloud ไม่ handle meta — มี loadMetaFromBackend แยก)
+          const hasLocalMeta = mainSummary.__byDate && Object.keys(mainSummary.__byDate).length > 0;
+          if (!hasLocalMeta) {
+            console.log('[sync] local meta empty → force loadMetaFromBackend');
+            await loadMetaFromBackend();
+          }
         } else if (r) {
           const total = (r.bills||0) + (r.stmts||0) + (r.payments||0) + (r.cashflow||0);
+          
+          // ⭐ Auto-pull ไม่ pull meta (mainSummary.__byDate + cashCount) — ต้อง load แยก
+          //    หลัง auto-pull เสร็จ reload meta เสมอ (เพื่อให้หน้าเครื่องใหม่ได้ข้อมูล นำเงินเข้า/ขาย/ออก/คืน)
+          await loadMetaFromBackend();
+          
           if (total > 0) {
             toast(`☁️ Auto-sync: โหลด ${total} รายการใหม่จาก cloud`, 'success', 4000);
             // Refresh current page to show new data
@@ -13962,6 +14044,27 @@ function renderData(el) {
           }
         } catch(err) { tsLog(`   ⚠️ Supplier Payments: ${err.message}`); }
         
+        // ⭐ Pull Meta (mainSummary + cashCount) — เก็บ user input รายวัน: นำเงินเข้า/ขาย/ออก/คืนสินค้า
+        const tempSummary = { __byDate: {} };
+        const tempCashCount = { __byDate: {} };
+        for (const y of years) {
+          try {
+            const r = await api('getDailyMeta', { year: y });
+            if (r?.data?.summary?.__byDate) {
+              Object.entries(r.data.summary.__byDate).forEach(([d, v]) => {
+                tempSummary.__byDate[d] = v;
+              });
+            }
+            if (r?.data?.cash_count?.__byDate) {
+              Object.entries(r.data.cash_count.__byDate).forEach(([d, v]) => {
+                tempCashCount.__byDate[d] = v;
+              });
+            }
+            const metaRows = Object.keys(tempSummary.__byDate).length;
+            tsLog(`   ✓ Meta ${y}: ${metaRows} วัน (cumulative)`);
+          } catch(err) { tsLog(`   ⚠️ Meta ${y}: ${err.message}`); }
+        }
+        
         // ── Step 2: VALIDATE pulled data ──
         tsLog(`\n🔍 [2/3] Validate ข้อมูลที่ดึงมา...`);
         const totalStmts = Object.values(tempStmts).reduce((s,arr) => s + arr.length, 0);
@@ -14003,12 +14106,29 @@ function renderData(el) {
         supplierList = tempSuppliers;
         supplierPayments = tempSupplierPayments;
         
+        // ⭐ Swap meta — user input รายวัน: นำเงินเข้า/ขาย/ออก/คืนสินค้า + นับธนบัตร
+        //    Policy: merge แบบ "cloud ชนะ" — ถ้าต้องการเก็บ local data ไว้ ต้อง backup JSON ก่อน
+        if (Object.keys(tempSummary.__byDate).length > 0) {
+          if (!mainSummary.__byDate) mainSummary.__byDate = {};
+          Object.entries(tempSummary.__byDate).forEach(([d, v]) => {
+            mainSummary.__byDate[d] = v;
+          });
+        }
+        if (Object.keys(tempCashCount.__byDate).length > 0) {
+          if (!cashCount.__byDate) cashCount.__byDate = {};
+          Object.entries(tempCashCount.__byDate).forEach(([d, v]) => {
+            cashCount.__byDate[d] = v;
+          });
+        }
+        
         // Reset fingerprints so next push compares fresh
         if (syncManager._fpCache) syncManager._fpCache = {};
         
         persistMainState();
         safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank));
         safeStorage.set('sf_spTempList', JSON.stringify(spTempList));
+        safeStorage.set('sf_mainSummary', JSON.stringify(mainSummary));
+        safeStorage.set('sf_cashCount', JSON.stringify(cashCount));
         
         statusEl.style.color = 'var(--success)';
         tsLog(`\n🎉 Rebuild สำเร็จ!`);
