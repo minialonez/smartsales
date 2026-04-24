@@ -5917,36 +5917,13 @@ async function renderMain(el) {
     let _popupMonth = null;  // ISO year-month of the currently-displayed calendar page
     
     function _getDatesWithData() {
-      // Build Set of ISO dates that have REAL data — cached
-      // ⭐ Strict criteria (ไม่นับ placeholder bills):
-      //    - Bill: ต้องมี amount > 0 และ type ไม่ว่าง
-      //    - Stmt: ต้องมี amount > 0
-      //    - Meta: มี label ที่ meaningful + value > 0
-      // Cache ใช้ _stateVersion เพื่อ rebuild เมื่อ state เปลี่ยน (เทียบ length อย่างเดียวไม่พอ)
-      const cacheKey = `${billList.length}|${getAllStatements().length}|${(typeof _stateVersion !== 'undefined' ? _stateVersion : 0)}`;
+      // Build Set of ISO dates ที่ user บันทึกเสร็จแล้ว
+      // ⭐ "มีข้อมูล" = มี meta summary บันทึกไว้แล้ว (ไม่ใช่แค่มีบิล/stmt)
+      //    - Bills/Stmts อาจถูก import ล่วงหน้า แต่ยังไม่ได้ process → ไม่ถือว่า "มีข้อมูล"
+      //    - Meta summary = ยอดขาย/Cash Drawer/Transfer/... ที่ user บันทึกเอง → นี่คือ "มีข้อมูล"
+      const cacheKey = `${Object.keys(mainSummary?.__byDate || {}).length}|${(typeof _stateVersion !== 'undefined' ? _stateVersion : 0)}`;
       if (!window._datesWithDataCache || window._datesWithDataCacheKey !== cacheKey) {
         const dates = new Set();
-        
-        // Bills: strict — ต้องไม่ใช่ placeholder
-        //   ต้องมี amount > 0 + type ระบุ (ไม่ใช่ว่าง/null)
-        billList.forEach(b => {
-          const d = toISODate(b.date);
-          if (!d) return;
-          const amt = Math.abs(Number(b.amount) || 0);
-          if (amt <= 0) return;
-          if (!b.type || String(b.type).trim() === '') return;
-          dates.add(d);
-        });
-        
-        // Stmts: ต้องมี amount > 0
-        Object.values(statementsByBank).forEach(arr => {
-          (arr||[]).forEach(s => {
-            const d = toISODate(s.date);
-            if (!d) return;
-            const amt = Math.abs(Number(s.amount) || 0);
-            if (amt > 0) dates.add(d);
-          });
-        });
         
         // Meta: ต้องมี label ที่ meaningful + value > 0
         // ไม่นับ cashIn ซึ่งมักเป็น default 5155 ทุกวัน
