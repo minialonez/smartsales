@@ -4524,6 +4524,10 @@ async function renderMain(el) {
       if (filterStation !== 'ALL') data = data.filter(b => b.station === filterStation);
       if (filterType !== 'ALL') data = data.filter(b => b.type === filterType);
       if (hidePaid) data = data.filter(b => b.match_status !== 'paid');
+      // ⭐ Bug fix: apply filterMatch ใน date range branch ด้วย (เดิมลืม → แสดง matched ปน)
+      if (filterMatch === 'unmatched') data = data.filter(isUnmatchedCandidate);
+      else if (filterMatch === 'matched') data = data.filter(b => b.match_status === 'matched' || b.match_status === 'paid');
+      else if (filterMatch === 'pending') data = data.filter(b => !b.match_status || b.match_status === 'pending');
       data = data.filter(b => {
         const bd = toISODate(b.date);
         if (!bd) return true;
@@ -11850,14 +11854,14 @@ async function renderDashboard(el) {
         </div>
         <div class="flex gap-3 flex-wrap">
           ${unmatchedBillsTransfer.length > 0 ? `
-            <div style="padding:12px;background:rgba(245,166,35,.08);border-radius:8px;min-width:200px;flex:1;cursor:pointer" onclick="window.__mainFilterHint={filterMatch:'unmatched',filterType:'Transfer',showAll:true};navigateTo('main')" title="คลิกเพื่อดูบิลโอนที่ยังไม่ match">
+            <div style="padding:12px;background:rgba(245,166,35,.08);border-radius:8px;min-width:200px;flex:1;cursor:pointer" onclick="openPendingBillsModal('transfer')" title="คลิกเพื่อดูรายการ">
               <div class="text-xs text-dim">บิลโอน/บัตรรอ Match</div>
               <div style="font-size:1.4rem;font-weight:700;color:var(--warn)">${unmatchedBillsTransfer.length}</div>
               <div class="text-xs text-muted">฿${fmtNum(unmatchedBillsTransfer.reduce((s,b)=>s+Number(b.amount||0),0))}</div>
             </div>
           ` : ''}
           ${chequesAwaitingClear.length > 0 ? `
-            <div style="padding:12px;background:rgba(245,166,35,.08);border-radius:8px;min-width:200px;flex:1;cursor:pointer" onclick="window.__mainFilterHint={filterMatch:'unmatched',filterType:'Cheque',showAll:true};navigateTo('main')" title="คลิกเพื่อดูเช็ครอเคลียร์">
+            <div style="padding:12px;background:rgba(245,166,35,.08);border-radius:8px;min-width:200px;flex:1;cursor:pointer" onclick="openPendingBillsModal('cheque')" title="คลิกเพื่อดูรายการ">
               <div class="text-xs text-dim">เช็ครอเคลียร์</div>
               <div style="font-size:1.4rem;font-weight:700;color:var(--warn)">${chequesAwaitingClear.length}</div>
               <div class="text-xs text-muted">
@@ -11976,6 +11980,142 @@ async function renderDashboard(el) {
     }
   })();
 }
+
+// ⭐ Open modal showing pending bills (cheque or transfer/card) with action buttons
+// kind = 'cheque' | 'transfer'
+window.openPendingBillsModal = function(kind) {
+  const today = todayISO();
+  let bills, title, subtitle;
+  
+  if (kind === 'cheque') {
+    bills = billList.filter(b => 
+      b.type === 'Cheque' && 
+      b.match_status !== 'matched' && b.match_status !== 'bounced' && b.match_status !== 'paid' &&
+      !b.matched_stmt_ref
+    );
+    title = '📄 เช็ครอเคลียร์';
+    subtitle = 'เช็คที่ฝากแล้วรอเข้าบัญชี หรือยังไม่ได้ดำเนินการ';
+  } else {
+    bills = billList.filter(b => 
+      (b.type === 'Transfer' || b.type === 'Card') && 
+      b.match_status !== 'matched' && b.match_status !== 'paid' &&
+      b.station !== 'Invoice Credit' && b.station !== 'Order Credit' &&
+      !b.matched_stmt_ref
+    );
+    title = '💳 บิลโอน/บัตรรอ Match';
+    subtitle = 'บิลที่ลูกค้าโอนเงิน/รูดบัตร แต่ยังไม่ได้ match กับ statement';
+  }
+  
+  // Sort: overdue ก่อน, แล้วเรียงวันที่เก่าก่อน
+  bills.sort((a, b) => {
+    const aDate = toISODate(a.expected_clear_date || a.date) || '';
+    const bDate = toISODate(b.expected_clear_date || b.date) || '';
+    return aDate.localeCompare(bDate);
+  });
+  
+  if (bills.length === 0) {
+    openModal(title, `<div style="padding:40px;text-align:center;color:var(--text2)">✓ ไม่มีรายการที่ต้องติดตาม</div>`);
+    return;
+  }
+  
+  const totalAmt = bills.reduce((s,b)=>s + Math.abs(Number(b.amount)||0), 0);
+  
+  const rowsHtml = bills.map((b, i) => {
+    const amt = Math.abs(Number(b.amount)||0);
+    const bDate = toISODate(b.date);
+    const clearDate = b.expected_clear_date ? toISODate(b.expected_clear_date) : null;
+    const isOverdue = clearDate && clearDate < today;
+    const daysOver = isOverdue ? Math.floor((new Date(today) - new Date(clearDate)) / 86400000) : 0;
+    
+    let statusBadge = '';
+    if (kind === 'cheque') {
+      if (b.match_status === 'awaiting_clear') {
+        statusBadge = isOverdue 
+          ? `<span class="badge badge-danger" style="font-size:.65rem">⏰ เลยกำหนด ${daysOver} วัน</span>`
+          : `<span class="badge badge-warn" style="font-size:.65rem">⏳ รอเคลียร์</span>`;
+      } else {
+        statusBadge = `<span class="badge" style="background:var(--surface2);font-size:.65rem">ยังไม่ฝาก</span>`;
+      }
+    } else {
+      statusBadge = `<span class="badge" style="background:var(--surface2);font-size:.65rem">${b.type||''}</span>`;
+    }
+    
+    return `
+      <div class="pending-row" data-bill-idx="${i}" style="padding:10px 12px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px;cursor:pointer;transition:background .12s" onmouseenter="this.style.background='var(--bg2)'" onmouseleave="this.style.background=''">
+        <div style="flex:1;min-width:0;font-size:.85rem">
+          <div class="flex items-center gap-2" style="flex-wrap:wrap;margin-bottom:2px">
+            <span style="font-weight:600;font-family:var(--mono)">${b.bill_no || '(ไม่มีเลข)'}</span>
+            ${statusBadge}
+            ${b.station ? `<span class="badge" style="background:var(--surface2);font-size:.65rem">${b.station}</span>` : ''}
+            ${b.bank ? `<span class="badge badge-info" style="font-size:.65rem">${b.bank}</span>` : ''}
+          </div>
+          <div class="text-xs text-muted">
+            ${fmtDate(b.date)}
+            ${clearDate ? ` · คาดเข้า ${fmtDate(b.expected_clear_date)}` : ''}
+            ${b.remarks1 ? ` · ${String(b.remarks1).substring(0,50)}` : ''}
+          </div>
+        </div>
+        <div style="text-align:right;white-space:nowrap">
+          <div style="font-weight:700;color:var(--success);font-size:.95rem">฿${fmtNum(amt)}</div>
+          <button class="btn btn-primary btn-xs pending-match-btn" data-bill-idx="${i}" style="margin-top:4px;font-size:.7rem;padding:3px 10px">
+            🔗 Match
+          </button>
+        </div>
+      </div>
+    `;
+  }).join('');
+  
+  openModal(title, `
+    <div style="min-width:600px;max-width:750px">
+      <div style="padding:10px 12px;background:var(--bg2);border-radius:6px;margin-bottom:10px;font-size:.85rem">
+        <div class="flex justify-between items-center">
+          <div style="color:var(--text2)">${subtitle}</div>
+          <div><b>${bills.length}</b> รายการ · <b style="color:var(--warn)">฿${fmtNum(totalAmt)}</b></div>
+        </div>
+      </div>
+      <div style="max-height:450px;overflow-y:auto;border:1px solid var(--border);border-radius:6px">
+        ${rowsHtml}
+      </div>
+      <div class="flex gap-2 mt-3">
+        <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ปิด</button>
+      </div>
+    </div>
+  `);
+  
+  // Wire click handlers
+  document.querySelectorAll('.pending-match-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const idx = Number(btn.dataset.billIdx);
+      const bill = bills[idx];
+      if (!bill) return;
+      closeModal();
+      // จอง selectedDate เป็นวันของบิลนี้ ก่อน navigate
+      const bd = toISODate(bill.date);
+      if (bd) window.__mainSelectedDate = bd;
+      navigateTo('main');
+      // เปิด Quick Match modal หลัง main render เสร็จ
+      setTimeout(() => {
+        if (typeof openQuickMatchModal === 'function') {
+          openQuickMatchModal(bill);
+        }
+      }, 300);
+    });
+  });
+  // Click row = edit bill
+  document.querySelectorAll('.pending-row').forEach(row => {
+    row.addEventListener('click', (e) => {
+      if (e.target.closest('.pending-match-btn')) return;
+      const idx = Number(row.dataset.billIdx);
+      const bill = bills[idx];
+      if (!bill) return;
+      closeModal();
+      const bd = toISODate(bill.date);
+      if (bd) window.__mainSelectedDate = bd;
+      navigateTo('main');
+    });
+  });
+};
 
 function statCard(label, value, sub, color, icon) {
   return `<div class="card flex-1" style="min-width:170px">
