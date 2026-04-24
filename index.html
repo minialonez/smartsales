@@ -4368,7 +4368,7 @@ async function renderMain(el) {
                 return `📅 ${dow} ${d.getDate()} ${thMonths[d.getMonth()]} ${d.getFullYear()}`;
               })()}
             </button>
-            <input type="date" class="input" value="${selectedDate}" id="main-date" style="display:none">
+            <input type="date" class="input" value="${selectedDate}" id="main-date" hidden style="display:none !important">
             <button class="btn btn-outline btn-sm" id="main-date-next" title="วันถัดไป" style="padding:4px 10px;font-weight:700">▶</button>
             <div id="main-date-popup" style="display:none"></div>
           </div>
@@ -5837,11 +5837,11 @@ async function renderMain(el) {
       }
       
       popup.innerHTML = `
-        <div id="dp-backdrop" style="position:fixed;inset:0;background:rgba(0,0,0,0.3);z-index:9998"></div>
+        <div id="dp-backdrop" style="position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:9998"></div>
         <div style="position:absolute;top:calc(100% + 6px);left:50%;transform:translateX(-50%);
-                    background:var(--card);border:1px solid var(--border);border-radius:14px;
+                    background:#141721;border:1px solid var(--border);border-radius:14px;
                     padding:14px;width:320px;z-index:9999;
-                    box-shadow:0 12px 32px rgba(0,0,0,.5),0 0 0 1px rgba(255,255,255,.03)">
+                    box-shadow:0 12px 32px rgba(0,0,0,.7),0 0 0 1px rgba(255,255,255,.05)">
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
             <div style="color:var(--info);font-size:1rem;font-weight:600">
               ${thMonths[pm - 1]} ${py}
@@ -15032,10 +15032,22 @@ function renderData(el) {
         'returns': 'ยอดคืนสินค้า', 'cashDrawer': 'Cash Drawer',
         'transfer': 'Transfer', 'card': 'Card', 'cheque': 'Cheque', 'refund': 'Refund',
       };
+      const VALID_META_TYPES = ['summary', 'cash_count'];
       const summary = { __byDate: {} };
       const cash = { __byDate: {} };
+      let skippedJunk = 0;
       
       rows.forEach(function(r) {
+        // ⭐ Safety filter: reject junk rows from old shifted-column data
+        //    - meta_type must be 'summary' or 'cash_count'
+        //    - data_json must exist and be parseable
+        //    Old sheet had rows where meta_type='Front1'/'Invoice' (shifted columns)
+        //    → parseCompactMetaRows will now skip them silently
+        if (!VALID_META_TYPES.includes(r.meta_type)) {
+          skippedJunk++;
+          return;
+        }
+        
         // date: dd/mm/yyyy → dateISO yyyy-mm-dd
         let dateISO = r.date;
         if (/^\d{1,2}\/\d{1,2}\/\d{4}/.test(String(r.date))) {
@@ -15043,11 +15055,23 @@ function renderData(el) {
           let y = Number(parts[2]); if (y > 2400) y -= 543;
           dateISO = y + '-' + String(parts[1]).padStart(2,'0') + '-' + String(parts[0]).padStart(2,'0');
         }
+        // Also handle ISO with time: "2026-02-01 00:00:00" → "2026-02-01"
+        if (/^\d{4}-\d{2}-\d{2}/.test(String(dateISO))) {
+          dateISO = String(dateISO).substring(0, 10);
+        }
         
         let data;
         try {
           data = typeof r.data_json === 'string' ? JSON.parse(r.data_json) : (r.data_json || {});
-        } catch (e) { data = {}; }
+          // Extra safety: ต้องเป็น object ไม่ใช่ primitive (กันกรณี data_json = "cashIn" แบบ shifted)
+          if (!data || typeof data !== 'object' || Array.isArray(data)) {
+            skippedJunk++;
+            return;
+          }
+        } catch (e) {
+          skippedJunk++;
+          return;
+        }
         
         if (r.meta_type === 'summary') {
           if (!summary.__byDate[dateISO]) summary.__byDate[dateISO] = {};
@@ -15065,6 +15089,10 @@ function renderData(el) {
           cash.__byDate[dateISO] = data;
         }
       });
+      
+      if (skippedJunk > 0) {
+        console.warn(`[parseMeta] Skipped ${skippedJunk} junk rows (shifted-column legacy data)`);
+      }
       
       return { summary: summary, cashCount: cash };
     }
