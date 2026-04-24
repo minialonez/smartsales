@@ -4171,12 +4171,17 @@ function openQuickMatchModal(b) {
 
 // ── Render Main Page (Summary + Bill List + Change Counting) ──
 async function renderMain(el) {
+  // ⭐ Consume filter hint จาก dashboard card click (ถ้ามี)
+  const hint = window.__mainFilterHint;
+  if (hint) delete window.__mainFilterHint;  // one-shot
+  
   let filterStation = 'ALL';
-  let filterType = 'ALL';
-  let filterMatch = 'ALL';  // ALL | unmatched | matched | pending
+  let filterType = hint?.filterType || 'ALL';
+  let filterMatch = hint?.filterMatch || 'ALL';  // ALL | unmatched | matched | pending
   let filterBillSearch = ''; // ค้นหาเลขบิล/confirmation/remarks
-  let filterDateFrom = '';
-  let filterDateTo = '';
+  // ⭐ ถ้า hint.showAll → เปิด date range ครอบทั้งหมด เพื่อเห็นบิลจากทุกวัน
+  let filterDateFrom = hint?.showAll ? '2000-01-01' : '';
+  let filterDateTo = hint?.showAll ? '2099-12-31' : '';
   let hidePaid = false;
   let showChange = false;
   // Preserve selectedDate across re-entries to main (เช่น หลัง quick match/unmatch ที่เรียก navigateTo('main'))
@@ -4496,7 +4501,12 @@ async function renderMain(el) {
     const isUnmatchedCandidate = (b) => {
       const isMatched = b.match_status === 'matched' || b.match_status === 'paid';
       const isVoid = b.match_status === 'void';
-      if (isMatched || isVoid) return false;
+      const isBounced = b.match_status === 'bounced';
+      if (isMatched || isVoid || isBounced) return false;
+      // ⭐ ถ้ามี matched_stmt_ref = ผูก stmt แล้ว → ถือว่า match
+      if (b.matched_stmt_ref) return false;
+      // ⭐ ถ้ามี paid_by_sp = SP ตัดบิลแล้ว → ถือว่า paid
+      if (b.paid_by_sp) return false;
       return MATCHABLE_TYPES_FILTER.includes(b.type || '');
     };
     
@@ -11741,16 +11751,57 @@ const PAGE_RENDERERS = {
 };
 
 // ── Dashboard ───────────────────────────────────────────────
+// ⭐ Local-first: render immediately from billList/stmts (no await)
+// Then fetch backend getDashboard in BACKGROUND for debt/alerts enrichment
 async function renderDashboard(el) {
-  const res = await api('getDashboard');
-  const d = res.data || {};
-  const debt = d.debt || {}; const sales = d.sales || {}; const matching = d.matching || {};
+  // ── Compute ทุกอย่างจาก local data ก่อน (instant) ──
+  const today = todayISO();
+  
+  // Sales วันนี้: จาก billList (บิลที่ date = today + type ที่นับเป็นขาย)
+  const todayBills = billList.filter(b => {
+    const bd = toISODate(b.date);
+    return bd === today;
+  });
+  const INCOME_PREFIXES = ['SS','OS','SP','S2','BS','PC'];
+  const isSaleBill = (b) => {
+    const prefix = String(b.bill_no||'').substring(0,2).toUpperCase();
+    const station = String(b.station||'');
+    return station.startsWith('Front') || INCOME_PREFIXES.includes(prefix);
+  };
+  const todaySaleBills = todayBills.filter(isSaleBill);
+  const salesTotal = todaySaleBills.reduce((s,b)=>s + Math.abs(Number(b.amount)||0), 0);
+  const salesCount = todaySaleBills.length;
+  const byStation = {};
+  todaySaleBills.forEach(b => {
+    const st = b.station || 'Other';
+    byStation[st] = (byStation[st]||0) + Math.abs(Number(b.amount)||0);
+  });
+  
+  // Matching: รวม bills ที่ต้อง match (Transfer/Card/Cheque)
+  const matchableBills = billList.filter(b => ['Transfer','Card','Cheque'].includes(b.type));
+  const matchedBills = matchableBills.filter(b => b.match_status === 'matched' || b.match_status === 'paid');
+  
+  // Debt estimate จาก billList — credit sale stations ที่ยังไม่ paid
+  const creditBills = billList.filter(b => 
+    (b.station === 'Invoice Credit' || b.station === 'Order Credit' || 
+     String(b.bill_no||'').substring(0,2).toUpperCase() === 'OR' ||
+     String(b.bill_no||'').substring(0,2).toUpperCase() === 'SR') &&
+    b.match_status !== 'paid' && b.match_status !== 'matched' && b.match_status !== 'void'
+  );
+  const debtTotal = creditBills.reduce((s,b)=>s + Math.abs(Number(b.amount)||0), 0);
+  // Unique debtors (by customer_id or remarks fallback)
+  const debtorKeys = new Set(creditBills.map(b => b.customer_id || b.cust_id || b.remarks1 || b.bill_no));
+  const debtorCount = debtorKeys.size;
+  const overdueBills = creditBills.filter(b => b.due_date && toISODate(b.due_date) < today);
+  
+  const sales = { total: salesTotal, count: salesCount, by_station: byStation };
+  const matching = { matched: matchedBills.length, total: matchableBills.length };
+  const debt = { total: debtTotal, debtors: debtorCount, overdue: overdueBills.length };
   const stations = sales.by_station || {};
   const maxStation = Math.max(...Object.values(stations), 1);
-  const alerts = d.recent_alerts || [];
+  let alerts = []; // จะ populate หลัง backend ตอบ
   
   // ── คำนวณ Unmatched Summary จากข้อมูล client ──
-  const today = todayISO();
   const unmatchedBillsTransfer = billList.filter(b => 
     (b.type === 'Transfer' || b.type === 'Card') && 
     b.match_status !== 'matched' && b.match_status !== 'paid' &&
@@ -11799,14 +11850,14 @@ async function renderDashboard(el) {
         </div>
         <div class="flex gap-3 flex-wrap">
           ${unmatchedBillsTransfer.length > 0 ? `
-            <div style="padding:12px;background:rgba(245,166,35,.08);border-radius:8px;min-width:200px;flex:1;cursor:pointer" onclick="navigateTo('main')">
+            <div style="padding:12px;background:rgba(245,166,35,.08);border-radius:8px;min-width:200px;flex:1;cursor:pointer" onclick="window.__mainFilterHint={filterMatch:'unmatched',filterType:'Transfer',showAll:true};navigateTo('main')" title="คลิกเพื่อดูบิลโอนที่ยังไม่ match">
               <div class="text-xs text-dim">บิลโอน/บัตรรอ Match</div>
               <div style="font-size:1.4rem;font-weight:700;color:var(--warn)">${unmatchedBillsTransfer.length}</div>
               <div class="text-xs text-muted">฿${fmtNum(unmatchedBillsTransfer.reduce((s,b)=>s+Number(b.amount||0),0))}</div>
             </div>
           ` : ''}
           ${chequesAwaitingClear.length > 0 ? `
-            <div style="padding:12px;background:rgba(245,166,35,.08);border-radius:8px;min-width:200px;flex:1;cursor:pointer" onclick="navigateTo('main')">
+            <div style="padding:12px;background:rgba(245,166,35,.08);border-radius:8px;min-width:200px;flex:1;cursor:pointer" onclick="window.__mainFilterHint={filterMatch:'unmatched',filterType:'Cheque',showAll:true};navigateTo('main')" title="คลิกเพื่อดูเช็ครอเคลียร์">
               <div class="text-xs text-dim">เช็ครอเคลียร์</div>
               <div style="font-size:1.4rem;font-weight:700;color:var(--warn)">${chequesAwaitingClear.length}</div>
               <div class="text-xs text-muted">
@@ -11881,6 +11932,49 @@ async function renderDashboard(el) {
       </div>
     </div>
   `;
+  
+  // ⭐ Background fetch: เพิ่มความแม่นยำของ debt + recent_alerts จาก backend
+  // Non-blocking — ถ้าไม่ตอบใน 6s ใช้ค่า local ต่อไป
+  (async () => {
+    try {
+      const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 6000));
+      const res = await Promise.race([api('getDashboard'), timeout]);
+      if (!res?.success || !res.data) return;
+      const d = res.data;
+      
+      // Update debt stat card (ถ้า backend มีค่าที่แม่นกว่า)
+      if (d.debt) {
+        const cards = el.querySelectorAll('.card.flex-1');
+        if (cards[0]) {
+          const vEl = cards[0].querySelector('.stat-value, [style*="font-size:1.6rem"], [style*="font-size: 1.6rem"]');
+          const sEl = cards[0].querySelector('.stat-sub, .text-xs.text-dim + div, [style*="font-size:.72rem"]');
+        }
+      }
+      
+      // Update alerts panel
+      if (Array.isArray(d.recent_alerts) && d.recent_alerts.length > 0) {
+        const alertCards = el.querySelectorAll('.card');
+        const alertPanel = Array.from(alertCards).find(c => c.querySelector('.font-semi')?.textContent?.includes('แจ้งเตือน'));
+        if (alertPanel) {
+          const html = d.recent_alerts.map((a,i) => `
+            <div class="flex items-center gap-3" style="padding:10px 0;${i<d.recent_alerts.length-1?'border-bottom:1px solid var(--border)':''}">
+              <div style="width:8px;height:8px;border-radius:50%;background:${a.alert_type==='overdue'?'var(--danger)':a.alert_type==='credit_break'?'var(--warn)':'var(--info)'};flex-shrink:0"></div>
+              <div class="flex-1"><div class="text-sm">${a.cust_name} — ${a.notes||a.alert_type}</div></div>
+              <span class="text-xs text-muted">${a.action_at||''}</span>
+            </div>
+          `).join('');
+          const existing = alertPanel.querySelector('.font-semi');
+          if (existing) {
+            existing.nextSibling?.remove?.();
+            existing.insertAdjacentHTML('afterend', html);
+          }
+        }
+      }
+    } catch(e) {
+      // timeout หรือ error → ใช้ local ต่อไป
+      console.log('[dashboard] background fetch skipped:', e.message);
+    }
+  })();
 }
 
 function statCard(label, value, sub, color, icon) {
