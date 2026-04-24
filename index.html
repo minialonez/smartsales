@@ -14713,6 +14713,7 @@ function renderData(el) {
                 year,
                 records: normalized,
                 deletes: [],
+                fresh_only: true,  // ⚡ Fast path — Step 3 clear แล้ว ไม่ต้อง preserve
               });
               if (r?.success) {
                 totalBillsPushed += r.data.inserted + r.data.updated;
@@ -14738,6 +14739,7 @@ function renderData(el) {
                 year,
                 records: normalized,
                 deletes: [],
+                fresh_only: true,  // ⚡ Fast path
               });
               if (r?.success) {
                 totalStmtsPushed += r.data.inserted + r.data.updated;
@@ -14759,6 +14761,7 @@ function renderData(el) {
                 year,
                 records: chunk,
                 deletes: [],
+                fresh_only: true,  // ⚡ Fast path
               });
               if (r?.success) {
                 totalMetaPushed += r.data.inserted + r.data.updated;
