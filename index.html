@@ -1522,6 +1522,10 @@ const syncManager = {
   enabled: true,            // toggle ผ่าน localStorage['sf_sync_enabled']
   pushDelayMs: 5000,        // debounce 5s หลัง mutation สุดท้าย
   dirty: new Set(),         // types ที่ต้อง push: 'bills','stmts','payments','cashflow','suppliers','meta'
+  // ⭐ Delete tracking — uuids ที่ user ลบ local แล้ว ต้อง push ให้ cloud ลบด้วย
+  // Persistent: เก็บใน localStorage เพื่อให้ survive refresh (ถ้า push ไม่สำเร็จ)
+  deletedBillUuids: new Set(),
+  deletedStmtUuids: new Set(),
   lastPushAt: 0,
   lastPullAt: 0,
   pushTimer: null,
@@ -1535,6 +1539,28 @@ const syncManager = {
     if (saved === '0' || saved === 'false') this.enabled = false;
     const lp = Number(localStorage.getItem('sf_sync_last_pull') || 0);
     if (lp) this.lastPullAt = lp;
+    // Restore deletedUuids from localStorage
+    try {
+      const dBills = JSON.parse(localStorage.getItem('sf_deleted_bill_uuids') || '[]');
+      if (Array.isArray(dBills)) this.deletedBillUuids = new Set(dBills);
+      const dStmts = JSON.parse(localStorage.getItem('sf_deleted_stmt_uuids') || '[]');
+      if (Array.isArray(dStmts)) this.deletedStmtUuids = new Set(dStmts);
+    } catch(_){}
+  },
+  
+  // ⭐ เรียกจาก code ที่ลบ bill/stmt → track uuid + schedule push
+  markDeleted(type, uuid) {
+    if (!uuid) return;
+    if (type === 'bills') {
+      this.deletedBillUuids.add(uuid);
+      try { localStorage.setItem('sf_deleted_bill_uuids', JSON.stringify([...this.deletedBillUuids])); } catch(_){}
+      this.dirty.add('bills');
+    } else if (type === 'stmts') {
+      this.deletedStmtUuids.add(uuid);
+      try { localStorage.setItem('sf_deleted_stmt_uuids', JSON.stringify([...this.deletedStmtUuids])); } catch(_){}
+      this.dirty.add('stmts');
+    }
+    this._schedulePush();
   },
   
   setEnabled(on) {
@@ -1706,17 +1732,34 @@ const syncManager = {
             billsByYr[y].push({ ...b, date: isoDate });
           });
           // Push ต่อปี
+          // ⭐ Pass deleted uuids ด้วย — backend จะลบ row ที่ uuid ตรงกัน
+          const delUuids = [...this.deletedBillUuids];
+          let deleteSent = false;
           for (const yr of Object.keys(billsByYr)) {
             // Chunk 500 ต่อ request
             const chunks = billsByYr[yr];
             for (let i = 0; i < chunks.length; i += 500) {
+              const isFirstChunk = !deleteSent && i === 0;
               const r = await api('upsertBills', {
                 year: yr,
                 records: chunks.slice(i, i + 500),
-                deletes: [],
+                // ส่ง deletes พร้อม chunk แรกเท่านั้น (กันลบซ้ำ)
+                deletes: isFirstChunk ? delUuids : [],
               });
               if (r?.success === false) throw new Error(r.error || 'upsertBills API error');
+              if (isFirstChunk) deleteSent = true;
             }
+          }
+          // ถ้าไม่มี bill เหลือ (ลบหมดทั้ง year) → push delete-only ไปเลย
+          if (Object.keys(billsByYr).length === 0 && delUuids.length > 0) {
+            const curYr = String(new Date().getFullYear());
+            await api('upsertBills', { year: curYr, records: [], deletes: delUuids });
+          }
+          // Clear tracked deletes เฉพาะเมื่อ push สำเร็จ
+          if (delUuids.length > 0) {
+            this.deletedBillUuids.clear();
+            try { localStorage.removeItem('sf_deleted_bill_uuids'); } catch(_){}
+            console.log(`[sync] Deleted ${delUuids.length} bills from cloud`);
           }
           this._fpCache.bills = fp;
         } else if (type === 'stmts') {
@@ -1761,16 +1804,30 @@ const syncManager = {
             const isoDate = typeof toISODate === 'function' ? (toISODate(s.date || s.trans_date) || s.date) : s.date;
             stmtsByYr[y].push({ ...s, date: isoDate });
           });
+          // ⭐ Pass deleted stmt uuids
+          const delStmtUuids = [...this.deletedStmtUuids];
+          let stmtDeleteSent = false;
           for (const yr of Object.keys(stmtsByYr)) {
             const chunks = stmtsByYr[yr];
             for (let i = 0; i < chunks.length; i += 500) {
+              const isFirstChunk = !stmtDeleteSent && i === 0;
               const r = await api('upsertStatements', {
                 year: yr,
                 records: chunks.slice(i, i + 500),
-                deletes: [],
+                deletes: isFirstChunk ? delStmtUuids : [],
               });
               if (r?.success === false) throw new Error(r.error || 'upsertStatements API error');
+              if (isFirstChunk) stmtDeleteSent = true;
             }
+          }
+          if (Object.keys(stmtsByYr).length === 0 && delStmtUuids.length > 0) {
+            const curYr = String(new Date().getFullYear());
+            await api('upsertStatements', { year: curYr, records: [], deletes: delStmtUuids });
+          }
+          if (delStmtUuids.length > 0) {
+            this.deletedStmtUuids.clear();
+            try { localStorage.removeItem('sf_deleted_stmt_uuids'); } catch(_){}
+            console.log(`[sync] Deleted ${delStmtUuids.length} stmts from cloud`);
           }
           this._fpCache.stmts = fp;
         } else if (type === 'payments') {
@@ -1918,6 +1975,8 @@ const syncManager = {
           if (r?.success && Array.isArray(r.data?.rows) && r.data.rows.length > 0) {
             r.data.rows.forEach(b => {
               const uuid = b.bill_uuid;
+              // ⭐ Skip uuids ที่ local ลบไปแล้ว แต่ cloud ยังไม่ได้ลบตาม (push ค้าง)
+              if (uuid && this.deletedBillUuids.has(uuid)) return;
               if (uuid) {
                 // UUID-based dedup (stable)
                 if (!seenBillUuids.has(uuid)) {
@@ -1997,6 +2056,8 @@ const syncManager = {
             r.data.rows.forEach(s => {
               normalizeStmt(s);
               const uuid = s.stmt_uuid;
+              // ⭐ Skip uuids ที่ local ลบไปแล้ว
+              if (uuid && this.deletedStmtUuids.has(uuid)) return;
               if (!statementsByBank[s.bank]) statementsByBank[s.bank] = [];
               if (uuid) {
                 if (!seenStmtUuids.has(uuid)) {
@@ -3722,10 +3783,11 @@ function openQuickMatchModal(b) {
     if (confirmBtn) {
       const hasBasics = selectedStmtRef && selectedBills.size > 0;
       let diff = 0;
+      let stmtAbs = 0;
       if (hasBasics) {
         const stmt = getAllStatements().find(s => s.ref_no === selectedStmtRef);
         if (stmt) {
-          const stmtAbs = Math.abs(Number(stmt.amount)||0);
+          stmtAbs = Math.abs(Number(stmt.amount)||0);
           diff = stmtAbs - targetSum;  // + = ลูกค้าโอนเกิน (stmt > bills)
         }
       }
@@ -3733,11 +3795,32 @@ function openQuickMatchModal(b) {
       const reasonEl = document.getElementById('qm-reason');
       const reasonFilled = (reasonEl?.value || '').trim().length > 0;
       
+      // ⭐ Diagnostic: ถ้ามี diff ให้ console log รายละเอียด
+      // User จะเห็น breakdown ว่า target มาจากไหน → หา root cause ได้
+      if (hasDiff) {
+        const billBreakdown = [...selectedBills].map(x => {
+          const amt = Math.abs(Number(x.amount)||0);
+          const wht = Number(x.wht_amount)||0;
+          const tf = Number(x.transfer_fee)||0;
+          const cf = Number(x.card_fee)||0;
+          const fees = wht + tf + cf;
+          const prefix = String(x.bill_no||'').substring(0,2).toUpperCase();
+          const isCredit = ['SC','JS','JR'].includes(prefix);
+          const net = fees > 0 ? amt - fees : amt;
+          const contrib = isCredit ? -net : net;
+          return { bill: x.bill_no||'(no#)', gross: amt, wht, tf, cf, net, isCredit, contrib };
+        });
+        console.group(`⚠️ Match diff: stmt ฿${stmtAbs.toFixed(2)} − target ฿${targetSum.toFixed(2)} = ${diff > 0 ? '+' : ''}${diff.toFixed(2)}`);
+        console.table(billBreakdown);
+        console.log('Selected bills sum:', billBreakdown.reduce((s,b)=>s+b.contrib, 0).toFixed(2));
+        console.groupEnd();
+      }
+      
       // Update reason label + border — ให้ user เห็นชัดว่าต้องกรอก
       const reasonLabel = document.getElementById('qm-reason-label');
       const reasonGroup = document.getElementById('qm-reason-group');
       if (hasDiff) {
-        if (reasonLabel) reasonLabel.innerHTML = `<span style="color:var(--danger)">* หมายเหตุ (บังคับเมื่อยอดต่าง)</span> — <span style="color:var(--warn)">diff ${diff > 0 ? '+' : ''}${fmtNum(diff)} (${diff > 0 ? 'ลูกค้าโอนเกิน' : 'ลูกค้าโอนขาด'})</span>`;
+        if (reasonLabel) reasonLabel.innerHTML = `<span style="color:var(--danger)">* หมายเหตุ (บังคับเมื่อยอดต่าง)</span> — <span style="color:var(--warn)">stmt ฿${fmtNum(stmtAbs)} − รวม ฿${fmtNum(targetSum)} = ${diff > 0 ? '+' : ''}${fmtNum(diff)}</span> <span class="text-xs" style="color:var(--text3)">(ดู console สำหรับ breakdown)</span>`;
         if (reasonEl && !reasonFilled) reasonEl.style.borderColor = 'var(--danger)';
         else if (reasonEl) reasonEl.style.borderColor = '';
         if (reasonGroup) reasonGroup.style.background = 'rgba(244,180,26,.05)';
@@ -6511,6 +6594,10 @@ async function renderMain(el) {
           // ใช้ reference (b) แทน idx — กัน idx shift ถ้ามี mutation อื่น
           const realIdx = billList.indexOf(b);
           if (realIdx < 0) { toast('บิลไม่อยู่ในระบบแล้ว', 'warn'); closeModal(); return; }
+          // ⭐ Track uuid เพื่อ push delete ไป cloud
+          if (b.bill_uuid && typeof syncManager !== 'undefined') {
+            syncManager.markDeleted('bills', b.bill_uuid);
+          }
           billList.splice(realIdx, 1);
           persistMainState();
           invalidateBillsCache();    // สำคัญ: ล้าง cache ให้ Sum refresh
