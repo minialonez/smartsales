@@ -11756,64 +11756,129 @@ const PAGE_RENDERERS = {
 
 // ── Dashboard ───────────────────────────────────────────────
 // ⭐ Local-first: render immediately from billList/stmts (no await)
-// Then fetch backend getDashboard in BACKGROUND for debt/alerts enrichment
+// Period selector: today | yesterday | 7d | 30d | this_month | last_month | this_year | custom
 async function renderDashboard(el) {
-  // ── Compute ทุกอย่างจาก local data ก่อน (instant) ──
+  // ══════════════════════════════════════════════════════════════
+  // PERIOD STATE — persistent across re-renders
+  // ══════════════════════════════════════════════════════════════
+  const PERIOD_STORAGE_KEY = 'sf_dashboard_period';
+  let period = safeStorage.get(PERIOD_STORAGE_KEY) || '30d';
+  let customFrom = safeStorage.get('sf_dashboard_custom_from') || '';
+  let customTo = safeStorage.get('sf_dashboard_custom_to') || '';
+  
   const today = todayISO();
   
-  // Sales วันนี้: จาก billList (บิลที่ date = today + type ที่นับเป็นขาย)
-  const todayBills = billList.filter(b => {
-    const bd = toISODate(b.date);
-    return bd === today;
-  });
+  // ── Helpers ──
+  function getPeriodRange(p) {
+    const now = new Date();
+    const iso = (d) => d.toISOString().substring(0, 10);
+    switch (p) {
+      case 'today': return { from: today, to: today, label: 'วันนี้' };
+      case 'yesterday': {
+        const y = new Date(now); y.setDate(y.getDate() - 1);
+        return { from: iso(y), to: iso(y), label: 'เมื่อวาน' };
+      }
+      case '7d': {
+        const s = new Date(now); s.setDate(s.getDate() - 6);
+        return { from: iso(s), to: today, label: '7 วันล่าสุด' };
+      }
+      case '30d': {
+        const s = new Date(now); s.setDate(s.getDate() - 29);
+        return { from: iso(s), to: today, label: '30 วันล่าสุด' };
+      }
+      case 'this_month': {
+        const s = new Date(now.getFullYear(), now.getMonth(), 1);
+        return { from: iso(s), to: today, label: 'เดือนนี้' };
+      }
+      case 'last_month': {
+        const s = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+        const e = new Date(now.getFullYear(), now.getMonth(), 0);
+        return { from: iso(s), to: iso(e), label: 'เดือนที่แล้ว' };
+      }
+      case 'this_year': {
+        const s = new Date(now.getFullYear(), 0, 1);
+        return { from: iso(s), to: today, label: 'ปีนี้' };
+      }
+      case 'custom': return { from: customFrom, to: customTo, label: 'กำหนดเอง' };
+      default: return { from: today, to: today, label: 'วันนี้' };
+    }
+  }
+  
+  // ⭐ Sale detection — case-safe
   const INCOME_PREFIXES = ['SS','OS','SP','S2','BS','PC'];
+  const CREDIT_PREFIXES = ['SC','JS','JR']; // credit notes (negative)
   const isSaleBill = (b) => {
     const prefix = String(b.bill_no||'').substring(0,2).toUpperCase();
     const station = String(b.station||'');
     return station.startsWith('Front') || INCOME_PREFIXES.includes(prefix);
   };
-  const todaySaleBills = todayBills.filter(isSaleBill);
-  const salesTotal = todaySaleBills.reduce((s,b)=>s + Math.abs(Number(b.amount)||0), 0);
-  const salesCount = todaySaleBills.length;
-  const byStation = {};
-  todaySaleBills.forEach(b => {
-    const st = b.station || 'Other';
-    byStation[st] = (byStation[st]||0) + Math.abs(Number(b.amount)||0);
+  
+  // ── Range computation (memoized per render) ──
+  function computeSalesInRange(from, to) {
+    const filtered = billList.filter(b => {
+      const bd = toISODate(b.date);
+      if (!bd) return false;
+      if (from && bd < from) return false;
+      if (to && bd > to) return false;
+      return true;
+    });
+    const saleBills = filtered.filter(isSaleBill);
+    const total = saleBills.reduce((s,b)=>s + Math.abs(Number(b.amount)||0), 0);
+    const byStation = {};
+    saleBills.forEach(b => {
+      const st = b.station || 'Other';
+      if (!byStation[st]) byStation[st] = { total: 0, count: 0 };
+      byStation[st].total += Math.abs(Number(b.amount)||0);
+      byStation[st].count++;
+    });
+    return { total, count: saleBills.length, byStation };
+  }
+  
+  // ⭐ Matching — type-safe filter (handle whitespace/case)
+  const normalizeType = (t) => String(t||'').trim();
+  const matchableBills = billList.filter(b => {
+    const t = normalizeType(b.type);
+    return t === 'Transfer' || t === 'Card' || t === 'Cheque';
   });
-  
-  // Matching: รวม bills ที่ต้อง match (Transfer/Card/Cheque)
-  const matchableBills = billList.filter(b => ['Transfer','Card','Cheque'].includes(b.type));
-  const matchedBills = matchableBills.filter(b => b.match_status === 'matched' || b.match_status === 'paid');
-  
-  // Debt estimate จาก billList — credit sale stations ที่ยังไม่ paid
-  const creditBills = billList.filter(b => 
-    (b.station === 'Invoice Credit' || b.station === 'Order Credit' || 
-     String(b.bill_no||'').substring(0,2).toUpperCase() === 'OR' ||
-     String(b.bill_no||'').substring(0,2).toUpperCase() === 'SR') &&
-    b.match_status !== 'paid' && b.match_status !== 'matched' && b.match_status !== 'void'
+  const matchedBills = matchableBills.filter(b => 
+    b.match_status === 'matched' || b.match_status === 'paid' || !!b.matched_stmt_ref
   );
+  
+  // ⭐ Debt — กว้างขึ้น: Credit station OR credit note prefix OR unmatched credit sale
+  const creditBills = billList.filter(b => {
+    if (b.match_status === 'paid' || b.match_status === 'matched' || b.match_status === 'void') return false;
+    if (b.paid_by_sp) return false;
+    const st = String(b.station||'');
+    const prefix = String(b.bill_no||'').substring(0,2).toUpperCase();
+    return st === 'Invoice Credit' || st === 'Order Credit' || prefix === 'OR' || prefix === 'SR';
+  });
   const debtTotal = creditBills.reduce((s,b)=>s + Math.abs(Number(b.amount)||0), 0);
-  // Unique debtors (by customer_id or remarks fallback)
-  const debtorKeys = new Set(creditBills.map(b => b.customer_id || b.cust_id || b.remarks1 || b.bill_no));
-  const debtorCount = debtorKeys.size;
+  const debtorKeys = new Set(creditBills.map(b => b.customer_id || b.cust_id || b.remarks1 || '').filter(Boolean));
+  const debtorCount = debtorKeys.size || creditBills.length; // fallback if no customer field
   const overdueBills = creditBills.filter(b => b.due_date && toISODate(b.due_date) < today);
   
-  const sales = { total: salesTotal, count: salesCount, by_station: byStation };
+  // ⭐ Period-based sales
+  const range = getPeriodRange(period);
+  const salesRange = computeSalesInRange(range.from, range.to);
+  
+  const sales = { total: salesRange.total, count: salesRange.count, by_station: salesRange.byStation };
   const matching = { matched: matchedBills.length, total: matchableBills.length };
   const debt = { total: debtTotal, debtors: debtorCount, overdue: overdueBills.length };
-  const stations = sales.by_station || {};
-  const maxStation = Math.max(...Object.values(stations), 1);
-  let alerts = []; // จะ populate หลัง backend ตอบ
+  const stationEntries = Object.entries(sales.by_station).sort((a,b) => b[1].total - a[1].total);
+  const maxStation = Math.max(...stationEntries.map(([,v])=>v.total), 1);
   
-  // ── คำนวณ Unmatched Summary จากข้อมูล client ──
-  const unmatchedBillsTransfer = billList.filter(b => 
-    (b.type === 'Transfer' || b.type === 'Card') && 
-    b.match_status !== 'matched' && b.match_status !== 'paid' &&
-    b.station !== 'Invoice Credit' && b.station !== 'Order Credit'
-  );
+  // ── คำนวณ Unmatched Summary ──
+  const unmatchedBillsTransfer = billList.filter(b => {
+    const t = normalizeType(b.type);
+    return (t === 'Transfer' || t === 'Card') && 
+           b.match_status !== 'matched' && b.match_status !== 'paid' &&
+           !b.matched_stmt_ref &&
+           b.station !== 'Invoice Credit' && b.station !== 'Order Credit';
+  });
   const chequesAwaitingClear = billList.filter(b => 
-    b.type === 'Cheque' && 
-    b.match_status !== 'matched' && b.match_status !== 'bounced' && b.match_status !== 'paid'
+    normalizeType(b.type) === 'Cheque' && 
+    b.match_status !== 'matched' && b.match_status !== 'bounced' && b.match_status !== 'paid' &&
+    !b.matched_stmt_ref
   );
   const chequesOverdue = chequesAwaitingClear.filter(b => b.expected_clear_date && toISODate(b.expected_clear_date) < today);
   const unmatchedStmts = getAllStatements().filter(s => s.match_status !== 'matched');
@@ -11824,10 +11889,28 @@ async function renderDashboard(el) {
   const transferLogNoPP = [...(transferLog.vatTransfers||[]), ...(transferLog.novatTransfers||[])].filter(t => !t.pp_no).length;
   
   const totalUnmatched = unmatchedBillsTransfer.length + chequesAwaitingClear.length + unmatchedStmts.length + cashflowPending.length + supplierPendingPay.length + supplierUnmatched.length + transferLogNoPP;
+  const alerts = []; // populate after background fetch
+  
+  // ── Build period selector pills ──
+  const PERIODS = [
+    { key: 'today', label: 'วันนี้' },
+    { key: 'yesterday', label: 'เมื่อวาน' },
+    { key: '7d', label: '7 วัน' },
+    { key: '30d', label: '30 วัน' },
+    { key: 'this_month', label: 'เดือนนี้' },
+    { key: 'last_month', label: 'เดือนก่อน' },
+    { key: 'this_year', label: 'ปีนี้' },
+    { key: 'custom', label: 'กำหนดเอง' },
+  ];
+  const periodPillsHtml = PERIODS.map(p => 
+    `<button class="pill dash-period-btn ${period===p.key?'active':''}" data-period="${p.key}">${p.label}</button>`
+  ).join('');
 
   el.innerHTML = `
-    <div class="page-title">แดชบอร์ด</div>
-    <p class="text-dim mb-4 text-sm">ภาพรวมระบบ — ${fmtDate(new Date())}</p>
+    <div class="flex justify-between items-center mb-4" style="flex-wrap:wrap;gap:10px">
+      <div class="page-title" style="margin:0">แดชบอร์ด</div>
+      <div class="text-xs text-dim">อัปเดต ${fmtDate(new Date())}</div>
+    </div>
     
     <!-- Quick Actions -->
     <div class="flex gap-2 flex-wrap mb-4">
@@ -11838,11 +11921,33 @@ async function renderDashboard(el) {
       <button class="btn btn-outline btn-sm" onclick="navigateTo('matching')">🔍 Matching</button>
     </div>
     
+    <!-- ⭐ Period selector -->
+    <div class="card mb-4" style="padding:12px 14px">
+      <div class="flex justify-between items-center mb-2" style="flex-wrap:wrap;gap:8px">
+        <div class="font-semi">ยอดขาย — <span style="color:var(--info)">${range.label}</span>
+          ${range.from === range.to ? `<span class="text-xs text-muted">(${fmtDate(range.from)})</span>` : `<span class="text-xs text-muted">(${fmtDate(range.from)} → ${fmtDate(range.to)})</span>`}
+        </div>
+        <div class="text-xs text-dim">${sales.count} รายการ · <b style="color:var(--success);font-size:1rem">฿${fmtNum(sales.total)}</b></div>
+      </div>
+      <div class="flex gap-1 flex-wrap" id="dash-period-pills">
+        ${periodPillsHtml}
+      </div>
+      <div id="dash-custom-range" style="margin-top:8px;${period==='custom'?'':'display:none'}">
+        <div class="flex gap-2 items-center flex-wrap">
+          <span class="text-xs text-dim">จาก:</span>
+          <input type="date" id="dash-custom-from" value="${customFrom}" class="input" style="padding:4px 8px;font-size:.8rem;max-width:150px">
+          <span class="text-xs text-dim">ถึง:</span>
+          <input type="date" id="dash-custom-to" value="${customTo}" class="input" style="padding:4px 8px;font-size:.8rem;max-width:150px">
+          <button class="btn btn-primary btn-xs" id="dash-custom-apply" style="padding:4px 12px;font-size:.75rem">ตกลง</button>
+        </div>
+      </div>
+    </div>
+    
     <div class="flex gap-3 flex-wrap mb-4 stagger">
       ${statCard('ยอดหนี้คงค้าง', '฿'+fmtNum(debt.total||0), debt.debtors+' ราย', 'var(--warn)', ICONS.card)}
       ${statCard('เกินกำหนด', debt.overdue||0, 'ต้องดำเนินการ', 'var(--danger)', ICONS.alert)}
-      ${statCard('ยอดขายวันนี้', '฿'+fmtNum(sales.total||0), (sales.count||0)+' รายการ', 'var(--success)', ICONS.dollar)}
-      ${statCard('Matched', (matching.matched||0)+'/'+(matching.total||0), 'รายการ', 'var(--info)', ICONS.pulse)}
+      ${statCard(`ยอดขาย${range.label}`, '฿'+fmtNum(sales.total||0), (sales.count||0)+' รายการ', 'var(--success)', ICONS.dollar)}
+      ${statCard('Matched', (matching.matched||0)+'/'+(matching.total||0), 'Transfer/Card/Cheque', 'var(--info)', ICONS.pulse)}
     </div>
     
     ${totalUnmatched > 0 ? `
@@ -11913,29 +12018,62 @@ async function renderDashboard(el) {
     
     <div class="flex gap-3" style="display:grid;grid-template-columns:1fr 1fr">
       <div class="card">
-        <div class="font-semi mb-3">ยอดขายตาม Station วันนี้</div>
-        ${Object.entries(stations).map(([st, val]) => `
-          <div class="flex items-center gap-3 mb-2">
-            <span class="text-xs text-dim" style="width:55px">${st}</span>
-            <div class="progress flex-1"><div class="progress-fill" style="width:${(val/maxStation*100)}%;background:linear-gradient(90deg,var(--primary),var(--info))"></div></div>
-            <span class="text-sm font-semi" style="width:85px;text-align:right">฿${fmtNum(val)}</span>
-          </div>
-        `).join('')}
+        <div class="flex justify-between items-center mb-3">
+          <div class="font-semi">ยอดขายตาม Station</div>
+          <span class="text-xs text-dim">${range.label}</span>
+        </div>
+        ${stationEntries.length === 0 ? 
+          `<div class="text-sm text-muted" style="padding:12px 0;text-align:center">ไม่มีข้อมูลในช่วงนี้</div>` :
+          stationEntries.map(([st, v]) => `
+            <div class="flex items-center gap-3 mb-2">
+              <span class="text-xs text-dim" style="width:110px">${st} <span class="text-muted">(${v.count})</span></span>
+              <div class="progress flex-1"><div class="progress-fill" style="width:${(v.total/maxStation*100)}%;background:linear-gradient(90deg,var(--primary),var(--info))"></div></div>
+              <span class="text-sm font-semi" style="width:90px;text-align:right">฿${fmtNum(v.total)}</span>
+            </div>
+          `).join('')
+        }
       </div>
       <div class="card">
         <div class="font-semi mb-3">แจ้งเตือนล่าสุด</div>
-        ${alerts.map((a,i) => `
-          <div class="flex items-center gap-3" style="padding:10px 0;${i<alerts.length-1?'border-bottom:1px solid var(--border)':''}">
-            <div style="width:8px;height:8px;border-radius:50%;background:${a.alert_type==='overdue'?'var(--danger)':a.alert_type==='credit_break'?'var(--warn)':'var(--info)'};flex-shrink:0"></div>
-            <div class="flex-1">
-              <div class="text-sm">${a.cust_name} — ${a.notes||a.alert_type}</div>
-            </div>
-            <span class="text-xs text-muted">${a.action_at||''}</span>
-          </div>
-        `).join('')}
+        <div id="dash-alerts-container">
+          ${alerts.length === 0 ? `<div class="text-sm text-muted" style="padding:12px 0;text-align:center">กำลังโหลด...</div>` : 
+            alerts.map((a,i) => `
+              <div class="flex items-center gap-3" style="padding:10px 0;${i<alerts.length-1?'border-bottom:1px solid var(--border)':''}">
+                <div style="width:8px;height:8px;border-radius:50%;background:${a.alert_type==='overdue'?'var(--danger)':a.alert_type==='credit_break'?'var(--warn)':'var(--info)'};flex-shrink:0"></div>
+                <div class="flex-1"><div class="text-sm">${a.cust_name} — ${a.notes||a.alert_type}</div></div>
+                <span class="text-xs text-muted">${a.action_at||''}</span>
+              </div>
+            `).join('')
+          }
+        </div>
       </div>
     </div>
   `;
+  
+  // ⭐ Wire period selector
+  document.querySelectorAll('.dash-period-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const newPeriod = btn.dataset.period;
+      safeStorage.set(PERIOD_STORAGE_KEY, newPeriod);
+      if (newPeriod !== 'custom') {
+        renderDashboard(el); // re-render
+      } else {
+        safeStorage.set(PERIOD_STORAGE_KEY, 'custom');
+        document.getElementById('dash-custom-range').style.display = '';
+        document.querySelectorAll('.dash-period-btn').forEach(b => b.classList.toggle('active', b === btn));
+      }
+    });
+  });
+  document.getElementById('dash-custom-apply')?.addEventListener('click', () => {
+    const f = document.getElementById('dash-custom-from').value;
+    const t = document.getElementById('dash-custom-to').value;
+    if (!f || !t) { toast('กรอกช่วงวันที่', 'warn'); return; }
+    if (f > t) { toast('วันเริ่มต้นต้องก่อนวันสิ้นสุด', 'warn'); return; }
+    safeStorage.set('sf_dashboard_custom_from', f);
+    safeStorage.set('sf_dashboard_custom_to', t);
+    safeStorage.set(PERIOD_STORAGE_KEY, 'custom');
+    renderDashboard(el);
+  });
   
   // ⭐ Background fetch: เพิ่มความแม่นยำของ debt + recent_alerts จาก backend
   // Non-blocking — ถ้าไม่ตอบใน 6s ใช้ค่า local ต่อไป
@@ -11946,36 +12084,30 @@ async function renderDashboard(el) {
       if (!res?.success || !res.data) return;
       const d = res.data;
       
-      // Update debt stat card (ถ้า backend มีค่าที่แม่นกว่า)
-      if (d.debt) {
-        const cards = el.querySelectorAll('.card.flex-1');
-        if (cards[0]) {
-          const vEl = cards[0].querySelector('.stat-value, [style*="font-size:1.6rem"], [style*="font-size: 1.6rem"]');
-          const sEl = cards[0].querySelector('.stat-sub, .text-xs.text-dim + div, [style*="font-size:.72rem"]');
-        }
-      }
+      // Update debt stat card (reserved for future — backend debt may be more accurate)
+      // Currently we trust local compute
       
       // Update alerts panel
-      if (Array.isArray(d.recent_alerts) && d.recent_alerts.length > 0) {
-        const alertCards = el.querySelectorAll('.card');
-        const alertPanel = Array.from(alertCards).find(c => c.querySelector('.font-semi')?.textContent?.includes('แจ้งเตือน'));
-        if (alertPanel) {
-          const html = d.recent_alerts.map((a,i) => `
-            <div class="flex items-center gap-3" style="padding:10px 0;${i<d.recent_alerts.length-1?'border-bottom:1px solid var(--border)':''}">
+      const alertsContainer = document.getElementById('dash-alerts-container');
+      if (alertsContainer) {
+        const list = Array.isArray(d.recent_alerts) ? d.recent_alerts : [];
+        if (list.length === 0) {
+          alertsContainer.innerHTML = `<div class="text-sm text-muted" style="padding:12px 0;text-align:center">ไม่มีแจ้งเตือน</div>`;
+        } else {
+          alertsContainer.innerHTML = list.map((a,i) => `
+            <div class="flex items-center gap-3" style="padding:10px 0;${i<list.length-1?'border-bottom:1px solid var(--border)':''}">
               <div style="width:8px;height:8px;border-radius:50%;background:${a.alert_type==='overdue'?'var(--danger)':a.alert_type==='credit_break'?'var(--warn)':'var(--info)'};flex-shrink:0"></div>
               <div class="flex-1"><div class="text-sm">${a.cust_name} — ${a.notes||a.alert_type}</div></div>
               <span class="text-xs text-muted">${a.action_at||''}</span>
             </div>
           `).join('');
-          const existing = alertPanel.querySelector('.font-semi');
-          if (existing) {
-            existing.nextSibling?.remove?.();
-            existing.insertAdjacentHTML('afterend', html);
-          }
         }
       }
     } catch(e) {
-      // timeout หรือ error → ใช้ local ต่อไป
+      const alertsContainer = document.getElementById('dash-alerts-container');
+      if (alertsContainer && alertsContainer.innerHTML.includes('กำลังโหลด')) {
+        alertsContainer.innerHTML = `<div class="text-sm text-muted" style="padding:12px 0;text-align:center">ไม่สามารถโหลดแจ้งเตือนได้</div>`;
+      }
       console.log('[dashboard] background fetch skipped:', e.message);
     }
   })();
