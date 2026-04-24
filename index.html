@@ -394,11 +394,14 @@ async function pushMatchDelta(bill, stmt) {
     
     if (allOk) {
       console.log('[delta] push OK —', results.map(r => r.type).join(' + '));
-      // Invalidate fingerprint cache → next full sync จะ skip เพราะ hash จะตรงกับที่เพิ่ง push
-      // แต่ถ้า user แก้เพิ่มก่อน full sync — hash จะเปลี่ยน → ยัง push ถูกต้อง
-      if (window.syncManager?._fpCache) {
-        delete window.syncManager._fpCache.bills;
-        delete window.syncManager._fpCache.stmts;
+      // ⭐ Advance fingerprint cache: set ให้ตรงกับ state ปัจจุบัน
+      // เหตุผล: local state ตรงกับ cloud state แล้ว (delta push สำเร็จ)
+      // syncManager cycle ถัดไปจะ compute fp ตัวใหม่ → เทียบ cache → ตรงกัน → skip full push
+      // ของเดิม (delete cache) ผิด: cache=undefined → fp≠undefined → push full → body-loss
+      if (window.syncManager?.markClean) {
+        const pushed = new Set(results.map(r => r.type));
+        if (pushed.has('bill')) window.syncManager.markClean('bills');
+        if (pushed.has('stmt')) window.syncManager.markClean('stmts');
       }
     } else {
       const fails = results.filter(r => !r.ok);
@@ -1428,6 +1431,56 @@ const syncManager = {
     let h = 0;
     for (let i = 0; i < s.length; i++) { h = ((h << 5) - h + s.charCodeAt(i)) | 0; }
     return s.length + ':' + h;
+  },
+  
+  // ⭐ Compute current fp for a type (must match logic in _flushPush)
+  // ใช้หลัง pushMatchDelta สำเร็จ → set cache ให้ตรงกับ state ปัจจุบัน → skip redundant full push
+  _computeFp(type) {
+    if (type === 'bills') {
+      const fpParts = new Array(billList.length);
+      for (let i = 0; i < billList.length; i++) {
+        const b = billList[i];
+        fpParts[i] = (b.bill_uuid || b.bill_no || i) + '|' +
+                    (b.amount || 0) + '|' +
+                    (b.match_status || '') + '|' +
+                    (b.confirmation || '') + '|' +
+                    (b.pay_date || '') + '|' +
+                    (b.remarks1 || '') + '|' +
+                    (b.remarks2 || '') + '|' +
+                    (b.matched_stmt_ref || '') + '|' +
+                    (b.paid_by_sp || '') + '|' +
+                    (b.due_date || '');
+      }
+      return this._fp(billList.length + ':' + fpParts.join(';'));
+    }
+    if (type === 'stmts') {
+      const allStmts = getAllStatements();
+      const fpParts = new Array(allStmts.length);
+      for (let i = 0; i < allStmts.length; i++) {
+        const s = allStmts[i];
+        fpParts[i] = (s.stmt_uuid || s.ref_no || i) + '|' +
+                    (s.amount || 0) + '|' +
+                    (s.match_status || '') + '|' +
+                    (s.match_bill || '') + '|' +
+                    (s.match_station || '') + '|' +
+                    (s.match_sp || '') + '|' +
+                    (s.matched_bills ? s.matched_bills.join(',') : '') + '|' +
+                    (s.match_method || '');
+      }
+      return this._fp(allStmts.length + ':' + fpParts.join(';'));
+    }
+    return null;
+  },
+  
+  // ⭐ Mark a type as clean by setting fp cache to current state fp
+  // Called after successful delta push → next full sync cycle will skip (fp matches)
+  markClean(type) {
+    const fp = this._computeFp(type);
+    if (fp) {
+      this._fpCache[type] = fp;
+      // Also remove from dirty set if queued (delta already handled it)
+      this.dirty.delete(type);
+    }
   },
   
   async _flushPush() {
