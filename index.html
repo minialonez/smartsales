@@ -5753,19 +5753,42 @@ async function renderMain(el) {
     let _popupMonth = null;  // ISO year-month of the currently-displayed calendar page
     
     function _getDatesWithData() {
-      // Build Set of ISO dates that have any data — cached
+      // Build Set of ISO dates that have REAL data — cached
+      // ⭐ Strict check: ไม่ใช่แค่มี key ใน __byDate (อาจเป็น stub/default)
+      //    ต้องมี bills/stmts จริง หรือมี sales/cashDrawer value > 0
       if (!window._datesWithDataCache || window._datesWithDataCacheVer !== billList.length + getAllStatements().length) {
         const dates = new Set();
+        
+        // มีบิลในวันนั้น = มีข้อมูล
         billList.forEach(b => { const d = toISODate(b.date); if (d) dates.add(d); });
+        
+        // มี stmt ในวันนั้น = มีข้อมูล
         Object.values(statementsByBank).forEach(arr => {
           (arr||[]).forEach(s => { const d = toISODate(s.date); if (d) dates.add(d); });
         });
+        
+        // ⭐ __byDate: ต้องมี sales/cashDrawer/transfer/card/cheque > 0 จริง
+        //    ไม่นับเฉพาะ cashIn (5155 default) เพราะทุกวันมี = false positive
+        const MEANINGFUL_LABELS = ['ยอดขาย', 'Cash Drawer', 'Transfer', 'Card', 'Cheque', 'นำเงินออก', 'ยอดคืนสินค้า'];
         if (mainSummary.__byDate) {
           Object.keys(mainSummary.__byDate).forEach(d => {
             const v = mainSummary.__byDate[d];
-            if (v && Object.keys(v).length > 0) dates.add(d);
+            if (!v || typeof v !== 'object') return;
+            
+            // เช็คทีละ label ที่มีความหมาย
+            for (const label of MEANINGFUL_LABELS) {
+              const stations = v[label];
+              if (!stations || typeof stations !== 'object') continue;
+              // ถ้ามี station ไหน value > 0 → ถือว่ามีข้อมูลจริง
+              const hasReal = Object.values(stations).some(val => {
+                const n = Number(val);
+                return !isNaN(n) && Math.abs(n) > 0;
+              });
+              if (hasReal) { dates.add(d); return; }
+            }
           });
         }
+        
         window._datesWithDataCache = dates;
         window._datesWithDataCacheVer = billList.length + getAllStatements().length;
       }
