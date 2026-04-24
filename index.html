@@ -1458,13 +1458,17 @@ const syncManager = {
       const fpParts = new Array(allStmts.length);
       for (let i = 0; i < allStmts.length; i++) {
         const s = allStmts[i];
+        let mb = s.matched_bills;
+        if (Array.isArray(mb)) mb = mb.join(',');
+        else if (typeof mb === 'string') mb = mb;
+        else mb = '';
         fpParts[i] = (s.stmt_uuid || s.ref_no || i) + '|' +
                     (s.amount || 0) + '|' +
                     (s.match_status || '') + '|' +
                     (s.match_bill || '') + '|' +
                     (s.match_station || '') + '|' +
                     (s.match_sp || '') + '|' +
-                    (s.matched_bills ? s.matched_bills.join(',') : '') + '|' +
+                    mb + '|' +
                     (s.match_method || '');
       }
       return this._fp(allStmts.length + ':' + fpParts.join(';'));
@@ -1565,13 +1569,18 @@ const syncManager = {
           const fpParts = new Array(allStmts.length);
           for (let i = 0; i < allStmts.length; i++) {
             const s = allStmts[i];
+            // Safe matched_bills: may be Array, String, or missing
+            let mb = s.matched_bills;
+            if (Array.isArray(mb)) mb = mb.join(',');
+            else if (typeof mb === 'string') mb = mb;
+            else mb = '';
             fpParts[i] = (s.stmt_uuid || s.ref_no || i) + '|' +
                         (s.amount || 0) + '|' +
                         (s.match_status || '') + '|' +
                         (s.match_bill || '') + '|' +
                         (s.match_station || '') + '|' +
                         (s.match_sp || '') + '|' +
-                        (s.matched_bills ? s.matched_bills.join(',') : '') + '|' +
+                        mb + '|' +
                         (s.match_method || '');
           }
           const fp = this._fp(allStmts.length + ':' + fpParts.join(';'));
@@ -1807,11 +1816,31 @@ const syncManager = {
         (arr||[]).forEach(s => seenStmtCompositeKeys.add(stmtCompositeKey(s)));
       });
       
+      // ⭐ Normalize stmt fields ที่อาจกลับมาเป็น string แทน array
+      //   matched_bills: ถ้า backend เก็บเป็น JSON string หรือ comma-separated → parse เป็น array
+      const normalizeStmt = (s) => {
+        if (s.matched_bills != null && !Array.isArray(s.matched_bills)) {
+          const str = String(s.matched_bills).trim();
+          if (str === '' || str === '[]') {
+            delete s.matched_bills;
+          } else if (str.startsWith('[')) {
+            try { s.matched_bills = JSON.parse(str); }
+            catch { s.matched_bills = str.split(',').map(x => x.trim()).filter(Boolean); }
+          } else {
+            s.matched_bills = str.split(',').map(x => x.trim()).filter(Boolean);
+          }
+          // Final guard: ensure Array
+          if (!Array.isArray(s.matched_bills)) delete s.matched_bills;
+        }
+        return s;
+      };
+      
       for (const y of years) {
         try {
           const r = await api('getStatementsWithUuid', { year: y });
           if (r?.success && Array.isArray(r.data?.rows) && r.data.rows.length > 0) {
             r.data.rows.forEach(s => {
+              normalizeStmt(s);
               const uuid = s.stmt_uuid;
               if (!statementsByBank[s.bank]) statementsByBank[s.bank] = [];
               if (uuid) {
@@ -1836,6 +1865,7 @@ const syncManager = {
             const items = (r2?.data?.data) || (Array.isArray(r2?.data) ? r2.data : []) || [];
             if (!Array.isArray(items)) throw new Error(`Stmts ${y}: unexpected format`);
             items.forEach(s => {
+              normalizeStmt(s);
               const key = stmtCompositeKey(s);
               if (!seenStmtCompositeKeys.has(key)) {
                 if (!statementsByBank[s.bank]) statementsByBank[s.bank] = [];
@@ -1847,6 +1877,11 @@ const syncManager = {
           }
         } catch(err) { stats.errors.push(`Stmts ${y}: ${err.message}`); console.warn('[sync] Stmts', y, err); }
       }
+      
+      // ⭐ Normalize existing stmts in state (one-time fix for bad data already loaded)
+      Object.values(statementsByBank).forEach(arr => {
+        (arr || []).forEach(normalizeStmt);
+      });
       uploadedStatements = getAllStatements();
       
       // Payments / Cashflow / Suppliers (รวม)
@@ -4368,7 +4403,6 @@ async function renderMain(el) {
                 return `📅 ${dow} ${d.getDate()} ${thMonths[d.getMonth()]} ${d.getFullYear()}`;
               })()}
             </button>
-            <input type="date" class="input" value="${selectedDate}" id="main-date" hidden style="display:none !important">
             <button class="btn btn-outline btn-sm" id="main-date-next" title="วันถัดไป" style="padding:4px 10px;font-weight:700">▶</button>
             <div id="main-date-popup" style="display:none"></div>
           </div>
@@ -5741,9 +5775,6 @@ async function renderMain(el) {
       _changeDateTo(iso);
     }
     
-    document.getElementById('main-date')?.addEventListener('change', e => { 
-      _changeDateTo(e.target.value);
-    });
     document.getElementById('main-date-prev')?.addEventListener('click', () => _shiftDate(-1));
     document.getElementById('main-date-next')?.addEventListener('click', () => _shiftDate(+1));
     
