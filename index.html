@@ -257,7 +257,10 @@ let currentPage = 'dashboard';
 // ── API Helper — auto GET/POST: GET สำหรับ read, POST สำหรับ write ใหญ่ๆ ──
 // Apps Script handleRequest() parse e.postData.contents เป็น JSON อยู่แล้ว
 // Content-Type: text/plain เลี่ยง CORS preflight (simple request)
-async function api(action, params = {}) {
+async function api(action, params = {}, _retryCount = 0) {
+  // ── Retry config สำหรับ GAS transient body-loss (Unknown action + empty params) ──
+  const MAX_RETRIES = 4;
+  const RETRY_WAITS = [3000, 7000, 15000, 30000]; // 3s, 7s, 15s, 30s
   try {
     if (!API_URL) return demoResponse(action, params);
 
@@ -334,7 +337,24 @@ async function api(action, params = {}) {
     }
     
     try {
-      return JSON.parse(text);
+      const parsed = JSON.parse(text);
+      
+      // ── Detect GAS transient body-loss: "Unknown action:  | params: []" ──
+      // Signature: success=false, error starts with "Unknown action: " + action ว่าง + params ว่าง
+      // นี่คือ signal ว่า request ถึง backend แต่ POST body หายระหว่างทาง (random GAS issue)
+      // ต่างจาก action ที่ไม่มีจริง (เช่น typo) ที่ error จะเป็น "Unknown action: someName"
+      const isBodyLoss = parsed?.success === false 
+        && /^Unknown action:\s*\|\s*params:\s*\[\]/.test(String(parsed.error || ''))
+        && action && action.length > 0;
+      
+      if (isBodyLoss && _retryCount < MAX_RETRIES) {
+        const wait = RETRY_WAITS[_retryCount];
+        console.warn(`⚠️  GAS body-loss on "${action}" — retry ${_retryCount+1}/${MAX_RETRIES} in ${wait/1000}s`);
+        await new Promise(r => setTimeout(r, wait));
+        return api(action, params, _retryCount + 1);
+      }
+      
+      return parsed;
     } catch {
       console.error('API response not JSON:', text.substring(0, 300));
       return demoResponse(action, params);
