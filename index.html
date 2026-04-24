@@ -1948,20 +1948,57 @@ const syncManager = {
       
       for (const y of years) {
         try {
-          const r = await api('getDailyMeta', { year: y });
-          if (r?.data?.summary?.__byDate) {
-            if (!mainSummary.__byDate) mainSummary.__byDate = {};
-            Object.entries(r.data.summary.__byDate).forEach(([d, v]) => {
-              if (!mainSummary.__byDate[d]) mainSummary.__byDate[d] = {};
-              stats.meta += mergeFields(mainSummary.__byDate[d], v);
-            });
+          // ⭐ Try new schema first (meta_uuid + data_json) via getMetaWithUuid
+          // Sheet ใหม่ใช้ schema: [meta_uuid, date, meta_type, data_json, updated_at]
+          // Old getDailyMeta อ่าน schema เก่า [date, meta_type, station, key, value] → ไม่เจอ
+          let handled = false;
+          try {
+            const r = await api('getMetaWithUuid', { year: y });
+            if (r?.success && Array.isArray(r.data?.rows) && r.data.rows.length > 0) {
+              // Parse via parseCompactMetaRows (decodes data_json per row)
+              if (typeof window.parseCompactMetaRows === 'function') {
+                const parsed = window.parseCompactMetaRows(r.data.rows);
+                // Merge summary
+                if (parsed.summary?.__byDate) {
+                  if (!mainSummary.__byDate) mainSummary.__byDate = {};
+                  Object.entries(parsed.summary.__byDate).forEach(([d, v]) => {
+                    if (!mainSummary.__byDate[d]) mainSummary.__byDate[d] = {};
+                    stats.meta += mergeFields(mainSummary.__byDate[d], v);
+                  });
+                }
+                // Merge cash_count
+                if (parsed.cashCount?.__byDate) {
+                  if (!cashCount.__byDate) cashCount.__byDate = {};
+                  Object.entries(parsed.cashCount.__byDate).forEach(([d, v]) => {
+                    if (!cashCount.__byDate[d]) cashCount.__byDate[d] = {};
+                    mergeFields(cashCount.__byDate[d], v);
+                  });
+                }
+                handled = true;
+                console.log(`[sync] Meta ${y}: ${r.data.rows.length} rows via getMetaWithUuid (new schema)`);
+              }
+            }
+          } catch(err) {
+            console.warn(`[sync] getMetaWithUuid ${y} failed, trying fallback:`, err.message);
           }
-          if (r?.data?.cash_count?.__byDate) {
-            if (!cashCount.__byDate) cashCount.__byDate = {};
-            Object.entries(r.data.cash_count.__byDate).forEach(([d, v]) => {
-              if (!cashCount.__byDate[d]) cashCount.__byDate[d] = {};
-              mergeFields(cashCount.__byDate[d], v);
-            });
+          
+          // Fallback to old getDailyMeta (schema เก่า) — เผื่อ sheet ยังไม่ได้ migrate
+          if (!handled) {
+            const r = await api('getDailyMeta', { year: y });
+            if (r?.data?.summary?.__byDate) {
+              if (!mainSummary.__byDate) mainSummary.__byDate = {};
+              Object.entries(r.data.summary.__byDate).forEach(([d, v]) => {
+                if (!mainSummary.__byDate[d]) mainSummary.__byDate[d] = {};
+                stats.meta += mergeFields(mainSummary.__byDate[d], v);
+              });
+            }
+            if (r?.data?.cash_count?.__byDate) {
+              if (!cashCount.__byDate) cashCount.__byDate = {};
+              Object.entries(r.data.cash_count.__byDate).forEach(([d, v]) => {
+                if (!cashCount.__byDate[d]) cashCount.__byDate[d] = {};
+                mergeFields(cashCount.__byDate[d], v);
+              });
+            }
           }
         } catch(err) { stats.errors.push(`Meta ${y}: ${err.message}`); }
       }
@@ -4320,10 +4357,20 @@ async function renderMain(el) {
       <div class="flex justify-between items-center mb-3">
         <div class="page-title">Main — สรุปยอดรายวัน</div>
         <div class="flex gap-2 items-center flex-wrap">
-          <div class="flex items-center" style="gap:4px">
+          <div class="flex items-center" style="gap:4px;position:relative">
             <button class="btn btn-outline btn-sm" id="main-date-prev" title="วันก่อนหน้า" style="padding:4px 10px;font-weight:700">◀</button>
-            <input type="date" class="input" value="${selectedDate}" id="main-date" style="width:160px">
+            <button class="btn btn-outline" id="main-date-btn" style="padding:5px 14px;font-weight:600;min-width:160px;font-variant-numeric:tabular-nums" title="คลิกเพื่อเลือกวัน">
+              ${(() => {
+                const d = new Date(selectedDate);
+                if (isNaN(d)) return selectedDate;
+                const thMonths = ['ม.ค.','ก.พ.','มี.ค.','เม.ย.','พ.ค.','มิ.ย.','ก.ค.','ส.ค.','ก.ย.','ต.ค.','พ.ย.','ธ.ค.'];
+                const dow = ['อา.','จ.','อ.','พ.','พฤ.','ศ.','ส.'][d.getDay()];
+                return `📅 ${dow} ${d.getDate()} ${thMonths[d.getMonth()]} ${d.getFullYear()}`;
+              })()}
+            </button>
+            <input type="date" class="input" value="${selectedDate}" id="main-date" style="display:none">
             <button class="btn btn-outline btn-sm" id="main-date-next" title="วันถัดไป" style="padding:4px 10px;font-weight:700">▶</button>
+            <div id="main-date-popup" style="display:none"></div>
           </div>
           <button class="btn btn-primary btn-sm" id="btn-gen-smart">${ICONS.download} Smart (SS/OS/OR/SR)</button>
           <button class="btn btn-info btn-sm" id="btn-import-pos" style="background:var(--info);color:#fff">${ICONS.download} Front POS</button>
@@ -4332,65 +4379,6 @@ async function renderMain(el) {
           <button class="btn btn-success btn-sm" id="btn-save-main">${ICONS.check} บันทึก</button>
         </div>
       </div>
-      
-      <!-- ⭐ Date strip: 14 days back — dot = มีข้อมูล, คลิกไปวันนั้น -->
-      ${(() => {
-        // Build set of dates with data (bills or stmts) — cached via _datesWithDataCache
-        if (!window._datesWithDataCache || window._datesWithDataCacheVer !== billList.length + getAllStatements().length) {
-          const dates = new Set();
-          billList.forEach(b => { const d = toISODate(b.date); if (d) dates.add(d); });
-          Object.values(statementsByBank).forEach(arr => {
-            (arr||[]).forEach(s => { const d = toISODate(s.date); if (d) dates.add(d); });
-          });
-          // Also include meta dates (cashIn/cashOut etc.)
-          if (mainSummary.__byDate) {
-            Object.keys(mainSummary.__byDate).forEach(d => {
-              const v = mainSummary.__byDate[d];
-              if (v && Object.keys(v).length > 0) dates.add(d);
-            });
-          }
-          window._datesWithDataCache = dates;
-          window._datesWithDataCacheVer = billList.length + getAllStatements().length;
-        }
-        const datesSet = window._datesWithDataCache;
-        
-        // Render 14 days ending at selectedDate
-        const cells = [];
-        const baseDate = new Date(selectedDate);
-        if (isNaN(baseDate)) return '';
-        for (let i = 13; i >= 0; i--) {
-          const d = new Date(baseDate);
-          d.setDate(d.getDate() - i);
-          const iso = d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
-          const dayNum = d.getDate();
-          const isSelected = iso === selectedDate;
-          const hasData = datesSet.has(iso);
-          const isSunday = d.getDay() === 0;
-          const thMonths = ['ม.ค.','ก.พ.','มี.ค.','เม.ย.','พ.ค.','มิ.ย.','ก.ค.','ส.ค.','ก.ย.','ต.ค.','พ.ย.','ธ.ค.'];
-          const tooltipDate = `${dayNum} ${thMonths[d.getMonth()]}`;
-          const tooltip = hasData ? `${tooltipDate} — มีข้อมูล` : (isSunday ? `${tooltipDate} — อาทิตย์ (ปิดร้าน)` : `${tooltipDate} — ไม่มีข้อมูล`);
-          
-          const bg = isSelected ? 'var(--primary)' : (hasData ? 'rgba(45,212,160,.08)' : 'transparent');
-          const color = isSelected ? '#fff' : (hasData ? 'var(--text)' : 'var(--text3)');
-          const border = isSelected ? '2px solid var(--primary)' : (hasData ? '1px solid rgba(45,212,160,.3)' : '1px solid var(--border)');
-          const dotColor = isSelected ? '#fff' : (hasData ? 'var(--success)' : (isSunday ? '#777' : 'transparent'));
-          
-          cells.push(`<button class="date-strip-cell" data-iso="${iso}" title="${tooltip}" style="
-            min-width:42px;padding:6px 4px;background:${bg};color:${color};border:${border};
-            border-radius:6px;cursor:pointer;display:flex;flex-direction:column;align-items:center;
-            gap:3px;font-size:.78rem;line-height:1;transition:all .15s">
-            <span style="font-weight:${isSelected?'800':'600'}">${dayNum}</span>
-            <span style="width:5px;height:5px;border-radius:50%;background:${dotColor}"></span>
-          </button>`);
-        }
-        return `<div class="flex items-center flex-wrap mb-3" style="gap:4px;padding:8px 10px;background:var(--surface);border-radius:8px;border:1px solid var(--border)">
-          <span style="font-size:.75rem;color:var(--text3);margin-right:6px">14 วันล่าสุด:</span>
-          ${cells.join('')}
-          <span style="font-size:.7rem;color:var(--text3);margin-left:auto">
-            <span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--success);margin-right:3px"></span>มีข้อมูล
-          </span>
-        </div>`;
-      })()}
       
       ${(() => {
         const v = validateAll();
@@ -5759,12 +5747,188 @@ async function renderMain(el) {
     document.getElementById('main-date-prev')?.addEventListener('click', () => _shiftDate(-1));
     document.getElementById('main-date-next')?.addEventListener('click', () => _shiftDate(+1));
     
-    // ⭐ Date strip cells — click → navigate to that date
-    el.querySelectorAll('.date-strip-cell').forEach(btn => {
-      btn.addEventListener('click', () => {
-        const iso = btn.dataset.iso;
-        if (iso && iso !== selectedDate) _changeDateTo(iso);
+    // ═══════════════════════════════════════════════════════════════════════
+    // ⭐ iPhone-style date picker popup with data dots
+    // ═══════════════════════════════════════════════════════════════════════
+    let _popupMonth = null;  // ISO year-month of the currently-displayed calendar page
+    
+    function _getDatesWithData() {
+      // Build Set of ISO dates that have any data — cached
+      if (!window._datesWithDataCache || window._datesWithDataCacheVer !== billList.length + getAllStatements().length) {
+        const dates = new Set();
+        billList.forEach(b => { const d = toISODate(b.date); if (d) dates.add(d); });
+        Object.values(statementsByBank).forEach(arr => {
+          (arr||[]).forEach(s => { const d = toISODate(s.date); if (d) dates.add(d); });
+        });
+        if (mainSummary.__byDate) {
+          Object.keys(mainSummary.__byDate).forEach(d => {
+            const v = mainSummary.__byDate[d];
+            if (v && Object.keys(v).length > 0) dates.add(d);
+          });
+        }
+        window._datesWithDataCache = dates;
+        window._datesWithDataCacheVer = billList.length + getAllStatements().length;
+      }
+      return window._datesWithDataCache;
+    }
+    
+    function _renderDatePopup() {
+      const popup = document.getElementById('main-date-popup');
+      if (!popup) return;
+      
+      // Default: show month of selectedDate
+      if (!_popupMonth) {
+        const [y, m] = selectedDate.split('-');
+        _popupMonth = `${y}-${m}`;
+      }
+      
+      const [py, pm] = _popupMonth.split('-').map(Number);
+      const datesSet = _getDatesWithData();
+      const todayIso = todayISO();
+      
+      // Month grid — อาทิตย์ first (Sun=0)
+      const firstDay = new Date(py, pm - 1, 1);
+      const lastDay = new Date(py, pm, 0);
+      const startOffset = firstDay.getDay();  // 0..6 where 0=Sun
+      const totalDays = lastDay.getDate();
+      
+      const thMonths = ['มกราคม','กุมภาพันธ์','มีนาคม','เมษายน','พฤษภาคม','มิถุนายน','กรกฎาคม','สิงหาคม','กันยายน','ตุลาคม','พฤศจิกายน','ธันวาคม'];
+      const dowNames = ['อา','จ','อ','พ','พฤ','ศ','ส'];
+      
+      let cellsHtml = '';
+      // Empty cells before day 1
+      for (let i = 0; i < startOffset; i++) {
+        cellsHtml += `<div></div>`;
+      }
+      // Day cells
+      for (let day = 1; day <= totalDays; day++) {
+        const iso = `${py}-${String(pm).padStart(2,'0')}-${String(day).padStart(2,'0')}`;
+        const isSelected = iso === selectedDate;
+        const isToday = iso === todayIso;
+        const hasData = datesSet.has(iso);
+        const dow = new Date(py, pm - 1, day).getDay();
+        const isSunday = dow === 0;
+        
+        let bg = 'transparent';
+        let color = 'var(--text)';
+        let fontWeight = '500';
+        
+        if (isSelected) {
+          bg = 'var(--primary)';
+          color = '#fff';
+          fontWeight = '700';
+        } else if (isSunday && !hasData) {
+          color = 'var(--text3)';  // วันอาทิตย์ไม่มีข้อมูล = เทา
+        } else if (!hasData) {
+          color = 'var(--text2)';
+        }
+        
+        const dotColor = isSelected ? '#fff' : (hasData ? 'var(--success)' : 'transparent');
+        const todayRing = isToday && !isSelected ? 'box-shadow:inset 0 0 0 1.5px var(--primary);' : '';
+        
+        cellsHtml += `<button class="dp-day" data-iso="${iso}" style="
+          aspect-ratio:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
+          gap:2px;background:${bg};color:${color};border:none;border-radius:50%;cursor:pointer;
+          font-size:.9rem;font-weight:${fontWeight};font-variant-numeric:tabular-nums;${todayRing}
+          transition:background .12s">
+          <span>${day}</span>
+          <span style="width:4px;height:4px;border-radius:50%;background:${dotColor}"></span>
+        </button>`;
+      }
+      
+      popup.innerHTML = `
+        <div id="dp-backdrop" style="position:fixed;inset:0;background:rgba(0,0,0,0.3);z-index:9998"></div>
+        <div style="position:absolute;top:calc(100% + 6px);left:50%;transform:translateX(-50%);
+                    background:var(--card);border:1px solid var(--border);border-radius:14px;
+                    padding:14px;width:320px;z-index:9999;
+                    box-shadow:0 12px 32px rgba(0,0,0,.5),0 0 0 1px rgba(255,255,255,.03)">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+            <div style="color:var(--info);font-size:1rem;font-weight:600">
+              ${thMonths[pm - 1]} ${py}
+            </div>
+            <div style="display:flex;gap:14px">
+              <button id="dp-prev" style="background:none;border:none;color:var(--info);font-size:1.3rem;cursor:pointer;padding:0 4px;line-height:1">‹</button>
+              <button id="dp-today" style="background:none;border:none;color:var(--info);font-size:.8rem;cursor:pointer;padding:0 6px;font-weight:600">วันนี้</button>
+              <button id="dp-next" style="background:none;border:none;color:var(--info);font-size:1.3rem;cursor:pointer;padding:0 4px;line-height:1">›</button>
+            </div>
+          </div>
+          
+          <div style="display:grid;grid-template-columns:repeat(7,1fr);gap:2px;margin-bottom:6px">
+            ${dowNames.map(n => `<div style="font-size:.72rem;color:var(--text3);text-align:center;padding:4px 0">${n}</div>`).join('')}
+          </div>
+          
+          <div style="display:grid;grid-template-columns:repeat(7,1fr);gap:2px">
+            ${cellsHtml}
+          </div>
+          
+          <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);
+                      display:flex;justify-content:space-between;align-items:center;font-size:.7rem;color:var(--text3)">
+            <span style="display:flex;align-items:center;gap:4px">
+              <span style="width:5px;height:5px;border-radius:50%;background:var(--success)"></span>
+              มีข้อมูล
+            </span>
+            <button id="dp-close" style="background:none;border:none;color:var(--info);font-size:.8rem;cursor:pointer;font-weight:600">ปิด</button>
+          </div>
+        </div>
+      `;
+      popup.style.display = 'block';
+      
+      // Wire up popup handlers
+      popup.querySelectorAll('.dp-day').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const iso = btn.dataset.iso;
+          _hideDatePopup();
+          _changeDateTo(iso);
+        });
+        // Hover effect
+        btn.addEventListener('mouseenter', () => {
+          if (btn.dataset.iso !== selectedDate) btn.style.background = 'var(--surface2)';
+        });
+        btn.addEventListener('mouseleave', () => {
+          if (btn.dataset.iso !== selectedDate) btn.style.background = 'transparent';
+        });
       });
+      document.getElementById('dp-prev')?.addEventListener('click', () => {
+        const nm = pm === 1 ? 12 : pm - 1;
+        const ny = pm === 1 ? py - 1 : py;
+        _popupMonth = `${ny}-${String(nm).padStart(2,'0')}`;
+        _renderDatePopup();
+      });
+      document.getElementById('dp-next')?.addEventListener('click', () => {
+        const nm = pm === 12 ? 1 : pm + 1;
+        const ny = pm === 12 ? py + 1 : py;
+        _popupMonth = `${ny}-${String(nm).padStart(2,'0')}`;
+        _renderDatePopup();
+      });
+      document.getElementById('dp-today')?.addEventListener('click', () => {
+        const t = todayISO();
+        _hideDatePopup();
+        _changeDateTo(t);
+      });
+      document.getElementById('dp-close')?.addEventListener('click', _hideDatePopup);
+      document.getElementById('dp-backdrop')?.addEventListener('click', _hideDatePopup);
+    }
+    
+    function _hideDatePopup() {
+      const popup = document.getElementById('main-date-popup');
+      if (popup) {
+        popup.style.display = 'none';
+        popup.innerHTML = '';
+      }
+      _popupMonth = null;
+    }
+    
+    document.getElementById('main-date-btn')?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const popup = document.getElementById('main-date-popup');
+      if (popup && popup.style.display === 'block') {
+        _hideDatePopup();
+      } else {
+        // Reset to month of selectedDate when opening
+        const [y, m] = selectedDate.split('-');
+        _popupMonth = `${y}-${m}`;
+        _renderDatePopup();
+      }
     });
 
     // Filter pills
@@ -14090,24 +14254,53 @@ function renderData(el) {
           }
         } catch(err) { tsLog(`   ⚠️ Supplier Payments: ${err.message}`); }
         
-        // ⭐ Pull Meta (mainSummary + cashCount) — เก็บ user input รายวัน: นำเงินเข้า/ขาย/ออก/คืนสินค้า
+        // ⭐ Pull Meta (mainSummary + cashCount) — user input รายวัน: นำเงินเข้า/ขาย/ออก/คืนสินค้า
+        // Use new schema (getMetaWithUuid + parseCompactMetaRows) with fallback to old getDailyMeta
         const tempSummary = { __byDate: {} };
         const tempCashCount = { __byDate: {} };
         for (const y of years) {
           try {
-            const r = await api('getDailyMeta', { year: y });
-            if (r?.data?.summary?.__byDate) {
-              Object.entries(r.data.summary.__byDate).forEach(([d, v]) => {
-                tempSummary.__byDate[d] = v;
-              });
+            let handled = false;
+            // Try new schema first
+            try {
+              const r = await api('getMetaWithUuid', { year: y });
+              if (r?.success && Array.isArray(r.data?.rows) && r.data.rows.length > 0) {
+                if (typeof window.parseCompactMetaRows === 'function') {
+                  const parsed = window.parseCompactMetaRows(r.data.rows);
+                  if (parsed.summary?.__byDate) {
+                    Object.entries(parsed.summary.__byDate).forEach(([d, v]) => {
+                      tempSummary.__byDate[d] = v;
+                    });
+                  }
+                  if (parsed.cashCount?.__byDate) {
+                    Object.entries(parsed.cashCount.__byDate).forEach(([d, v]) => {
+                      tempCashCount.__byDate[d] = v;
+                    });
+                  }
+                  handled = true;
+                  tsLog(`   ✓ Meta ${y}: ${r.data.rows.length} rows via getMetaWithUuid (new schema)`);
+                }
+              }
+            } catch(err) {
+              tsLog(`   ⚠️ getMetaWithUuid ${y}: ${err.message}`);
             }
-            if (r?.data?.cash_count?.__byDate) {
-              Object.entries(r.data.cash_count.__byDate).forEach(([d, v]) => {
-                tempCashCount.__byDate[d] = v;
-              });
+            
+            // Fallback to old schema
+            if (!handled) {
+              const r = await api('getDailyMeta', { year: y });
+              if (r?.data?.summary?.__byDate) {
+                Object.entries(r.data.summary.__byDate).forEach(([d, v]) => {
+                  tempSummary.__byDate[d] = v;
+                });
+              }
+              if (r?.data?.cash_count?.__byDate) {
+                Object.entries(r.data.cash_count.__byDate).forEach(([d, v]) => {
+                  tempCashCount.__byDate[d] = v;
+                });
+              }
+              const metaRows = Object.keys(tempSummary.__byDate).length;
+              tsLog(`   ✓ Meta ${y}: ${metaRows} วัน (fallback, cumulative)`);
             }
-            const metaRows = Object.keys(tempSummary.__byDate).length;
-            tsLog(`   ✓ Meta ${y}: ${metaRows} วัน (cumulative)`);
           } catch(err) { tsLog(`   ⚠️ Meta ${y}: ${err.message}`); }
         }
         
