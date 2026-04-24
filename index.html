@@ -3289,10 +3289,34 @@ function openQuickMatchModal(b) {
     }).slice(0, 50); // cap 50 ผลลัพธ์ — กันหน้ารก
   }
   
-  // Sum ของบิลที่เลือก (absolute value — direction บน statement จะดูแยก)
+  // Sum ของบิลที่เลือก — port logic จาก Matching page (mmBillMatchAmt + isSC)
+  // ═══════════════════════════════════════════════════════════════════════
+  // Formula (ตรงกับ renderMatching L12719, L13058-13065):
+  //   แต่ละบิล: net = มี fee (wht/transfer_fee/card_fee) ? amount − fees : amount
+  //   SC/JS/JR (credit note) → นับ −net (ลบ)
+  //   อื่นๆ → นับ +net
+  // ─ ของเดิม: sum += Math.abs(amount) — bug: ไม่หัก fee + ไม่ handle credit note
+  // ─ User's self-fix เดิม: สูตรผิดทำให้ target double/inflated
+  // ═══════════════════════════════════════════════════════════════════════
   function getSelectedSum() {
     let sum = 0;
-    selectedBills.forEach(x => { sum += Math.abs(Number(x.amount)||0); });
+    selectedBills.forEach(x => {
+      if (!x) return;
+      const amt = Math.abs(Number(x.amount) || 0);
+      // Net amount (หัก fee ถ้ามี)
+      let net = amt;
+      if (!x._cashflow && !x._supplierPayment) {
+        const wht = Number(x.wht_amount) || 0;
+        const tf = Number(x.transfer_fee) || 0;
+        const cf = Number(x.card_fee) || 0;
+        const fees = wht + tf + cf;
+        if (fees > 0) net = amt - fees;
+      }
+      // Credit note prefix = SC / JS / JR → contribute เป็นลบ
+      const prefix = String(x.bill_no || '').substring(0, 2).toUpperCase();
+      const isCredit = ['SC', 'JS', 'JR'].includes(prefix);
+      sum += isCredit ? -net : net;
+    });
     return sum;
   }
   
@@ -6059,6 +6083,7 @@ async function renderMain(el) {
           const b = billList[idx];
           const hasConf = b.confirmation && b.confirmation.trim();
           const canMatchByType = MATCHABLE_TYPES_INLINE.includes(b.type || '');
+          const oldStatus = b.match_status;
           
           if (hasConf && canMatchByType) {
             // Type = Transfer/Card/Cheque + มี confirmation → matched
@@ -6083,8 +6108,13 @@ async function renderMain(el) {
             }
           }
           persistMainState();
-          updateRowStatus(b);
-          updateSumCheckRow(); // ยอดรวมอาจเปลี่ยน (matched bill affect auto value)
+          // ⭐ ถ้า match_status เปลี่ยน → re-render เพื่อ update status badge (ไม่ใช่แค่ cell)
+          if (b.match_status !== oldStatus) {
+            renderKeepScroll();
+          } else {
+            updateRowStatus(b);
+            updateSumCheckRow();
+          }
           return;
         }
         
@@ -6092,6 +6122,7 @@ async function renderMain(el) {
         if (field === 'type') {
           const b = billList[idx];
           const hasConf = b.confirmation && b.confirmation.trim();
+          const oldStatus = b.match_status;
           
           if (b.type === 'Cash') {
             // Cash → auto matched
@@ -6122,8 +6153,14 @@ async function renderMain(el) {
             }
           }
           persistMainState();
-          updateRowStatus(b);
-          updateSumCheckRow(); // matched status เปลี่ยน → sum เปลี่ยน
+          // ⭐ ถ้า match_status เปลี่ยน → ต้อง re-render เพื่อ update status badge + row style
+          //    (updateRowStatus ไม่ touch badge cell) ใช้ renderKeepScroll เพื่อไม่ให้ scroll เด้ง
+          if (b.match_status !== oldStatus) {
+            renderKeepScroll();
+          } else {
+            updateRowStatus(b);
+            updateSumCheckRow();
+          }
           return;
         }
         
