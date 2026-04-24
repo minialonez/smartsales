@@ -1829,12 +1829,13 @@ const syncManager = {
     }
     
     if (mode === 'auto') {
-      // "มี local data พอแล้ว" = มีบิลพอสมควร + มี stmts อย่างน้อย 1
-      // ถ้า billList น้อยมาก (<10) → treat as empty แม้จะไม่ว่าง 100%
-      // เพราะอาจเป็นกรณี: summary โหลดจาก backend แต่ bills ยังว่าง
+      // "มี local data พอแล้ว" = มีบิล + stmts + meta อย่างน้อย 1 date
+      // ถ้า billList น้อยมาก (<10) → treat as empty
+      // ถ้า meta ว่างแต่ bills/stmts ครบ → ต้อง pull meta (ไม่ skip)
       const hasEnoughBills = billList.length >= 10;
       const hasStmts = getAllStatements().length > 0;
-      const hasLocalData = hasEnoughBills && hasStmts;
+      const hasMeta = Object.keys(mainSummary?.__byDate || {}).length > 0;
+      const hasLocalData = hasEnoughBills && hasStmts && hasMeta;
       const lastPullRecent = Date.now() - this.lastPullAt < 30 * 60 * 1000; // 30 min
       if (hasLocalData && lastPullRecent) {
         return { skipped: 'has_local_and_recent' };
