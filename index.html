@@ -12031,9 +12031,9 @@ async function renderDashboard(el) {
     </div>
     
     <div class="flex gap-3 flex-wrap mb-4 stagger">
+      ${statCard(`ยอดขาย${range.label}`, '฿'+fmtNum(sales.total||0), (sales.count||0)+' รายการ', 'var(--success)', ICONS.dollar)}
       ${statCard('ยอดหนี้คงค้าง', '฿'+fmtNum(debt.total||0), debt.debtors+' ราย', 'var(--warn)', ICONS.card)}
       ${statCard('เกินกำหนด', debt.overdue||0, 'ต้องดำเนินการ', 'var(--danger)', ICONS.alert)}
-      ${statCard(`ยอดขาย${range.label}`, '฿'+fmtNum(sales.total||0), (sales.count||0)+' รายการ', 'var(--success)', ICONS.dollar)}
       ${statCard('Matched', (matching.matched||0)+'/'+(matching.total||0), 'Transfer/Card/Cheque', 'var(--info)', ICONS.pulse)}
     </div>
     
