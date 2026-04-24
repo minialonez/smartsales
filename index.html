@@ -257,10 +257,7 @@ let currentPage = 'dashboard';
 // ── API Helper — auto GET/POST: GET สำหรับ read, POST สำหรับ write ใหญ่ๆ ──
 // Apps Script handleRequest() parse e.postData.contents เป็น JSON อยู่แล้ว
 // Content-Type: text/plain เลี่ยง CORS preflight (simple request)
-async function api(action, params = {}, _retryCount = 0) {
-  // ── Retry config สำหรับ GAS transient body-loss (Unknown action + empty params) ──
-  const MAX_RETRIES = 4;
-  const RETRY_WAITS = [3000, 7000, 15000, 30000]; // 3s, 7s, 15s, 30s
+async function api(action, params = {}) {
   try {
     if (!API_URL) return demoResponse(action, params);
 
@@ -337,24 +334,7 @@ async function api(action, params = {}, _retryCount = 0) {
     }
     
     try {
-      const parsed = JSON.parse(text);
-      
-      // ── Detect GAS transient body-loss: "Unknown action:  | params: []" ──
-      // Signature: success=false, error starts with "Unknown action: " + action ว่าง + params ว่าง
-      // นี่คือ signal ว่า request ถึง backend แต่ POST body หายระหว่างทาง (random GAS issue)
-      // ต่างจาก action ที่ไม่มีจริง (เช่น typo) ที่ error จะเป็น "Unknown action: someName"
-      const isBodyLoss = parsed?.success === false 
-        && /^Unknown action:\s*\|\s*params:\s*\[\]/.test(String(parsed.error || ''))
-        && action && action.length > 0;
-      
-      if (isBodyLoss && _retryCount < MAX_RETRIES) {
-        const wait = RETRY_WAITS[_retryCount];
-        console.warn(`⚠️  GAS body-loss on "${action}" — retry ${_retryCount+1}/${MAX_RETRIES} in ${wait/1000}s`);
-        await new Promise(r => setTimeout(r, wait));
-        return api(action, params, _retryCount + 1);
-      }
-      
-      return parsed;
+      return JSON.parse(text);
     } catch {
       console.error('API response not JSON:', text.substring(0, 300));
       return demoResponse(action, params);
@@ -363,6 +343,81 @@ async function api(action, params = {}, _retryCount = 0) {
     console.error('API Error:', err);
     toast('ไม่สามารถเชื่อมต่อเซิร์ฟเวอร์ — ใช้ Demo Mode', 'error');
     return demoResponse(action, params);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// ⭐ pushMatchDelta: Push เฉพาะ bill + stmt ที่เพิ่ง match/unmatch (fire-and-forget)
+// ─────────────────────────────────────────────────────────────────────────
+// เหตุผล: syncManager push full array ทุกครั้ง (9K bills + 7K stmts) → payload ใหญ่
+// → GAS body-loss เจอบ่อย → match ไม่ sync ขึ้น cloud
+// 
+// Delta push = ส่งแค่ 1-2 records → payload เล็ก → body-loss เจอแทบไม่ได้
+// 
+// ใช้ตอน confirm match/unmatch — ไม่บล็อก UI (.catch แทน await)
+// ถ้า fail → syncManager จะ retry แบบ full array ครั้งถัดไป (graceful fallback)
+async function pushMatchDelta(bill, stmt) {
+  try {
+    // Determine year from bill or stmt date
+    const billYear = bill ? String(new Date(toISODate(bill.date) || bill.date).getFullYear()) : null;
+    const stmtYear = stmt ? String(new Date(toISODate(stmt.date) || stmt.date).getFullYear()) : null;
+    
+    const promises = [];
+    
+    // Push bill if has uuid (ถ้าไม่มี uuid = old data, ปล่อยให้ syncManager handle)
+    if (bill && bill.bill_uuid && billYear) {
+      const billRec = { ...bill, date: toISODate(bill.date) || bill.date };
+      promises.push(
+        api('upsertBills', { year: billYear, records: [billRec], deletes: [] })
+          .then(r => ({ type: 'bill', ok: r?.success !== false, r }))
+          .catch(e => ({ type: 'bill', ok: false, err: e.message }))
+      );
+    }
+    
+    // Push stmt if has uuid
+    if (stmt && stmt.stmt_uuid && stmtYear) {
+      const stmtRec = { ...stmt, date: toISODate(stmt.date) || stmt.date };
+      promises.push(
+        api('upsertStatements', { year: stmtYear, records: [stmtRec], deletes: [] })
+          .then(r => ({ type: 'stmt', ok: r?.success !== false, r }))
+          .catch(e => ({ type: 'stmt', ok: false, err: e.message }))
+      );
+    }
+    
+    if (promises.length === 0) {
+      console.log('[delta] skipped — no uuid on bill/stmt');
+      return;
+    }
+    
+    const results = await Promise.all(promises);
+    const allOk = results.every(r => r.ok);
+    
+    if (allOk) {
+      console.log('[delta] push OK —', results.map(r => r.type).join(' + '));
+      // Invalidate fingerprint cache → next full sync จะ skip เพราะ hash จะตรงกับที่เพิ่ง push
+      // แต่ถ้า user แก้เพิ่มก่อน full sync — hash จะเปลี่ยน → ยัง push ถูกต้อง
+      if (window.syncManager?._fpCache) {
+        delete window.syncManager._fpCache.bills;
+        delete window.syncManager._fpCache.stmts;
+      }
+    } else {
+      const fails = results.filter(r => !r.ok);
+      console.warn('[delta] push partial fail —', fails);
+      // Mark dirty เพื่อให้ syncManager retry
+      if (window.syncManager?.markDirty) {
+        fails.forEach(f => {
+          if (f.type === 'bill') window.syncManager.markDirty('bills');
+          if (f.type === 'stmt') window.syncManager.markDirty('stmts');
+        });
+      }
+    }
+  } catch (err) {
+    console.warn('[delta] push error (will retry via full sync):', err);
+    // Fallback: mark dirty
+    if (window.syncManager?.markDirty) {
+      window.syncManager.markDirty('bills');
+      window.syncManager.markDirty('stmts');
+    }
   }
 }
 
@@ -3073,6 +3128,7 @@ function quickUnmatchBill(b) {
   
   // 1) หา statement ที่ผูกอยู่ → unmatch
   let stmtCleared = false;
+  let unmatchedStmt = null;  // ⭐ hoist out for delta push
   if (stmtRef) {
     const allStmts = getAllStatements();
     const stmt = allStmts.find(s => s.ref_no === stmtRef);
@@ -3087,6 +3143,7 @@ function quickUnmatchBill(b) {
       delete stmt.match_reason;
       delete stmt.overpay_amount;
       stmtCleared = true;
+      unmatchedStmt = stmt;
     }
   }
   
@@ -3100,6 +3157,9 @@ function quickUnmatchBill(b) {
   try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(_){}
   persistMainState();
   invalidateBillsCache();
+  
+  // ⭐ Delta push: push bill + stmt ที่เพิ่ง unmatch (fire-and-forget)
+  pushMatchDelta(b, unmatchedStmt);
   
   toast(`ยกเลิก match สำเร็จ${stmtCleared?' — statement กลับเป็น pending แล้ว':' (ไม่เจอ statement ผูกอยู่)'}`, 'success');
   
@@ -3656,8 +3716,9 @@ function openQuickMatchModal(b) {
                       : (billArr.length > 1 ? 'quick_multi' : 'quick_manual');
     stmt.match_station = billArr[0].station || '';
     stmt.match_bill = billArr.length > 1 ? billLabels.join(' + ') : billLabels[0];
-    if (billArr.length > 1) stmt.matched_bills = billNos; // เลขบิลล้วน (ใช้ใน unmatch lookup)
-    else delete stmt.matched_bills;
+    // ⭐ Always set matched_bills (เลขบิลล้วน ไม่มี "(฿amount)" suffix) — ใช้เป็น source of truth ตอน unmatch
+    // แก้บั๊ก: Main page ใส่ "(฿amount)" ใน match_bill ทำให้ Matching page หาบิลไม่เจอตอน unmatch
+    stmt.matched_bills = billNos;
     stmt.matched_at = now;
     stmt.matched_by = currentUser?.display_name || 'Admin';
     // ⭐ Overpay amount: + = โอนเกิน (ลูกค้าจ่ายเกินยอดบิล), − = โอนขาด
@@ -3676,6 +3737,13 @@ function openQuickMatchModal(b) {
     try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(_){}
     persistMainState();
     invalidateBillsCache();
+    
+    // ⭐ Delta push: push เฉพาะ 2 records ที่เพิ่ง match (fire-and-forget)
+    // กัน GAS body-loss บน full push 9K+ rows — ถ้า fail → fallback เป็น full sync
+    // Multi-bill: push แต่ละบิลทีละตัว (ยัง payload เล็ก)
+    billArr.forEach(bx => pushMatchDelta(bx, null));
+    pushMatchDelta(null, stmt);
+    
     closeModal();
     toast(
       billArr.length > 1
@@ -12945,7 +13013,8 @@ async function renderMatching(el) {
                             : (matchedBills.length > 1 ? 'manual_multi' : 'manual');
           stmt.match_station = matchStation;
           stmt.match_bill = matchBillNo;
-          if (matchedBills.length > 1) stmt.matched_bills = matchedBills;  // traceability
+          // ⭐ Always set matched_bills — ใช้เป็น source of truth ตอน unmatch (ไม่ว่า single หรือ multi)
+          if (matchedBills.length > 0) stmt.matched_bills = matchedBills;
           else delete stmt.matched_bills;
           stmt.matched_at = new Date().toISOString();
           stmt.matched_by = currentUser?.display_name || 'Admin';
@@ -12957,6 +13026,16 @@ async function renderMatching(el) {
           // Persist
           try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(e) {}
           persistMainState();
+          
+          // ⭐ Delta push: push เฉพาะ records ที่เพิ่ง match (fire-and-forget)
+          if (selectedBills.size > 0) {
+            Array.from(selectedBills).forEach(bx => {
+              if (bx && !bx._cashflow && !bx._supplierPayment) {
+                pushMatchDelta(bx, null);
+              }
+            });
+          }
+          pushMatchDelta(null, stmt);
           
           closeModal();
           toast(`Match สำเร็จ: ${stmt.bank} ↔ ${targetLabel}`, 'success');
@@ -12976,9 +13055,13 @@ async function renderMatching(el) {
         if (!confirm(`ยกเลิกการ match กับ ${stmt.match_bill}?`)) return;
         
         // รองรับ multi-bill match: ใช้ matched_bills ถ้ามี ไม่งั้น fallback เป็น match_bill
+        // ⭐ Backward compat: stmt เก่า (match จาก Main ก่อน fix) มี match_bill แบบ "SS00126-000114 (฿16,343.00) + OS00126-000123 (฿5,000.00)"
+        //    → ต้อง split " + " แล้ว strip " (฿..." ออก ไม่งั้น billList.find(b => b.bill_no === bn) หาไม่เจอ
         const billNumbersToUnmatch = Array.isArray(stmt.matched_bills) && stmt.matched_bills.length 
           ? stmt.matched_bills 
-          : [stmt.match_bill];
+          : (stmt.match_bill 
+              ? String(stmt.match_bill).split(' + ').map(s => s.split(' (')[0].trim()).filter(Boolean)
+              : []);
         
         billNumbersToUnmatch.forEach(bn => {
           const bill = billList.find(b => b.bill_no === bn);
@@ -13003,6 +13086,14 @@ async function renderMatching(el) {
         
         try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(e) {}
         persistMainState();
+        
+        // ⭐ Delta push: push bills ที่เพิ่ง unmatch + stmt
+        billNumbersToUnmatch.forEach(bn => {
+          const bill = billList.find(b => b.bill_no === bn);
+          if (bill) pushMatchDelta(bill, null);
+        });
+        pushMatchDelta(null, stmt);
+        
         toast('ยกเลิก match แล้ว', 'success');
         render();
       });
@@ -14733,7 +14824,6 @@ function renderData(el) {
                 year,
                 records: normalized,
                 deletes: [],
-                fresh_only: true,  // ⚡ Fast path — Step 3 clear แล้ว ไม่ต้อง preserve
               });
               if (r?.success) {
                 totalBillsPushed += r.data.inserted + r.data.updated;
@@ -14759,7 +14849,6 @@ function renderData(el) {
                 year,
                 records: normalized,
                 deletes: [],
-                fresh_only: true,  // ⚡ Fast path
               });
               if (r?.success) {
                 totalStmtsPushed += r.data.inserted + r.data.updated;
@@ -14781,7 +14870,6 @@ function renderData(el) {
                 year,
                 records: chunk,
                 deletes: [],
-                fresh_only: true,  // ⚡ Fast path
               });
               if (r?.success) {
                 totalMetaPushed += r.data.inserted + r.data.updated;
