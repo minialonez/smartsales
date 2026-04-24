@@ -4080,7 +4080,9 @@ async function renderMain(el) {
     // (OC = ลูกค้าค้างจ่าย: ก่อนรับ sales>0, accounted=0 → diff ลบ = ยังรอรับเงิน ✓)
     const diff = accountedSide - incomeSide;
     
-    return { diff, isOk: Math.abs(diff) < 1.0, empty: false };
+    // Threshold 0.01 = 2-decimal precision (ตรงกับ fmtNum/fmtDiff)
+    // ของเดิม 1.0 บังข้อมูล diff ที่มีนัยสำคัญ เช่น +0.50, −0.75
+    return { diff, isOk: Math.abs(diff) < 0.01, empty: false };
   }
 
   function render() {
@@ -12169,7 +12171,7 @@ async function renderSales(el) {
                     const inflow = (ent['cash_in_'+s]||0) + (ent['sales_'+s]||0) + (ent['cash_out_'+s]||0) + (ent['returns_'+s]||0);
                     const outflow = (ent['drawer_'+s]||0) + (ent['transfer_'+s]||0) + (ent['card_'+s]||0) + (ent['cheque_'+s]||0) + (ent['refund_'+s]||0);
                     const diff = outflow - inflow;
-                    const isOk = Math.abs(diff) < 1;
+                    const isOk = Math.abs(diff) < 0.01;  // 2-decimal precision ตรงกับ fmtNum
                     return `<td style="text-align:center;font-weight:800;font-size:.85rem;color:${isOk?'var(--success)':'var(--danger)'}">
                       ${isOk ? '✓ OK' : '฿'+fmtNum(diff)}
                     </td>`;
@@ -12239,7 +12241,7 @@ async function renderSales(el) {
           const inflow = (ent['cash_in_'+s]||0) + (ent['sales_'+s]||0) + (ent['cash_out_'+s]||0) + (ent['returns_'+s]||0);
           const outflow = (ent['drawer_'+s]||0) + (ent['transfer_'+s]||0) + (ent['card_'+s]||0) + (ent['cheque_'+s]||0) + (ent['refund_'+s]||0);
           const diff = outflow - inflow;
-          const isOk = Math.abs(diff) < 1;
+          const isOk = Math.abs(diff) < 0.01;  // 2-decimal precision ตรงกับ fmtNum
           if (sumCells[idx + 2]) {
             sumCells[idx + 2].textContent = isOk ? '✓ OK' : '฿' + fmtNum(diff);
             sumCells[idx + 2].style.color = isOk ? 'var(--success)' : 'var(--danger)';
