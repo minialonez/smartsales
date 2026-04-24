@@ -2541,6 +2541,31 @@ async function restoreMainState() {
         uploadedStatements = getAllStatements();
       }
     }
+    
+    // ⭐ One-shot normalize: matched_bills ที่เคยเก็บเป็น string → convert เป็น array
+    // กัน bug: `s.matched_bills.join is not a function` ตอน fingerprint compute
+    let normalizedCount = 0;
+    Object.values(statementsByBank).forEach(arr => {
+      (arr || []).forEach(s => {
+        if (s.matched_bills != null && !Array.isArray(s.matched_bills)) {
+          const str = String(s.matched_bills).trim();
+          if (str === '' || str === '[]') {
+            delete s.matched_bills;
+          } else if (str.startsWith('[')) {
+            try { s.matched_bills = JSON.parse(str); }
+            catch { s.matched_bills = str.split(',').map(x => x.trim()).filter(Boolean); }
+          } else {
+            s.matched_bills = str.split(',').map(x => x.trim()).filter(Boolean);
+          }
+          if (!Array.isArray(s.matched_bills)) delete s.matched_bills;
+          else normalizedCount++;
+        }
+      });
+    });
+    if (normalizedCount > 0) {
+      console.log(`[restore] Normalized ${normalizedCount} stmts with string matched_bills → array`);
+      uploadedStatements = getAllStatements();
+    }
   } catch (e) { console.warn('Could not restore state:', e); }
   
   // ── Bank field = USER MANUAL ENTRY ──
@@ -3998,7 +4023,7 @@ async function renderMain(el) {
     _billsForSelectedDateCacheKey = null;
     // ⭐ Invalidate date strip cache เมื่อ bills/stmts เปลี่ยน
     window._datesWithDataCache = null;
-    window._datesWithDataCacheVer = -1;
+    window._datesWithDataCacheKey = null;
   }
   // Expose เป็น global เพื่อให้ syncManager + other handlers นอก renderMain scope เรียกได้
   window.invalidateBillsCache = invalidateBillsCache;
@@ -5785,32 +5810,46 @@ async function renderMain(el) {
     
     function _getDatesWithData() {
       // Build Set of ISO dates that have REAL data — cached
-      // ⭐ Strict check: ไม่ใช่แค่มี key ใน __byDate (อาจเป็น stub/default)
-      //    ต้องมี bills/stmts จริง หรือมี sales/cashDrawer value > 0
-      if (!window._datesWithDataCache || window._datesWithDataCacheVer !== billList.length + getAllStatements().length) {
+      // ⭐ Strict criteria (ไม่นับ placeholder bills):
+      //    - Bill: ต้องมี amount > 0 และ type ไม่ว่าง
+      //    - Stmt: ต้องมี amount > 0
+      //    - Meta: มี label ที่ meaningful + value > 0
+      // Cache ใช้ _stateVersion เพื่อ rebuild เมื่อ state เปลี่ยน (เทียบ length อย่างเดียวไม่พอ)
+      const cacheKey = `${billList.length}|${getAllStatements().length}|${(typeof _stateVersion !== 'undefined' ? _stateVersion : 0)}`;
+      if (!window._datesWithDataCache || window._datesWithDataCacheKey !== cacheKey) {
         const dates = new Set();
         
-        // มีบิลในวันนั้น = มีข้อมูล
-        billList.forEach(b => { const d = toISODate(b.date); if (d) dates.add(d); });
-        
-        // มี stmt ในวันนั้น = มีข้อมูล
-        Object.values(statementsByBank).forEach(arr => {
-          (arr||[]).forEach(s => { const d = toISODate(s.date); if (d) dates.add(d); });
+        // Bills: strict — ต้องไม่ใช่ placeholder
+        //   ต้องมี amount > 0 + type ระบุ (ไม่ใช่ว่าง/null)
+        billList.forEach(b => {
+          const d = toISODate(b.date);
+          if (!d) return;
+          const amt = Math.abs(Number(b.amount) || 0);
+          if (amt <= 0) return;
+          if (!b.type || String(b.type).trim() === '') return;
+          dates.add(d);
         });
         
-        // ⭐ __byDate: ต้องมี sales/cashDrawer/transfer/card/cheque > 0 จริง
-        //    ไม่นับเฉพาะ cashIn (5155 default) เพราะทุกวันมี = false positive
+        // Stmts: ต้องมี amount > 0
+        Object.values(statementsByBank).forEach(arr => {
+          (arr||[]).forEach(s => {
+            const d = toISODate(s.date);
+            if (!d) return;
+            const amt = Math.abs(Number(s.amount) || 0);
+            if (amt > 0) dates.add(d);
+          });
+        });
+        
+        // Meta: ต้องมี label ที่ meaningful + value > 0
+        // ไม่นับ cashIn ซึ่งมักเป็น default 5155 ทุกวัน
         const MEANINGFUL_LABELS = ['ยอดขาย', 'Cash Drawer', 'Transfer', 'Card', 'Cheque', 'นำเงินออก', 'ยอดคืนสินค้า'];
         if (mainSummary.__byDate) {
           Object.keys(mainSummary.__byDate).forEach(d => {
             const v = mainSummary.__byDate[d];
             if (!v || typeof v !== 'object') return;
-            
-            // เช็คทีละ label ที่มีความหมาย
             for (const label of MEANINGFUL_LABELS) {
               const stations = v[label];
               if (!stations || typeof stations !== 'object') continue;
-              // ถ้ามี station ไหน value > 0 → ถือว่ามีข้อมูลจริง
               const hasReal = Object.values(stations).some(val => {
                 const n = Number(val);
                 return !isNaN(n) && Math.abs(n) > 0;
@@ -5821,7 +5860,7 @@ async function renderMain(el) {
         }
         
         window._datesWithDataCache = dates;
-        window._datesWithDataCacheVer = billList.length + getAllStatements().length;
+        window._datesWithDataCacheKey = cacheKey;
       }
       return window._datesWithDataCache;
     }
