@@ -499,6 +499,49 @@ function extractTimeStr(val) {
   return match ? match[0] : '';
 }
 
+// ⭐ Format stmt.time for display — handles all junk cases
+// ─────────────────────────────────────────────────────────────
+// Problem: stmt.time มักถูก import เป็น "30/12/1899 HH:MM" (Excel epoch)
+//          หรือ "30/12/1899" ล้วน (ไม่มีเวลา)
+//          หรือ Date object ที่มาจาก getValues()
+// Solution: extract HH:MM อย่างเดียว, ถ้าเป็น Excel serial (fraction) → convert
+function fmtStmtTime(val) {
+  if (!val && val !== 0) return '';
+  
+  // Date object (จาก Google Sheets getValues)
+  if (val instanceof Date && !isNaN(val)) {
+    // ถ้า date คือ 1899-12-30 (Excel epoch) → มีแต่ time portion
+    const y = val.getFullYear();
+    const hh = String(val.getHours()).padStart(2, '0');
+    const mm = String(val.getMinutes()).padStart(2, '0');
+    return `${hh}:${mm}`;
+  }
+  
+  // Excel time serial (0.5 = 12:00)
+  if (typeof val === 'number' && val >= 0 && val < 1) {
+    const totalMin = Math.round(val * 1440);
+    const hh = String(Math.floor(totalMin / 60)).padStart(2, '0');
+    const mm = String(totalMin % 60).padStart(2, '0');
+    return `${hh}:${mm}`;
+  }
+  
+  const str = String(val).trim();
+  if (!str) return '';
+  
+  // "30/12/1899 HH:MM" หรือ "30/12/1899 HH:MM:SS" → extract HH:MM
+  const m = str.match(/(\d{2}:\d{2}(:\d{2})?)/);
+  if (m) return m[1].substring(0, 5);  // trim seconds
+  
+  // "30/12/1899" (junk date ไม่มีเวลา) → empty
+  if (/^30\/12\/1899/.test(str) || /^1899-12-30/.test(str)) return '';
+  
+  // ISO datetime "2026-04-08T10:30:00" → extract time
+  const iso = str.match(/T(\d{2}:\d{2})/);
+  if (iso) return iso[1];
+  
+  return '';
+}
+
 // ── Toast ──
 function toast(msg, type = 'info') {
   const el = document.createElement('div');
@@ -1940,6 +1983,10 @@ const syncManager = {
           // Final guard: ensure Array
           if (!Array.isArray(s.matched_bills)) delete s.matched_bills;
         }
+        // ⭐ Clean junk time: "30/12/1899", "30/12/1899 HH:MM" → "HH:MM" or ""
+        if (s.time != null && typeof fmtStmtTime === 'function') {
+          s.time = fmtStmtTime(s.time);
+        }
         return s;
       };
       
@@ -2653,6 +2700,7 @@ async function restoreMainState() {
     // ⭐ One-shot normalize: matched_bills ที่เคยเก็บเป็น string → convert เป็น array
     // กัน bug: `s.matched_bills.join is not a function` ตอน fingerprint compute
     let normalizedCount = 0;
+    let timeFixedCount = 0;
     Object.values(statementsByBank).forEach(arr => {
       (arr || []).forEach(s => {
         if (s.matched_bills != null && !Array.isArray(s.matched_bills)) {
@@ -2668,11 +2716,23 @@ async function restoreMainState() {
           if (!Array.isArray(s.matched_bills)) delete s.matched_bills;
           else normalizedCount++;
         }
+        
+        // ⭐ Clean junk time: "30/12/1899", "30/12/1899 HH:MM" → "HH:MM" or ""
+        if (s.time && typeof fmtStmtTime === 'function') {
+          const cleaned = fmtStmtTime(s.time);
+          if (cleaned !== String(s.time).trim()) {
+            s.time = cleaned;
+            timeFixedCount++;
+          }
+        }
       });
     });
     if (normalizedCount > 0) {
       console.log(`[restore] Normalized ${normalizedCount} stmts with string matched_bills → array`);
       uploadedStatements = getAllStatements();
+    }
+    if (timeFixedCount > 0) {
+      console.log(`[restore] Cleaned ${timeFixedCount} stmts with junk time (e.g. "30/12/1899" → "HH:MM")`);
     }
   } catch (e) { console.warn('Could not restore state:', e); }
   
@@ -12929,7 +12989,7 @@ async function renderMatching(el) {
                 <tr style="${rowStyle}" data-stmt-idx="${i}">
                   <td><span class="badge" style="background:${(bankColors[s.bank]||'#555')}22;color:${bankColors[s.bank]||'#aaa'}">${s.bank}</span></td>
                   <td>${fmtDate(s.date)}</td>
-                  <td>${s.time}</td>
+                  <td>${fmtStmtTime(s.time)}</td>
                   <td class="text-xs" style="font-family:var(--mono)">${s.ref_no}</td>
                   <td style="text-align:right;font-weight:600;color:${Number(s.amount)>=0?'var(--success)':'var(--danger)'}">${Number(s.amount)>=0?'+':''}${fmtNum(s.amount)}</td>
                   <td class="truncate" style="max-width:170px;color:var(--text)">
@@ -13270,7 +13330,7 @@ async function renderMatching(el) {
             <div style="padding:10px;background:var(--surface2);border-radius:8px">
               <div class="flex justify-between items-center">
                 <div>
-                  <div class="text-sm font-semi">${stmt.bank} · ${fmtDate(stmt.date)} · ${stmt.time||''}</div>
+                  <div class="text-sm font-semi">${stmt.bank} · ${fmtDate(stmt.date)} · ${fmtStmtTime(stmt.time)||''}</div>
                   <div class="text-xs text-muted">${stmt.description||stmt.ref_no||''}</div>
                 </div>
                 <div style="font-size:1.2rem;font-weight:700;color:var(--success)">฿${fmtNum(stmtAmt)}</div>
