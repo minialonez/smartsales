@@ -6237,8 +6237,9 @@ function spTempCounter() {
 }
 
 function genSpTempNo() {
+  // ⭐ Pure function — no side effects. Counter persist moved to markDirtySpTemps()
+  // Fix bug: previously localStorage.setItem here → counter advanced แม้ user cancel modal
   const n = spTempCounter();
-  localStorage.setItem('sf_spTempCounter', String(n));
   return 'SP-TEMP-' + String(n).padStart(4, '0');
 }
 
@@ -6261,6 +6262,15 @@ function recomputeSpTempStatus(t) {
 }
 
 function markDirtySpTemps() {
+  // ⭐ Persist counter to localStorage (moved from genSpTempNo)
+  // Only fires on commit path → counter ไม่เขยิบถ้า user cancel modal
+  let max = 0;
+  spTempList.forEach(t => {
+    const m = String(t.no||'').match(/SP-TEMP-(\d+)/);
+    if (m) max = Math.max(max, Number(m[1]));
+  });
+  if (max > 0) localStorage.setItem('sf_spTempCounter', String(max));
+  
   persistMainState();
   if (window.syncManager) syncManager.markDirty('sp_temps');
 }
@@ -6295,7 +6305,7 @@ function spTempCustomerInput(id, selectedCode, selectedName) {
       <input class="input" id="${id}-search" placeholder="🔍 ค้นหาลูกค้า (รหัส / ชื่อ)" 
              value="${selectedCode ? `(${selectedCode}) ${selectedName||''}` : ''}" 
              autocomplete="off" style="width:100%">
-      <div id="${id}-drop" style="display:none;position:absolute;top:100%;left:0;right:0;background:var(--card);border:1px solid var(--border);border-radius:6px;max-height:260px;overflow-y:auto;z-index:10;box-shadow:0 4px 12px rgba(0,0,0,.3)"></div>
+      <div id="${id}-drop" style="display:none;position:absolute;top:100%;left:0;right:0;background:var(--bg);border:1px solid var(--border);border-radius:6px;max-height:260px;overflow-y:auto;z-index:1000;box-shadow:0 8px 24px rgba(0,0,0,.6),0 0 0 1px rgba(255,255,255,.05);margin-top:4px"></div>
       <input type="hidden" id="${id}-code" value="${selectedCode||''}">
       <input type="hidden" id="${id}-name" value="${selectedName||''}">
     </div>
@@ -6319,7 +6329,7 @@ function spTempWireCustomerInput(id) {
     }).slice(0, 20);
     
     if (matches.length === 0) {
-      drop.innerHTML = '<div style="padding:8px;color:var(--text3);font-size:.85rem">ไม่พบลูกค้า — กรอกเองได้</div>';
+      drop.innerHTML = '<div style="padding:10px 12px;color:var(--text3);font-size:.85rem;background:var(--bg)">ไม่พบลูกค้า — กรอกเองได้</div>';
       drop.style.display = 'block';
       return;
     }
@@ -6328,7 +6338,7 @@ function spTempWireCustomerInput(id) {
       const code = c.cust_code || c.cust_id || '';
       const name = c.cust_name || '';
       return `<div class="sp-cust-opt" data-code="${code}" data-name="${name.replace(/"/g,'&quot;')}" 
-              style="padding:6px 10px;cursor:pointer;border-bottom:1px solid var(--border);font-size:.85rem">
+              style="padding:8px 12px;cursor:pointer;border-bottom:1px solid var(--border);font-size:.85rem;background:var(--bg);color:var(--text)">
               <span style="font-family:monospace;color:var(--info)">${code}</span> · ${name}
               </div>`;
     }).join('');
