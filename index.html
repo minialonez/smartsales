@@ -11863,6 +11863,8 @@ async function renderDashboard(el) {
   let period = safeStorage.get(PERIOD_STORAGE_KEY) || '30d';
   let customFrom = safeStorage.get('sf_dashboard_custom_from') || '';
   let customTo = safeStorage.get('sf_dashboard_custom_to') || '';
+  // ⭐ Single-day mode — เก็บวันที่เลือกจาก calendar popup
+  let selectedSingleDate = safeStorage.get('sf_dashboard_single_date') || '';
   
   const today = todayISO();
   
@@ -11897,7 +11899,18 @@ async function renderDashboard(el) {
         const s = new Date(now.getFullYear(), 0, 1);
         return { from: iso(s), to: today, label: 'ปีนี้' };
       }
-      case 'custom': return { from: customFrom, to: customTo, label: 'กำหนดเอง' };
+      case 'single': {
+        // ⭐ Single day — label เป็นวันที่ไทยเต็ม
+        const d = selectedSingleDate || today;
+        let label = 'เลือกวัน';
+        const dt = new Date(d);
+        if (!isNaN(dt)) {
+          const thMonths = ['ม.ค.','ก.พ.','มี.ค.','เม.ย.','พ.ค.','มิ.ย.','ก.ค.','ส.ค.','ก.ย.','ต.ค.','พ.ย.','ธ.ค.'];
+          label = `${dt.getDate()} ${thMonths[dt.getMonth()]} ${dt.getFullYear()}`;
+        }
+        return { from: d, to: d, label };
+      }
+      case 'custom': return { from: customFrom, to: customTo, label: 'ช่วงเอง' };
       default: return { from: today, to: today, label: 'วันนี้' };
     }
   }
@@ -11998,7 +12011,8 @@ async function renderDashboard(el) {
     { key: 'this_month', label: 'เดือนนี้' },
     { key: 'last_month', label: 'เดือนก่อน' },
     { key: 'this_year', label: 'ปีนี้' },
-    { key: 'custom', label: 'กำหนดเอง' },
+    { key: 'single', label: period === 'single' ? `📅 ${range.label}` : '📅 เลือกวัน' },
+    { key: 'custom', label: 'ช่วงเอง' },
   ];
   const periodPillsHtml = PERIODS.map(p => 
     `<button class="pill dash-period-btn ${period===p.key?'active':''}" data-period="${p.key}">${p.label}</button>`
@@ -12027,8 +12041,9 @@ async function renderDashboard(el) {
         </div>
         <div class="text-xs text-dim">${sales.count} รายการ · <b style="color:var(--success);font-size:1rem">฿${fmtNum(sales.total)}</b></div>
       </div>
-      <div class="flex gap-1 flex-wrap" id="dash-period-pills">
+      <div class="flex gap-1 flex-wrap" id="dash-period-pills" style="position:relative">
         ${periodPillsHtml}
+        <div id="dash-date-popup" style="display:none"></div>
       </div>
       <div id="dash-custom-range" style="margin-top:8px;${period==='custom'?'':'display:none'}">
         <div class="flex gap-2 items-center flex-wrap">
@@ -12152,16 +12167,176 @@ async function renderDashboard(el) {
   document.querySelectorAll('.dash-period-btn').forEach(btn => {
     btn.addEventListener('click', () => {
       const newPeriod = btn.dataset.period;
-      safeStorage.set(PERIOD_STORAGE_KEY, newPeriod);
-      if (newPeriod !== 'custom') {
-        renderDashboard(el); // re-render
-      } else {
+      if (newPeriod === 'custom') {
         safeStorage.set(PERIOD_STORAGE_KEY, 'custom');
         document.getElementById('dash-custom-range').style.display = '';
         document.querySelectorAll('.dash-period-btn').forEach(b => b.classList.toggle('active', b === btn));
+      } else if (newPeriod === 'single') {
+        // ⭐ เปิด calendar popup แบบ Main
+        _openDashDatePopup();
+      } else {
+        safeStorage.set(PERIOD_STORAGE_KEY, newPeriod);
+        renderDashboard(el);
       }
     });
   });
+  
+  // ══════════════════════════════════════════════════════════════
+  // ⭐ CALENDAR POPUP (single-day) — copied pattern from Main
+  // ══════════════════════════════════════════════════════════════
+  let _dashPopupMonth = null; // "yyyy-MM"
+  
+  function _getSalesDatesSet() {
+    // วันที่มีบิลขาย (สำหรับ dot)
+    const set = new Set();
+    billList.forEach(b => {
+      if (!isSaleBill(b)) return;
+      const d = toISODate(b.date);
+      if (d) set.add(d);
+    });
+    return set;
+  }
+  
+  function _hideDashDatePopup() {
+    const p = document.getElementById('dash-date-popup');
+    if (p) p.style.display = 'none';
+    _dashPopupMonth = null;
+  }
+  
+  function _openDashDatePopup() {
+    const popup = document.getElementById('dash-date-popup');
+    if (!popup) return;
+    
+    const baseIso = selectedSingleDate || today;
+    if (!_dashPopupMonth) {
+      const [y, m] = baseIso.split('-');
+      _dashPopupMonth = `${y}-${m}`;
+    }
+    _renderDashDatePopup();
+  }
+  
+  function _renderDashDatePopup() {
+    const popup = document.getElementById('dash-date-popup');
+    if (!popup) return;
+    
+    const [py, pm] = _dashPopupMonth.split('-').map(Number);
+    const datesSet = _getSalesDatesSet();
+    const baseIso = selectedSingleDate || today;
+    
+    // Month grid — จันทร์ first
+    const firstDay = new Date(py, pm - 1, 1);
+    const lastDay = new Date(py, pm, 0);
+    const jsDow = firstDay.getDay();
+    const startOffset = (jsDow + 6) % 7;
+    const totalDays = lastDay.getDate();
+    
+    const thMonths = ['มกราคม','กุมภาพันธ์','มีนาคม','เมษายน','พฤษภาคม','มิถุนายน','กรกฎาคม','สิงหาคม','กันยายน','ตุลาคม','พฤศจิกายน','ธันวาคม'];
+    const dowNames = ['จ','อ','พ','พฤ','ศ','ส','อา'];
+    
+    let cellsHtml = '';
+    for (let i = 0; i < startOffset; i++) cellsHtml += `<div></div>`;
+    for (let day = 1; day <= totalDays; day++) {
+      const iso = `${py}-${String(pm).padStart(2,'0')}-${String(day).padStart(2,'0')}`;
+      const isSelected = iso === baseIso;
+      const isToday = iso === today;
+      const hasData = datesSet.has(iso);
+      const dow = new Date(py, pm - 1, day).getDay();
+      const isSunday = dow === 0;
+      
+      let bg = 'transparent', color = 'var(--text)', fontWeight = '500';
+      if (isSelected) { bg = 'var(--primary)'; color = '#fff'; fontWeight = '700'; }
+      else if (isSunday && !hasData) { color = 'var(--text3)'; }
+      else if (!hasData) { color = 'var(--text2)'; }
+      
+      const dotColor = isSelected ? '#fff' : (hasData ? 'var(--success)' : 'transparent');
+      const todayRing = isToday && !isSelected ? 'box-shadow:inset 0 0 0 1.5px var(--primary);' : '';
+      
+      cellsHtml += `<button class="dash-dp-day" data-iso="${iso}" style="
+        aspect-ratio:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
+        gap:2px;background:${bg};color:${color};border:none;border-radius:50%;cursor:pointer;
+        font-size:.9rem;font-weight:${fontWeight};font-variant-numeric:tabular-nums;${todayRing}
+        transition:background .12s">
+        <span>${day}</span>
+        <span style="width:4px;height:4px;border-radius:50%;background:${dotColor}"></span>
+      </button>`;
+    }
+    
+    popup.innerHTML = `
+      <div id="dash-dp-backdrop" style="position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:9998"></div>
+      <div style="position:absolute;top:calc(100% + 6px);left:50%;transform:translateX(-50%);
+                  background:#141721;border:1px solid var(--border);border-radius:14px;
+                  padding:14px;width:320px;z-index:9999;
+                  box-shadow:0 12px 32px rgba(0,0,0,.7),0 0 0 1px rgba(255,255,255,.05)">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+          <div style="color:var(--info);font-size:1rem;font-weight:600">
+            ${thMonths[pm - 1]} ${py}
+          </div>
+          <div style="display:flex;gap:14px">
+            <button id="dash-dp-prev" style="background:none;border:none;color:var(--info);font-size:1.3rem;cursor:pointer;padding:0 4px;line-height:1">‹</button>
+            <button id="dash-dp-today" style="background:none;border:none;color:var(--info);font-size:.8rem;cursor:pointer;padding:0 6px;font-weight:600">วันนี้</button>
+            <button id="dash-dp-next" style="background:none;border:none;color:var(--info);font-size:1.3rem;cursor:pointer;padding:0 4px;line-height:1">›</button>
+          </div>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(7,1fr);gap:2px;margin-bottom:6px">
+          ${dowNames.map(n => `<div style="font-size:.72rem;color:var(--text3);text-align:center;padding:4px 0">${n}</div>`).join('')}
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(7,1fr);gap:2px">
+          ${cellsHtml}
+        </div>
+        <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);
+                    display:flex;justify-content:space-between;align-items:center;font-size:.7rem;color:var(--text3)">
+          <span style="display:flex;align-items:center;gap:4px">
+            <span style="width:5px;height:5px;border-radius:50%;background:var(--success)"></span>
+            มีข้อมูล
+          </span>
+          <button id="dash-dp-close" style="background:none;border:none;color:var(--info);font-size:.8rem;cursor:pointer;font-weight:600">ปิด</button>
+        </div>
+      </div>
+    `;
+    popup.style.display = 'block';
+    
+    // Wire handlers
+    popup.querySelectorAll('.dash-dp-day').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const iso = btn.dataset.iso;
+        selectedSingleDate = iso;
+        safeStorage.set('sf_dashboard_single_date', iso);
+        safeStorage.set(PERIOD_STORAGE_KEY, 'single');
+        _hideDashDatePopup();
+        renderDashboard(el);
+      });
+      btn.addEventListener('mouseenter', () => {
+        if (!btn.style.background || btn.style.background === 'transparent') btn.style.background = 'rgba(85,107,255,.15)';
+      });
+      btn.addEventListener('mouseleave', () => {
+        const iso = btn.dataset.iso;
+        if (iso !== (selectedSingleDate || today)) btn.style.background = 'transparent';
+      });
+    });
+    document.getElementById('dash-dp-prev')?.addEventListener('click', () => {
+      const [y, m] = _dashPopupMonth.split('-').map(Number);
+      const nm = m === 1 ? 12 : m - 1;
+      const ny = m === 1 ? y - 1 : y;
+      _dashPopupMonth = `${ny}-${String(nm).padStart(2,'0')}`;
+      _renderDashDatePopup();
+    });
+    document.getElementById('dash-dp-next')?.addEventListener('click', () => {
+      const [y, m] = _dashPopupMonth.split('-').map(Number);
+      const nm = m === 12 ? 1 : m + 1;
+      const ny = m === 12 ? y + 1 : y;
+      _dashPopupMonth = `${ny}-${String(nm).padStart(2,'0')}`;
+      _renderDashDatePopup();
+    });
+    document.getElementById('dash-dp-today')?.addEventListener('click', () => {
+      selectedSingleDate = today;
+      safeStorage.set('sf_dashboard_single_date', today);
+      safeStorage.set(PERIOD_STORAGE_KEY, 'single');
+      _hideDashDatePopup();
+      renderDashboard(el);
+    });
+    document.getElementById('dash-dp-close')?.addEventListener('click', _hideDashDatePopup);
+    document.getElementById('dash-dp-backdrop')?.addEventListener('click', _hideDashDatePopup);
+  }
   document.getElementById('dash-custom-apply')?.addEventListener('click', () => {
     const f = document.getElementById('dash-custom-from').value;
     const t = document.getElementById('dash-custom-to').value;
