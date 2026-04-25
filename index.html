@@ -3237,14 +3237,11 @@ function parseFrontPosReport(result, fileName) {
   const newBills = [];
   let count = 0, transferCount = 0;
   
-  // summary ต่อ station (สำหรับใส่ในตาราง Summary ด้านบน)
-  const stationSummary = {
-    Front1: { cash: 0, card: 0, transfer: 0, sales: 0, refund: 0, cashier: '' },
-    Front2: { cash: 0, card: 0, transfer: 0, sales: 0, refund: 0, cashier: '' },
-    Front3: { cash: 0, card: 0, transfer: 0, sales: 0, refund: 0, cashier: '' },
-    Front4: { cash: 0, card: 0, transfer: 0, sales: 0, refund: 0, cashier: '' },
-  };
-
+  // ⭐ NOTE: User กรอก ยอดขาย/นำเงินเข้า/นำเงินออก/ยอดคืนสินค้า/Cash Drawer เองทั้งหมด
+  //         Front POS import ไม่แตะ summary section ใดๆ — เฉพาะ push billList รายตัวเท่านั้น
+  //         ไม่เขียน mainSummary (sales_*, transfer_*, card_*, cashDrawer_*, returns_*)
+  //         ไม่เขียน mainSummary.__byDate[*] section ของ summary
+  
   // Dynamic mapping: cashier → station (จาก bill prefix ในไฟล์นี้)
   const cashierToStation = {}; // key: "CAS008" → value: "Front1"
 
@@ -3252,17 +3249,12 @@ function parseFrontPosReport(result, fileName) {
   const sheet = result.sheets[sheetName] || [];
 
   // Helper: ดึง Station จาก bill prefix
+  // Format: S2604001003-... = month YYMM + station(001-004) + seq
   function getStationFromBill(billNo) {
     const match = String(billNo).match(/^[SR]\d{7}(\d{3})-/);
     if (!match) return '';
     const code = match[1];
     return { '001':'Front1', '002':'Front2', '003':'Front3', '004':'Front4' }[code] || '';
-  }
-
-  // Helper: ดึง cashier code (เช่น CAS008)
-  function getCashierCode(cashierStr) {
-    const m = String(cashierStr).match(/\((CAS\d+)\)/);
-    return m ? m[1] : '';
   }
 
   // ── PASS 1: สแกนเลขบิล → สร้าง cashier↔station mapping ──
@@ -3272,11 +3264,9 @@ function parseFrontPosReport(result, fileName) {
     const c1 = String(r[0] || '').trim();
     const c2 = String(r[1] || '').trim();
     
-    // จับ cashier header
     const cashMatch = c1.match(/^\((CAS\d+)\)/);
     if (cashMatch) { scanCashier = cashMatch[1]; continue; }
     
-    // จับ bill ของ cashier นี้ → ดู station จาก bill
     if (c2.startsWith('หมายเลข') && scanCashier) {
       const billNo = String(r[2] || '').trim();
       const st = getStationFromBill(billNo);
@@ -3286,10 +3276,12 @@ function parseFrontPosReport(result, fileName) {
     }
   }
 
-  // ── PASS 2: อ่านข้อมูลจริง ──
+  // ── PASS 2: อ่าน bills รายตัว ──
+  // เก็บเฉพาะ: เงินโอน (Type=Transfer) + Card (Type=Card อันเดียวต่อ cashier ถ้ามี)
   let currentStation = '';
   let currentCashier = '';
   let currentCashierName = '';
+  let currentCashierDateMode = ''; // วันของบิลส่วนใหญ่ใน cashier นี้ (สำหรับ Card aggregate row)
 
   for (let i = 0; i < sheet.length; i++) {
     const r = sheet[i] || [];
@@ -3305,34 +3297,21 @@ function parseFrontPosReport(result, fileName) {
       currentCashier = cashierMatch[1];
       currentCashierName = cashierMatch[2].trim();
       currentStation = cashierToStation[currentCashier] || '';
-      
-      if (currentStation && stationSummary[currentStation]) {
-        stationSummary[currentStation].cashier = currentCashierName;
-        stationSummary[currentStation].sales = Number(r[1]) || 0;
-        stationSummary[currentStation].refund = Math.abs(Number(r[2]) || 0);
-      }
+      // ⭐ ไม่แตะ summary เลย (user กรอกเอง)
       continue;
     }
 
-    // แถว "เงินสด"
-    if (c2 === 'เงินสด') {
-      const amt = Number(r[7]) || Number(r[2]) || 0;
-      if (currentStation && stationSummary[currentStation]) {
-        stationSummary[currentStation].cash = amt;
-      }
-      continue;
-    }
+    // แถว "เงินสด" — skip (user ใส่เอง)
+    if (c2 === 'เงินสด') continue;
     
-    // แถว "บัตรเครดิต"
-    if (c2 === 'บัตรเครดิต') {
-      const amt = Number(r[7]) || Number(r[2]) || 0;
-      if (currentStation && stationSummary[currentStation]) {
-        stationSummary[currentStation].card = amt;
-      }
-      continue;
-    }
+    // แถว "บัตรเครดิต" (ไม่มีเลขบิล แค่สรุปต่อ cashier) — SKIP
+    // ⭐ POS อาจมี 2 รูปแบบ:
+    //    รูปแบบ 1: row "บัตรเครดิต" (สรุป) + rows "หมายเลข : เงินโอน ..." (รายตัว)
+    //    รูปแบบ 2: row "บัตรเครดิต" (สรุป) + rows "หมายเลข : บัตรเครดิต ..." (รายตัว) + "หมายเลข : เงินโอน ..." (รายตัว)
+    //    ทั้ง 2 รูปแบบ: "บัตรเครดิต" สรุปคือ duplicate ของรายตัว → ข้าม (กันซ้ำ)
+    if (c2 === 'บัตรเครดิต') continue;
 
-    // แถวเงินโอน (มีเลขบิลจริง)
+    // แถวรายการ (มีเลขบิลจริง) — รองรับทั้ง "หมายเลข : เงินโอน ..." + "หมายเลข : บัตรเครดิต ..."
     if (c2.startsWith('หมายเลข')) {
       const billNo = String(r[2] || '').trim();
       if (!/^[SR]\d+-\d+$/.test(billNo)) continue;
@@ -3341,22 +3320,33 @@ function parseFrontPosReport(result, fileName) {
       const amount = Number(r[6]) || 0;
       if (!amount) continue;
 
-      const refMatch = c2.match(/เงินโอน\s+(.+?)$/);
+      // ⭐ แยกประเภทตาม keyword ใน c2:
+      //    "หมายเลข : บัตรเครดิต ..."  → Type = Card
+      //    "หมายเลข : เงินโอน OTHER ..." → Type = Other
+      //    "หมายเลข : เงินโอน ..."       → Type = Transfer
+      const isCard = c2.includes('บัตรเครดิต');
+      const isOther = c2.includes('OTHER');
+      let type = 'Transfer';
+      if (isCard) type = 'Card';
+      else if (isOther) type = 'Other';
+      
+      // Reference: หลัง "เงินโอน" หรือ "บัตรเครดิต"
+      const refMatch = c2.match(/(?:เงินโอน|บัตรเครดิต)\s+(.+?)$/);
       const transferRef = refMatch ? refMatch[1].trim() : '';
 
       // Station จากเลขบิล (ชัวร์กว่า cashier mapping)
       const station = getStationFromBill(billNo) || currentStation || 'Front1';
       
-      const isOther = c2.includes('OTHER');
-      const type = isOther ? 'Other' : 'Transfer';
-      
       const isReturn = billNo.startsWith('R');
       const finalAmount = isReturn ? -Math.abs(amount) : amount;
+      
+      // ⭐ Date = ISO (yyyy-mm-dd)
+      const billDateISO = toISODate(date) || todayISO();
 
       newBills.push({
         bill_no: billNo,
-        date: fmtDate(date) || todayISO(),
-        source_date: fmtDate(date) || todayISO(),
+        date: billDateISO,
+        source_date: billDateISO,
         station: station,
         type: isReturn ? 'Refund' : type,
         amount: finalAmount,
@@ -3370,30 +3360,18 @@ function parseFrontPosReport(result, fileName) {
         source: 'pos',
       });
       count++;
-      transferCount++;
-      
-      if (station && stationSummary[station] && !isReturn) {
-        stationSummary[station].transfer += amount;
-      }
+      if (type === 'Card') { /* counted as card */ }
+      else transferCount++;
     }
   }
 
-  // เก็บ summary + cashier-station mapping
-  Object.keys(stationSummary).forEach(st => {
-    const s = stationSummary[st];
-    if (s.sales > 0) {
-      mainSummary['sales_' + st] = s.sales;
-      // เก็บชื่อ cashier ประจำ station วันนี้
-      mainSummary['cashier_' + st] = s.cashier;
-    }
-  });
+  // Cleanup: ลบ markers (ถ้ามี — legacy)
+  newBills.forEach(b => { delete b._pos_cashier; delete b._pos_card_cashier; });
 
-  // รวมเข้า billList — ⭐ ใช้ composite key เพราะ Front POS ส่วนใหญ่ไม่มี bill_no
-  // Key: date|amount|station|type + bill_no (ถ้ามี)
+  // รวมเข้า billList — ใช้ composite key เพราะ Front POS ส่วนใหญ่ไม่มี bill_no
   const compKey = (b) => `${b.bill_no||''}|${toISODate(b.date)||''}|${Number(b.amount)||0}|${b.station||''}|${b.type||''}`;
   const existingKeys = new Set(billList.map(compKey));
   const uniqueNewBills = newBills.filter(b => !existingKeys.has(compKey(b)));
-  // Generate uuid for any imported bills missing one
   uniqueNewBills.forEach(b => {
     if (!b.bill_uuid) {
       b.bill_uuid = (typeof crypto !== 'undefined' && crypto.randomUUID) 
@@ -3410,8 +3388,20 @@ function parseFrontPosReport(result, fileName) {
     .map(([cas, st]) => `${st}=${cas}`)
     .join(', ');
   
-  toast(`นำเข้า Front POS สำเร็จ — ${uniqueNewBills.length} บิลเงินโอน${dup?` (ข้าม ${dup} ซ้ำ)`:''}`, 'success');
+  // Breakdown ใน toast
+  const tCount = uniqueNewBills.filter(b => b.type === 'Transfer' || b.type === 'Other').length;
+  const cCount = uniqueNewBills.filter(b => b.type === 'Card').length;
+  const rCount = uniqueNewBills.filter(b => b.type === 'Refund').length;
+  const breakdownStr = [
+    tCount && `${tCount} โอน`,
+    cCount && `${cCount} บัตร`,
+    rCount && `${rCount} คืน`,
+  ].filter(Boolean).join(' · ');
+  
+  toast(`นำเข้า Front POS สำเร็จ — ${uniqueNewBills.length} บิล (${breakdownStr})${dup?` · ข้าม ${dup} ซ้ำ`:''}`, 'success');
   if (mappingStr) setTimeout(() => toast('Cashier วันนี้: ' + mappingStr, 'info'), 600);
+  console.log(`[Front POS] cashierToStation:`, cashierToStation);
+  console.log(`[Front POS] Imported: Transfer=${tCount} · Card=${cCount} · Refund=${rCount} · Skipped dup=${dup}`);
   
   if (currentPage === 'main') navigateTo('main');
 }
