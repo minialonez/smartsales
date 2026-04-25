@@ -5236,11 +5236,14 @@ async function renderMain(el) {
               ${(function(){
                 const vals = SUMMARY_STATIONS.map(s => calcSales(s) || _getSummaryValue('sales', s));
                 const allSum = vals.reduce((a,b)=>a+b,0);
+                const _locked = isDateLocked(selectedDate);
+                const _ro = _locked ? 'readonly' : '';
+                const _roStyle = _locked ? ';background:rgba(127,127,127,.08);color:var(--text2);cursor:not-allowed;opacity:.65' : '';
                 const cellParts = [];
                 SUMMARY_STATIONS.forEach((s, i) => {
                   const isManual = ['Front1','Front2','Front3','Front4'].includes(s);
                   if (isManual) {
-                    cellParts.push(`<td><input class="input sum-cell" data-k="sales_${s}" type="number" value="${mainSummary['sales_'+s]||''}" step="0.01" placeholder="0" style="width:95%;padding:3px 6px;font-size:.78rem;text-align:right;border-color:var(--primary)"></td>`);
+                    cellParts.push(`<td><input class="input sum-cell" ${_ro} data-k="sales_${s}" type="number" value="${mainSummary['sales_'+s]||''}" step="0.01" placeholder="0" style="width:95%;padding:3px 6px;font-size:.78rem;text-align:right;border-color:var(--primary)${_roStyle}"></td>`);
                   } else {
                     // Invoice / Order / Payment / Invoice Credit / Order Credit — read-only per station
                     cellParts.push(`<td style="text-align:right;font-weight:600;color:var(--info)">${vals[i]?fmtNum(vals[i]):'-'}</td>`);
@@ -5326,10 +5329,13 @@ async function renderMain(el) {
             <tbody>
               ${(() => {
                 const dayCash = getCashForDate(selectedDate);
+                const _locked = isDateLocked(selectedDate);
+                const _ro = _locked ? 'readonly' : '';
+                const _roStyle = _locked ? ';background:rgba(127,127,127,.08);color:var(--text2);cursor:not-allowed;opacity:.65' : '';
                 return DENOMINATIONS.map(d => `
                   <tr>
                     <td style="font-weight:700;color:var(--primary);text-align:center">฿${fmtInt(d)}</td>
-                    <td><input type="number" class="input cash-cell" data-denom="${d}" data-station="Invoice" value="${dayCash[d+'_Invoice']||''}" min="0" step="1" placeholder="0" style="width:95%;padding:4px 8px;font-size:.9rem;text-align:right"></td>
+                    <td><input type="number" class="input cash-cell" ${_ro} data-denom="${d}" data-station="Invoice" value="${dayCash[d+'_Invoice']||''}" min="0" step="1" placeholder="0" style="width:95%;padding:4px 8px;font-size:.9rem;text-align:right${_roStyle}"></td>
                     <td style="text-align:right;font-weight:600;color:var(--success)" data-denom-total="${d}">
                       ${fmtNum(d * (Number(dayCash[d+'_Invoice'])||0))}
                     </td>
@@ -5700,6 +5706,10 @@ async function renderMain(el) {
     };
     const vals = SUMMARY_STATIONS.map(s => Number(_getVal(s)) || 0);
     const allSum = vals.reduce((a,b)=>a+b,0);
+    // 🔒 Lock: readonly + visual จาง
+    const _locked = isDateLocked(selectedDate);
+    const _ro = _locked ? 'readonly' : '';
+    const _roStyle = _locked ? ';background:rgba(127,127,127,.08);color:var(--text2);cursor:not-allowed;opacity:.65' : '';
     // cashIn: Front1-4 + Invoice (Merged with Order/Payment), cashOut: Front1 + Invoice (Merged), returns: Front1-3 + Invoice (Merged)
     const allowedStations = {
       cashIn: ['Front1','Front2','Front3','Front4','Invoice','Order','Payment'],
@@ -5717,7 +5727,7 @@ async function renderMain(el) {
         // เฉพาะถ้า Invoice allowed
         if (allowed.includes('Invoice')) {
           // Editable input โผล่ที่ Invoice (ใช้ key 'Invoice')
-          cellParts.push(`<td colspan="3" style="background:rgba(91,124,250,.04);border-left:1px dashed var(--border);border-right:1px dashed var(--border)"><input class="input sum-cell" data-k="${key}_Invoice" type="number" value="${_getVal('Invoice')}" step="0.01" placeholder="0" style="width:95%;padding:3px 6px;font-size:.78rem;text-align:center;border-color:${color}" title="รวม Invoice + Order + Payment"></td>`);
+          cellParts.push(`<td colspan="3" style="background:rgba(91,124,250,.04);border-left:1px dashed var(--border);border-right:1px dashed var(--border)"><input class="input sum-cell" ${_ro} data-k="${key}_Invoice" type="number" value="${_getVal('Invoice')}" step="0.01" placeholder="0" style="width:95%;padding:3px 6px;font-size:.78rem;text-align:center;border-color:${color}${_roStyle}" title="รวม Invoice + Order + Payment"></td>`);
         } else {
           cellParts.push(`<td colspan="3"></td>`);
         }
@@ -5728,7 +5738,7 @@ async function renderMain(el) {
         cellParts.push(`<td></td>`);
         return;
       }
-      cellParts.push(`<td><input class="input sum-cell" data-k="${key}_${s}" type="number" value="${_getVal(s)}" step="0.01" placeholder="0" style="width:95%;padding:3px 6px;font-size:.78rem;text-align:right;border-color:${color}"></td>`);
+      cellParts.push(`<td><input class="input sum-cell" ${_ro} data-k="${key}_${s}" type="number" value="${_getVal(s)}" step="0.01" placeholder="0" style="width:95%;padding:3px 6px;font-size:.78rem;text-align:right;border-color:${color}${_roStyle}"></td>`);
     });
     
     return `<tr>
@@ -5756,6 +5766,9 @@ async function renderMain(el) {
     const allSum = frontTotal + mergedInvoiceTotal;
     
     const cells = [];
+    const _locked = isDateLocked(selectedDate);
+    const _ro = _locked ? 'readonly' : '';
+    const _roStyle = _locked ? ';background:rgba(127,127,127,.08);color:var(--text2);cursor:not-allowed;opacity:.65' : '';
     SUMMARY_STATIONS.forEach(s => {
       if (s === 'Order' || s === 'Payment') return; // skip - handled by Invoice colspan
       if (s === 'Invoice') {
@@ -5771,7 +5784,7 @@ async function renderMain(el) {
       // Front1-4 — EDITABLE input (เหมือนช่องนำเงินเข้า)
       const idx = ['Front1','Front2','Front3','Front4'].indexOf(s);
       const v = idx >= 0 ? frontVals[idx] : 0;
-      cells.push(`<td><input class="input sum-cell" data-k="cashDrawer_${s}" type="number" value="${v||''}" step="0.01" placeholder="0" style="width:95%;padding:3px 6px;font-size:.78rem;text-align:right;border-color:var(--purple)"></td>`);
+      cells.push(`<td><input class="input sum-cell" ${_ro} data-k="cashDrawer_${s}" type="number" value="${v||''}" step="0.01" placeholder="0" style="width:95%;padding:3px 6px;font-size:.78rem;text-align:right;border-color:var(--purple)${_roStyle}"></td>`);
     });
     
     return `<tr>
