@@ -274,7 +274,8 @@ async function api(action, params = {}) {
     let res;
     
     // ── DEBUG: Log request สำหรับ action สำคัญ ──
-    const DEBUG_ACTIONS = ['saveDailySales', 'saveDailyMeta', 'savePayments'];
+    // ⭐ เหลือเฉพาะ new schema (old: saveDailySales/saveDailyMeta/saveStatements เลิกใช้แล้ว)
+    const DEBUG_ACTIONS = ['upsertBills', 'upsertStatements', 'upsertMeta'];
     const shouldLog = DEBUG_ACTIONS.includes(action) || window.__apiDebug;
     if (shouldLog) {
       console.group(`📤 API: ${action}`);
@@ -303,9 +304,10 @@ async function api(action, params = {}) {
     // ⚠️ FORCE POST: action ที่มี payload เป็น array/object → ต้อง POST เสมอ
     // เพราะ GET path stringify array แล้ว backend ได้ string (Array.isArray = false → error)
     // ต่อให้ payload เล็ก URL ก็ไม่เกิน 4000 chars แต่ backend ยังรับเป็น array ไม่ได้
+    // ⭐ เหลือเฉพาะ new schema actions + other collections
     const FORCE_POST_ACTIONS = [
       'saveSpTemps', 'saveCashflow', 'savePayments', 'saveSuppliers',
-      'saveDailySales', 'saveStatements', 'saveDailyMeta', 'savePPReport',
+      'savePPReport',
       'upsertBills', 'upsertStatements', 'upsertMeta',
       'saveSupplierPayments',
     ];
@@ -2057,20 +2059,9 @@ const syncManager = {
                 }
               }
             });
-          } else {
-            // Fallback to old endpoint
-            const r2 = await api('getDailySales', { year: y });
-            if (r2?.success === false) throw new Error(r2.error || 'API error');
-            const items = (r2?.data?.data) || (Array.isArray(r2?.data) ? r2.data : []) || [];
-            if (!Array.isArray(items)) throw new Error(`Bills ${y}: unexpected format`);
-            items.forEach(b => {
-              const key = billCompositeKey(b);
-              if (!seenBillCompositeKeys.has(key)) {
-                billList.push(b);
-                seenBillCompositeKeys.add(key);
-                stats.bills++;
-              }
-            });
+          } else if (r?.success === false && !r._networkError) {
+            // UUID endpoint มีอยู่แต่ไม่มีข้อมูล → OK, ไม่ต้อง fallback
+            // (สมัยก่อน fallback ไป getDailySales — ลบทิ้งเพราะ schema เก่าไม่ใช้แล้ว)
           }
         } catch(err) { stats.errors.push(`Bills ${y}: ${err.message}`); console.warn('[sync] Bills', y, err); }
       }
@@ -2148,22 +2139,8 @@ const syncManager = {
                 }
               }
             });
-          } else {
-            // Fallback
-            const r2 = await api('getStatements', { year: y });
-            if (r2?.success === false) throw new Error(r2.error || 'API error');
-            const items = (r2?.data?.data) || (Array.isArray(r2?.data) ? r2.data : []) || [];
-            if (!Array.isArray(items)) throw new Error(`Stmts ${y}: unexpected format`);
-            items.forEach(s => {
-              normalizeStmt(s);
-              const key = stmtCompositeKey(s);
-              if (!seenStmtCompositeKeys.has(key)) {
-                if (!statementsByBank[s.bank]) statementsByBank[s.bank] = [];
-                statementsByBank[s.bank].push(s);
-                seenStmtCompositeKeys.add(key);
-                stats.stmts++;
-              }
-            });
+          } else if (r?.success === false && !r._networkError) {
+            // UUID endpoint มีอยู่แต่ไม่มีข้อมูล → OK, ไม่ fallback
           }
         } catch(err) { stats.errors.push(`Stmts ${y}: ${err.message}`); console.warn('[sync] Stmts', y, err); }
       }
@@ -2314,23 +2291,9 @@ const syncManager = {
             console.warn(`[sync] getMetaWithUuid ${y} failed, trying fallback:`, err.message);
           }
           
-          // Fallback to old getDailyMeta (schema เก่า) — เผื่อ sheet ยังไม่ได้ migrate
+          // ⭐ ไม่มี fallback ไป getDailyMeta แล้ว — sheet ใช้ new schema (meta_uuid) เท่านั้น
           if (!handled) {
-            const r = await api('getDailyMeta', { year: y });
-            if (r?.data?.summary?.__byDate) {
-              if (!mainSummary.__byDate) mainSummary.__byDate = {};
-              Object.entries(r.data.summary.__byDate).forEach(([d, v]) => {
-                if (!mainSummary.__byDate[d]) mainSummary.__byDate[d] = {};
-                stats.meta += mergeFields(mainSummary.__byDate[d], v);
-              });
-            }
-            if (r?.data?.cash_count?.__byDate) {
-              if (!cashCount.__byDate) cashCount.__byDate = {};
-              Object.entries(r.data.cash_count.__byDate).forEach(([d, v]) => {
-                if (!cashCount.__byDate[d]) cashCount.__byDate[d] = {};
-                mergeFields(cashCount.__byDate[d], v);
-              });
-            }
+            console.log(`[sync] Meta ${y}: no rows in cloud (new schema)`);
           }
         } catch(err) { stats.errors.push(`Meta ${y}: ${err.message}`); }
       }
@@ -12064,56 +12027,40 @@ function showApp() {
 async function loadMetaFromBackend() {
   try {
     // โหลดปีปัจจุบัน + ปีที่แล้ว (กันเวลาใช้ข้ามปี)
+    // ⭐ ใช้ new schema (meta_uuid + data_json) เท่านั้น — ลบ fallback getDailyMeta ออกแล้ว
     var now = new Date();
     var years = [String(now.getFullYear()), String(now.getFullYear() - 1)];
     
     for (var y of years) {
-      var res = await api('getDailyMeta', { year: y });
-      if (!res || !res.success) continue;
-      var d = res.data || {};
+      var res = await api('getMetaWithUuid', { year: y });
+      if (!res || !res.success || !Array.isArray(res.data?.rows)) continue;
+      if (typeof window.parseCompactMetaRows !== 'function') continue;
       
-      // ── Merge summary.__byDate (ไม่ override ของใน memory ถ้าไม่ว่าง) ──
-      if (d.summary && d.summary.__byDate) {
+      var parsed = window.parseCompactMetaRows(res.data.rows);
+      
+      // ── Merge summary (backend มี, local ยังไม่มี → copy) ──
+      if (parsed.summary && parsed.summary.__byDate) {
         if (!mainSummary.__byDate) mainSummary.__byDate = {};
-        Object.keys(d.summary.__byDate).forEach(function(dateISO) {
-          // backend มี, local ยังไม่มี → copy
+        Object.keys(parsed.summary.__byDate).forEach(function(dateISO) {
           if (!mainSummary.__byDate[dateISO]) {
-            mainSummary.__byDate[dateISO] = d.summary.__byDate[dateISO];
+            mainSummary.__byDate[dateISO] = parsed.summary.__byDate[dateISO];
           }
         });
       }
       
-      // ── Merge cash_count.__byDate ──
-      if (d.cash_count && d.cash_count.__byDate) {
+      // ── Merge cash_count (per-key: in-memory ชนะถ้ามี) ──
+      if (parsed.cashCount && parsed.cashCount.__byDate) {
         if (!cashCount.__byDate) cashCount.__byDate = {};
-        Object.keys(d.cash_count.__byDate).forEach(function(dateISO) {
+        Object.keys(parsed.cashCount.__byDate).forEach(function(dateISO) {
           if (!cashCount.__byDate[dateISO]) {
-            cashCount.__byDate[dateISO] = d.cash_count.__byDate[dateISO];
+            cashCount.__byDate[dateISO] = parsed.cashCount.__byDate[dateISO];
           } else {
-            // merge per-key (ของใน memory ชนะถ้ามี)
-            Object.keys(d.cash_count.__byDate[dateISO]).forEach(function(k) {
+            Object.keys(parsed.cashCount.__byDate[dateISO]).forEach(function(k) {
               if (cashCount.__byDate[dateISO][k] == null) {
-                cashCount.__byDate[dateISO][k] = d.cash_count.__byDate[dateISO][k];
+                cashCount.__byDate[dateISO][k] = parsed.cashCount.__byDate[dateISO][k];
               }
             });
           }
-        });
-      }
-      
-      // ── Merge change_data → cashCount (change data เก็บรวมกับ cash_count ได้) ──
-      if (d.change_data && typeof d.change_data === 'object') {
-        if (!cashCount.__byDate) cashCount.__byDate = {};
-        Object.entries(d.change_data).forEach(function([dateISO, stationData]) {
-          if (!cashCount.__byDate[dateISO]) cashCount.__byDate[dateISO] = {};
-          Object.entries(stationData || {}).forEach(function([station, denoms]) {
-            Object.entries(denoms || {}).forEach(function([denom, count]) {
-              var key = denom + '_' + station;
-              // Change data เป็นข้อมูลเตรียมทอน → ใส่ถ้ายังไม่มี
-              if (cashCount.__byDate[dateISO][key] == null) {
-                cashCount.__byDate[dateISO][key] = Number(count) || 0;
-              }
-            });
-          });
         });
       }
     }
@@ -12200,8 +12147,6 @@ function demoResponse(action, params) {
         {alert_type:'upcoming',cust_name:'บจก. สยามเทรดดิ้ง',notes:'จะครบกำหนด 2 วัน',action_at:'08/04/2026 08:00'},
       ]}};
     case 'getArLedger': return { success:true, data: DEMO.debtors };
-    case 'getDailySales': return { success:true, data:{ data: DEMO.sales.filter(s => !params.date || s.date === params.date || formatDateKey(s.date) === params.date), totals:{} }};
-    case 'getStatements': return { success:true, data:{ data: DEMO.statements, totals:{} }};
     case 'getAlerts': return { success:true, data: DEMO.debtors.filter(d=>d.credit_status!=='active').map(d=>({alert_type:d.credit_status==='overdue'?'overdue':'credit_break',cust_id:d.cust_id,cust_name:d.cust_name,phone:d.phone,amount_due:d.total_outstanding,due_date:d.due_date,action_at:'08/04/2026'})) };
     case 'getUsers': return { success:true, data:[{user_id:'U001',username:'009',display_name:'Admin',role:'admin',permissions:['read','write','delete','manage_users'],status:'active'},{user_id:'U002',username:'010',display_name:'พนักงาน A',role:'staff',permissions:['read','write'],status:'active'}]};
     case 'getMatchLog': return { success:true, data:[] };
@@ -13877,8 +13822,12 @@ async function renderSales(el) {
   }
 
   async function render() {
-    const res = await api('getDailySales', { date: formatDateKey(selectedDate) });
-    let data = (res.data?.data || []);
+    // ⭐ ใช้ local billList + filter ตามวันที่ แทน getDailySales (old schema — ลบทิ้ง)
+    const dateKey = formatDateKey(selectedDate);
+    let data = billList.filter(b => {
+      const bd = toISODate(b.date);
+      return bd === dateKey || bd === selectedDate;
+    });
 
     // รวม uploaded sales (ถ้ามี)
     if (uploadedSales.length > 0) {
@@ -15634,16 +15583,8 @@ function renderData(el) {
               r.data.rows.forEach(b => tempBills.push(b));
               tsLog(`   ✓ Bills ${y}: ${r.data.rows.length} rows`);
             } else if (r?.success === false) {
-              // Fallback to old endpoint
-              const r2 = await api('getDailySales', { year: y });
-              if (r2?.success !== false) {
-                const items = (r2?.data?.data) || (Array.isArray(r2?.data) ? r2.data : []) || [];
-                items.forEach(b => tempBills.push(b));
-                tsLog(`   ✓ Bills ${y}: ${items.length} rows (fallback)`);
-              } else {
-                tsLog(`   ⚠️ Bills ${y}: ${r.error || r2.error}`);
-                pullErrors.push(`Bills ${y}`);
-              }
+              tsLog(`   ⚠️ Bills ${y}: ${r.error}`);
+              pullErrors.push(`Bills ${y}`);
             }
           } catch(err) {
             tsLog(`   ❌ Bills ${y}: ${err.message}`);
@@ -15661,16 +15602,6 @@ function renderData(el) {
                 tempStmts[s.bank].push(s);
               });
               tsLog(`   ✓ Stmts ${y}: ${r.data.rows.length} rows`);
-            } else {
-              const r2 = await api('getStatements', { year: y });
-              if (r2?.success !== false) {
-                const items = (r2?.data?.data) || (Array.isArray(r2?.data) ? r2.data : []) || [];
-                items.forEach(s => {
-                  if (!tempStmts[s.bank]) tempStmts[s.bank] = [];
-                  tempStmts[s.bank].push(s);
-                });
-                tsLog(`   ✓ Stmts ${y}: ${items.length} rows (fallback)`);
-              }
             }
           } catch(err) {
             tsLog(`   ❌ Stmts ${y}: ${err.message}`);
@@ -15728,7 +15659,7 @@ function renderData(el) {
         } catch(err) { tsLog(`   ⚠️ Supplier Payments: ${err.message}`); }
         
         // ⭐ Pull Meta (mainSummary + cashCount) — user input รายวัน: นำเงินเข้า/ขาย/ออก/คืนสินค้า
-        // Use new schema (getMetaWithUuid + parseCompactMetaRows) with fallback to old getDailyMeta
+        // ใช้ new schema (getMetaWithUuid + parseCompactMetaRows) เท่านั้น — ไม่มี fallback
         const tempSummary = { __byDate: {} };
         const tempCashCount = { __byDate: {} };
         for (const y of years) {
@@ -15758,21 +15689,9 @@ function renderData(el) {
               tsLog(`   ⚠️ getMetaWithUuid ${y}: ${err.message}`);
             }
             
-            // Fallback to old schema
+            // ⭐ ไม่ fallback ไป getDailyMeta แล้ว — sheet ใช้ new schema เท่านั้น
             if (!handled) {
-              const r = await api('getDailyMeta', { year: y });
-              if (r?.data?.summary?.__byDate) {
-                Object.entries(r.data.summary.__byDate).forEach(([d, v]) => {
-                  tempSummary.__byDate[d] = v;
-                });
-              }
-              if (r?.data?.cash_count?.__byDate) {
-                Object.entries(r.data.cash_count.__byDate).forEach(([d, v]) => {
-                  tempCashCount.__byDate[d] = v;
-                });
-              }
-              const metaRows = Object.keys(tempSummary.__byDate).length;
-              tsLog(`   ✓ Meta ${y}: ${metaRows} วัน (fallback, cumulative)`);
+              tsLog(`   ⚠️ Meta ${y}: no rows in cloud (new schema)`);
             }
           } catch(err) { tsLog(`   ⚠️ Meta ${y}: ${err.message}`); }
         }
@@ -15898,8 +15817,9 @@ function renderData(el) {
         for (const y of years) {
           try {
             statusEl.textContent = `กำลังดึง Bills ปี ${y}...`;
-            const r = await api('getDailySales', { year: y });
-            const items = (r?.data?.data) || r?.data || [];
+            // ⭐ ใช้ new schema
+            const r = await api('getBillsWithUuid', { year: y });
+            const items = (r?.success && Array.isArray(r.data?.rows)) ? r.data.rows : [];
             items.forEach(b => {
               const key = billKey(b);
               if (!seenBillKeys.has(key)) {
@@ -15916,8 +15836,9 @@ function renderData(el) {
         for (const y of years) {
           try {
             statusEl.textContent = `กำลังดึง Statements ปี ${y}...`;
-            const r = await api('getStatements', { year: y });
-            const items = (r?.data?.data) || r?.data || [];
+            // ⭐ ใช้ new schema
+            const r = await api('getStatementsWithUuid', { year: y });
+            const items = (r?.success && Array.isArray(r.data?.rows)) ? r.data.rows : [];
             const seenStmtKeys = new Set();
             Object.values(statementsByBank).forEach(arr => {
               (arr||[]).forEach(s => seenStmtKeys.add(`${s.bank}|${s.date}|${s.time}|${s.amount}|${s.ref_no||''}`));
@@ -15982,22 +15903,25 @@ function renderData(el) {
           });
         } catch(err) { stats.errors.push(`Suppliers: ${err.message}`); }
         
-        // 6) Meta (summary + cashCount) — loadMetaFromBackend existing
+        // 6) Meta (summary + cashCount) — ⭐ ใช้ new schema เท่านั้น (meta_uuid + data_json)
         try {
           statusEl.textContent = 'กำลังดึง Daily Summary...';
           for (const y of years) {
-            const r = await api('getDailyMeta', { year: y });
-            if (r?.data?.summary?.__byDate) {
-              if (!mainSummary.__byDate) mainSummary.__byDate = {};
-              Object.entries(r.data.summary.__byDate).forEach(([d, v]) => {
-                if (!mainSummary.__byDate[d]) { mainSummary.__byDate[d] = v; stats.meta++; }
-              });
-            }
-            if (r?.data?.cash_count?.__byDate) {
-              if (!cashCount.__byDate) cashCount.__byDate = {};
-              Object.entries(r.data.cash_count.__byDate).forEach(([d, v]) => {
-                if (!cashCount.__byDate[d]) cashCount.__byDate[d] = v;
-              });
+            const r = await api('getMetaWithUuid', { year: y });
+            if (r?.success && Array.isArray(r.data?.rows) && r.data.rows.length > 0 && typeof window.parseCompactMetaRows === 'function') {
+              const parsed = window.parseCompactMetaRows(r.data.rows);
+              if (parsed.summary?.__byDate) {
+                if (!mainSummary.__byDate) mainSummary.__byDate = {};
+                Object.entries(parsed.summary.__byDate).forEach(([d, v]) => {
+                  if (!mainSummary.__byDate[d]) { mainSummary.__byDate[d] = v; stats.meta++; }
+                });
+              }
+              if (parsed.cashCount?.__byDate) {
+                if (!cashCount.__byDate) cashCount.__byDate = {};
+                Object.entries(parsed.cashCount.__byDate).forEach(([d, v]) => {
+                  if (!cashCount.__byDate[d]) cashCount.__byDate[d] = v;
+                });
+              }
             }
           }
         } catch(err) { stats.errors.push(`Meta: ${err.message}`); }
