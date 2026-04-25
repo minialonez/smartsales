@@ -7113,6 +7113,144 @@ function spTempWireCustomerInput(id) {
   });
 }
 
+// ⭐ Modal: Edit SP-TEMP header (customer + expected)
+function openSpTempEditModal(no, onChange) {
+  const t = spTempList.find(x => x.no === no);
+  if (!t) { toast('ไม่พบ SP-TEMP', 'warn'); return; }
+  
+  const paidSum = spTempPaidTotal(t);
+  
+  openModal(`✎ แก้ไข ${no}`, `
+    <div class="flex-col gap-3" style="min-width:400px">
+      <div class="input-group">
+        <label>เลข SP ชั่วคราว</label>
+        <input class="input" value="${no}" readonly style="background:var(--bg2)">
+      </div>
+      
+      <div class="input-group">
+        <label>ลูกค้า</label>
+        ${spTempCustomerInput('ets-cust', t.cust_code || '', t.cust_name || '')}
+      </div>
+      
+      <div class="input-group">
+        <label>ยอดรวมทั้งหมดที่คาด (Expected)</label>
+        <input type="number" class="input" id="ets-expected" value="${Number(t.expected_total)||0}" step="0.01">
+        <div class="text-xs text-muted mt-1">จ่ายไปแล้ว ฿${fmtNum(paidSum)} · คงเหลือจะคำนวณใหม่อัตโนมัติ</div>
+      </div>
+      
+      <div style="padding:8px 10px;background:var(--bg2);border-radius:6px;font-size:.78rem;color:var(--text2)">
+        📋 Partials ${(t.partials||[]).length} รายการ — แก้ไข/ลบแต่ละรายการจากตารางด้านล่าง (หรือกด partial row ในหน้า Main)
+      </div>
+      
+      <div class="flex gap-2 mt-2">
+        <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ยกเลิก</button>
+        <button class="btn btn-primary btn-sm flex-1" id="ets-save">${ICONS.check} บันทึก</button>
+      </div>
+    </div>
+  `);
+  spTempWireCustomerInput('ets-cust');
+  
+  document.getElementById('ets-save')?.addEventListener('click', () => {
+    const code = document.getElementById('ets-cust-code').value.trim();
+    const name = document.getElementById('ets-cust-name').value.trim() || 
+                 document.getElementById('ets-cust-search').value.trim();
+    const expected = Number(document.getElementById('ets-expected').value) || 0;
+    
+    if (!name) { toast('กรอกข้อมูลลูกค้า', 'error'); return; }
+    if (expected <= 0) { toast('กรอก expected total', 'error'); return; }
+    
+    t.cust_code = code;
+    t.cust_name = name;
+    t.expected_total = expected;
+    t.updated_at = new Date().toISOString();
+    recomputeSpTempStatus(t);
+    markDirtySpTemps();
+    closeModal();
+    toast(`✓ บันทึก ${no} แล้ว`, 'success');
+    if (onChange) onChange();
+  });
+}
+
+// ⭐ Modal: Edit single partial
+function openSpTempPartialEditModal(no, idx, onChange) {
+  const t = spTempList.find(x => x.no === no);
+  if (!t || !t.partials || !t.partials[idx]) { toast('ไม่พบ partial', 'warn'); return; }
+  const pr = t.partials[idx];
+  
+  openModal(`✎ แก้ไข Partial #${idx + 1} ของ ${no}`, `
+    <div class="flex-col gap-3" style="min-width:400px">
+      <div class="flex gap-2">
+        <div class="input-group flex-1">
+          <label>จำนวน</label>
+          <input type="number" class="input" id="epr-amount" value="${Number(pr.amount)||0}" step="0.01">
+        </div>
+        <div class="input-group flex-1">
+          <label>วันที่</label>
+          <input type="date" class="input" id="epr-date" value="${toISODate(pr.date) || todayISO()}">
+        </div>
+      </div>
+      <div class="flex gap-2">
+        <div class="input-group flex-1">
+          <label>วิธี</label>
+          <select class="input" id="epr-method">
+            <option value="Transfer" ${pr.method==='Transfer'?'selected':''}>Transfer</option>
+            <option value="Cash" ${pr.method==='Cash'?'selected':''}>Cash</option>
+            <option value="Cheque" ${pr.method==='Cheque'?'selected':''}>Cheque</option>
+          </select>
+        </div>
+        <div class="input-group flex-1">
+          <label>ธนาคาร</label>
+          <input class="input" id="epr-bank" value="${pr.bank||''}" placeholder="KTB / BBL / ...">
+        </div>
+      </div>
+      <div class="input-group">
+        <label>Stmt ref</label>
+        <input class="input" id="epr-stmt-ref" value="${pr.stmt_ref||''}" placeholder="เลข ref จาก statement">
+      </div>
+      <div class="input-group">
+        <label>หมายเหตุ</label>
+        <input class="input" id="epr-notes" value="${pr.notes||''}">
+      </div>
+      
+      <div class="flex gap-2 mt-2">
+        <button class="btn btn-ghost btn-sm" id="epr-delete" style="color:var(--danger)">🗑 ลบ</button>
+        <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ยกเลิก</button>
+        <button class="btn btn-primary btn-sm flex-1" id="epr-save">${ICONS.check} บันทึก</button>
+      </div>
+    </div>
+  `);
+  
+  document.getElementById('epr-save')?.addEventListener('click', () => {
+    const amt = Number(document.getElementById('epr-amount').value) || 0;
+    if (amt <= 0) { toast('กรอกจำนวน', 'error'); return; }
+    
+    pr.amount = amt;
+    pr.date = document.getElementById('epr-date').value;
+    pr.method = document.getElementById('epr-method').value;
+    pr.bank = document.getElementById('epr-bank').value.trim();
+    pr.stmt_ref = document.getElementById('epr-stmt-ref').value.trim();
+    pr.notes = document.getElementById('epr-notes').value;
+    
+    t.updated_at = new Date().toISOString();
+    recomputeSpTempStatus(t);
+    markDirtySpTemps();
+    closeModal();
+    toast(`✓ บันทึก partial แล้ว`, 'success');
+    if (onChange) onChange();
+  });
+  
+  document.getElementById('epr-delete')?.addEventListener('click', () => {
+    if (!confirm(`ลบ partial #${idx + 1}?`)) return;
+    t.partials.splice(idx, 1);
+    t.updated_at = new Date().toISOString();
+    recomputeSpTempStatus(t);
+    markDirtySpTemps();
+    closeModal();
+    toast(`ลบแล้ว`, 'success');
+    if (onChange) onChange();
+  });
+}
+
 // Modal: Create new SP-TEMP
 function openSpTempModal() {
   const tempNo = genSpTempNo();
@@ -7576,6 +7714,7 @@ function renderSpSectionsForDate(opts) {
                 <div class="flex gap-1">
                   ${t.status === 'complete' ? `<button class="btn btn-success btn-sm main-sp-graduate" data-no="${t.no}" style="padding:3px 8px;font-size:.7rem">🎓 Graduate</button>` : ''}
                   <button class="btn btn-primary btn-sm main-sp-add-partial" data-no="${t.no}" style="padding:3px 8px;font-size:.7rem">+ Partial</button>
+                  <button class="btn btn-outline btn-sm main-sp-edit-temp" data-no="${t.no}" style="padding:3px 8px;font-size:.7rem">✎ แก้</button>
                   <button class="btn btn-ghost btn-sm main-sp-del-temp" data-no="${t.no}" style="padding:3px 6px;font-size:.7rem;color:var(--danger)">🗑</button>
                 </div>
               </div>
@@ -7591,7 +7730,7 @@ function renderSpSectionsForDate(opts) {
                       <th style="width:30px"></th>
                     </tr></thead>
                     <tbody>${(t.partials || []).map((pr, i) => `
-                      <tr>
+                      <tr class="main-sp-partial-row" data-no="${t.no}" data-idx="${i}" style="cursor:pointer" title="คลิกเพื่อแก้ไข">
                         <td style="padding:3px;color:var(--text3)">${i + 1}</td>
                         <td style="padding:3px">${fmtDate(pr.date)}</td>
                         <td style="padding:3px;text-align:right;font-weight:600;color:var(--success)">฿${fmtNum(pr.amount)}</td>
@@ -7768,6 +7907,25 @@ function renderSpSectionsForDate(opts) {
       recomputeSpTempStatus(t);
       markDirtySpTemps();
       if (onChange) onChange();
+    });
+  });
+  
+  // ⭐ SP-TEMP: edit header (expected/customer)
+  container.querySelectorAll('.main-sp-edit-temp').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const no = btn.dataset.no;
+      openSpTempEditModal(no, onChange);
+    });
+  });
+  
+  // ⭐ SP-TEMP: click partial row → edit partial
+  container.querySelectorAll('.main-sp-partial-row').forEach(row => {
+    row.addEventListener('click', (e) => {
+      if (e.target.closest('.main-sp-del-partial')) return;
+      const no = row.dataset.no;
+      const idx = Number(row.dataset.idx);
+      openSpTempPartialEditModal(no, idx, onChange);
     });
   });
 
