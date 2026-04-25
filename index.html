@@ -2620,18 +2620,20 @@ function validateBill(b, idx, allBills) {
 
 function findDuplicateBills() {
   // หาบิลที่ซ้ำกันจริงๆ (ไม่ใช่ split payment)
-  // Composite key: bill_no + type + amount (ตรงกับ dedup logic ตอน import)
-  // เหตุผล: บิลเดียวกันอาจชำระหลายวิธี เช่น
-  //   SS00126-000002 | Cash     | 3      ← ✓ เก็บได้
-  //   SS00126-000002 | Transfer | 5515   ← ✓ เก็บได้ (ไม่ถือว่าซ้ำ)
-  // แต่ถ้า bill_no + type + amount ตรงกัน = ซ้ำจริง
+  // Composite key: bill_no + type + amount + date (ตรงกับ dedup logic ตอน import)
+  // เหตุผล: บิลเดียวกันอาจชำระหลายวิธี/หลายรอบ เช่น
+  //   SS00126-000002 | Cash     | 3      | 2026-04-20  ← ✓ เก็บได้
+  //   SS00126-000002 | Transfer | 5515   | 2026-04-20  ← ✓ เก็บได้ (ไม่ถือว่าซ้ำ)
+  //   SS00126-001234 | Transfer | 3000   | 2026-04-20  ← ✓ มัดจำ
+  //   SS00126-001234 | Transfer | 3000   | 2026-04-25  ← ✓ ส่วนที่เหลือ (วันต่างกัน)
+  // แต่ถ้า bill_no + type + amount + date ตรงกัน = ซ้ำจริง
   const byKey = {};
   billList.forEach((b, i) => {
     if (b.match_status === 'void') return;
     const no = (b.bill_no || '').trim();
     if (!no || no.startsWith('MANUAL-')) return;
-    // Composite key
-    const key = `${no}|${(b.type || '').trim()}|${Number(b.amount) || 0}`;
+    // Composite key (รวม date เพื่อ allow split payment ข้ามวัน)
+    const key = `${no}|${(b.type || '').trim()}|${Number(b.amount) || 0}|${toISODate(b.date) || ''}`;
     if (!byKey[key]) byKey[key] = [];
     byKey[key].push(i);
   });
