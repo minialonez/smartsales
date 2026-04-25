@@ -1425,32 +1425,23 @@ window.buildCompactMetaRows = function() {
   const user = (window.currentUser && window.currentUser.display_name) || 'Admin';
   const rows = [];
   
-  // ⭐ Helper: ตรวจว่า dateISO เป็นวันอาทิตย์หรือไม่ — ร้านปิด ไม่ควรมีข้อมูล
-  const isSunday = (dateISO) => {
-    try {
-      const dt = new Date(dateISO);
-      return !isNaN(dt) && dt.getUTCDay() === 0; // ใช้ UTC กัน timezone shift
-    } catch(_) { return false; }
-  };
+  // ⭐ ไม่ filter Sunday — user อนุญาตให้กรอกข้อมูลวันอาทิตย์ได้
   
   if (mainSummary && mainSummary.__byDate) {
     Object.keys(mainSummary.__byDate).forEach(function(dateISO) {
       const dayLabels = mainSummary.__byDate[dateISO] || {};
       const flat = {};
-      // ⭐ ถ้าเป็น Sunday → ส่ง row ว่าง → cloud ลบ data ของวันนี้
-      if (!isSunday(dateISO)) {
-        Object.keys(dayLabels).forEach(function(label) {
-          const prefix = LABEL_TO_KEY[label] || label;
-          if (!prefix || !String(prefix).trim()) return;
-          const stations = dayLabels[label] || {};
-          Object.keys(stations).forEach(function(station) {
-            if (!station || !String(station).trim()) return;
-            const v = Number(stations[station]);
-            if (isNaN(v)) return;
-            flat[prefix + '_' + station] = v;
-          });
+      Object.keys(dayLabels).forEach(function(label) {
+        const prefix = LABEL_TO_KEY[label] || label;
+        if (!prefix || !String(prefix).trim()) return;
+        const stations = dayLabels[label] || {};
+        Object.keys(stations).forEach(function(station) {
+          if (!station || !String(station).trim()) return;
+          const v = Number(stations[station]);
+          if (isNaN(v)) return;
+          flat[prefix + '_' + station] = v;
         });
-      }
+      });
       rows.push({
         meta_uuid: dateISO + '|summary',
         date: dateISO,
@@ -1466,15 +1457,23 @@ window.buildCompactMetaRows = function() {
     Object.keys(cashCount.__byDate).forEach(function(dateISO) {
       const dayCash = cashCount.__byDate[dateISO] || {};
       const filtered = {};
-      // ⭐ Sunday → ส่งว่าง (ลบ cloud)
-      if (!isSunday(dateISO)) {
-        Object.keys(dayCash).forEach(function(k) {
-          if (!k || !String(k).trim()) return;
-          const v = Number(dayCash[k]);
-          if (isNaN(v)) return;
-          filtered[k] = v;
-        });
-      }
+      Object.keys(dayCash).forEach(function(k) {
+        // ⭐ Strict junk filter: key ต้องเป็น "denom_station" pattern (มี _ อย่างน้อย 1 ตัว แยกตำแหน่งกลาง)
+        // เช่น "1000_Front1" ✓, "_" ❌, "_Foo" ❌, "Foo_" ❌
+        if (!k || !String(k).trim()) return;
+        const trimmed = String(k).trim();
+        const idx = trimmed.indexOf('_');
+        // ต้องมี "_" + ทั้งสองข้างไม่ว่าง
+        if (idx <= 0 || idx >= trimmed.length - 1) return;
+        const denom = trimmed.substring(0, idx).trim();
+        const station = trimmed.substring(idx + 1).trim();
+        if (!denom || !station) return;
+        // denom ต้องเป็นตัวเลข (1, 5, 10, 20, 50, 100, 500, 1000)
+        if (isNaN(Number(denom))) return;
+        const v = Number(dayCash[k]);
+        if (isNaN(v)) return;
+        filtered[trimmed] = v;
+      });
       rows.push({
         meta_uuid: dateISO + '|cash_count',
         date: dateISO,
