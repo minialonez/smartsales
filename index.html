@@ -3175,6 +3175,32 @@ async function restoreMainState() {
     }
   }
   
+  // ⭐ Cleanup: ลบ cashIn ค้างที่ station ที่ไม่ควรมี (Order/Payment/IC/OC)
+  //    เกิดจาก default 5155 ที่ใส่ทุก station ใน version ก่อนหน้า
+  {
+    const ORPHAN_STATIONS = ['Order','Payment','Invoice Credit','Order Credit'];
+    let cleaned = 0;
+    ORPHAN_STATIONS.forEach(st => {
+      const k = 'cashIn_' + st;
+      if (mainSummary[k] !== undefined) {
+        delete mainSummary[k];
+        cleaned++;
+      }
+      // cleanup __byDate too
+      if (mainSummary.__byDate) {
+        Object.values(mainSummary.__byDate).forEach(day => {
+          if (day && day['นำเงินเข้า'] && day['นำเงินเข้า'][st] !== undefined) {
+            delete day['นำเงินเข้า'][st];
+            cleaned++;
+          }
+        });
+      }
+    });
+    if (cleaned > 0) {
+      console.log(`[cleanup] orphan cashIn keys: ${cleaned}`);
+    }
+  }
+  
   // ── Auto dedup: ⚠️ DISABLED - เสี่ยงลบข้อมูลจริง ──
   // ใช้ manual dedup เท่านั้น (ใน addStatementRows ตอน import จะ dedup อัตโนมัติ)
   // ถ้าจำเป็นต้อง dedup ทั้งหมด → เรียก dedupAllStatements() เอง
@@ -4770,6 +4796,16 @@ async function renderMain(el) {
   function _getSummaryValue(field, station) {
     // field: 'cashIn' | 'sales' | 'cashOut' | 'returns' | ...
     // station: 'Front1' | ...
+    
+    // ⭐ Guard: cashIn มีเฉพาะ station ที่มี input UI
+    //    — Order/Payment ไม่มี (Invoice cell merged รวม 3 stations แล้ว)
+    //    — Invoice Credit/Order Credit ไม่มี cashIn input
+    //    ค่า stored ที่ค้างที่ station เหล่านี้ → ignore
+    if (field === 'cashIn') {
+      const CASH_IN_INPUT_STATIONS = ['Front1','Front2','Front3','Front4','Invoice'];
+      if (!CASH_IN_INPUT_STATIONS.includes(station)) return 0;
+    }
+    
     // 1) ลอง flat key ก่อน (ถูก set ตอน date change)
     const flat = Number(mainSummary[field + '_' + station]);
     if (!isNaN(flat) && flat !== 0) return flat;
@@ -4782,7 +4818,7 @@ async function renderMain(el) {
       const dayData = mainSummary.__byDate[selectedDate][thLabel];
       if (dayData && dayData[station] != null) return Number(dayData[station]) || 0;
     }
-    // ⭐ Default cashIn = 5155 ทุก station ถ้ายังไม่เคยกรอก (เลขทอนเริ่มต้นวัน)
+    // ⭐ Default cashIn = 5155 ถ้ายังไม่เคยกรอก (เลขทอนเริ่มต้นวัน)
     if (field === 'cashIn') {
       const stored = mainSummary[field + '_' + station];
       if (stored === undefined || stored === null || stored === '') return 5155;
