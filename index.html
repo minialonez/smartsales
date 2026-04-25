@@ -5978,14 +5978,20 @@ async function renderMain(el) {
           
           <!-- Fee/WHT Section -->
           <div id="ab-fee-box" style="background:rgba(79,156,249,.05);border:1px solid rgba(79,156,249,.2);border-radius:6px;padding:10px;display:none">
-            <div style="font-size:.85rem;color:var(--info);font-weight:600;margin-bottom:8px">⚡ การหัก / ค่าธรรมเนียม <span style="color:var(--text3);font-weight:400">— WHT คำนวณอัตโนมัติจากยอดขาย (แก้ไขได้)</span></div>
+            <div style="font-size:.85rem;color:var(--info);font-weight:600;margin-bottom:8px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+              <span>⚡ การหัก / ค่าธรรมเนียม</span>
+              <label id="ab-wht-toggle-label" style="display:none;align-items:center;gap:6px;cursor:pointer;font-weight:400;color:var(--purple);background:rgba(167,139,250,.1);padding:3px 10px;border-radius:4px;border:1px solid rgba(167,139,250,.3)">
+                <input type="checkbox" id="ab-wht-enable" style="margin:0">
+                <span>หัก ณ ที่จ่าย 1%</span>
+              </label>
+            </div>
             <!-- Transfer/Cheque row: ฐาน + WHT + ค่าโอน -->
             <div class="flex gap-2" id="ab-fee-transfer" style="display:none">
               <div class="input-group flex-1">
                 <label>ฐานก่อน VAT</label>
                 <input type="number" class="input" id="ab-base" readonly style="background:rgba(255,255,255,.02)">
               </div>
-              <div class="input-group flex-1">
+              <div class="input-group flex-1" id="ab-wht-group" style="display:none">
                 <label style="color:var(--purple)">หัก ณ ที่จ่าย 1%</label>
                 <input type="number" class="input" id="ab-wht" step="0.01" style="color:var(--purple)" title="คำนวณอัตโนมัติ = ROUND(ยอด/1.07 × 1%, 2) — แก้ไขได้">
               </div>
@@ -6070,6 +6076,9 @@ async function renderMain(el) {
       function updateFeeUI() {
         const type = $type.value || '';
         const applies = feeApplies();
+        const $whtToggleLabel = document.getElementById('ab-wht-toggle-label');
+        const $whtGroup = document.getElementById('ab-wht-group');
+        const $whtEnable = document.getElementById('ab-wht-enable');
         
         if (!applies) {
           $feeBox.style.display = 'none';
@@ -6078,22 +6087,31 @@ async function renderMain(el) {
         $feeBox.style.display = 'block';
         
         // แสดงแถวตาม Type:
-        //   Transfer: ฐาน + WHT + ค่าโอน (ไม่มี extra)
-        //   Cheque:   ฐาน + WHT + ค่าโอน + extra (label: ค่าธรรมเนียม)
+        //   Transfer: ฐาน + (WHT ถ้าเปิด) + ค่าโอน
+        //   Cheque:   ฐาน + (WHT ถ้าเปิด) + ค่าโอน + extra (label: ค่าธรรมเนียม)
         //   Card:     extra (label: ค่าธรรมเนียมบัตร)
         if (type === 'Card') {
           $feeTransfer.style.display = 'none';
           $feeExtra.style.display = 'flex';
           $cardLabel.textContent = 'ค่าธรรมเนียมบัตร';
           $sumCfLabel.textContent = '− ค่าธรรมเนียมบัตร';
+          // Card ไม่มี WHT
+          if ($whtToggleLabel) $whtToggleLabel.style.display = 'none';
+          if ($whtGroup) $whtGroup.style.display = 'none';
         } else if (type === 'Cheque') {
           $feeTransfer.style.display = 'flex';
           $feeExtra.style.display = 'flex';
           $cardLabel.textContent = 'ค่าธรรมเนียม';
           $sumCfLabel.textContent = '− ค่าธรรมเนียม';
+          // แสดง toggle WHT
+          if ($whtToggleLabel) $whtToggleLabel.style.display = 'inline-flex';
+          if ($whtGroup) $whtGroup.style.display = $whtEnable?.checked ? 'block' : 'none';
         } else if (type === 'Transfer') {
           $feeTransfer.style.display = 'flex';
           $feeExtra.style.display = 'none';
+          // แสดง toggle WHT
+          if ($whtToggleLabel) $whtToggleLabel.style.display = 'inline-flex';
+          if ($whtGroup) $whtGroup.style.display = $whtEnable?.checked ? 'block' : 'none';
         }
         updateSummary();
       }
@@ -6102,16 +6120,24 @@ async function renderMain(el) {
         const amount = Number($amount.value) || 0;
         const type = $type.value || '';
         const applies = feeApplies();
+        const $whtEnable = document.getElementById('ab-wht-enable');
+        const whtOn = $whtEnable?.checked || false;
         
         let wht = 0, tf = 0, cf = 0;
         
         if (applies && (type === 'Transfer' || type === 'Cheque')) {
           $base.value = calcBase(amount).toFixed(2);
-          // Auto-fill WHT — เว้นแต่ user แก้เอง
-          if (!whtManuallyEdited) {
-            $whtOut.value = calcWHT(amount).toFixed(2);
+          // ⭐ Auto-fill WHT เฉพาะเมื่อ checkbox เปิด — เว้นแต่ user แก้เอง
+          if (whtOn) {
+            if (!whtManuallyEdited) {
+              $whtOut.value = calcWHT(amount).toFixed(2);
+            }
+            wht = Number($whtOut.value) || 0;
+          } else {
+            // ปิด WHT — เคลียร์ค่า
+            $whtOut.value = '';
+            wht = 0;
           }
-          wht = Number($whtOut.value) || 0;
           tf = Number($tf.value) || 0;
           if (type === 'Cheque') cf = Number($cf.value) || 0;
         } else if (applies && type === 'Card') {
@@ -6142,6 +6168,11 @@ async function renderMain(el) {
       $amount?.addEventListener('input', () => { whtManuallyEdited = false; updateFeeUI(); });
       $tf?.addEventListener('input', updateSummary);
       $cf?.addEventListener('input', updateSummary);
+      // ⭐ WHT toggle — เปิด/ปิดการหัก ณ ที่จ่าย
+      document.getElementById('ab-wht-enable')?.addEventListener('change', () => {
+        whtManuallyEdited = false; // reset เพื่อให้ auto-fill ทำงาน
+        updateFeeUI();
+      });
 
       document.getElementById('ab-confirm')?.addEventListener('click', () => {
         const amount = Number(document.getElementById('ab-amount').value) || 0;
@@ -6700,13 +6731,19 @@ async function renderMain(el) {
             
             <!-- Fee section: เหมือน Add Bill — Transfer/Cheque → WHT+ค่าโอน, Card → ค่าธรรมเนียมบัตร -->
             <div id="eb-fee-box" style="background:rgba(79,156,249,.05);border:1px solid rgba(79,156,249,.2);border-radius:6px;padding:10px;display:none">
-              <div style="font-size:.85rem;color:var(--info);font-weight:600;margin-bottom:8px">⚡ การหัก / ค่าธรรมเนียม <span style="color:var(--text3);font-weight:400">— WHT คำนวณอัตโนมัติจากยอด (แก้ไขได้)</span></div>
+              <div style="font-size:.85rem;color:var(--info);font-weight:600;margin-bottom:8px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+                <span>⚡ การหัก / ค่าธรรมเนียม</span>
+                <label id="eb-wht-toggle-label" style="display:none;align-items:center;gap:6px;cursor:pointer;font-weight:400;color:var(--purple);background:rgba(167,139,250,.1);padding:3px 10px;border-radius:4px;border:1px solid rgba(167,139,250,.3)">
+                  <input type="checkbox" id="eb-wht-enable" ${(Number(b.wht_amount)||0) > 0 ? 'checked' : ''} style="margin:0">
+                  <span>หัก ณ ที่จ่าย 1%</span>
+                </label>
+              </div>
               <div class="flex gap-2" id="eb-fee-transfer" style="display:none">
                 <div class="input-group flex-1">
                   <label>ฐานก่อน VAT</label>
                   <input type="number" class="input" id="eb-base" readonly style="background:rgba(255,255,255,.02)">
                 </div>
-                <div class="input-group flex-1">
+                <div class="input-group flex-1" id="eb-wht-group" style="display:none">
                   <label style="color:var(--purple)">หัก ณ ที่จ่าย 1%</label>
                   <input type="number" class="input" id="eb-wht" value="${Number(b.wht_amount)||0}" step="0.01" style="color:var(--purple)" title="auto-calc = ROUND(ยอด/1.07 × 1%, 2)">
                 </div>
@@ -6805,6 +6842,10 @@ async function renderMain(el) {
         function ebUpdateFeeUI() {
           const t = $ebType.value || '';
           const applies = ebFeeApplies();
+          const $ebWhtToggleLabel = document.getElementById('eb-wht-toggle-label');
+          const $ebWhtGroup = document.getElementById('eb-wht-group');
+          const $ebWhtEnable = document.getElementById('eb-wht-enable');
+          
           if (!applies) {
             $ebFeeBox.style.display = 'none';
             return;
@@ -6813,10 +6854,16 @@ async function renderMain(el) {
           if (t === 'Card') {
             $ebFeeTransfer.style.display = 'none';
             $ebFeeCard.style.display = 'flex';
+            // Card ไม่มี WHT
+            if ($ebWhtToggleLabel) $ebWhtToggleLabel.style.display = 'none';
+            if ($ebWhtGroup) $ebWhtGroup.style.display = 'none';
           } else {
             // Transfer หรือ Cheque
             $ebFeeTransfer.style.display = 'flex';
             $ebFeeCard.style.display = 'none';
+            // แสดง toggle WHT
+            if ($ebWhtToggleLabel) $ebWhtToggleLabel.style.display = 'inline-flex';
+            if ($ebWhtGroup) $ebWhtGroup.style.display = $ebWhtEnable?.checked ? 'block' : 'none';
           }
           ebUpdateSummary();
         }
@@ -6825,11 +6872,19 @@ async function renderMain(el) {
           const amount = Number($ebAmount.value) || 0;
           const t = $ebType.value || '';
           const applies = ebFeeApplies();
+          const $ebWhtEnable = document.getElementById('eb-wht-enable');
+          const whtOn = $ebWhtEnable?.checked || false;
           let wht = 0, tf = 0, cf = 0;
           
           if (applies && (t === 'Transfer' || t === 'Cheque')) {
             $ebBase.value = ebCalcBase(amount).toFixed(2);
-            wht = Number($ebWht.value) || 0;
+            // ⭐ WHT: นับเฉพาะเมื่อ checkbox เปิด
+            if (whtOn) {
+              wht = Number($ebWht.value) || 0;
+            } else {
+              $ebWht.value = '';
+              wht = 0;
+            }
             tf = Number($ebTf.value) || 0;
           } else if (applies && t === 'Card') {
             cf = Number($ebCf.value) || 0;
@@ -6849,21 +6904,27 @@ async function renderMain(el) {
           }
         }
         
-        // เมื่อ amount เปลี่ยน + type=Transfer/Cheque + ยังไม่ได้แก้ WHT เอง → auto-recalc
+        // เมื่อ amount เปลี่ยน + type=Transfer/Cheque + WHT toggle เปิด + ยังไม่ได้แก้ WHT เอง → auto-recalc
         function ebOnAmountChange() {
           const t = $ebType.value || '';
-          if ((t === 'Transfer' || t === 'Cheque') && !ebWhtManuallyEdited) {
+          const $ebWhtEnable = document.getElementById('eb-wht-enable');
+          const whtOn = $ebWhtEnable?.checked || false;
+          if ((t === 'Transfer' || t === 'Cheque') && whtOn && !ebWhtManuallyEdited) {
             $ebWht.value = ebCalcWHT(Number($ebAmount.value) || 0).toFixed(2);
           }
           ebUpdateSummary();
         }
         
-        // เมื่อเปลี่ยน Type → reset flag (ให้ auto-calc ใหม่ในครั้งถัดไป)
+        // เมื่อเปลี่ยน Type → reset flag
         $ebType?.addEventListener('change', () => {
           ebWhtManuallyEdited = false;
-          // ถ้าเพิ่งเปลี่ยนเป็น Transfer/Cheque + WHT ว่าง → auto-fill
-          const t = $ebType.value || '';
-          if ((t === 'Transfer' || t === 'Cheque') && (!Number($ebWht.value) || $ebWht.value === '0')) {
+          ebUpdateFeeUI();
+        });
+        // ⭐ WHT toggle — เปิดแล้ว auto-fill (ถ้ายังว่างหรือยังไม่ได้แก้เอง)
+        document.getElementById('eb-wht-enable')?.addEventListener('change', (e) => {
+          ebWhtManuallyEdited = false;
+          if (e.target.checked) {
+            // เปิด → auto-fill
             $ebWht.value = ebCalcWHT(Number($ebAmount.value) || 0).toFixed(2);
           }
           ebUpdateFeeUI();
