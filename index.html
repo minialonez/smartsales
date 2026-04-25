@@ -7496,34 +7496,41 @@ function openSpTempModal() {
       </div>
       
       <div style="padding:10px;background:var(--bg2);border-radius:6px">
-        <div style="font-weight:600;margin-bottom:8px">💰 Partial แรก (วันนี้)</div>
-        <div class="flex gap-2">
-          <div class="input-group flex-1">
-            <label>จำนวน</label>
-            <input type="number" class="input" id="tsp-p-amount" placeholder="0.00" step="0.01">
-          </div>
-          <div class="input-group flex-1">
-            <label>วันที่</label>
-            <input type="date" class="input" id="tsp-p-date" value="${todayISO()}">
-          </div>
+        <div class="flex justify-between items-center" style="margin-bottom:8px">
+          <div style="font-weight:600">💰 Partial แรก <span class="text-xs text-muted">(ไม่บังคับ)</span></div>
+          <label style="display:flex;align-items:center;gap:6px;font-size:.78rem;cursor:pointer;color:var(--text2)">
+            <input type="checkbox" id="tsp-skip-partial" style="cursor:pointer"> ข้าม (ยังไม่มียอดจ่าย)
+          </label>
         </div>
-        <div class="flex gap-2">
-          <div class="input-group flex-1">
-            <label>วิธี</label>
-            <select class="input" id="tsp-p-method">
-              <option value="Transfer">Transfer</option>
-              <option value="Cash">Cash</option>
-              <option value="Cheque">Cheque</option>
-            </select>
+        <div id="tsp-partial-fields">
+          <div class="flex gap-2">
+            <div class="input-group flex-1">
+              <label>จำนวน</label>
+              <input type="number" class="input" id="tsp-p-amount" placeholder="0.00" step="0.01">
+            </div>
+            <div class="input-group flex-1">
+              <label>วันที่</label>
+              <input type="date" class="input" id="tsp-p-date" value="${todayISO()}">
+            </div>
           </div>
-          <div class="input-group flex-1">
-            <label>ธนาคาร</label>
-            <input class="input" id="tsp-p-bank" placeholder="KTB / BBL / ...">
+          <div class="flex gap-2">
+            <div class="input-group flex-1">
+              <label>วิธี</label>
+              <select class="input" id="tsp-p-method">
+                <option value="Transfer">Transfer</option>
+                <option value="Cash">Cash</option>
+                <option value="Cheque">Cheque</option>
+              </select>
+            </div>
+            <div class="input-group flex-1">
+              <label>ธนาคาร</label>
+              <input class="input" id="tsp-p-bank" placeholder="KTB / BBL / ...">
+            </div>
           </div>
-        </div>
-        <div class="input-group">
-          <label>Stmt ref / หมายเหตุ</label>
-          <input class="input" id="tsp-p-notes" placeholder="">
+          <div class="input-group">
+            <label>Stmt ref / หมายเหตุ</label>
+            <input class="input" id="tsp-p-notes" placeholder="">
+          </div>
         </div>
       </div>
       
@@ -7535,25 +7542,37 @@ function openSpTempModal() {
   `);
   spTempWireCustomerInput('tsp-cust');
   
+  // Toggle partial fields enabled/disabled
+  document.getElementById('tsp-skip-partial')?.addEventListener('change', (e) => {
+    const skip = e.target.checked;
+    const fields = document.getElementById('tsp-partial-fields');
+    if (fields) {
+      fields.style.opacity = skip ? '0.45' : '1';
+      fields.style.pointerEvents = skip ? 'none' : 'auto';
+    }
+  });
+  
   document.getElementById('tsp-confirm')?.addEventListener('click', () => {
     const code = document.getElementById('tsp-cust-code').value.trim();
     const name = document.getElementById('tsp-cust-name').value.trim() || 
                  document.getElementById('tsp-cust-search').value.trim();
     const expected = Number(document.getElementById('tsp-expected').value) || 0;
+    const skipPartial = document.getElementById('tsp-skip-partial')?.checked || false;
     const pAmt = Number(document.getElementById('tsp-p-amount').value) || 0;
     
     if (!name) { toast('กรอกข้อมูลลูกค้า', 'error'); return; }
     if (expected <= 0) { toast('กรอก expected total', 'error'); return; }
-    if (pAmt <= 0) { toast('กรอก partial amount', 'error'); return; }
+    // ⭐ Partial is optional — skip if checkbox ticked OR amount is 0
+    const hasPartial = !skipPartial && pAmt > 0;
     
-    const partial = {
+    const partial = hasPartial ? {
       date: document.getElementById('tsp-p-date').value,
       amount: pAmt,
       method: document.getElementById('tsp-p-method').value,
       bank: document.getElementById('tsp-p-bank').value,
       stmt_ref: '',
       notes: document.getElementById('tsp-p-notes').value,
-    };
+    } : null;
     
     const now = new Date().toISOString();
     const newTemp = {
@@ -7564,33 +7583,39 @@ function openSpTempModal() {
       status: 'open', linked_sp: '', parent_temp: '', graduated_at: '',
     };
     
-    // Check rollover
-    const check = spTempCheckRollover(newTemp, partial);
-    if (check.split) {
-      newTemp.partials.push(check.partialThis);
+    if (!hasPartial) {
+      // ⭐ No partial — just create empty SP-TEMP
       recomputeSpTempStatus(newTemp);
       spTempList.push(newTemp);
-      
-      // Rollover
-      const nextNo = genSpTempNo();
-      const nextTemp = {
-        no: nextNo, created_at: now, updated_at: now,
-        cust_code: code, cust_name: name,
-        expected_total: 0, // ยังไม่รู้ → user แก้ทีหลัง
-        partials: [check.partialNext],
-        status: 'open', linked_sp: '', parent_temp: tempNo, graduated_at: '',
-      };
-      spTempList.push(nextTemp);
-      toast(`⚠️ เกิน ${check.overflow.toLocaleString()} → สร้าง ${nextNo} อัตโนมัติ`, 'info');
     } else {
-      newTemp.partials.push(partial);
-      recomputeSpTempStatus(newTemp);
-      spTempList.push(newTemp);
+      // Check rollover
+      const check = spTempCheckRollover(newTemp, partial);
+      if (check.split) {
+        newTemp.partials.push(check.partialThis);
+        recomputeSpTempStatus(newTemp);
+        spTempList.push(newTemp);
+        
+        // Rollover
+        const nextNo = genSpTempNo();
+        const nextTemp = {
+          no: nextNo, created_at: now, updated_at: now,
+          cust_code: code, cust_name: name,
+          expected_total: 0, // ยังไม่รู้ → user แก้ทีหลัง
+          partials: [check.partialNext],
+          status: 'open', linked_sp: '', parent_temp: tempNo, graduated_at: '',
+        };
+        spTempList.push(nextTemp);
+        toast(`⚠️ เกิน ${check.overflow.toLocaleString()} → สร้าง ${nextNo} อัตโนมัติ`, 'info');
+      } else {
+        newTemp.partials.push(partial);
+        recomputeSpTempStatus(newTemp);
+        spTempList.push(newTemp);
+      }
     }
     
     markDirtySpTemps();
     closeModal();
-    toast(`สร้าง ${tempNo} สำเร็จ`, 'success');
+    toast(`สร้าง ${tempNo} สำเร็จ${hasPartial ? '' : ' (ยังไม่มียอดจ่าย)'}`, 'success');
     // Re-render caller
     const mainEl = document.getElementById('main');
     if (mainEl && typeof currentPage !== 'undefined' && currentPage === 'payments') navigateTo('payments');
