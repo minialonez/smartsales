@@ -5452,6 +5452,12 @@ async function renderMain(el) {
       if (!confirm(`ยืนยันลบ ${toDelete.length} บิล?\n\n${stationStr}\n\n⚠️ ลบแล้วกู้คืนไม่ได้`)) return;
       
       const toDeleteSet = new Set(toDelete);
+      // ⭐ Track uuids for cloud sync delete
+      toDelete.forEach(b => {
+        if (b.bill_uuid && typeof syncManager !== 'undefined' && syncManager.markDeleted) {
+          syncManager.markDeleted('bills', b.bill_uuid);
+        }
+      });
       billList = billList.filter(b => !toDeleteSet.has(b));
       
       persistMainState();
@@ -5510,10 +5516,21 @@ async function renderMain(el) {
       if (!confirm('ล้างข้อมูลของวัน ' + fmtDate(selectedDate) + ' ทั้งหมด?\n\n• Bill List\n• Summary (นำเงินเข้า/ยอดขาย/Cash Drawer ฯลฯ)\n• Cash counting (นับธนบัตร)')) return;
       
       // 1) ล้างบิลของวันที่เลือก (เก็บวันอื่น)
+      // ⭐ Track uuids ที่ถูกลบ → sync จะ push delete ไป cloud
+      var selectedDisplay = fmtDate(selectedDate);
+      var billsToDelete = billList.filter(function(b) {
+        var d = String(b.date || '').trim();
+        return d === selectedDisplay || d === selectedDate;
+      });
+      var deletedCount = 0;
+      billsToDelete.forEach(function(b) {
+        if (b.bill_uuid && typeof syncManager !== 'undefined' && syncManager.markDeleted) {
+          syncManager.markDeleted('bills', b.bill_uuid);
+          deletedCount++;
+        }
+      });
       billList = billList.filter(function(b) {
         var d = String(b.date || '').trim();
-        // เทียบในรูปแบบเดิม: dd/mm/yyyy หรือ yyyy-mm-dd
-        var selectedDisplay = fmtDate(selectedDate);
         return d !== selectedDisplay && d !== selectedDate;
       });
       
@@ -5534,7 +5551,7 @@ async function renderMain(el) {
       persistMainState();
       invalidateBillsCache();
       render();
-      toast('ล้างข้อมูลของ ' + fmtDate(selectedDate) + ' แล้ว', 'success');
+      toast('ล้างข้อมูลของ ' + fmtDate(selectedDate) + ' แล้ว (' + billsToDelete.length + ' บิล, sync กำลังลบใน cloud)', 'success', 4000);
     });
 
     // Date range filter handlers
@@ -18191,7 +18208,13 @@ async function importDailyXlsm(file) {
   }
   
   // ── 4. ลบบิลเดิมของวันที่นี้ (ป้องกันซ้ำ) ──
+  // ⭐ Track uuid สำหรับ sync delete (ก่อน filter ออก)
   const beforeCount = billList.length;
+  billList.forEach(b => {
+    if (toISODate(b.date) === dateISO && b.bill_uuid && typeof syncManager !== 'undefined' && syncManager.markDeleted) {
+      syncManager.markDeleted('bills', b.bill_uuid);
+    }
+  });
   billList = billList.filter(b => toISODate(b.date) !== dateISO);
   const deleted = beforeCount - billList.length;
   
