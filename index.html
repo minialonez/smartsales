@@ -2227,6 +2227,15 @@ const syncManager = {
                       // ⭐ Match-state guard: ถ้า local matched + matched_at ใหม่กว่า cloud updated_at → skip
                       //    ป้องกัน race delta push ค้าง → poll pull มาก่อน → revert
                       const localBill = billList[idx];
+                      // 🔒 Lock guard: ถ้าวันที่บิลถูก lock → ไม่ให้ cloud ทับ local (ยกเว้น matching fields)
+                      if (typeof isDateLocked === 'function' && isDateLocked(toISODate(localBill.date))) {
+                        // Allow merge เฉพาะ matching fields (เพราะ matching ทำได้ใน lock day)
+                        const MATCH_FIELDS = ['match_status','confirmation','matched_stmt_ref','matched_at','pay_date','paid_by_sp'];
+                        MATCH_FIELDS.forEach(f => {
+                          if (b[f] !== undefined) localBill[f] = b[f];
+                        });
+                        return; // skip full merge
+                      }
                       const localMatched = localBill.match_status === 'matched' || localBill.match_status === 'paid';
                       const cloudMatched = b.match_status === 'matched' || b.match_status === 'paid';
                       if (localMatched && !cloudMatched) {
@@ -2478,6 +2487,8 @@ const syncManager = {
                 if (parsed.summary?.__byDate) {
                   if (!mainSummary.__byDate) mainSummary.__byDate = {};
                   Object.entries(parsed.summary.__byDate).forEach(([d, v]) => {
+                    // 🔒 Lock guard: ถ้าวันที่ lock → ไม่ให้ cloud ทับ local (freeze ตัวเลข)
+                    if (typeof isDateLocked === 'function' && isDateLocked(d)) return;
                     if (!mainSummary.__byDate[d]) mainSummary.__byDate[d] = {};
                     stats.meta += mergeFields(mainSummary.__byDate[d], v);
                   });
@@ -2486,6 +2497,8 @@ const syncManager = {
                 if (parsed.cashCount?.__byDate) {
                   if (!cashCount.__byDate) cashCount.__byDate = {};
                   Object.entries(parsed.cashCount.__byDate).forEach(([d, v]) => {
+                    // 🔒 Lock guard
+                    if (typeof isDateLocked === 'function' && isDateLocked(d)) return;
                     if (!cashCount.__byDate[d]) cashCount.__byDate[d] = {};
                     mergeFields(cashCount.__byDate[d], v);
                   });
@@ -5150,13 +5163,14 @@ async function renderMain(el) {
         <div class="flex gap-2 items-center flex-wrap">
           <div class="flex items-center" style="gap:4px;position:relative">
             <button class="btn btn-outline btn-sm" id="main-date-prev" title="วันก่อนหน้า" style="padding:4px 10px;font-weight:700">◀</button>
-            <button class="btn btn-outline" id="main-date-btn" style="padding:5px 14px;font-weight:600;min-width:160px;font-variant-numeric:tabular-nums" title="คลิกเพื่อเลือกวัน">
+            <button class="btn btn-outline" id="main-date-btn" style="padding:5px 14px;font-weight:600;min-width:160px;font-variant-numeric:tabular-nums${isDateLocked(selectedDate)?';background:rgba(239,87,87,.18);border-color:var(--danger);color:var(--danger)':''}" title="คลิกเพื่อเลือกวัน">
               ${(() => {
                 const d = new Date(selectedDate);
                 if (isNaN(d)) return selectedDate;
                 const thMonths = ['ม.ค.','ก.พ.','มี.ค.','เม.ย.','พ.ค.','มิ.ย.','ก.ค.','ส.ค.','ก.ย.','ต.ค.','พ.ย.','ธ.ค.'];
                 const dow = ['อา.','จ.','อ.','พ.','พฤ.','ศ.','ส.'][d.getDay()];
-                return `📅 ${dow} ${d.getDate()} ${thMonths[d.getMonth()]} ${d.getFullYear()}`;
+                const lockIcon = isDateLocked(selectedDate) ? '🔒 ' : '📅 ';
+                return `${lockIcon}${dow} ${d.getDate()} ${thMonths[d.getMonth()]} ${d.getFullYear()}`;
               })()}
             </button>
             <button class="btn btn-outline btn-sm" id="main-date-next" title="วันถัดไป" style="padding:4px 10px;font-weight:700">▶</button>
@@ -5166,16 +5180,22 @@ async function renderMain(el) {
           <button class="btn btn-info btn-sm" id="btn-import-pos" style="background:var(--info);color:#fff">${ICONS.download} Front POS</button>
           <button class="btn ${showChange?'btn-primary':'btn-outline'} btn-sm" id="btn-toggle-change">🪙 นับธนบัตร</button>
           <button class="btn btn-ghost btn-sm" id="btn-unmatch-day" style="color:var(--warn);border:1px solid var(--warn)" title="Unmatch บิลทั้งหมดในวันนี้">↩ Unmatch วันนี้</button>
-          <button class="btn ${isDateLocked(selectedDate)?'btn-warn':'btn-ghost'} btn-sm" id="btn-toggle-lock" style="${isDateLocked(selectedDate)?'background:var(--warn);color:#fff':'border:1px solid var(--border);color:var(--text2)'}" title="${isDateLocked(selectedDate)?'วันนี้ถูก lock — คลิกเพื่อปลด':'คลิกเพื่อ lock วันนี้ ป้องกันแก้ไข'}">${isDateLocked(selectedDate)?'🔒 Locked':'🔓 Lock'}</button>
+          <button class="btn btn-sm" id="btn-lock-day" ${isDateLocked(selectedDate)?'disabled':''} style="${isDateLocked(selectedDate)?'background:rgba(239,87,87,.08);border:1px solid rgba(239,87,87,.3);color:rgba(239,87,87,.4);cursor:not-allowed':'background:var(--danger);color:#fff;border:1px solid var(--danger);font-weight:700'}" title="Lock วันนี้ — ป้องกันการแก้ไข">🔒 Lock</button>
+          <button class="btn btn-sm" id="btn-unlock-day" ${!isDateLocked(selectedDate)?'disabled':''} style="${!isDateLocked(selectedDate)?'background:rgba(45,212,160,.08);border:1px solid rgba(45,212,160,.3);color:rgba(45,212,160,.4);cursor:not-allowed':'background:var(--success);color:#fff;border:1px solid var(--success);font-weight:700;box-shadow:0 0 0 2px rgba(45,212,160,.2)'}" title="ปลด Lock วันนี้">🔓 Unlock</button>
+          <button class="btn btn-outline btn-sm" id="btn-bulk-lock" title="Lock/Unlock หลายวันพร้อมกัน" style="border:1px dashed var(--text2);color:var(--text2)">📅 Bulk</button>
           <button class="btn btn-outline btn-sm" id="btn-check-issues">🔍 ตรวจสอบ</button>
           <button class="btn btn-success btn-sm" id="btn-save-main">${ICONS.check} บันทึก</button>
         </div>
       </div>
       
       ${isDateLocked(selectedDate) ? `
-        <div class="text-sm" style="padding:10px 14px;background:rgba(245,166,35,.12);border:1px solid var(--warn);border-radius:6px;color:var(--warn);margin-bottom:12px;display:flex;align-items:center;gap:10px;font-weight:600">
-          🔒 วันที่ ${fmtDate(selectedDate)} ถูก lock — ไม่สามารถแก้ไขข้อมูลได้
-          <span style="margin-left:auto;font-weight:400;font-size:.78rem">กดปุ่ม "🔒 Locked" ด้านบนเพื่อปลด lock</span>
+        <div style="padding:14px 18px;background:linear-gradient(90deg,rgba(239,87,87,.18),rgba(239,87,87,.08));border:2px solid var(--danger);border-left:6px solid var(--danger);border-radius:8px;color:var(--danger);margin-bottom:14px;display:flex;align-items:center;gap:14px;font-weight:700;box-shadow:0 2px 8px rgba(239,87,87,.15)">
+          <span style="font-size:1.6rem">🔒</span>
+          <div style="flex:1">
+            <div style="font-size:1rem;letter-spacing:.3px">วันที่ ${fmtDate(selectedDate)} ถูก LOCK</div>
+            <div style="font-weight:400;font-size:.78rem;color:var(--text2);margin-top:2px">แก้ไขตัวเลข/บิล/import ไม่ได้ — แต่ matching statement ยังทำได้</div>
+          </div>
+          <button class="btn btn-sm" onclick="document.getElementById('btn-unlock-day')?.click()" style="background:var(--success);color:#fff;border:none;font-weight:700;padding:6px 14px">🔓 ปลด Lock</button>
         </div>
       ` : ''}
       
@@ -5791,18 +5811,158 @@ async function renderMain(el) {
       showChange = !showChange; render();
     });
     
-    // ── 🔒 Lock/Unlock วันนี้ ──
-    document.getElementById('btn-toggle-lock')?.addEventListener('click', () => {
+    // ── 🔒 Lock วันนี้ ──
+    document.getElementById('btn-lock-day')?.addEventListener('click', () => {
       const d = selectedDate;
-      if (isDateLocked(d)) {
-        if (!confirm(`ปลด lock วันที่ ${fmtDate(d)}?\n\nหลังปลด lock จะแก้ไขข้อมูลได้อีกครั้ง`)) return;
-        unlockDate(d);
-        toast(`🔓 ปลด lock ${fmtDate(d)} แล้ว — แก้ไขได้`, 'info');
-      } else {
-        lockDate(d);
-        toast(`🔒 Lock ${fmtDate(d)} — ป้องกันการแก้ไข`, 'success');
-      }
+      if (isDateLocked(d)) return;
+      lockDate(d);
+      toast(`🔒 Lock ${fmtDate(d)} — ป้องกันการแก้ไข`, 'success');
       render();
+    });
+    
+    // ── 🔓 Unlock วันนี้ ──
+    document.getElementById('btn-unlock-day')?.addEventListener('click', () => {
+      const d = selectedDate;
+      if (!isDateLocked(d)) return;
+      if (!confirm(`ปลด lock วันที่ ${fmtDate(d)}?\n\nหลังปลด lock จะแก้ไขข้อมูลได้อีกครั้ง`)) return;
+      unlockDate(d);
+      toast(`🔓 ปลด lock ${fmtDate(d)} แล้ว — แก้ไขได้`, 'info');
+      render();
+    });
+    
+    // ── 📅🔒 Bulk Lock — Lock/Unlock หลายวันพร้อมกัน ──
+    document.getElementById('btn-bulk-lock')?.addEventListener('click', () => {
+      const today = todayISO();
+      const lockedNow = Object.keys(mainSummary.__lockedDates || {}).sort();
+      const lockedCount = lockedNow.length;
+      
+      // Preset: เดือนนี้, เดือนก่อน, 30 วัน, ปีนี้
+      const _ym = (d) => d.substring(0, 7);
+      const _firstOfMonth = (ym) => ym + '-01';
+      const _lastOfMonth = (ym) => {
+        const [y, m] = ym.split('-').map(Number);
+        const last = new Date(y, m, 0).getDate();
+        return ym + '-' + String(last).padStart(2,'0');
+      };
+      const thisMonth = _ym(today);
+      const lastMonthYM = (() => {
+        const [y, m] = thisMonth.split('-').map(Number);
+        if (m === 1) return (y-1) + '-12';
+        return y + '-' + String(m-1).padStart(2,'0');
+      })();
+      const minus30 = (() => {
+        const d = new Date(today + 'T00:00:00');
+        d.setDate(d.getDate() - 30);
+        return d.toISOString().substring(0, 10);
+      })();
+      
+      openModal('📅🔒 Bulk Lock — Lock/Unlock หลายวัน', `
+        <div class="flex-col gap-3" style="min-width:420px">
+          <div style="padding:10px 12px;background:rgba(239,87,87,.08);border-radius:6px;border-left:3px solid var(--danger);font-size:.85rem">
+            <b>ตอนนี้มีวันที่ lock อยู่:</b> ${lockedCount} วัน
+            ${lockedCount > 0 ? `<div class="text-xs text-muted" style="margin-top:4px;max-height:60px;overflow-y:auto">${lockedNow.slice(0,20).map(d=>fmtDate(d)).join(', ')}${lockedCount>20?` +${lockedCount-20} อื่นๆ`:''}</div>` : ''}
+          </div>
+          
+          <div class="flex gap-2 items-center">
+            <span class="text-xs text-dim">Preset:</span>
+            <button class="btn btn-outline btn-xs bl-preset" data-from="${_firstOfMonth(thisMonth)}" data-to="${_lastOfMonth(thisMonth)}">เดือนนี้</button>
+            <button class="btn btn-outline btn-xs bl-preset" data-from="${_firstOfMonth(lastMonthYM)}" data-to="${_lastOfMonth(lastMonthYM)}">เดือนก่อน</button>
+            <button class="btn btn-outline btn-xs bl-preset" data-from="${minus30}" data-to="${today}">30 วันที่ผ่านมา</button>
+          </div>
+          
+          <div class="flex gap-2">
+            <div class="input-group flex-1">
+              <label>จากวันที่</label>
+              <input type="date" class="input" id="bl-from" value="${_firstOfMonth(thisMonth)}">
+            </div>
+            <div class="input-group flex-1">
+              <label>ถึงวันที่</label>
+              <input type="date" class="input" id="bl-to" value="${today}">
+            </div>
+          </div>
+          
+          <div id="bl-preview" style="padding:10px;background:var(--bg2);border-radius:6px;font-size:.82rem;color:var(--text2)"></div>
+          
+          <div class="flex gap-2 mt-2">
+            <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ยกเลิก</button>
+            <button class="btn btn-sm flex-1" id="bl-unlock" style="background:transparent;border:1px solid var(--success);color:var(--success);font-weight:600">🔓 Unlock ในช่วงนี้</button>
+            <button class="btn btn-sm flex-1" id="bl-lock" style="background:var(--danger);color:#fff;font-weight:700">🔒 Lock ในช่วงนี้</button>
+          </div>
+        </div>
+      `);
+      
+      const $from = document.getElementById('bl-from');
+      const $to = document.getElementById('bl-to');
+      const $preview = document.getElementById('bl-preview');
+      
+      function _datesBetween(from, to) {
+        const out = [];
+        if (!from || !to || from > to) return out;
+        const start = new Date(from + 'T00:00:00');
+        const end = new Date(to + 'T00:00:00');
+        for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+          out.push(d.toISOString().substring(0, 10));
+        }
+        return out;
+      }
+      
+      function updatePreview() {
+        const dates = _datesBetween($from.value, $to.value);
+        const willLock = dates.filter(d => !isDateLocked(d)).length;
+        const willUnlock = dates.filter(d => isDateLocked(d)).length;
+        $preview.innerHTML = `
+          ช่วง <b>${fmtDate($from.value)} → ${fmtDate($to.value)}</b> = <b>${dates.length} วัน</b><br>
+          <span style="color:var(--text3);font-size:.78rem">
+            • <span style="color:var(--danger)">ยังไม่ lock: ${willLock} วัน</span>
+            · <span style="color:var(--success)">lock อยู่: ${willUnlock} วัน</span>
+          </span>
+        `;
+      }
+      updatePreview();
+      $from.addEventListener('change', updatePreview);
+      $to.addEventListener('change', updatePreview);
+      
+      // Preset buttons
+      document.querySelectorAll('.bl-preset').forEach(btn => {
+        btn.addEventListener('click', () => {
+          $from.value = btn.dataset.from;
+          $to.value = btn.dataset.to;
+          updatePreview();
+        });
+      });
+      
+      document.getElementById('bl-lock')?.addEventListener('click', () => {
+        const dates = _datesBetween($from.value, $to.value);
+        if (dates.length === 0) { toast('เลือกช่วงวันที่ไม่ถูกต้อง', 'warn'); return; }
+        if (!confirm(`Lock ${dates.length} วัน ตั้งแต่ ${fmtDate($from.value)} → ${fmtDate($to.value)}?\n\nวันเหล่านี้จะแก้ไขไม่ได้`)) return;
+        if (!mainSummary.__lockedDates) mainSummary.__lockedDates = {};
+        let added = 0;
+        dates.forEach(d => {
+          if (!mainSummary.__lockedDates[d]) { mainSummary.__lockedDates[d] = true; added++; }
+        });
+        persistMainState();
+        if (window.syncManager?.markDirty) syncManager.markDirty('meta');
+        closeModal();
+        toast(`🔒 Lock เพิ่ม ${added} วัน (รวมทั้งหมด ${Object.keys(mainSummary.__lockedDates).length} วัน)`, 'success', 4000);
+        render();
+      });
+      
+      document.getElementById('bl-unlock')?.addEventListener('click', () => {
+        const dates = _datesBetween($from.value, $to.value);
+        if (dates.length === 0) { toast('เลือกช่วงวันที่ไม่ถูกต้อง', 'warn'); return; }
+        const willUnlock = dates.filter(d => isDateLocked(d)).length;
+        if (willUnlock === 0) { toast('ไม่มีวันที่ lock ในช่วงนี้', 'info'); return; }
+        if (!confirm(`Unlock ${willUnlock} วัน ในช่วง ${fmtDate($from.value)} → ${fmtDate($to.value)}?`)) return;
+        let removed = 0;
+        dates.forEach(d => {
+          if (mainSummary.__lockedDates?.[d]) { delete mainSummary.__lockedDates[d]; removed++; }
+        });
+        persistMainState();
+        if (window.syncManager?.markDirty) syncManager.markDirty('meta');
+        closeModal();
+        toast(`🔓 Unlock ${removed} วัน — แก้ไขได้แล้ว`, 'info', 4000);
+        render();
+      });
     });
     
     // ── Unmatch บิล + statement ทั้งหมดในวันที่เลือก ──
@@ -6432,10 +6592,12 @@ async function renderMain(el) {
 
     // ── Auto Due Date (วันที่ 20 เดือนถัดไปของ bill_date) ──
     document.getElementById('btn-auto-duedate')?.addEventListener('click', () => {
-      let count = 0;
+      let count = 0, skippedLocked = 0;
       billList.forEach(b => {
         // เฉพาะบิลเครดิต (Invoice Credit / Order Credit) ที่ยังไม่มี Due Date
         if ((b.station === 'Invoice Credit' || b.station === 'Order Credit') && !b.due_date && b.date) {
+          // 🔒 Lock guard: ข้าม bills ในวัน lock
+          if (isDateLocked(toISODate(b.date))) { skippedLocked++; return; }
           const next = calcNextMonth20(b.date);
           if (next) {
             b.due_date = next;
@@ -6444,7 +6606,8 @@ async function renderMain(el) {
         }
       });
       persistMainState();
-      toast(`ตั้ง Due Date อัตโนมัติ ${count} รายการ (วันที่ 20 ของเดือนถัดไป)`, 'success');
+      const lockMsg = skippedLocked > 0 ? ` (ข้าม ${skippedLocked} ในวัน lock)` : '';
+      toast(`ตั้ง Due Date อัตโนมัติ ${count} รายการ (วันที่ 20 ของเดือนถัดไป)${lockMsg}`, 'success');
       renderKeepScroll();
     });
     // ── Check issues button (เปิด modal validation) ──
@@ -7476,6 +7639,7 @@ async function renderMain(el) {
         const idx = Number(btn.dataset.idx);
         const b = billList[idx];
         if (!b) return;
+        if (blockIfLocked(toISODate(b.date), 'ยกเลิกบิล')) return;
         
         openModal(`❌ ยกเลิกบิล ${b.bill_no||'(ไม่มีเลข)'}`, `
           <div class="flex-col gap-3">
@@ -7517,6 +7681,7 @@ async function renderMain(el) {
         const idx = Number(btn.dataset.idx);
         const b = billList[idx];
         if (!b) return;
+        if (blockIfLocked(toISODate(b.date), 'คืนบิล')) return;
         if (!confirm(`คืนบิล ${b.bill_no||''} กลับมาใช้งาน?\n(เหตุผลเดิม: ${b.void_reason||'-'})`)) return;
         b.match_status = 'pending';
         delete b.voided_at;
@@ -16540,12 +16705,18 @@ function renderData(el) {
       const beforeStmts = getAllStatements().length;
       const beforePayments = paymentList.length;
       
+      // 🔒 Lock guard: เตือนถ้ามี locked dates
+      const lockedDates = Object.keys(mainSummary.__lockedDates || {});
+      const lockMsg = lockedDates.length > 0 
+        ? `\n\n⚠️ พบ ${lockedDates.length} วันที่ lock — Rebuild จะทับข้อมูลทั้งหมดรวมวัน lock` 
+        : '';
+      
       if (!confirm(
         `🔄 Rebuild Local จาก Cloud\n\n` +
         `Local ตอนนี้:\n` +
         `  • Bills: ${beforeBills}\n` +
         `  • Statements: ${beforeStmts}\n` +
-        `  • SP Payments: ${beforePayments}\n\n` +
+        `  • SP Payments: ${beforePayments}${lockMsg}\n\n` +
         `ระบบจะ pull จาก cloud ก่อน → validate → ถ้า OK ค่อยแทนที่ local\n` +
         `(ถ้า pull ได้น้อยผิดปกติ จะ abort + เก็บ local เดิมไว้)\n\n` +
         `⚠️ ควร Backup JSON ไว้ก่อน\nทำต่อ?`
@@ -17185,6 +17356,11 @@ function renderData(el) {
     
     // ── Restore JSON ──
     document.getElementById('btn-restore-json')?.addEventListener('click', () => {
+      // 🔒 Lock guard: เตือนถ้ามี locked dates
+      const lockedDates = Object.keys(mainSummary.__lockedDates || {});
+      if (lockedDates.length > 0) {
+        if (!confirm(`⚠️ พบ ${lockedDates.length} วันที่ถูก lock อยู่\n\nการ Restore จะทับข้อมูลทั้งหมด รวมวันที่ lock\n\nต้องการดำเนินการต่อ?`)) return;
+      }
       const inp = document.createElement('input');
       inp.type = 'file';
       inp.accept = '.json';
