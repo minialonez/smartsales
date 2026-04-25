@@ -443,6 +443,43 @@ async function pushMatchDelta(bill, stmt) {
 }
 
 // ── Date Helpers (dd/mm/yyyy เสมอ) ──
+// ──────────────────────────────────────────────────────────────────────────
+// 🔒 Date Lock — กันแก้ข้อมูลวันเก่าโดยไม่ตั้งใจ
+// ──────────────────────────────────────────────────────────────────────────
+// State: mainSummary.__lockedDates = { 'yyyy-mm-dd': true, ... }
+//   ถ้า isDateLocked(date) === true → block ทุก mutation ของวันนั้น
+//   user กด 🔒 toggle ได้เอง — unlock ต้อง confirm
+function isDateLocked(dateISO) {
+  if (!dateISO) return false;
+  if (typeof mainSummary !== 'object' || !mainSummary) return false;
+  const locks = mainSummary.__lockedDates || {};
+  return locks[dateISO] === true;
+}
+function lockDate(dateISO) {
+  if (!dateISO) return;
+  if (!mainSummary.__lockedDates) mainSummary.__lockedDates = {};
+  mainSummary.__lockedDates[dateISO] = true;
+  if (typeof persistMainState === 'function') persistMainState();
+  if (window.syncManager?.markDirty) syncManager.markDirty('meta');
+}
+function unlockDate(dateISO) {
+  if (!dateISO) return;
+  if (!mainSummary.__lockedDates) return;
+  delete mainSummary.__lockedDates[dateISO];
+  if (typeof persistMainState === 'function') persistMainState();
+  if (window.syncManager?.markDirty) syncManager.markDirty('meta');
+}
+// Guard helper: ตรวจก่อน mutation — return true ถ้า block, false ถ้า allow
+function blockIfLocked(dateISO, action) {
+  if (isDateLocked(dateISO)) {
+    if (typeof toast === 'function') {
+      toast(`🔒 วันที่ ${dateISO} ถูก lock — กดปลด lock ก่อน${action ? ' ('+action+')' : ''}`, 'warn', 3500);
+    }
+    return true;
+  }
+  return false;
+}
+
 function todayISO() {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
@@ -1576,13 +1613,14 @@ window.parseCompactMetaRows = function(rows) {
       dateISO = uuidMatch[1];
     } else {
       // Fallback: ถ้าไม่มี uuid (legacy row) → ใช้ date column
+      // ⚠️ Thai dd/mm/yyyy ปลอดภัย — convert ตรง
+      // ⚠️ ISO yyyy-mm-dd ไม่ปลอดภัย — Sheets อาจ swap เดือนกับวัน → SKIP
       if (/^\d{1,2}\/\d{1,2}\/\d{4}/.test(String(r.date))) {
         const parts = String(r.date).split('/');
         let y = Number(parts[2]); if (y > 2400) y -= 543;
         dateISO = y + '-' + String(parts[1]).padStart(2,'0') + '-' + String(parts[0]).padStart(2,'0');
-      } else if (/^\d{4}-\d{2}-\d{2}/.test(String(r.date))) {
-        dateISO = String(r.date).substring(0, 10);
       }
+      // ❌ ไม่ fallback ไป ISO substring (เพราะอาจถูก Sheets swap แล้ว)
     }
     if (!dateISO) { skippedJunk++; return; }
     
@@ -1810,20 +1848,19 @@ const syncManager = {
   // ⭐ Recompute fp cache for ALL types — used after pullFromCloud
   // Ensures fp cache reflects post-pull state so next push skips correctly
   // (prevents pull→push→pull loop ที่ทำให้ sheet บวม)
+  //
+  // ⚠️ CRITICAL: ต้อง preserve dirty types ที่มี pre-pull edits ของ user
+  //    เก่า: dirty.delete ทุก type → user's edits ก่อน pull หาย (race: edit→pull→push skip)
+  //    ใหม่: ถ้า dirty.has(type) → skip update fp + keep dirty → push cycle ถัดไปจะ sync
   _recomputeFpCache() {
     this._fpCache = this._fpCache || {};
-    const fpBills = this._computeFp('bills');
-    const fpStmts = this._computeFp('stmts');
-    if (fpBills) this._fpCache.bills = fpBills;
-    if (fpStmts) this._fpCache.stmts = fpStmts;
-    // Clear dirty flags that might have leaked in during pull
-    this.dirty.delete('bills');
-    this.dirty.delete('stmts');
-    this.dirty.delete('meta');
-    this.dirty.delete('payments');
-    this.dirty.delete('sp_temps');
-    this.dirty.delete('cashflow');
-    this.dirty.delete('suppliers');
+    const TYPES = ['bills','stmts','meta','payments','sp_temps','cashflow','suppliers'];
+    TYPES.forEach(t => {
+      if (this.dirty.has(t)) return; // skip — local has pending edit ที่ยังไม่ push
+      const fp = this._computeFp(t);
+      if (fp) this._fpCache[t] = fp;
+    });
+    // ⭐ DO NOT clear dirty — pre-pull edits ต้อง trigger push ครั้งถัดไป
   },
   
   async _flushPush() {
@@ -4818,11 +4855,6 @@ async function renderMain(el) {
       const dayData = mainSummary.__byDate[selectedDate][thLabel];
       if (dayData && dayData[station] != null) return Number(dayData[station]) || 0;
     }
-    // ⭐ Default cashIn = 5155 ถ้ายังไม่เคยกรอก (เลขทอนเริ่มต้นวัน)
-    if (field === 'cashIn') {
-      const stored = mainSummary[field + '_' + station];
-      if (stored === undefined || stored === null || stored === '') return 5155;
-    }
     return 0;
   }
   
@@ -5134,10 +5166,18 @@ async function renderMain(el) {
           <button class="btn btn-info btn-sm" id="btn-import-pos" style="background:var(--info);color:#fff">${ICONS.download} Front POS</button>
           <button class="btn ${showChange?'btn-primary':'btn-outline'} btn-sm" id="btn-toggle-change">🪙 นับธนบัตร</button>
           <button class="btn btn-ghost btn-sm" id="btn-unmatch-day" style="color:var(--warn);border:1px solid var(--warn)" title="Unmatch บิลทั้งหมดในวันนี้">↩ Unmatch วันนี้</button>
+          <button class="btn ${isDateLocked(selectedDate)?'btn-warn':'btn-ghost'} btn-sm" id="btn-toggle-lock" style="${isDateLocked(selectedDate)?'background:var(--warn);color:#fff':'border:1px solid var(--border);color:var(--text2)'}" title="${isDateLocked(selectedDate)?'วันนี้ถูก lock — คลิกเพื่อปลด':'คลิกเพื่อ lock วันนี้ ป้องกันแก้ไข'}">${isDateLocked(selectedDate)?'🔒 Locked':'🔓 Lock'}</button>
           <button class="btn btn-outline btn-sm" id="btn-check-issues">🔍 ตรวจสอบ</button>
           <button class="btn btn-success btn-sm" id="btn-save-main">${ICONS.check} บันทึก</button>
         </div>
       </div>
+      
+      ${isDateLocked(selectedDate) ? `
+        <div class="text-sm" style="padding:10px 14px;background:rgba(245,166,35,.12);border:1px solid var(--warn);border-radius:6px;color:var(--warn);margin-bottom:12px;display:flex;align-items:center;gap:10px;font-weight:600">
+          🔒 วันที่ ${fmtDate(selectedDate)} ถูก lock — ไม่สามารถแก้ไขข้อมูลได้
+          <span style="margin-left:auto;font-weight:400;font-size:.78rem">กดปุ่ม "🔒 Locked" ด้านบนเพื่อปลด lock</span>
+        </div>
+      ` : ''}
       
       ${(() => {
         const v = validateAll();
@@ -5634,11 +5674,9 @@ async function renderMain(el) {
 
   // ── Helper: สร้าง row ที่กรอกเอง (cashIn, cashOut, returns) ──
   function buildSumRow(key, label, color, editable) {
-    // ⭐ Default value: cashIn = 5155 ถ้ายังไม่เคยกรอก (เลขทอนเริ่มต้นวัน)
     const _getVal = (s) => {
       const stored = mainSummary[key+'_'+s];
-      if (stored !== undefined && stored !== null && stored !== '') return stored;
-      return key === 'cashIn' ? 5155 : '';
+      return (stored !== undefined && stored !== null && stored !== '') ? stored : '';
     };
     const vals = SUMMARY_STATIONS.map(s => Number(_getVal(s)) || 0);
     const allSum = vals.reduce((a,b)=>a+b,0);
@@ -5741,9 +5779,11 @@ async function renderMain(el) {
   function bindMainEvents() {
     // Buttons
     document.getElementById('btn-gen-smart')?.addEventListener('click', () => {
+      if (blockIfLocked(selectedDate, 'Smart import')) return;
       triggerFileUpload('file-sales', generateBillList);
     });
     document.getElementById('btn-import-pos')?.addEventListener('click', () => {
+      if (blockIfLocked(selectedDate, 'Front POS import')) return;
       triggerFileUpload('file-sales', parseFrontPosReport);
     });
     
@@ -5751,8 +5791,23 @@ async function renderMain(el) {
       showChange = !showChange; render();
     });
     
+    // ── 🔒 Lock/Unlock วันนี้ ──
+    document.getElementById('btn-toggle-lock')?.addEventListener('click', () => {
+      const d = selectedDate;
+      if (isDateLocked(d)) {
+        if (!confirm(`ปลด lock วันที่ ${fmtDate(d)}?\n\nหลังปลด lock จะแก้ไขข้อมูลได้อีกครั้ง`)) return;
+        unlockDate(d);
+        toast(`🔓 ปลด lock ${fmtDate(d)} แล้ว — แก้ไขได้`, 'info');
+      } else {
+        lockDate(d);
+        toast(`🔒 Lock ${fmtDate(d)} — ป้องกันการแก้ไข`, 'success');
+      }
+      render();
+    });
+    
     // ── Unmatch บิล + statement ทั้งหมดในวันที่เลือก ──
     document.getElementById('btn-unmatch-day')?.addEventListener('click', async () => {
+      if (blockIfLocked(selectedDate, 'Unmatch')) return;
       const dayBills = getBillsForSelectedDate();
       
       // นับเฉพาะที่ matched (ไม่นับ Cash/void/paid)
@@ -5881,6 +5936,13 @@ async function renderMain(el) {
       const indexes = Array.from(checked).map(c => Number(c.dataset.idx));
       const toDelete = indexes.map(i => billList[i]).filter(Boolean);
       
+      // ⭐ ตรวจ lock — ถ้ามีบิลในวัน lock แม้ 1 บิล → block
+      const lockedBill = toDelete.find(b => isDateLocked(toISODate(b.date)));
+      if (lockedBill) {
+        toast(`🔒 มีบิลในวัน ${fmtDate(lockedBill.date)} ที่ถูก lock — ปลด lock ก่อน`, 'warn', 3500);
+        return;
+      }
+      
       const byStation = {};
       toDelete.forEach(b => { byStation[b.station||'(ว่าง)'] = (byStation[b.station||'(ว่าง)']||0) + 1; });
       const stationStr = Object.keys(byStation).sort().map(s => `${s}: ${byStation[s]}`).join(', ');
@@ -5949,6 +6011,7 @@ async function renderMain(el) {
     });
     
     document.getElementById('btn-clear-bl')?.addEventListener('click', () => {
+      if (blockIfLocked(selectedDate, 'ล้างวัน')) return;
       if (!confirm('ล้างข้อมูลของวัน ' + fmtDate(selectedDate) + ' ทั้งหมด?\n\n• Bill List\n• Summary (นำเงินเข้า/ยอดขาย/Cash Drawer ฯลฯ)\n• Cash counting (นับธนบัตร)')) return;
       
       // 1) ล้างบิลของวันที่เลือก (เก็บวันอื่น)
@@ -6036,6 +6099,7 @@ async function renderMain(el) {
 
     // ── เพิ่มบิลเอง ──
     document.getElementById('btn-add-bill')?.addEventListener('click', () => {
+      if (blockIfLocked(selectedDate, 'เพิ่มบิล')) return;
       openModal('➕ เพิ่มบิลด้วยตัวเอง', `
         <div class="flex-col gap-3">
           <div class="flex gap-2">
@@ -6322,6 +6386,7 @@ async function renderMain(el) {
 
     // ── Bulk ตั้งวันที่ ──
     document.getElementById('btn-bulk-date')?.addEventListener('click', () => {
+      if (blockIfLocked(selectedDate, 'Bulk')) return;
       const visible = filterStation === 'ALL' && filterType === 'ALL' ? billList : 
         billList.filter(b => (filterStation === 'ALL' || b.station === filterStation) && (filterType === 'ALL' || b.type === filterType));
       
@@ -6792,6 +6857,7 @@ async function renderMain(el) {
         const idx = Number(btn.dataset.idx);
         const b = billList[idx];
         if (!b) return;
+        if (blockIfLocked(toISODate(b.date), 'แก้ไขบิล')) return;
         
         openModal(`✏️ แก้ไขบิล — ${b.bill_no || '(ไม่มีเลข)'}`, `
           <div class="flex-col gap-3">
@@ -7103,6 +7169,14 @@ async function renderMain(el) {
     // Summary cells (cashIn/cashOut/returns/sales/drawer)
     el.querySelectorAll('.sum-cell').forEach(inp => {
       inp.addEventListener('input', debounce(() => {
+        // ⭐ ตรวจ lock — ถ้า locked ห้ามแก้
+        if (isDateLocked(selectedDate)) {
+          toast(`🔒 ${fmtDate(selectedDate)} ถูก lock — ปลด lock ก่อน`, 'warn', 3000);
+          // Reset value กลับเป็นเดิม
+          const key = inp.dataset.k;
+          inp.value = mainSummary[key] !== undefined ? mainSummary[key] : '';
+          return;
+        }
         // ⭐ ตรวจวันอาทิตย์ — ร้านปิด ไม่ควรกรอกข้อมูล
         try {
           const dt = new Date(selectedDate);
@@ -7138,6 +7212,8 @@ async function renderMain(el) {
         }
         
         persistMainState();
+        // ⭐ Explicit markDirty('meta') — ป้องกัน race ที่ persistMainState skip ตอน pulling
+        if (window.syncManager?.markDirty) syncManager.markDirty('meta');
         updateSumCheckRow();
         updateAllStationColumn();
       }, 200));
@@ -7146,6 +7222,14 @@ async function renderMain(el) {
     // Cash counting cells — บันทึกลง cashCount ของวันที่เลือก
     el.querySelectorAll('.cash-cell').forEach(inp => {
       inp.addEventListener('input', debounce(() => {
+        // ⭐ ตรวจ lock
+        if (isDateLocked(selectedDate)) {
+          toast(`🔒 ${fmtDate(selectedDate)} ถูก lock — ปลด lock ก่อน`, 'warn', 3000);
+          const dayCash = getCashForDate(selectedDate);
+          const k = inp.dataset.denom + '_' + inp.dataset.station;
+          inp.value = dayCash[k] || '';
+          return;
+        }
         // ⭐ ตรวจวันอาทิตย์
         try {
           const dt = new Date(selectedDate);
@@ -7160,6 +7244,8 @@ async function renderMain(el) {
         const k = inp.dataset.denom + '_' + inp.dataset.station;
         dayCash[k] = parseInt(inp.value) || 0;
         persistMainState();
+        // ⭐ Explicit markDirty('meta') — cashCount เป็นส่วนของ meta
+        if (window.syncManager?.markDirty) syncManager.markDirty('meta');
         // Update totals ในตารางธนบัตรด้านล่าง
         const denom = Number(inp.dataset.denom);
         const rowTotal = ['Front1','Front2','Front3','Front4','Invoice']
@@ -7219,6 +7305,15 @@ async function renderMain(el) {
         const tr = inp.closest('tr');
         const idx = Number(tr.dataset.idx);
         const field = inp.dataset.field;
+        const b = billList[idx];
+        // ⭐ ตรวจ lock — ถ้าวันที่บิลถูก lock → block
+        //    ⚠️ ยกเว้น 'confirmation' — เพราะเป็น matching action (อนุญาตแม้ locked)
+        if (b && field !== 'confirmation' && isDateLocked(toISODate(b.date))) {
+          toast(`🔒 ${fmtDate(b.date)} ถูก lock — แก้ไขไม่ได้ (ยกเว้น confirmation)`, 'warn', 3000);
+          // Reset value
+          inp.value = b[field] || '';
+          return;
+        }
         billList[idx][field] = inp.value;
         
         // ── Surgical update: อัปเดตแค่ pay_date cell + status badge ใน row นี้ ──
