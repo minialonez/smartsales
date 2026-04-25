@@ -1551,6 +1551,35 @@ const syncManager = {
       const dStmts = JSON.parse(localStorage.getItem('sf_deleted_stmt_uuids') || '[]');
       if (Array.isArray(dStmts)) this.deletedStmtUuids = new Set(dStmts);
     } catch(_){}
+    // ⭐ Start auto-pull polling (multi-device sync)
+    this._startPollPull();
+    // Pull เมื่อ user กลับมาจาก tab อื่น
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden && this.enabled) {
+        const age = Date.now() - (this.lastPullAt || 0);
+        if (age > 30000) this._backgroundPull(); // เกิน 30s = pull
+      }
+    });
+  },
+  
+  // ⭐ Poll pull every 90s to sync changes from other devices
+  _startPollPull() {
+    if (this._pollTimer) clearInterval(this._pollTimer);
+    this._pollTimer = setInterval(() => {
+      if (!this.enabled) return;
+      if (document.hidden) return; // ไม่ pull ถ้า tab ไม่ active (ประหยัด API)
+      if (this.status === 'pushing' || this.status === 'pulling') return;
+      this._backgroundPull();
+    }, 90 * 1000); // 90 วินาที
+  },
+  
+  // Background pull (ไม่ interrupt UI, silent fail)
+  async _backgroundPull() {
+    try {
+      await this.pullFromCloud(1, 'force'); // 1 ปี เท่านั้น (เร็ว)
+    } catch(e) {
+      console.warn('[sync] background pull failed:', e.message);
+    }
   },
   
   // ⭐ เรียกจาก code ที่ลบ bill/stmt → track uuid + schedule push
@@ -1988,6 +2017,16 @@ const syncManager = {
                   billList.push(b);
                   seenBillUuids.add(uuid);
                   stats.bills++;
+                } else {
+                  // ⭐ UPDATE existing — multi-device sync
+                  // เครื่องอื่นอาจแก้ record นี้ → merge cloud data เข้า local
+                  // ยกเว้นถ้า local อยู่ใน dirty state (กำลังจะ push) → trust local
+                  if (!this.dirty.has('bills')) {
+                    const idx = billList.findIndex(x => x.bill_uuid === uuid);
+                    if (idx >= 0) {
+                      Object.assign(billList[idx], b); // cloud-wins merge
+                    }
+                  }
                 }
               } else {
                 // Fallback: row ไม่มี uuid → ใช้ composite
@@ -2069,6 +2108,17 @@ const syncManager = {
                   statementsByBank[s.bank].push(s);
                   seenStmtUuids.add(uuid);
                   stats.stmts++;
+                } else {
+                  // ⭐ UPDATE existing — multi-device sync
+                  if (!this.dirty.has('stmts')) {
+                    // หา stmt เดิม (search ทุก bank เพราะอาจย้าย bank ได้)
+                    let found = null;
+                    for (const bk of Object.keys(statementsByBank)) {
+                      const idx = statementsByBank[bk].findIndex(x => x.stmt_uuid === uuid);
+                      if (idx >= 0) { found = { bk, idx }; break; }
+                    }
+                    if (found) Object.assign(statementsByBank[found.bk][found.idx], s);
+                  }
                 }
               } else {
                 const key = stmtCompositeKey(s);
@@ -5861,196 +5911,73 @@ async function renderMain(el) {
     });
     
     async function actuallySaveMain() {
-      const CHUNK_SIZE = 500; // รายการต่อ chunk (ลด URL/body size + หลีกเลี่ยง 6-min timeout)
+      // ⭐ NEW: ใช้ syncManager push (UUID-based upsert) แทน legacy save API
+      // เดิม: saveDailySales + saveDailyMeta + saveStatements = append only = sheet บวม
+      // ตอนนี้: markDirty → push ผ่าน upsertBills + upsertMeta + upsertStatements
       
-      // Flush pending localStorage writes ก่อน save (กันกรณี debounce ยังไม่ถึงเวลา)
+      // Flush pending localStorage writes ก่อน save
       if (typeof flushPersistState === 'function') flushPersistState();
       
-      // ── 1. บันทึก Bills — group ตามปี (backend ใช้ bills_YYYY, 1 sheet ต่อปี) ──
       const bills = Array.isArray(billList) ? billList : [];
-      const totalBills = bills.length;
-      
-      if (totalBills === 0) {
+      if (bills.length === 0) {
         toast('ไม่มีบิลให้บันทึก', 'warn');
         return;
       }
       
-      // Helper: ดึง YYYY จากวันที่รูปแบบต่างๆ
-      function yearFromDate(val) {
-        if (!val) return '';
-        var str = String(val).trim();
-        var m1 = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
-        if (m1) { var y = Number(m1[3]); if (y > 2400) y -= 543; return String(y); }
-        var m2 = str.match(/^(\d{4})-(\d{2})-(\d{2})/);
-        if (m2) { var y2 = Number(m2[1]); if (y2 > 2400) y2 -= 543; return String(y2); }
-        if (/^\d{8}$/.test(str)) { var y3 = Number(str.substring(0,4)); if (y3 > 2400) y3 -= 543; return String(y3); }
-        return '';
-      }
-      
-      // Group bills by year
-      var billsByYear = {};
-      var billsNoDate = [];
-      bills.forEach(function(b) {
-        var year = yearFromDate(b.date);
-        if (!year) { billsNoDate.push(b); return; }
-        if (!billsByYear[year]) billsByYear[year] = [];
-        billsByYear[year].push(b);
+      // Ensure every bill has bill_uuid (สำคัญ: ถ้าไม่มี backend จะ skip ลูกเลย)
+      let assigned = 0;
+      bills.forEach(b => {
+        if (!b.bill_uuid) {
+          b.bill_uuid = (typeof crypto !== 'undefined' && crypto.randomUUID) 
+            ? crypto.randomUUID() 
+            : 'b-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
+          assigned++;
+        }
       });
+      if (assigned > 0) console.log(`[save] Auto-assigned ${assigned} bill_uuids`);
       
-      // บิลไม่มีวันที่ → ใส่ในปีของวันที่เลือก (fallback)
-      if (billsNoDate.length > 0) {
-        var fallbackYear = yearFromDate(selectedDate) || String(new Date().getFullYear());
-        if (!billsByYear[fallbackYear]) billsByYear[fallbackYear] = [];
-        billsByYear[fallbackYear] = billsByYear[fallbackYear].concat(billsNoDate);
-      }
+      // Ensure every stmt has stmt_uuid
+      let stmtAssigned = 0;
+      Object.values(statementsByBank).forEach(arr => {
+        (arr || []).forEach(s => {
+          if (!s.stmt_uuid) {
+            s.stmt_uuid = (typeof crypto !== 'undefined' && crypto.randomUUID) 
+              ? crypto.randomUUID() 
+              : 's-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
+            stmtAssigned++;
+          }
+        });
+      });
+      if (stmtAssigned > 0) console.log(`[save] Auto-assigned ${stmtAssigned} stmt_uuids`);
       
-      var yearKeys = Object.keys(billsByYear).sort();
-      toast('กำลังบันทึก ' + totalBills + ' บิล (' + yearKeys.length + ' ปี)...', 'info');
+      // Persist เพื่อเก็บ uuid ใหม่
+      persistMainState();
       
-      var savedBills = 0;
+      // Mark everything dirty + force flush (push ทันที ไม่รอ debounce 5s)
       try {
-        for (var yi = 0; yi < yearKeys.length; yi++) {
-          var year = yearKeys[yi];
-          var billsOfYear = billsByYear[year];
-          // ส่งวันแรกของปีเป็น pivot — backend จะใช้เฉพาะ year ในการหา sheet name
-          var pivotDate = year + '0101';
-          for (var ci = 0; ci < billsOfYear.length; ci += CHUNK_SIZE) {
-            var chunk = billsOfYear.slice(ci, ci + CHUNK_SIZE);
-            // ⚠️ Normalize date to ISO ก่อน push — ป้องกัน backend dedup key mismatch
-            // Backend composite key = bill_no|date|amount|pay_method
-            // ถ้า local เก็บ dd/mm/yyyy แต่ cloud เก็บ ISO → dedup ไม่ match → append double
-            var normalizedChunk = chunk.map(function(b) {
-              var isoDate = toISODate(b.date);
-              if (!isoDate || isoDate === b.date) return b;
-              return Object.assign({}, b, { date: isoDate });
-            });
-            var res = await api('saveDailySales', {
-              date: pivotDate,
-              rows: normalizedChunk,
-              created_by: currentUser?.display_name || 'Admin',
-            });
-            if (!res || !res.success) {
-              toast('บันทึกบิลล้มเหลวปี ' + year + ': ' + (res?.error||''), 'error');
-              return;
-            }
-            savedBills += chunk.length;
-            if (totalBills > CHUNK_SIZE) {
-              toast('กำลังบันทึก... ' + savedBills + '/' + totalBills + ' บิล', 'info');
-            }
-          }
-        }
+        syncManager.markDirty('bills');
+        syncManager.markDirty('stmts');
+        syncManager.markDirty('meta');
+        syncManager.markDirty('payments');
+        syncManager.markDirty('cashflow');
+        syncManager.markDirty('suppliers');
+        syncManager.markDirty('sp_temps');
         
-        // ── 1b. บันทึก Meta (summary + cash_count + change) แยกต่อปี ──
-        // รวม dates ทั้งหมดที่ต้องเก็บ meta แล้ว group ตามปี
-        var metaYears = new Set();
-        if (mainSummary && mainSummary.__byDate) {
-          Object.keys(mainSummary.__byDate).forEach(function(d) {
-            var y = yearFromDate(d);
-            if (y) metaYears.add(y);
-          });
-        }
-        // flat keys (จาก render วันปัจจุบัน) → ผูกกับ selectedDate's year
-        var hasFlatSummary = Object.keys(mainSummary).some(function(k) { return k !== '__byDate' && k.includes('_'); });
-        if (hasFlatSummary) {
-          var y = yearFromDate(selectedDate);
-          if (y) metaYears.add(y);
-        }
-        if (cashCount && cashCount.__byDate) {
-          Object.keys(cashCount.__byDate).forEach(function(d) {
-            var y = yearFromDate(d);
-            if (y) metaYears.add(y);
-          });
-        }
+        toast('กำลังบันทึก...', 'info');
+        const result = await syncManager._flushPush();
         
-        for (var my of metaYears) {
-          // filter __byDate ให้เหลือแค่ปีนี้
-          var subSummary = { __byDate: {} };
-          if (mainSummary.__byDate) {
-            Object.keys(mainSummary.__byDate).forEach(function(d) {
-              if (yearFromDate(d) === my) subSummary.__byDate[d] = mainSummary.__byDate[d];
-            });
-          }
-          // flat keys (แนบให้ปีของ selectedDate)
-          if (my === yearFromDate(selectedDate) && hasFlatSummary) {
-            Object.keys(mainSummary).forEach(function(k) {
-              if (k !== '__byDate' && k.includes('_')) subSummary[k] = mainSummary[k];
-            });
-          }
-          
-          var subCash = { __byDate: {} };
-          if (cashCount.__byDate) {
-            Object.keys(cashCount.__byDate).forEach(function(d) {
-              if (yearFromDate(d) === my) subCash.__byDate[d] = cashCount.__byDate[d];
-            });
-          }
-          
-          // Skip ถ้าไม่มีข้อมูล meta ในปีนี้
-          var hasMeta = Object.keys(subSummary.__byDate).length > 0 
-                     || Object.keys(subSummary).filter(k => k !== '__byDate').length > 0 
-                     || Object.keys(subCash.__byDate).length > 0;
-          if (!hasMeta) continue;
-          
-          var metaRes = await api('saveDailyMeta', {
-            date: my + '0101',
-            summary: subSummary,
-            cash_count: subCash,
-            updated_by: currentUser?.display_name || 'Admin',
-          });
-          if (!metaRes || !metaRes.success) {
-            toast('บันทึก Meta ปี ' + my + ' ล้มเหลว (ไม่ critical)', 'warn');
-          }
-        }
+        const stats = result || {};
+        const pushed = stats.pushed || 0;
+        const errors = stats.errors || 0;
         
-        // ── 2. บันทึก Statements (group ตามปีเหมือนกัน) ──
-        var allStmts = typeof getAllStatements === 'function' ? getAllStatements() : [];
-        if (allStmts.length > 0) {
-          var byYearStmt = {};
-          allStmts.forEach(function(s) {
-            var y = yearFromDate(s.date);
-            if (!y) return;
-            if (!byYearStmt[y]) byYearStmt[y] = [];
-            byYearStmt[y].push(s);
-          });
-          
-          var stmtYearKeys = Object.keys(byYearStmt).sort();
-          var savedStmts = 0;
-          var totalStmts = allStmts.length;
-          toast('กำลังบันทึก Statement ' + totalStmts + ' รายการ (' + stmtYearKeys.length + ' ปี)...', 'info');
-          
-          for (var si = 0; si < stmtYearKeys.length; si++) {
-            var sYear = stmtYearKeys[si];
-            var stmtsOfYear = byYearStmt[sYear];
-            var sPivot = sYear + '0101';
-            for (var i = 0; i < stmtsOfYear.length; i += CHUNK_SIZE) {
-              var sChunk = stmtsOfYear.slice(i, i + CHUNK_SIZE);
-              // ⚠️ Normalize date → ISO เพื่อให้ backend dedup key match
-              var sChunkNormalized = sChunk.map(function(s) {
-                var isoDate = toISODate(s.date || s.trans_date);
-                if (!isoDate || isoDate === s.date) return s;
-                return Object.assign({}, s, { date: isoDate });
-              });
-              var sRes = await api('saveStatements', {
-                date: sPivot,
-                rows: sChunkNormalized,
-              });
-              if (!sRes || !sRes.success) {
-                toast('บันทึก Statement ปี ' + sYear + ' ล้มเหลว: ' + (sRes?.error||''), 'error');
-                return;
-              }
-              savedStmts += sChunk.length;
-              if (totalStmts > CHUNK_SIZE) {
-                toast('กำลังบันทึก Statement... ' + savedStmts + '/' + totalStmts, 'info');
-              }
-            }
-          }
-          
-          toast('✅ บันทึกสำเร็จ — ' + savedBills + ' บิล + ' + savedStmts + ' statements (' + yearKeys.length + ' ปี)', 'success', 5000);
+        if (errors > 0) {
+          toast(`⚠️ บันทึก ${pushed} ประเภท แต่มี error ${errors} (ดู console)`, 'warn', 6000);
         } else {
-          toast('✅ บันทึกสำเร็จ — ' + savedBills + ' บิล (' + yearKeys.length + ' ปี)', 'success');
+          toast(`✅ บันทึกสำเร็จ — ${bills.length} บิล + ${Object.values(statementsByBank).reduce((s,a)=>s+(a?.length||0),0)} statements`, 'success', 4000);
         }
       } catch (err) {
         console.error('Save error:', err);
-        toast('บันทึกล้มเหลว: ' + err.message, 'error');
+        toast('บันทึกล้มเหลว: ' + err.message, 'error', 6000);
       }
     }
     // ── Helper: เปลี่ยนวันที่ + reload summary + render ──
@@ -6996,7 +6923,8 @@ function genSpTempNo() {
 }
 
 function spTempPaidTotal(t) {
-  return (t.partials || []).reduce((s,p) => s + (Number(p.amount)||0), 0);
+  const opening = Number(t.opening_balance) || 0;
+  return opening + (t.partials || []).reduce((s,p) => s + (Number(p.amount)||0), 0);
 }
 
 function spTempProgress(t) {
@@ -7142,6 +7070,12 @@ function openSpTempEditModal(no, onChange) {
         <div class="text-xs text-muted mt-1">จ่ายไปแล้ว ฿${fmtNum(paidSum)} · คงเหลือจะคำนวณใหม่อัตโนมัติ</div>
       </div>
       
+      <div class="input-group">
+        <label>ยอดยกมา</label>
+        <input type="number" class="input" id="ets-opening" value="${Number(t.opening_balance)||0}" step="0.01">
+        <div class="text-xs text-muted mt-1">รวมอยู่ใน Paid แล้ว (ไม่นับเป็น partial แยก)</div>
+      </div>
+      
       <div style="padding:8px 10px;background:var(--bg2);border-radius:6px;font-size:.78rem;color:var(--text2)">
         📋 Partials ${(t.partials||[]).length} รายการ — แก้ไข/ลบแต่ละรายการจากตารางด้านล่าง (หรือกด partial row ในหน้า Main)
       </div>
@@ -7159,6 +7093,7 @@ function openSpTempEditModal(no, onChange) {
     const name = document.getElementById('ets-cust-name').value.trim() || 
                  document.getElementById('ets-cust-search').value.trim();
     const expected = Number(document.getElementById('ets-expected').value) || 0;
+    const opening = Number(document.getElementById('ets-opening').value) || 0;
     
     if (!name) { toast('กรอกข้อมูลลูกค้า', 'error'); return; }
     if (expected <= 0) { toast('กรอก expected total', 'error'); return; }
@@ -7166,6 +7101,7 @@ function openSpTempEditModal(no, onChange) {
     t.cust_code = code;
     t.cust_name = name;
     t.expected_total = expected;
+    t.opening_balance = opening;
     t.updated_at = new Date().toISOString();
     recomputeSpTempStatus(t);
     markDirtySpTemps();
@@ -7499,6 +7435,12 @@ function openSpTempModal() {
         <div class="text-xs text-muted mt-1">ยอด SP เต็มที่ POS จะออกให้ — จะเทียบเวลา graduate</div>
       </div>
       
+      <div class="input-group">
+        <label>ยอดยกมา <span class="text-xs text-muted">(ไม่บังคับ)</span></label>
+        <input type="number" class="input" id="tsp-opening" placeholder="0.00" step="0.01" value="0">
+        <div class="text-xs text-muted mt-1">ยอดที่ลูกค้าจ่ายมาก่อนหน้านี้แล้ว (ไม่ต้องลง partial ย้อน)</div>
+      </div>
+      
       <div style="padding:10px;background:var(--bg2);border-radius:6px">
         <div class="flex justify-between items-center" style="margin-bottom:8px">
           <div style="font-weight:600">💰 Partial แรก <span class="text-xs text-muted">(ไม่บังคับ)</span></div>
@@ -7579,10 +7521,12 @@ function openSpTempModal() {
     } : null;
     
     const now = new Date().toISOString();
+    const opening = Number(document.getElementById('tsp-opening')?.value) || 0;
     const newTemp = {
       no: tempNo, created_at: now, updated_at: now,
       cust_code: code, cust_name: name,
       expected_total: expected,
+      opening_balance: opening,
       partials: [],
       status: 'open', linked_sp: '', parent_temp: '', graduated_at: '',
     };
@@ -7954,7 +7898,7 @@ function renderSpSectionsForDate(opts) {
                   </div>
                   <div class="flex items-center gap-3" style="margin-top:4px;font-size:.75rem">
                     <span style="color:var(--text2)">Expected: <b style="color:var(--text)">฿${fmtNum(p.expected)}</b></span>
-                    <span style="color:var(--success)">Paid: <b>฿${fmtNum(p.paid)}</b></span>
+                    <span style="color:var(--success)">Paid: <b>฿${fmtNum(p.paid)}</b>${Number(t.opening_balance)>0 ? ` <span style="color:var(--text3);font-weight:400">(ยกมา ฿${fmtNum(t.opening_balance)})</span>` : ''}</span>
                     <span style="color:var(--danger)">เหลือ: <b>฿${fmtNum(p.remaining)}</b></span>
                     <span style="flex:1;max-width:180px;height:5px;background:var(--surface2);border-radius:3px;overflow:hidden">
                       <span style="display:block;height:100%;width:${pctBar}%;background:${barColor};transition:width .3s"></span>
