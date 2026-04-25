@@ -1725,6 +1725,25 @@ const syncManager = {
     }
   },
   
+  // ⭐ Recompute fp cache for ALL types — used after pullFromCloud
+  // Ensures fp cache reflects post-pull state so next push skips correctly
+  // (prevents pull→push→pull loop ที่ทำให้ sheet บวม)
+  _recomputeFpCache() {
+    this._fpCache = this._fpCache || {};
+    const fpBills = this._computeFp('bills');
+    const fpStmts = this._computeFp('stmts');
+    if (fpBills) this._fpCache.bills = fpBills;
+    if (fpStmts) this._fpCache.stmts = fpStmts;
+    // Clear dirty flags that might have leaked in during pull
+    this.dirty.delete('bills');
+    this.dirty.delete('stmts');
+    this.dirty.delete('meta');
+    this.dirty.delete('payments');
+    this.dirty.delete('sp_temps');
+    this.dirty.delete('cashflow');
+    this.dirty.delete('suppliers');
+  },
+  
   async _flushPush() {
     if (!this.enabled || this.dirty.size === 0) return;
     if (this.status === 'pushing') return; // อย่า concurrent push
@@ -1998,6 +2017,7 @@ const syncManager = {
     }
     
     this.status = 'pulling';
+    this._inPull = true;  // ⭐ Gate: persistMainState() จะ skip markDirty ระหว่าง flag นี้
     this._emit();
     
     const stats = { bills: 0, stmts: 0, payments: 0, cashflow: 0, suppliers: 0, meta: 0, errors: [] };
@@ -2299,6 +2319,7 @@ const syncManager = {
       }
       
       // Persist locally (หลัง merge แล้ว)
+      // ⭐ _inPull flag ยังเป็น true → persistMainState จะไม่ markDirty
       if (typeof persistMainState === 'function') persistMainState();
       if (typeof invalidateBillsCache === 'function') invalidateBillsCache();
       
@@ -2307,11 +2328,16 @@ const syncManager = {
       this.stats.pulled += Object.values(stats).filter(v => typeof v === 'number').reduce((a,b)=>a+b,0);
       this.status = stats.errors.length ? 'error' : 'idle';
       this.lastError = stats.errors[0] || null;
+      this._inPull = false;  // ⭐ Clear flag
+      // ⭐ Update fingerprint cache ให้ตรงกับ state ปัจจุบัน
+      // (ถ้าไม่ทำ → ครั้งหน้าที่ user แก้ → fp ต่างจาก cache เก่า → อาจ push ข้อมูลที่มาจาก pull)
+      this._recomputeFpCache();
       this._emit();
       return stats;
     } catch(err) {
       this.status = 'error';
       this.lastError = err.message;
+      this._inPull = false;  // ⭐ Clear flag แม้ error
       this._emit();
       throw err;
     }
@@ -2366,10 +2392,16 @@ function persistMainState() {
   // ─ no-arg: mark NO_ARG_TYPES (payments, sp_temps, cashflow, suppliers, meta)
   // ─ explicit 'bills' + 'stmts' เสมอ — persistMainState ถูกเรียกหลังแก้ข้อมูล
   //   ถ้าไม่มีการเปลี่ยนจริง → fingerprint detect → push skip อยู่แล้ว
+  // ⭐ CRITICAL: ถ้ากำลัง pull อยู่ (หรือเพิ่ง pull เสร็จ) → ห้าม markDirty
+  //   เหตุผล: pullFromCloud → persistMainState (L2302) ต้องไม่ trigger push
+  //   เพราะข้อมูลมาจาก cloud อยู่แล้ว — push กลับ = sheet บวม + race condition ข้ามเครื่อง
   try {
-    syncManager.markDirty();           // NO_ARG_TYPES
-    syncManager.markDirty('bills');    // bills explicit
-    syncManager.markDirty('stmts');    // stmts explicit
+    const isPulling = syncManager.status === 'pulling' || syncManager._inPull === true;
+    if (!isPulling) {
+      syncManager.markDirty();           // NO_ARG_TYPES
+      syncManager.markDirty('bills');    // bills explicit
+      syncManager.markDirty('stmts');    // stmts explicit
+    }
   } catch(_) {}
 }
 
