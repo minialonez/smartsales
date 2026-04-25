@@ -4994,9 +4994,9 @@ async function renderMain(el) {
     // ── FIX: Sync summary flat keys กับ selectedDate ก่อนเสมอ ──
     // ไม่งั้น flat keys จากวันเก่าจะค้างแสดง
     (function syncSummaryToSelectedDate() {
-      // 1. Clear all flat keys (เก็บแค่ __byDate)
+      // 1. Clear all flat keys (เก็บแค่ meta keys: __byDate, __lockedDates ฯลฯ)
       Object.keys(mainSummary).forEach(k => {
-        if (k === '__byDate') return;
+        if (k.startsWith('__')) return; // skip meta keys (__byDate, __lockedDates, ...)
         if (k.includes('_')) delete mainSummary[k];
       });
       // 2. Load from __byDate[selectedDate] ถ้ามี
@@ -6208,7 +6208,7 @@ async function renderMain(el) {
       
       // 2) ล้าง summary flat keys (ของวันปัจจุบัน — __byDate[selectedDate] ด้วย)
       Object.keys(mainSummary).forEach(function(k) {
-        if (k === '__byDate') return;
+        if (k.startsWith('__')) return;
         if (k.includes('_')) delete mainSummary[k];
       });
       if (mainSummary.__byDate && mainSummary.__byDate[selectedDate]) {
@@ -6740,7 +6740,7 @@ async function renderMain(el) {
       
       // Clear flat summary keys (ค่าจากวันก่อนจะค้างถ้าไม่ล้าง)
       Object.keys(mainSummary).forEach(k => {
-        if (k === '__byDate') return;
+        if (k.startsWith('__')) return;
         if (k.includes('_')) delete mainSummary[k];
       });
       
