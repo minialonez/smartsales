@@ -16085,9 +16085,10 @@ function renderData(el) {
     
     document.getElementById('btn-backup-json')?.addEventListener('click', () => {
       const backup = {
-        version: 'SmartFinance-v1',
+        version: 'SmartFinance-v2',
         exported_at: new Date().toISOString(),
         exported_by: currentUser?.display_name || 'Admin',
+        // Core collections
         billList: billList,
         paymentList: paymentList,
         spTempList: spTempList,
@@ -16095,6 +16096,24 @@ function renderData(el) {
         statementsByBank: statementsByBank,
         mainSummary: mainSummary,
         cashCount: cashCount,
+        // ⭐ Extended collections
+        supplierList: supplierList || [],
+        supplierPayments: supplierPayments || [],
+        ppReport: ppReport || {},
+        transferLog: transferLog || { vatTransfers: [], novatTransfers: [] },
+        customerList: customerList || [],
+        // Metadata สำหรับ verify
+        _counts: {
+          bills: billList.length,
+          stmts: getAllStatements().length,
+          payments: paymentList.length,
+          spTemps: spTempList.length,
+          cashflow: cashflowList.length,
+          suppliers: (supplierList||[]).length,
+          supplierPayments: (supplierPayments||[]).length,
+          metaSummary: Object.keys(mainSummary?.__byDate||{}).length,
+          metaCashCount: Object.keys(cashCount?.__byDate||{}).length,
+        },
       };
       const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
@@ -16103,7 +16122,7 @@ function renderData(el) {
       a.download = `SmartFinance_Backup_${todayISO()}_${Date.now()}.json`;
       a.click();
       URL.revokeObjectURL(url);
-      toast('Backup JSON สำเร็จ — บันทึกไฟล์ไว้ในที่ปลอดภัย', 'success');
+      toast(`Backup สำเร็จ — ${backup._counts.bills} bills · ${backup._counts.stmts} stmts · ${backup._counts.metaSummary} meta dates`, 'success', 5000);
     });
     
     // ── Restore JSON ──
@@ -16120,8 +16139,42 @@ function renderData(el) {
             toast('ไฟล์นี้ไม่ใช่ backup ของ Smart Finance', 'error');
             return;
           }
-          if (!confirm(`⚠️ การ Restore จะทับข้อมูลปัจจุบันทั้งหมด!\n\nBackup นี้:\n• Export: ${new Date(backup.exported_at).toLocaleString('th-TH')}\n• โดย: ${backup.exported_by || 'ไม่ระบุ'}\n• บิล: ${backup.billList?.length || 0}\n• SP: ${backup.paymentList?.length || 0}\n• Cashflow: ${backup.cashflowList?.length || 0}\n\nยืนยัน Restore?`)) return;
           
+          // ⭐ Compute stats from backup (handle both v1 and v2)
+          const bkBills = (backup.billList || []).length;
+          const bkStmts = Object.values(backup.statementsByBank || {}).reduce((s,arr) => s + (Array.isArray(arr)?arr.length:0), 0);
+          const bkPayments = (backup.paymentList || []).length;
+          const bkCashflow = (backup.cashflowList || []).length;
+          const bkSuppliers = (backup.supplierList || []).length;
+          const bkSupplierPayments = (backup.supplierPayments || []).length;
+          const bkMetaSummary = Object.keys(backup.mainSummary?.__byDate || {}).length;
+          const bkMetaCash = Object.keys(backup.cashCount?.__byDate || {}).length;
+          
+          if (!confirm(
+            `⚠️ การ Restore จะทับข้อมูล local ทั้งหมด!\n\n` +
+            `Backup:\n` +
+            `• Version: ${backup.version}\n` +
+            `• Export: ${new Date(backup.exported_at).toLocaleString('th-TH')}\n` +
+            `• โดย: ${backup.exported_by || 'ไม่ระบุ'}\n\n` +
+            `ข้อมูลใน backup:\n` +
+            `• Bills: ${bkBills}\n` +
+            `• Statements: ${bkStmts}\n` +
+            `• SP: ${bkPayments}\n` +
+            `• Cashflow: ${bkCashflow}\n` +
+            `• Suppliers: ${bkSuppliers}\n` +
+            `• SupplierPayments: ${bkSupplierPayments}\n` +
+            `• Meta summary: ${bkMetaSummary} วัน\n` +
+            `• Meta cashCount: ${bkMetaCash} วัน\n\n` +
+            `ยืนยัน Restore?`
+          )) return;
+          
+          // ⭐ Suspend sync ก่อน restore (กันไม่ให้ auto-push ระหว่างทำ)
+          const wasEnabled = syncManager.enabled;
+          syncManager.enabled = false;
+          try { syncManager._inPull = true; } catch(_){}  // กัน markDirty
+          if (syncManager.pushTimer) { clearTimeout(syncManager.pushTimer); syncManager.pushTimer = null; }
+          
+          // ── Restore core collections ──
           if (backup.billList) billList = backup.billList;
           if (backup.paymentList) paymentList = backup.paymentList;
           if (backup.spTempList) spTempList = backup.spTempList;
@@ -16129,13 +16182,60 @@ function renderData(el) {
           if (backup.statementsByBank) statementsByBank = backup.statementsByBank;
           if (backup.mainSummary) mainSummary = backup.mainSummary;
           if (backup.cashCount) cashCount = backup.cashCount;
+          // ⭐ v2 extended collections
+          if (backup.supplierList) supplierList = backup.supplierList;
+          if (backup.supplierPayments) supplierPayments = backup.supplierPayments;
+          if (backup.ppReport) ppReport = backup.ppReport;
+          if (backup.transferLog) transferLog = backup.transferLog;
+          if (backup.customerList) customerList = backup.customerList;
           
+          // ⭐ Clear sync artifacts
+          syncManager.deletedBillUuids.clear();
+          syncManager.deletedStmtUuids.clear();
+          try { 
+            localStorage.removeItem('sf_deleted_bill_uuids');
+            localStorage.removeItem('sf_deleted_stmt_uuids');
+          } catch(_){}
+          syncManager.dirty.clear();
+          
+          // Persist + update storage
           persistMainState();
           safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank));
+          if (typeof invalidateBillsCache === 'function') invalidateBillsCache();
           
-          toast(`Restore สำเร็จ — บิล ${backup.billList?.length || 0} | SP ${backup.paymentList?.length || 0}`, 'success');
+          // ⭐ Recompute fp cache ตรงกับ state ใหม่ (ไม่ push เบื้องต้น)
+          syncManager._recomputeFpCache?.();
+          
+          // Re-enable sync but keep _inPull for a bit to avoid immediate push
+          syncManager.enabled = wasEnabled;
+          setTimeout(() => { syncManager._inPull = false; }, 2000);
+          
+          // ⭐ ถามว่าจะทำอะไรต่อ
+          const action = confirm(
+            `✅ Restore สำเร็จ!\n\n` +
+            `• Bills: ${bkBills}\n` +
+            `• Statements: ${bkStmts}\n` +
+            `• Meta: ${bkMetaSummary} วัน\n\n` +
+            `ต่อไปทำอะไรดี?\n` +
+            `  [OK] = Push ไป cloud เลย (ทับ cloud ด้วย backup)\n` +
+            `  [Cancel] = ดูข้อมูลก่อน (sync ตัดสินใจเอง)\n\n` +
+            `⚠️ Push จะทับข้อมูลบน cloud ที่ใหม่กว่า!`
+          );
+          
+          if (action && wasEnabled) {
+            // Force push ทุกอย่าง
+            ['bills','stmts','meta','payments','sp_temps','cashflow','suppliers'].forEach(t => syncManager.dirty.add(t));
+            // Reset fp cache → force push ทุก type
+            syncManager._fpCache = {};
+            await syncManager._flushPush();
+            toast('✅ Restore + Push cloud สำเร็จ', 'success', 5000);
+          } else {
+            toast(`Restore สำเร็จ — Bills ${bkBills} · Stmts ${bkStmts}`, 'success', 5000);
+          }
+          
           render();
         } catch (err) {
+          syncManager._inPull = false;
           toast('อ่านไฟล์ไม่สำเร็จ: ' + err.message, 'error');
         }
       };
