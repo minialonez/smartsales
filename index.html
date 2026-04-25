@@ -667,24 +667,61 @@ function parseExcelFile(file) {
     reader.onload = (e) => {
       try {
         if (isCsv) {
-          // CSV → auto-detect encoding: UTF-8 strict → Windows-874 (TIS-620) fallback
-          // วิธีนี้แก้ปัญหา KBANK/ธนาคารไทยแสดงภาษาประหลาด เพราะอ่าน encoding ผิด
+          // CSV → smart encoding detection
+          // ปัญหาที่เคยเจอ: ไฟล์ KBANK CSV จากบางเครื่อง encode UTF-8 ปนกับ Windows-874
+          //                ทำให้ description กลายเป็น mojibake "เนเธญเธ..."
+          // วิธีแก้: ลอง decode 2 แบบ (UTF-8 + Windows-874) แล้วเลือกตัวที่ "Thai char zone" เยอะกว่า
+          //   - Thai Unicode range: U+0E00 - U+0E7F (เ, ก, ข, ..., ๛)
+          //   - mojibake จะมี chars ในช่วงนี้น้อย เพราะถูก mangle
           const bytes = new Uint8Array(e.target.result);
-          let text = '';
+          
+          // ตัด BOM ก่อน detect (UTF-8 BOM = EF BB BF)
+          let trimmedBytes = bytes;
+          if (bytes.length >= 3 && bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF) {
+            trimmedBytes = bytes.subarray(3);
+          }
+          
+          const countThaiChars = (str) => {
+            let n = 0;
+            for (let i = 0; i < str.length; i++) {
+              const c = str.charCodeAt(i);
+              if (c >= 0x0E00 && c <= 0x0E7F) n++;
+            }
+            return n;
+          };
+          
+          let textUtf8 = '', textWin874 = '';
+          let thaiUtf8 = 0, thaiWin874 = 0;
+          
+          // ลอง UTF-8 (non-fatal — replace invalid bytes)
           try {
-            // ลอง UTF-8 แบบ strict ก่อน — ถ้า valid ใช้เลย (ครอบคลุม UTF-8 with/without BOM)
-            text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-          } catch {
-            // UTF-8 fail → ใช้ Windows-874 (Thai) — ไฟล์ bank ไทยส่วนใหญ่ใช้ตัวนี้
-            try {
-              text = new TextDecoder('windows-874').decode(bytes);
-            } catch {
-              // หมดทาง → UTF-8 replaceable
-              text = new TextDecoder('utf-8').decode(bytes);
+            textUtf8 = new TextDecoder('utf-8').decode(trimmedBytes);
+            thaiUtf8 = countThaiChars(textUtf8);
+          } catch(_) {}
+          
+          // ลอง Windows-874 (TIS-620 superset)
+          try {
+            textWin874 = new TextDecoder('windows-874').decode(trimmedBytes);
+            thaiWin874 = countThaiChars(textWin874);
+          } catch(_) {}
+          
+          // เลือกตัวที่ Thai chars เยอะกว่า
+          //   ถ้าเสมอ → UTF-8 (default มาตรฐานปัจจุบัน)
+          //   ถ้าไม่มี Thai เลยทั้ง 2 → UTF-8 (ไฟล์อาจเป็น English)
+          let text;
+          if (thaiWin874 > thaiUtf8 * 1.5) {
+            text = textWin874;
+            console.log(`[parseExcelFile] ${file.name} → Windows-874 (Thai: ${thaiWin874} vs UTF-8: ${thaiUtf8})`);
+          } else {
+            text = textUtf8;
+            if (thaiUtf8 > 0) {
+              console.log(`[parseExcelFile] ${file.name} → UTF-8 (Thai: ${thaiUtf8})`);
             }
           }
-          // ตัด BOM ถ้ามี
+          
+          // ตัด BOM ถ้าเหลือ
           if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+          
           // Parse CSV
           const workbook = XLSX.read(text, { type: 'string', cellDates: false, raw: true });
           const result = {};
@@ -1341,10 +1378,20 @@ function dedupAllStatements() {
 function parseThaiDate(s) {
   if (!s) return 0;
   if (s instanceof Date) return s.getTime();
-  const m = String(s).match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
-  if (!m) return 0;
-  let y = Number(m[3]); if (y > 2400) y -= 543;
-  return new Date(y, Number(m[2])-1, Number(m[1])).getTime();
+  const str = String(s).trim();
+  // 1) dd/mm/yyyy (Thai format)
+  const m = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+  if (m) {
+    let y = Number(m[3]); if (y > 2400) y -= 543;
+    return new Date(y, Number(m[2])-1, Number(m[1])).getTime();
+  }
+  // 2) yyyy-mm-dd (ISO) — เพิ่ม support เพราะ persistMainState normalize เป็น ISO หมดแล้ว
+  const iso = str.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (iso) {
+    let y = Number(iso[1]); if (y > 2400) y -= 543;
+    return new Date(y, Number(iso[2])-1, Number(iso[3])).getTime();
+  }
+  return 0;
 }
 
 function getAllStatements() {
@@ -3005,6 +3052,53 @@ async function restoreMainState() {
     }
     if (timeFixedCount > 0) {
       console.log(`[restore] Cleaned ${timeFixedCount} stmts with junk time (e.g. "30/12/1899" → "HH:MM")`);
+    }
+    
+    // ⭐ One-shot fix: KBANK description ที่เคย mojibake (UTF-8 อ่านเป็น Windows-874)
+    //    Pattern: chars ที่ขึ้นต้นด้วย "เธ", "เน" repeat — มาจาก double-encoding bug
+    //    Fix: แปลงกลับโดย encode เป็น Latin-1 → decode เป็น UTF-8
+    //    เกิดเฉพาะตอน import — code ใหม่ detect encoding ฉลาดขึ้นแล้ว
+    let descFixedCount = 0;
+    const isMojibake = (s) => {
+      if (!s) return false;
+      const str = String(s);
+      // Pattern: contains "เธ" + "เน" + chars ที่ไม่ใช่ภาษาไทยจริง
+      const mojiPattern = /(เธ[เน][เธ]|เน[เธ][เธ])/;
+      return mojiPattern.test(str);
+    };
+    const fixMojibake = (s) => {
+      if (!s) return s;
+      try {
+        const str = String(s);
+        // mojibake = UTF-8 bytes ของ Thai → ถูก decode เป็น Latin-1/cp1252 → re-encode UTF-8
+        // Reverse: chars → cp1252 byte → bytes → decode UTF-8
+        const bytes = new Uint8Array(str.length);
+        for (let i = 0; i < str.length; i++) {
+          const c = str.charCodeAt(i);
+          if (c > 0xFF) return s; // not single-byte char → not mojibake → skip
+          bytes[i] = c;
+        }
+        const fixed = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+        return fixed;
+      } catch(_) { return s; }
+    };
+    Object.values(statementsByBank).forEach(arr => {
+      if (!Array.isArray(arr)) return;
+      arr.forEach(s => {
+        ['description', 'sender_name', 'sender_bank_name'].forEach(f => {
+          if (s[f] && isMojibake(s[f])) {
+            const fixed = fixMojibake(s[f]);
+            if (fixed && fixed !== s[f] && !isMojibake(fixed)) {
+              s[f] = fixed;
+              descFixedCount++;
+            }
+          }
+        });
+      });
+    });
+    if (descFixedCount > 0) {
+      console.log(`[restore] Fixed ${descFixedCount} mojibake fields in stmts (KBANK encoding bug)`);
+      uploadedStatements = getAllStatements();
     }
   } catch (e) { console.warn('Could not restore state:', e); }
   
@@ -6208,14 +6302,15 @@ async function renderMain(el) {
     
     function _getDatesWithData() {
       // Build Set of ISO dates ที่ user บันทึกเสร็จแล้ว
-      // ⭐ "มีข้อมูล" = มี meta summary บันทึกไว้แล้ว (ไม่ใช่แค่มีบิล/stmt)
-      //    - Bills/Stmts อาจถูก import ล่วงหน้า แต่ยังไม่ได้ process → ไม่ถือว่า "มีข้อมูล"
-      //    - Meta summary = ยอดขาย/Cash Drawer/Transfer/... ที่ user บันทึกเอง → นี่คือ "มีข้อมูล"
-      const cacheKey = `${Object.keys(mainSummary?.__byDate || {}).length}|${(typeof _stateVersion !== 'undefined' ? _stateVersion : 0)}`;
+      // ⭐ "มีข้อมูล" = มี meta summary บันทึกไว้แล้ว **หรือ** มีบิล/stmt ของวันนั้น
+      //    Bug ที่เคยเจอ: user import bills 27/03 ครบ 147 ใบ แต่ยังไม่กรอก meta summary
+      //                  → Calendar dot ไม่ขึ้น → user เห็นปฏิทินว่าง → คิดว่า "ข้อมูลไม่มา"
+      //    Fix: นับวันที่มี bills/stmts ด้วย — meaningful enough
+      const cacheKey = `${Object.keys(mainSummary?.__byDate || {}).length}|${billList.length}|${(typeof _stateVersion !== 'undefined' ? _stateVersion : 0)}`;
       if (!window._datesWithDataCache || window._datesWithDataCacheKey !== cacheKey) {
         const dates = new Set();
         
-        // Meta: ต้องมี label ที่ meaningful + value > 0
+        // 1. Meta: ต้องมี label ที่ meaningful + value > 0
         // ไม่นับ cashIn ซึ่งมักเป็น default 5155 ทุกวัน
         const MEANINGFUL_LABELS = ['ยอดขาย', 'Cash Drawer', 'Transfer', 'Card', 'Cheque', 'นำเงินออก', 'ยอดคืนสินค้า'];
         if (mainSummary.__byDate) {
@@ -6233,6 +6328,12 @@ async function renderMain(el) {
             }
           });
         }
+        
+        // 2. ⭐ Bills: ถ้ามีบิลของวันใด → ถือว่ามีข้อมูล (แม้ summary ยังไม่กรอก)
+        billList.forEach(b => {
+          const iso = toISODate(b.date);
+          if (iso) dates.add(iso);
+        });
         
         window._datesWithDataCache = dates;
         window._datesWithDataCacheKey = cacheKey;
