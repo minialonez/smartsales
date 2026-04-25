@@ -14409,7 +14409,7 @@ async function renderMatching(el) {
         <div class="flex gap-2 items-center">
           <button class="btn btn-outline btn-sm" id="btn-stmt-upload" title="วางได้หลายไฟล์พร้อมกัน (Ctrl/Shift+คลิก)">${ICONS.file} วาง Statement</button>
           <button class="btn btn-outline btn-sm" id="btn-dedup-stmts" title="ลบ statement ซ้ำ (date+time HH:MM+amount+ref)">🧹 ลบซ้ำ</button>
-          <button class="btn btn-ghost btn-sm" id="btn-unmatch-all" style="color:var(--warn);border:1px solid var(--warn)" title="ยกเลิก match ทั้งหมด (ไม่ลบข้อมูล)">↩ Unmatch ทั้งหมด</button>
+          <button class="btn btn-ghost btn-sm" id="btn-unmatch-all" style="color:var(--warn);border:1px solid var(--warn)" title="ยกเลิก match — เลือกช่วงวันที่หรือทั้งหมด">↩ Unmatch...</button>
           <button class="btn btn-primary btn-sm" id="btn-auto-match">${ICONS.pulse} Auto Match</button>
         </div>
       </div>
@@ -15209,65 +15209,128 @@ async function renderMatching(el) {
       });
     });
     document.getElementById('btn-unmatch-all')?.addEventListener('click', async () => {
-      // นับเพื่อ preview
-      const matchedBills = billList.filter(b => 
-        b.match_status === 'matched' && b.match_status !== 'void' && b.match_status !== 'paid'
-      );
-      const matchedStmts = uploadedStatements.filter(s => s.match_status === 'matched');
+      // ── เปิด modal เลือกช่วงวันที่ (เหมือน Auto Match) ──
+      const today = new Date().toISOString().substring(0, 10);
+      const stmtDates = [];
+      uploadedStatements.forEach(s => {
+        if (s.match_status !== 'matched') return; // เอาเฉพาะที่ matched
+        const d = toISODate(s.date || s.trans_date);
+        if (d) stmtDates.push(d);
+      });
+      stmtDates.sort();
+      const minDate = stmtDates[0] || today;
+      const maxDate = stmtDates[stmtDates.length - 1] || today;
       
-      if (matchedBills.length === 0 && matchedStmts.length === 0) {
+      // นับรวมก่อน preview
+      const totalMatchedBills = billList.filter(b => b.match_status === 'matched' && b.type !== 'Cash').length;
+      const totalMatchedStmts = uploadedStatements.filter(s => s.match_status === 'matched').length;
+      
+      if (totalMatchedBills === 0 && totalMatchedStmts === 0) {
         toast('ไม่มีรายการที่ match อยู่', 'info');
         return;
       }
       
-      const msg = `ยกเลิก match ทั้งหมด?\n\n` +
-                  `• บิล matched: ${matchedBills.length} รายการ\n` +
-                  `• Statement matched: ${matchedStmts.length} รายการ\n\n` +
-                  `การดำเนินการนี้จะ:\n` +
-                  `✓ เปลี่ยน match_status → pending\n` +
-                  `✓ ล้าง confirmation, pay_date, matched_stmt_ref\n` +
-                  `✗ ไม่ลบข้อมูลบิล/statement\n` +
-                  `✗ ไม่แตะ Type, Station, Amount, Bank (manual input)\n\n` +
-                  `(บิลที่เป็น Cash/Refund + Matched จาก Cash rule จะคงสภาพ matched)`;
+      openModal('↩ Unmatch — เลือกช่วงวันที่', `
+        <div class="flex-col gap-3">
+          <div style="padding:10px;background:rgba(245,166,35,.08);border-radius:6px;border-left:3px solid var(--warn)" class="text-xs">
+            <strong>⚠️ Unmatch จะ:</strong><br>
+            • เปลี่ยน match_status → pending (ทั้งบิล + statement)<br>
+            • ล้าง confirmation, pay_date, matched_stmt_ref<br>
+            • ไม่ลบข้อมูลบิล/statement<br>
+            • ไม่แตะบิล Cash/Refund (auto-matched)
+          </div>
+          <div style="padding:10px;background:rgba(79,156,249,.08);border-radius:6px" class="text-xs">
+            <strong>📅 Statement matched ในระบบ:</strong><br>
+            ช่วง ${fmtDate(minDate)} → ${fmtDate(maxDate)} (${stmtDates.length} รายการ)<br>
+            รวม: บิล ${totalMatchedBills} · Stmt ${totalMatchedStmts}
+          </div>
+          <div class="input-group">
+            <label>จากวันที่</label>
+            <input type="date" id="um-from" class="input" value="${minDate}">
+          </div>
+          <div class="input-group">
+            <label>ถึงวันที่</label>
+            <input type="date" id="um-to" class="input" value="${maxDate}">
+          </div>
+          <div class="flex gap-2 mt-2">
+            <button class="btn btn-outline btn-sm flex-1" id="um-all" title="Unmatch ทั้งหมดทุกวัน (ไม่ filter ช่วงวันที่)">↩ Unmatch ทั้งหมด</button>
+            <button class="btn btn-ghost btn-sm" onclick="closeModal()">ยกเลิก</button>
+            <button class="btn btn-warn btn-sm flex-1" id="um-go" style="background:var(--warn);color:#fff">↩ Unmatch ในช่วงนี้</button>
+          </div>
+        </div>
+      `);
       
-      if (!confirm(msg)) return;
-      
-      let unmatched = 0, stmtsCleared = 0;
-      billList.forEach(b => {
-        // Skip Cash-auto-matched bills (ไม่ต้องการ unmatch เพราะ Cash ไม่ได้ match กับ stmt)
-        if (b.type === 'Cash') return;
-        // Skip void/paid (manually set status)
-        if (b.match_status === 'void' || b.match_status === 'paid') return;
+      // ── Helper: ทำ unmatch จริง ──
+      const doUnmatch = async (dateFrom, dateTo) => {
+        const useRange = !!(dateFrom && dateTo);
+        const inRange = (d) => {
+          if (!useRange) return true;
+          const iso = toISODate(d);
+          if (!iso) return false;
+          return iso >= dateFrom && iso <= dateTo;
+        };
         
-        if (b.match_status === 'matched') {
+        let unmatchedBills = 0, stmtsCleared = 0;
+        
+        // 1. Unmatch bills
+        billList.forEach(b => {
+          if (b.type === 'Cash') return; // skip cash-auto
+          if (b.match_status === 'void' || b.match_status === 'paid') return;
+          if (b.match_status !== 'matched') return;
+          if (!inRange(b.date)) return;
+          
           b.match_status = 'pending';
           delete b.confirmation;
           delete b.pay_date;
           delete b.matched_stmt_ref;
           delete b.matched_at;
-          unmatched++;
-        }
-      });
-      
-      Object.values(statementsByBank).forEach(arr => {
-        if (!Array.isArray(arr)) return;
-        arr.forEach(s => {
-          if (s.match_status === 'matched') {
+          unmatchedBills++;
+        });
+        
+        // 2. Unmatch statements
+        Object.values(statementsByBank).forEach(arr => {
+          if (!Array.isArray(arr)) return;
+          arr.forEach(s => {
+            if (s.match_status !== 'matched') return;
+            if (!inRange(s.date || s.trans_date)) return;
+            
             s.match_status = 'pending';
             delete s.match_station;
             delete s.match_bill;
+            delete s.matched_bills;
             delete s.matched_at;
             delete s.match_method;
+            delete s.match_reason;
+            delete s.overpay_amount;
             stmtsCleared++;
-          }
+          });
         });
-      });
-      uploadedStatements = getAllStatements();
+        
+        uploadedStatements = getAllStatements();
+        try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(e) {}
+        persistMainState();
+        
+        const rangeMsg = useRange ? ` ช่วง ${fmtDate(dateFrom)} → ${fmtDate(dateTo)}` : ' ทั้งหมด';
+        toast(`↩ Unmatch${rangeMsg} — บิล: ${unmatchedBills} · Stmt: ${stmtsCleared}`, 'success', 6000);
+        closeModal();
+        render();
+      };
       
-      try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(e) {}
-      persistMainState();
-      toast(`↩ Unmatch สำเร็จ — บิล: ${unmatched} · Stmt: ${stmtsCleared}`, 'success', 6000);
-      render();
+      // Wire ปุ่ม
+      setTimeout(() => {
+        document.getElementById('um-go')?.addEventListener('click', () => {
+          const f = document.getElementById('um-from')?.value;
+          const t = document.getElementById('um-to')?.value;
+          if (!f || !t) { toast('กรุณาเลือกช่วงวันที่', 'error'); return; }
+          if (f > t) { toast('"จาก" ต้องน้อยกว่าหรือเท่ากับ "ถึง"', 'error'); return; }
+          if (!confirm(`ยืนยัน unmatch ในช่วง ${fmtDate(f)} → ${fmtDate(t)}?`)) return;
+          doUnmatch(f, t);
+        });
+        document.getElementById('um-all')?.addEventListener('click', () => {
+          if (!confirm(`ยืนยัน unmatch ทั้งหมด?\n\nบิล: ${totalMatchedBills} · Stmt: ${totalMatchedStmts}`)) return;
+          doUnmatch(null, null);
+        });
+      }, 100);
     });
     
     document.getElementById('btn-auto-match')?.addEventListener('click', async () => {
