@@ -3088,9 +3088,11 @@ function parseFrontPosReport(result, fileName) {
     }
   });
 
-  // รวมเข้า billList
-  const existingKeys = new Set(billList.map(b => b.bill_no).filter(Boolean));
-  const uniqueNewBills = newBills.filter(b => !b.bill_no || !existingKeys.has(b.bill_no));
+  // รวมเข้า billList — ⭐ ใช้ composite key เพราะ Front POS ส่วนใหญ่ไม่มี bill_no
+  // Key: date|amount|station|type + bill_no (ถ้ามี)
+  const compKey = (b) => `${b.bill_no||''}|${toISODate(b.date)||''}|${Number(b.amount)||0}|${b.station||''}|${b.type||''}`;
+  const existingKeys = new Set(billList.map(compKey));
+  const uniqueNewBills = newBills.filter(b => !existingKeys.has(compKey(b)));
   // Generate uuid for any imported bills missing one
   uniqueNewBills.forEach(b => {
     if (!b.bill_uuid) {
@@ -3410,8 +3412,10 @@ function generateBillList(result, fileName) {
   // ── 3. (ยกเลิก) ไม่ import summary rows แล้ว — ผู้ใช้จะกรอกเองในตาราง Summary ด้านบน ──
 
   // รวมกับของเดิม (ไม่ทับ) — รองรับดึงหลายวัน
-  const existingKeys = new Set(billList.map(b => b.bill_no).filter(Boolean));
-  const uniqueNewBills = newBills.filter(b => !b.bill_no || !existingKeys.has(b.bill_no));
+  // ⭐ Composite key: bill_no มีเกือบทั้งหมด แต่เพิ่ม safety นิดหน่อย
+  const compKey = (b) => `${b.bill_no||''}|${toISODate(b.date)||''}|${Number(b.amount)||0}|${b.station||''}|${b.type||''}`;
+  const existingKeys = new Set(billList.map(compKey));
+  const uniqueNewBills = newBills.filter(b => !existingKeys.has(compKey(b)));
   // Generate uuid for any imported bills missing one
   uniqueNewBills.forEach(b => {
     if (!b.bill_uuid) {
