@@ -1854,6 +1854,8 @@ const syncManager = {
             // ลำดับสำคัญ — ถ้าเพิ่ม field ใหม่ต้องเพิ่มที่นี่ด้วย
             fpParts[i] = (b.bill_uuid || b.bill_no || i) + '|' +
                         (b.amount || 0) + '|' +
+                        (b.type || '') + '|' +
+                        (b.station || '') + '|' +
                         (b.match_status || '') + '|' +
                         (b.confirmation || '') + '|' +
                         (b.pay_date || '') + '|' +
@@ -3148,6 +3150,30 @@ async function restoreMainState() {
   
   // ── Bank field = USER MANUAL ENTRY ──
   // ไม่แตะข้อมูล user อัตโนมัติ (เคย clear สำหรับ SP/SC/JS/JR แต่ทำให้ข้อมูลหาย)
+  
+  // ⭐ Self-heal stmts: match_station+match_bill มี แต่ match_status ไม่ใช่ 'matched'
+  //    สาเหตุ: partial sync push / pull cloud-wins overwrite match_status field
+  //    → กลับสถานะให้ตรงกับข้อมูลจริง
+  {
+    let healedMatched = 0, healedUnmatched = 0;
+    uploadedStatements.forEach(s => {
+      const hasStation = !!(s.match_station && String(s.match_station).trim());
+      const hasBill = !!(s.match_bill && String(s.match_bill).trim());
+      const hasMatchedBills = Array.isArray(s.matched_bills) && s.matched_bills.length > 0;
+      const hasMatchData = (hasStation && hasBill) || hasMatchedBills;
+      
+      if (hasMatchData && s.match_status !== 'matched') {
+        s.match_status = 'matched';
+        healedMatched++;
+      } else if (!hasMatchData && s.match_status === 'matched') {
+        s.match_status = 'unmatched';
+        healedUnmatched++;
+      }
+    });
+    if (healedMatched + healedUnmatched > 0) {
+      console.log(`[heal stmts] matched:+${healedMatched} unmatched:+${healedUnmatched}`);
+    }
+  }
   
   // ── Auto dedup: ⚠️ DISABLED - เสี่ยงลบข้อมูลจริง ──
   // ใช้ manual dedup เท่านั้น (ใน addStatementRows ตอน import จะ dedup อัตโนมัติ)
@@ -4756,6 +4782,11 @@ async function renderMain(el) {
       const dayData = mainSummary.__byDate[selectedDate][thLabel];
       if (dayData && dayData[station] != null) return Number(dayData[station]) || 0;
     }
+    // ⭐ Default cashIn = 5155 ทุก station ถ้ายังไม่เคยกรอก (เลขทอนเริ่มต้นวัน)
+    if (field === 'cashIn') {
+      const stored = mainSummary[field + '_' + station];
+      if (stored === undefined || stored === null || stored === '') return 5155;
+    }
     return 0;
   }
   
@@ -5567,7 +5598,13 @@ async function renderMain(el) {
 
   // ── Helper: สร้าง row ที่กรอกเอง (cashIn, cashOut, returns) ──
   function buildSumRow(key, label, color, editable) {
-    const vals = SUMMARY_STATIONS.map(s => Number(mainSummary[key+'_'+s]) || 0);
+    // ⭐ Default value: cashIn = 5155 ถ้ายังไม่เคยกรอก (เลขทอนเริ่มต้นวัน)
+    const _getVal = (s) => {
+      const stored = mainSummary[key+'_'+s];
+      if (stored !== undefined && stored !== null && stored !== '') return stored;
+      return key === 'cashIn' ? 5155 : '';
+    };
+    const vals = SUMMARY_STATIONS.map(s => Number(_getVal(s)) || 0);
     const allSum = vals.reduce((a,b)=>a+b,0);
     // cashIn: Front1-4 + Invoice (Merged with Order/Payment), cashOut: Front1 + Invoice (Merged), returns: Front1-3 + Invoice (Merged)
     const allowedStations = {
@@ -5586,7 +5623,7 @@ async function renderMain(el) {
         // เฉพาะถ้า Invoice allowed
         if (allowed.includes('Invoice')) {
           // Editable input โผล่ที่ Invoice (ใช้ key 'Invoice')
-          cellParts.push(`<td colspan="3" style="background:rgba(91,124,250,.04);border-left:1px dashed var(--border);border-right:1px dashed var(--border)"><input class="input sum-cell" data-k="${key}_Invoice" type="number" value="${mainSummary[key+'_Invoice']||''}" step="0.01" placeholder="0" style="width:95%;padding:3px 6px;font-size:.78rem;text-align:center;border-color:${color}" title="รวม Invoice + Order + Payment"></td>`);
+          cellParts.push(`<td colspan="3" style="background:rgba(91,124,250,.04);border-left:1px dashed var(--border);border-right:1px dashed var(--border)"><input class="input sum-cell" data-k="${key}_Invoice" type="number" value="${_getVal('Invoice')}" step="0.01" placeholder="0" style="width:95%;padding:3px 6px;font-size:.78rem;text-align:center;border-color:${color}" title="รวม Invoice + Order + Payment"></td>`);
         } else {
           cellParts.push(`<td colspan="3"></td>`);
         }
@@ -5597,7 +5634,7 @@ async function renderMain(el) {
         cellParts.push(`<td></td>`);
         return;
       }
-      cellParts.push(`<td><input class="input sum-cell" data-k="${key}_${s}" type="number" value="${mainSummary[key+'_'+s]||''}" step="0.01" placeholder="0" style="width:95%;padding:3px 6px;font-size:.78rem;text-align:right;border-color:${color}"></td>`);
+      cellParts.push(`<td><input class="input sum-cell" data-k="${key}_${s}" type="number" value="${_getVal(s)}" step="0.01" placeholder="0" style="width:95%;padding:3px 6px;font-size:.78rem;text-align:right;border-color:${color}"></td>`);
     });
     
     return `<tr>
@@ -6191,6 +6228,10 @@ async function renderMain(el) {
         whtManuallyEdited = false; // reset เพื่อให้ auto-fill ทำงาน
         updateFeeUI();
       });
+      
+      // ⭐ Wire customer autocomplete ใน Remarks
+      const $abRemarks = document.getElementById('ab-remarks');
+      if ($abRemarks) wireRemarks1Autocomplete($abRemarks);
 
       document.getElementById('ab-confirm')?.addEventListener('click', () => {
         const amount = Number(document.getElementById('ab-amount').value) || 0;
@@ -6953,6 +6994,10 @@ async function renderMain(el) {
         
         ebUpdateFeeUI(); // init
         
+        // ⭐ Wire customer autocomplete ใน Remarks 1
+        const $ebRemarks1 = document.getElementById('eb-remarks1');
+        if ($ebRemarks1) wireRemarks1Autocomplete($ebRemarks1);
+        
         document.getElementById('eb-save')?.addEventListener('click', () => {
           b.bill_no = document.getElementById('eb-bill').value.trim();
           b.date = document.getElementById('eb-date').value;
@@ -7130,6 +7175,10 @@ async function renderMain(el) {
 
     // Bill list cells — in-place edit (NO full render → ไม่มี scroll เด้ง)
     el.querySelectorAll('.bl-cell').forEach(inp => {
+      // ⭐ Wire customer autocomplete สำหรับ remarks1 cell
+      if (inp.dataset.field === 'remarks1') {
+        wireRemarks1Autocomplete(inp);
+      }
       inp.addEventListener('change', () => {
         const tr = inp.closest('tr');
         const idx = Number(tr.dataset.idx);
@@ -7481,6 +7530,95 @@ function spTempCustomerInput(id, selectedCode, selectedName) {
   `;
 }
 
+// ── General customer autocomplete: wire ให้ input ใดๆ ──
+//   ใช้ใน Add Bill / Edit Bill / inline edit remarks1
+//   user พิมพ์ → search customerList → dropdown ทึบ (พื้นหลังเต็ม)
+//   เลือก → fill value = "(CUST_CODE) ชื่อลูกค้า"
+function wireRemarks1Autocomplete(input) {
+  if (!input || input._remarks1Wired) return;
+  input._remarks1Wired = true;
+  
+  // สร้าง dropdown ที่ position absolute เกาะ input
+  const drop = document.createElement('div');
+  drop.style.cssText = 'position:absolute;display:none;z-index:9999;background:var(--surface,#1a1f2e);' +
+                       'border:1px solid var(--border);border-radius:6px;max-height:240px;overflow-y:auto;' +
+                       'box-shadow:0 4px 12px rgba(0,0,0,.35);min-width:240px';
+  document.body.appendChild(drop);
+  
+  function positionDrop() {
+    const r = input.getBoundingClientRect();
+    drop.style.left = (r.left + window.scrollX) + 'px';
+    drop.style.top = (r.bottom + window.scrollY + 2) + 'px';
+    drop.style.width = Math.max(r.width, 240) + 'px';
+  }
+  
+  function doSearch(q) {
+    q = String(q||'').toLowerCase().trim();
+    if (!q || q.length < 1) { drop.style.display = 'none'; return; }
+    
+    if (!Array.isArray(customerList) || customerList.length === 0) {
+      drop.style.display = 'none';
+      return;
+    }
+    
+    const matches = customerList.filter(c => {
+      const code = String(c.cust_code||c.cust_id||'').toLowerCase();
+      const name = String(c.cust_name||'').toLowerCase();
+      return code.includes(q) || name.includes(q);
+    }).slice(0, 15);
+    
+    if (matches.length === 0) {
+      drop.innerHTML = '<div style="padding:10px 12px;color:var(--text3);font-size:.85rem;background:var(--surface,#1a1f2e)">ไม่พบลูกค้า — กรอกเองได้</div>';
+      positionDrop();
+      drop.style.display = 'block';
+      return;
+    }
+    
+    drop.innerHTML = matches.map((c, i) => {
+      const code = c.cust_code || c.cust_id || '';
+      const name = c.cust_name || '';
+      return `<div class="r1-cust-opt" data-i="${i}" 
+              style="padding:8px 12px;cursor:pointer;border-bottom:1px solid var(--border);font-size:.85rem;background:var(--surface,#1a1f2e);color:var(--text)">
+              <span style="font-family:monospace;color:var(--info)">${code}</span> · ${name}
+              </div>`;
+    }).join('');
+    positionDrop();
+    drop.style.display = 'block';
+    
+    drop.querySelectorAll('.r1-cust-opt').forEach((opt, i) => {
+      opt.addEventListener('mouseenter', () => opt.style.background = 'var(--bg2,#2a3142)');
+      opt.addEventListener('mouseleave', () => opt.style.background = 'var(--surface,#1a1f2e)');
+      opt.addEventListener('mousedown', (e) => {
+        e.preventDefault(); // กัน blur ก่อน fill
+        const c = matches[i];
+        const code = c.cust_code || c.cust_id || '';
+        const name = c.cust_name || '';
+        input.value = code ? `(${code}) ${name}` : name;
+        // Trigger change event เพื่อให้ inline edit handler save value
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        drop.style.display = 'none';
+      });
+    });
+  }
+  
+  let searchTimer = null;
+  input.addEventListener('input', () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => doSearch(input.value), 100);
+  });
+  input.addEventListener('focus', () => { if (input.value) doSearch(input.value); });
+  input.addEventListener('blur', () => setTimeout(() => { drop.style.display = 'none'; }, 200));
+  // Cleanup on remove
+  const observer = new MutationObserver(() => {
+    if (!document.body.contains(input)) {
+      drop.remove();
+      observer.disconnect();
+    }
+  });
+  observer.observe(document.body, { childList: true, subtree: true });
+}
+
 function spTempWireCustomerInput(id) {
   const search = document.getElementById(id + '-search');
   const drop = document.getElementById(id + '-drop');
@@ -7635,6 +7773,17 @@ function openSpTempPartialEditModal(no, idx, onChange) {
           <input class="input" id="epr-bank" value="${pr.bank||''}" placeholder="KTB / BBL / ...">
         </div>
       </div>
+      <!-- ⭐ Cheque-only fields -->
+      <div id="epr-cheque-extra" class="flex gap-2" style="display:${pr.method==='Cheque'?'flex':'none'}">
+        <div class="input-group flex-1">
+          <label>เลขเช็ค</label>
+          <input class="input" id="epr-cheque-no" value="${pr.cheque_no||''}" placeholder="เลขที่เช็ค">
+        </div>
+        <div class="input-group flex-1">
+          <label>วันขึ้นเงิน</label>
+          <input type="date" class="input" id="epr-cheque-due" value="${toISODate(pr.cheque_due_date)||''}">
+        </div>
+      </div>
       
       <!-- ⭐ Match section -->
       <div style="padding:10px;background:var(--bg2);border-radius:6px;border-left:3px solid ${isMatched ? 'var(--success)' : 'var(--warn)'}">
@@ -7710,6 +7859,14 @@ function openSpTempPartialEditModal(no, idx, onChange) {
     if (onChange) onChange();
   });
   
+  // ⭐ Toggle Cheque fields ตาม method
+  const $eprMethod = document.getElementById('epr-method');
+  const $eprChqExtra = document.getElementById('epr-cheque-extra');
+  function toggleEprChqExtra() {
+    if ($eprChqExtra) $eprChqExtra.style.display = ($eprMethod?.value === 'Cheque') ? 'flex' : 'none';
+  }
+  $eprMethod?.addEventListener('change', toggleEprChqExtra);
+  
   document.getElementById('epr-save')?.addEventListener('click', () => {
     const amt = Number(document.getElementById('epr-amount').value) || 0;
     if (amt <= 0) { toast('กรอกจำนวน', 'error'); return; }
@@ -7718,6 +7875,15 @@ function openSpTempPartialEditModal(no, idx, onChange) {
     pr.date = document.getElementById('epr-date').value;
     pr.method = document.getElementById('epr-method').value;
     pr.bank = document.getElementById('epr-bank').value.trim();
+    // ⭐ Cheque-specific fields
+    if (pr.method === 'Cheque') {
+      pr.cheque_no = document.getElementById('epr-cheque-no')?.value.trim() || '';
+      pr.cheque_due_date = document.getElementById('epr-cheque-due')?.value || '';
+    } else {
+      // ลบออกถ้าเปลี่ยนวิธีไม่ใช่ Cheque
+      delete pr.cheque_no;
+      delete pr.cheque_due_date;
+    }
     // ถ้ายังไม่ matched — อนุญาตแก้ stmt_ref เอง
     if (!isMatched) pr.stmt_ref = document.getElementById('epr-stmt-ref').value.trim();
     pr.notes = document.getElementById('epr-notes').value;
@@ -7962,6 +8128,17 @@ function openSpTempModal() {
               <input class="input" id="tsp-p-bank" placeholder="KTB / BBL / ...">
             </div>
           </div>
+          <!-- ⭐ Cheque-only fields -->
+          <div id="tsp-p-cheque-extra" class="flex gap-2" style="display:none">
+            <div class="input-group flex-1">
+              <label>เลขเช็ค</label>
+              <input class="input" id="tsp-p-cheque-no" placeholder="เลขที่เช็ค">
+            </div>
+            <div class="input-group flex-1">
+              <label>วันขึ้นเงิน</label>
+              <input type="date" class="input" id="tsp-p-cheque-due">
+            </div>
+          </div>
           <div class="input-group">
             <label>Stmt ref / หมายเหตุ</label>
             <input class="input" id="tsp-p-notes" placeholder="">
@@ -7976,6 +8153,15 @@ function openSpTempModal() {
     </div>
   `);
   spTempWireCustomerInput('tsp-cust');
+  
+  // ⭐ Toggle Cheque fields ตาม method
+  const $tspPMethod = document.getElementById('tsp-p-method');
+  const $tspPChqExtra = document.getElementById('tsp-p-cheque-extra');
+  function toggleTspChqExtra() {
+    if ($tspPChqExtra) $tspPChqExtra.style.display = ($tspPMethod?.value === 'Cheque') ? 'flex' : 'none';
+  }
+  $tspPMethod?.addEventListener('change', toggleTspChqExtra);
+  toggleTspChqExtra();
   
   // Toggle partial fields enabled/disabled
   document.getElementById('tsp-skip-partial')?.addEventListener('change', (e) => {
@@ -8008,6 +8194,10 @@ function openSpTempModal() {
       stmt_ref: '',
       notes: document.getElementById('tsp-p-notes').value,
     } : null;
+    if (partial && partial.method === 'Cheque') {
+      partial.cheque_no = document.getElementById('tsp-p-cheque-no')?.value.trim() || '';
+      partial.cheque_due_date = document.getElementById('tsp-p-cheque-due')?.value || '';
+    }
     
     const now = new Date().toISOString();
     const opening = Number(document.getElementById('tsp-opening')?.value) || 0;
@@ -8096,6 +8286,17 @@ function openPartialModal(tempNo) {
           <input class="input" id="prt-bank">
         </div>
       </div>
+      <!-- ⭐ Cheque-only fields -->
+      <div id="prt-cheque-extra" class="flex gap-2" style="display:none">
+        <div class="input-group flex-1">
+          <label>เลขเช็ค</label>
+          <input class="input" id="prt-cheque-no" placeholder="เลขที่เช็ค">
+        </div>
+        <div class="input-group flex-1">
+          <label>วันขึ้นเงิน</label>
+          <input type="date" class="input" id="prt-cheque-due">
+        </div>
+      </div>
       <div class="input-group">
         <label>Stmt ref / หมายเหตุ</label>
         <input class="input" id="prt-notes">
@@ -8108,18 +8309,32 @@ function openPartialModal(tempNo) {
     </div>
   `);
   
+  // ⭐ Toggle Cheque fields ตาม method
+  const $prtMethod = document.getElementById('prt-method');
+  const $prtChqExtra = document.getElementById('prt-cheque-extra');
+  function toggleChqExtra() {
+    if ($prtChqExtra) $prtChqExtra.style.display = ($prtMethod?.value === 'Cheque') ? 'flex' : 'none';
+  }
+  $prtMethod?.addEventListener('change', toggleChqExtra);
+  toggleChqExtra();
+  
   document.getElementById('prt-confirm')?.addEventListener('click', () => {
     const amt = Number(document.getElementById('prt-amount').value) || 0;
     if (amt <= 0) { toast('กรอกจำนวน', 'error'); return; }
     
+    const method = document.getElementById('prt-method').value;
     const partial = {
       date: document.getElementById('prt-date').value,
       amount: amt,
-      method: document.getElementById('prt-method').value,
+      method: method,
       bank: document.getElementById('prt-bank').value,
       stmt_ref: '',
       notes: document.getElementById('prt-notes').value,
     };
+    if (method === 'Cheque') {
+      partial.cheque_no = document.getElementById('prt-cheque-no')?.value.trim() || '';
+      partial.cheque_due_date = document.getElementById('prt-cheque-due')?.value || '';
+    }
     
     const check = spTempCheckRollover(t, partial);
     if (check.split) {
