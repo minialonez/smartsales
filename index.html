@@ -259,7 +259,7 @@ let currentPage = 'dashboard';
 // Content-Type: text/plain เลี่ยง CORS preflight (simple request)
 async function api(action, params = {}) {
   try {
-    if (!API_URL) return demoResponse(action, params);
+    if (!API_URL) return { success: false, error: 'ยังไม่ได้ตั้งค่า API_URL' };
 
     // สร้าง URL query string (ใช้สำหรับ GET หรือเช็คขนาด)
     const qs = new URLSearchParams({ action });
@@ -339,12 +339,12 @@ async function api(action, params = {}) {
       return JSON.parse(text);
     } catch {
       console.error('API response not JSON:', text.substring(0, 300));
-      return demoResponse(action, params);
+      return { success: false, error: 'เซิร์ฟเวอร์ตอบไม่ใช่ JSON', raw: text.substring(0, 200) };
     }
   } catch (err) {
     console.error('API Error:', err);
-    toast('ไม่สามารถเชื่อมต่อเซิร์ฟเวอร์ — ใช้ Demo Mode', 'error');
-    return demoResponse(action, params);
+    toast('เชื่อมต่อเซิร์ฟเวอร์ไม่ได้ — โปรดลองอีกครั้ง', 'error');
+    return { success: false, error: String(err?.message || err) };
   }
 }
 
@@ -12598,60 +12598,6 @@ function navigateTo(page) {
   else main.innerHTML = `<div class="card"><p class="text-dim">หน้า "${page}" กำลังพัฒนา</p></div>`;
   // Apply dd/mm/yyyy date picker (flatpickr) after render
   setTimeout(applyFlatpickrAll, 100);
-}
-
-// ══════════════════════════════════════════════════════════════
-// DEMO DATA (ใช้เมื่อยังไม่ได้ตั้ง API_URL)
-// ══════════════════════════════════════════════════════════════
-const DEMO = {
-  debtors: [
-    { cust_id:'C001', cust_name:'บจก. สยามเทรดดิ้ง', phone:'081-234-5678', credit_limit:500000, months:{'2026-01':45000,'2026-02':82000,'2026-03':35000}, total_outstanding:162000, credit_status:'active', due_date:'2026-04-10' },
-    { cust_id:'C002', cust_name:'หจก. พิชัยพาณิชย์', phone:'089-876-5432', credit_limit:300000, months:{'2026-02':120000,'2026-03':95000}, total_outstanding:215000, credit_status:'overdue', due_date:'2026-04-05' },
-    { cust_id:'C003', cust_name:'บจก. แสงทองซัพพลาย', phone:'092-111-2233', credit_limit:200000, months:{'2026-03':28000}, total_outstanding:28000, credit_status:'active', due_date:'2026-04-20' },
-    { cust_id:'C004', cust_name:'ร้านเจริญกิจ', phone:'086-555-7788', credit_limit:150000, months:{'2025-12':15000,'2026-01':22000,'2026-02':18000,'2026-03':45000}, total_outstanding:100000, credit_status:'credit_break', due_date:'2026-04-01' },
-  ],
-  sales: [
-    { id:1, date:'2026-04-08', bill_no:'OS26040001', station:'FRONT1', pay_method:'Cash', customer:'ลูกค้าทั่วไป', amount:1250, sp_no:'', match_status:'pending' },
-    { id:2, date:'2026-04-08', bill_no:'SS26040002', station:'FRONT1', pay_method:'Transfer', customer:'บจก. สยามเทรดดิ้ง', amount:8500, sp_no:'SP00126-040801', match_status:'matched' },
-    { id:3, date:'2026-04-08', bill_no:'OS26040003', station:'FRONT2', pay_method:'Credit Card', customer:'คุณสมชาย', amount:3200, sp_no:'', match_status:'pending' },
-    { id:4, date:'2026-04-08', bill_no:'SS26040004', station:'FRONT3', pay_method:'Transfer', customer:'หจก. พิชัยพาณิชย์', amount:15000, sp_no:'SP00126-040802', match_status:'matched' },
-    { id:5, date:'2026-04-08', bill_no:'SR26040005', station:'FRONT1', pay_method:'Cash', customer:'คุณวิภา', amount:-500, sp_no:'', match_status:'pending' },
-    { id:6, date:'2026-04-08', bill_no:'OR26040006', station:'FRONT4', pay_method:'Cheque', customer:'บจก. แสงทองซัพพลาย', amount:22000, sp_no:'', match_status:'pending' },
-    { id:7, date:'2026-04-08', bill_no:'SS26040007', station:'SS', pay_method:'Transfer', customer:'ร้านเจริญกิจ', amount:4500, sp_no:'SP00126-040803', match_status:'unmatched' },
-    { id:8, date:'2026-04-08', bill_no:'OS26040008', station:'FRONT2', pay_method:'Cash', customer:'ลูกค้าทั่วไป', amount:890, sp_no:'', match_status:'pending' },
-    { id:9, date:'2026-04-07', bill_no:'SS26040701', station:'FRONT1', pay_method:'Transfer', customer:'บจก. สยามเทรดดิ้ง', amount:12500, sp_no:'SP00126-040701', match_status:'matched' },
-    { id:10, date:'2026-04-07', bill_no:'OS26040702', station:'FRONT2', pay_method:'Cash', customer:'ลูกค้าทั่วไป', amount:3400, sp_no:'', match_status:'pending' },
-  ],
-  statements: [
-    { stmt_id:1, bank:'KBANK', date:'2026-04-08', time:'10:32', ref_no:'KBK20260408001', description:'โอนเงิน บจก.สยามเทรด', amount:8500, match_status:'matched', match_station:'FRONT1', match_bill:'SS26040002' },
-    { stmt_id:2, bank:'KTB', date:'2026-04-08', time:'11:15', ref_no:'KTB20260408003', description:'โอนเงิน หจก.พิชัย', amount:15000, match_status:'matched', match_station:'FRONT3', match_bill:'SS26040004' },
-    { stmt_id:3, bank:'KBANK', date:'2026-04-08', time:'14:20', ref_no:'KBK20260408005', description:'โอนเงิน ร้านเจริญกิจ', amount:4500, match_status:'unmatched', match_station:'', match_bill:'' },
-    { stmt_id:4, bank:'BBL', date:'2026-04-08', time:'09:45', ref_no:'BBL20260408002', description:'โอนเงิน', amount:12000, match_status:'unmatched', match_station:'', match_bill:'' },
-    { stmt_id:5, bank:'KTB', date:'2026-04-08', time:'16:00', ref_no:'KTB20260408007', description:'ฝากเงินสด', amount:6800, match_status:'unmatched', match_station:'', match_bill:'' },
-  ],
-};
-
-function demoResponse(action, params) {
-  switch(action) {
-    case 'login':
-      if (params.username === '009' && params.password === 'bxkssnrz')
-        return { success:true, data:{ user_id:'U001', username:'009', display_name:'Admin', role:'admin', permissions:['read','write','delete','manage_users'] }};
-      return { success:false, error:'ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง' };
-    case 'getDashboard': return { success:true, data:{
-      debt:{total:505000,debtors:4,overdue:2},
-      sales:{total:54840,count:8,by_station:{FRONT1:9250,FRONT2:4090,FRONT3:15000,FRONT4:22000,SS:4500}},
-      matching:{matched:2,total:5},
-      recent_alerts:[
-        {alert_type:'overdue',cust_name:'หจก. พิชัยพาณิชย์',notes:'เกินกำหนดชำระ 3 วัน',action_at:'08/04/2026 14:00'},
-        {alert_type:'credit_break',cust_name:'ร้านเจริญกิจ',notes:'เบรกเครดิตแล้ว',action_at:'08/04/2026 10:00'},
-        {alert_type:'upcoming',cust_name:'บจก. สยามเทรดดิ้ง',notes:'จะครบกำหนด 2 วัน',action_at:'08/04/2026 08:00'},
-      ]}};
-    case 'getArLedger': return { success:true, data: DEMO.debtors };
-    case 'getAlerts': return { success:true, data: DEMO.debtors.filter(d=>d.credit_status!=='active').map(d=>({alert_type:d.credit_status==='overdue'?'overdue':'credit_break',cust_id:d.cust_id,cust_name:d.cust_name,phone:d.phone,amount_due:d.total_outstanding,due_date:d.due_date,action_at:'08/04/2026'})) };
-    case 'getUsers': return { success:true, data:[{user_id:'U001',username:'009',display_name:'Admin',role:'admin',permissions:['read','write','delete','manage_users'],status:'active'},{user_id:'U002',username:'010',display_name:'พนักงาน A',role:'staff',permissions:['read','write'],status:'active'}]};
-    case 'getMatchLog': return { success:true, data:[] };
-    default: return { success:true, data:[] };
-  }
 }
 
 function formatDateKey(d) { return d ? d.replace(/-/g,'') : todayKey(); }
