@@ -1429,10 +1429,17 @@ window.buildCompactMetaRows = function() {
       const flat = {};
       Object.keys(dayLabels).forEach(function(label) {
         const prefix = LABEL_TO_KEY[label] || label;
+        // ⭐ Sanitize: skip empty label (ข้อมูลเสีย)
+        if (!prefix || !String(prefix).trim()) return;
         const stations = dayLabels[label] || {};
         Object.keys(stations).forEach(function(station) {
+          // ⭐ Sanitize: skip empty station
+          if (!station || !String(station).trim()) return;
           const v = Number(stations[station]);
-          if (!isNaN(v) && v !== 0) flat[prefix + '_' + station] = v;
+          // ⭐ Include 0 — ถ้า user ลบยอดเป็น 0 ต้อง push เพื่อทับ cloud
+          // (เดิม skip 0 → cloud ยังค้างค่าเก่า → pull กลับ = data corruption)
+          if (isNaN(v)) return;
+          flat[prefix + '_' + station] = v;
         });
       });
       if (Object.keys(flat).length > 0) {
@@ -1454,8 +1461,12 @@ window.buildCompactMetaRows = function() {
       const dayCash = cashCount.__byDate[dateISO] || {};
       const filtered = {};
       Object.keys(dayCash).forEach(function(k) {
+        // ⭐ Sanitize: skip empty key
+        if (!k || !String(k).trim()) return;
         const v = Number(dayCash[k]);
-        if (!isNaN(v) && v !== 0) filtered[k] = v;
+        if (isNaN(v)) return;
+        // Cash denomination: 0 = ไม่มีธนบัตรเลย → push ก็ OK (consistent)
+        filtered[k] = v;
       });
       if (Object.keys(filtered).length > 0) {
         const dateDisplay = typeof fmtDate === 'function' ? fmtDate(dateISO) : dateISO;
@@ -1510,12 +1521,20 @@ window.parseCompactMetaRows = function(rows) {
         if (idx < 0) return;
         const prefix = key.substring(0, idx);
         const station = key.substring(idx + 1);
+        // ⭐ Skip junk: empty prefix or station (data corruption gate)
+        if (!prefix || !station) return;
         const label = KEY_TO_LABEL[prefix] || prefix;
         if (!summary.__byDate[dateISO][label]) summary.__byDate[dateISO][label] = {};
         summary.__byDate[dateISO][label][station] = Number(data[key]) || 0;
       });
     } else if (r.meta_type === 'cash_count') {
-      cash.__byDate[dateISO] = data;
+      // ⭐ Filter out empty keys
+      const cleaned = {};
+      Object.keys(data).forEach(function(k) {
+        if (!k || !String(k).trim()) return;
+        cleaned[k] = Number(data[k]) || 0;
+      });
+      if (Object.keys(cleaned).length > 0) cash.__byDate[dateISO] = cleaned;
     }
   });
   
@@ -2222,19 +2241,22 @@ const syncManager = {
       
       // Meta — field-level merge (prev bug: date-level skip ทำให้ cloud ไม่มาถ้า local มี {} แล้ว)
       // ─────────────────────────────────────────────────────────────
-      // Logic: ต่อ field ใน cloud entry:
-      //   - Local ไม่มี field หรือเป็นค่าว่าง (0, '', null, undefined) → เอา cloud
-      //   - Local มีค่าจริง (user พิมพ์เอง) → keep local (ไม่ overwrite)
-      // นับ stats.meta = จำนวน fields ที่ pull มา (ไม่ใช่ dates)
-      const isEmpty = (v) => v === null || v === undefined || v === '' || v === 0;
+      // ── Meta pull merge strategy ──
+      // Problem: เดิมใช้ "local-wins for non-empty" — ถ้า local มีค่าเก่า 1000, cloud มีค่าใหม่ 1500
+      //          → pull จะไม่ทับ → local ยังเห็น 1000 → data corruption ข้ามเครื่อง
+      // Fix: "cloud-wins" ยกเว้นถ้า local กำลัง dirty (กำลังจะ push เอง)
+      //      ถ้า local ไม่ dirty → ข้อมูล cloud = source of truth
+      const localDirty = this.dirty.has('meta');
+      const isEmpty = (v) => v === null || v === undefined || v === '';
       const mergeFields = (target, source) => {
         let added = 0;
         if (!source || typeof source !== 'object') return 0;
         Object.keys(source).forEach(key => {
           const srcVal = source[key];
-          if (isEmpty(srcVal)) return;  // Skip empty cloud fields
+          // Skip undefined/null source (ไม่มีใน cloud = ไม่เขียนทับ)
+          if (srcVal === undefined || srcVal === null) return;
           
-          // Nested object (e.g., stationSummary, mutex inner objects)
+          // Nested object (stations, denominations)
           if (srcVal && typeof srcVal === 'object' && !Array.isArray(srcVal)) {
             if (!target[key] || typeof target[key] !== 'object') {
               target[key] = {};
@@ -2243,8 +2265,12 @@ const syncManager = {
             return;
           }
           
-          // Primitive: take cloud if local empty
-          if (isEmpty(target[key])) {
+          // Primitive: 
+          //   - local dirty → keep local (user กำลังจะ push)
+          //   - local empty → take cloud
+          //   - local has value & cloud has value → cloud-wins (multi-device correctness)
+          if (localDirty && !isEmpty(target[key])) return;
+          if (isEmpty(target[key]) || target[key] !== srcVal) {
             target[key] = srcVal;
             added++;
           }
