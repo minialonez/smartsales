@@ -360,6 +360,16 @@ async function api(action, params = {}) {
 // ถ้า fail → syncManager จะ retry แบบ full array ครั้งถัดไป (graceful fallback)
 async function pushMatchDelta(bill, stmt) {
   try {
+    // ⭐ CRITICAL: Mark dirty IMMEDIATELY (before async API call)
+    // เหตุผล: delta push ใช้เวลา 1-3s — ระหว่างนั้น poll pull อาจ trigger
+    //   pull merge L2169/L2247: if (!dirty.has(...)) → cloud-wins → REVERT match!
+    // ต้อง mark dirty ตอนนี้ → pull จะ skip merge ของ type นี้
+    // markClean ตอน delta สำเร็จจะ clear dirty ภายหลัง
+    if (window.syncManager?.markDirty) {
+      if (bill) window.syncManager.markDirty('bills');
+      if (stmt) window.syncManager.markDirty('stmts');
+    }
+    
     // Determine year from bill or stmt date
     const billYear = bill ? String(new Date(toISODate(bill.date) || bill.date).getFullYear()) : null;
     const stmtYear = stmt ? String(new Date(toISODate(stmt.date) || stmt.date).getFullYear()) : null;
@@ -396,15 +406,21 @@ async function pushMatchDelta(bill, stmt) {
     
     if (allOk) {
       console.log('[delta] push OK —', results.map(r => r.type).join(' + '));
-      // ⭐ Advance fingerprint cache: set ให้ตรงกับ state ปัจจุบัน
-      // เหตุผล: local state ตรงกับ cloud state แล้ว (delta push สำเร็จ)
-      // syncManager cycle ถัดไปจะ compute fp ตัวใหม่ → เทียบ cache → ตรงกัน → skip full push
-      // ของเดิม (delete cache) ผิด: cache=undefined → fp≠undefined → push full → body-loss
-      if (window.syncManager?.markClean) {
-        const pushed = new Set(results.map(r => r.type));
-        if (pushed.has('bill')) window.syncManager.markClean('bills');
-        if (pushed.has('stmt')) window.syncManager.markClean('stmts');
-      }
+      // ⭐ DON'T markClean: ทำให้ race condition
+      //   ถ้า user match อันใหม่ระหว่าง delta push → markClean ทับ fp รวม state ใหม่
+      //   → next push skip → cloud ขาด → pull cloud-wins → revert match ใหม่
+      //   วิธีถูก: ปล่อย dirty flag + fp ทำงานตามปกติ
+      //   - dirty='stmts' จาก markDirty บรรทัดบนยังคงอยู่ (ถ้ามี match ใหม่)
+      //   - syncManager poll cycle ถัดไป compute fp → ถ้า state ตรงกับ cloud → fp matches cache → skip
+      //   - ถ้า state เปลี่ยนใหม่ → fp ต่าง → push เพิ่มเติม
+      //
+      // เคลียร์ dirty ที่เพิ่ง mark เฉพาะ type ที่ push success
+      // ⭐ แต่ — เคลียร์เฉพาะถ้าไม่มี match/edit ใหม่หลัง markDirty
+      //    วิธีง่าย: เคลียร์ dirty ทันทีที่ delta push ไม่ทันแน่ → ไม่เคลียร์เลย
+      //    เพราะ syncManager push full ครั้งถัดไปยังไง fp จะ skip ถ้า state ตรง cloud อยู่แล้ว
+      //    → ไม่เสียอะไร แค่ตรวจ fp ทีละ field (cheap operation)
+      //
+      // (no-op intentional)
     } else {
       const fails = results.filter(r => !r.ok);
       console.warn('[delta] push partial fail —', fails);
@@ -2169,7 +2185,19 @@ const syncManager = {
                   if (!this.dirty.has('bills')) {
                     const idx = billList.findIndex(x => x.bill_uuid === uuid);
                     if (idx >= 0) {
-                      Object.assign(billList[idx], b); // cloud-wins merge
+                      // ⭐ Match-state guard: ถ้า local matched + matched_at ใหม่กว่า cloud updated_at → skip
+                      //    ป้องกัน race delta push ค้าง → poll pull มาก่อน → revert
+                      const localBill = billList[idx];
+                      const localMatched = localBill.match_status === 'matched' || localBill.match_status === 'paid';
+                      const cloudMatched = b.match_status === 'matched' || b.match_status === 'paid';
+                      if (localMatched && !cloudMatched) {
+                        const localMatchedAt = localBill.matched_at ? new Date(localBill.matched_at).getTime() : 0;
+                        const cloudUpdatedAt = b.updated_at ? new Date(b.updated_at).getTime() : 0;
+                        if (localMatchedAt > cloudUpdatedAt - 60000) {
+                          return; // skip — local is fresher
+                        }
+                      }
+                      Object.assign(localBill, b); // cloud-wins merge (default)
                     }
                   }
                 }
@@ -2251,7 +2279,23 @@ const syncManager = {
                       const idx = statementsByBank[bk].findIndex(x => x.stmt_uuid === uuid);
                       if (idx >= 0) { found = { bk, idx }; break; }
                     }
-                    if (found) Object.assign(statementsByBank[found.bk][found.idx], s);
+                    if (found) {
+                      // ⭐ Match-state guard: ถ้า local matched แต่ cloud unmatched + matched_at ของ local ใหม่กว่า → skip merge
+                      //    ป้องกัน race: delta push ส่ง stmt matched ขึ้น cloud → poll pull มาก่อน push เสร็จ → cloud มี state เก่า (unmatched) → revert
+                      const localStmt = statementsByBank[found.bk][found.idx];
+                      const localMatched = localStmt.match_status === 'matched';
+                      const cloudMatched = s.match_status === 'matched';
+                      if (localMatched && !cloudMatched) {
+                        const localMatchedAt = localStmt.matched_at ? new Date(localStmt.matched_at).getTime() : 0;
+                        const cloudUpdatedAt = s.updated_at ? new Date(s.updated_at).getTime() : 0;
+                        // local ใหม่กว่า cloud (within 60s window) → keep local
+                        if (localMatchedAt > cloudUpdatedAt - 60000) {
+                          // skip merge — local is fresher
+                          return;
+                        }
+                      }
+                      Object.assign(localStmt, s);
+                    }
                   }
                 }
               } else {
@@ -2620,20 +2664,18 @@ function validateBill(b, idx, allBills) {
 
 function findDuplicateBills() {
   // หาบิลที่ซ้ำกันจริงๆ (ไม่ใช่ split payment)
-  // Composite key: bill_no + type + amount + date (ตรงกับ dedup logic ตอน import)
-  // เหตุผล: บิลเดียวกันอาจชำระหลายวิธี/หลายรอบ เช่น
-  //   SS00126-000002 | Cash     | 3      | 2026-04-20  ← ✓ เก็บได้
-  //   SS00126-000002 | Transfer | 5515   | 2026-04-20  ← ✓ เก็บได้ (ไม่ถือว่าซ้ำ)
-  //   SS00126-001234 | Transfer | 3000   | 2026-04-20  ← ✓ มัดจำ
-  //   SS00126-001234 | Transfer | 3000   | 2026-04-25  ← ✓ ส่วนที่เหลือ (วันต่างกัน)
-  // แต่ถ้า bill_no + type + amount + date ตรงกัน = ซ้ำจริง
+  // Composite key: bill_no + type + amount (ตรงกับ dedup logic ตอน import)
+  // เหตุผล: บิลเดียวกันอาจชำระหลายวิธี เช่น
+  //   SS00126-000002 | Cash     | 3      ← ✓ เก็บได้
+  //   SS00126-000002 | Transfer | 5515   ← ✓ เก็บได้ (ไม่ถือว่าซ้ำ)
+  // แต่ถ้า bill_no + type + amount ตรงกัน = ซ้ำจริง
   const byKey = {};
   billList.forEach((b, i) => {
     if (b.match_status === 'void') return;
     const no = (b.bill_no || '').trim();
     if (!no || no.startsWith('MANUAL-')) return;
-    // Composite key (รวม date เพื่อ allow split payment ข้ามวัน)
-    const key = `${no}|${(b.type || '').trim()}|${Number(b.amount) || 0}|${toISODate(b.date) || ''}`;
+    // Composite key
+    const key = `${no}|${(b.type || '').trim()}|${Number(b.amount) || 0}`;
     if (!byKey[key]) byKey[key] = [];
     byKey[key].push(i);
   });
@@ -5024,6 +5066,7 @@ async function renderMain(el) {
           <button class="btn btn-primary btn-sm" id="btn-gen-smart">${ICONS.download} Smart (SS/OS/OR/SR)</button>
           <button class="btn btn-info btn-sm" id="btn-import-pos" style="background:var(--info);color:#fff">${ICONS.download} Front POS</button>
           <button class="btn ${showChange?'btn-primary':'btn-outline'} btn-sm" id="btn-toggle-change">🪙 นับธนบัตร</button>
+          <button class="btn btn-ghost btn-sm" id="btn-unmatch-day" style="color:var(--warn);border:1px solid var(--warn)" title="Unmatch บิลทั้งหมดในวันนี้">↩ Unmatch วันนี้</button>
           <button class="btn btn-outline btn-sm" id="btn-check-issues">🔍 ตรวจสอบ</button>
           <button class="btn btn-success btn-sm" id="btn-save-main">${ICONS.check} บันทึก</button>
         </div>
@@ -5633,6 +5676,87 @@ async function renderMain(el) {
     
     document.getElementById('btn-toggle-change')?.addEventListener('click', () => {
       showChange = !showChange; render();
+    });
+    
+    // ── Unmatch บิล + statement ทั้งหมดในวันที่เลือก ──
+    document.getElementById('btn-unmatch-day')?.addEventListener('click', async () => {
+      const dayBills = getBillsForSelectedDate();
+      
+      // นับเฉพาะที่ matched (ไม่นับ Cash/void/paid)
+      const billsToUnmatch = dayBills.filter(b => 
+        b.match_status === 'matched' && b.type !== 'Cash'
+      );
+      
+      // หา stmt ที่ผูกอยู่กับบิลของวันนี้
+      const stmtRefsOfDay = new Set();
+      billsToUnmatch.forEach(b => {
+        if (b.matched_stmt_ref) stmtRefsOfDay.add(b.matched_stmt_ref);
+      });
+      
+      // หา stmt ของวันนี้ที่ matched (ครอบคลุมกรณีที่ stmt match กับบิลวันอื่น)
+      const dayISO = toISODate(selectedDate);
+      const allStmts = getAllStatements();
+      const stmtsToUnmatch = allStmts.filter(s => {
+        if (s.match_status !== 'matched') return false;
+        const sDate = toISODate(s.date || s.trans_date);
+        if (sDate === dayISO) return true; // stmt ของวันนี้
+        if (stmtRefsOfDay.has(s.ref_no)) return true; // stmt ที่บิลวันนี้ผูกอยู่
+        return false;
+      });
+      
+      if (billsToUnmatch.length === 0 && stmtsToUnmatch.length === 0) {
+        toast('ไม่มีรายการที่ match อยู่ในวันนี้', 'info');
+        return;
+      }
+      
+      const dateStr = fmtDate(dayISO);
+      if (!confirm(
+        `Unmatch ทั้งหมดของวันที่ ${dateStr}?\n\n` +
+        `• บิลที่จะ unmatch: ${billsToUnmatch.length} รายการ\n` +
+        `• Statement ที่จะ unmatch: ${stmtsToUnmatch.length} รายการ\n\n` +
+        `จะเปลี่ยน match_status → pending\n` +
+        `ล้าง confirmation, pay_date, matched_stmt_ref\n` +
+        `ไม่ลบข้อมูลบิล/statement\n` +
+        `ไม่แตะบิล Cash (auto-matched)`
+      )) return;
+      
+      // Unmatch bills
+      let billCount = 0;
+      billsToUnmatch.forEach(b => {
+        b.match_status = 'pending';
+        delete b.confirmation;
+        delete b.pay_date;
+        delete b.matched_stmt_ref;
+        delete b.matched_at;
+        billCount++;
+      });
+      
+      // Unmatch statements
+      let stmtCount = 0;
+      stmtsToUnmatch.forEach(s => {
+        s.match_status = 'unmatched';
+        delete s.match_station;
+        delete s.match_bill;
+        delete s.matched_bills;
+        delete s.matched_at;
+        delete s.matched_by;
+        delete s.match_method;
+        delete s.match_reason;
+        delete s.overpay_amount;
+        stmtCount++;
+      });
+      
+      try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(_){}
+      persistMainState();
+      
+      // Mark dirty
+      if (window.syncManager?.markDirty) {
+        if (billCount > 0) window.syncManager.markDirty('bills');
+        if (stmtCount > 0) window.syncManager.markDirty('stmts');
+      }
+      
+      toast(`↩ Unmatch ${dateStr} — บิล ${billCount} · Stmt ${stmtCount}`, 'success', 5000);
+      render();
     });
     
     // ── Checkbox selection + Delete Selected ──
@@ -15561,45 +15685,149 @@ async function renderMatching(el) {
         }
       });
 
-      // Save to IndexedDB
-      const req = indexedDB.open('SmartFinanceDB', 1);
-      req.onsuccess = (e) => {
-        const tx = e.target.result.transaction('data', 'readwrite');
-        const store = tx.objectStore('data');
-        store.put(JSON.stringify(billList), 'sf_billList');
-        store.put(JSON.stringify(statementsByBank), 'sf_statementsByBank');
-        tx.oncomplete = () => {
-          let msg = `✅ Auto Match ${fmtDate(dateFrom)} → ${fmtDate(dateTo)}\n\n`;
-          msg += `💰 เงินเข้า match: ${matched}\n`;
-          msg += `💸 เงินออก match: ${matchedExp}\n`;
-          const totalNoMatch = noMatch + skippedNeg;
-          msg += `✗ ไม่เจอคู่: ${totalNoMatch}\n\n`;
-          msg += `(Stmt ในช่วง: ${stmtsInRange} · Bills: ${billsInRange} รับ + ${expBillsInRange} จ่าย)`;
-          
-          // ── Diagnostic: ถ้ามี stmt ไม่ match → แสดง 3 ตัวอย่าง + เหตุผล ──
-          if (totalNoMatch > 0) {
-            const unmatchedStmts = uploadedStatements.filter(s => {
-              if (s.match_status === 'matched') return false;
-              const sd = toISODate(s.date || s.trans_date);
-              return sd && sd >= dateFrom && sd <= dateTo && Number(s.amount);
+      // ── Save แบบ proper sync (persistMainState + push delta) ──
+      // ⭐ FIX: ก่อนนี้ save IndexedDB ตรงๆ ไม่ผ่าน persistMainState → markDirty ไม่ทำ
+      //         → ของเก่าใน localStorage ถูก push ทับ cloud → pull รอบถัดไปเอาของเก่ามาทับ
+      //         → "match แล้ว unmatch เองในหน้า matching" bug
+      uploadedStatements = getAllStatements();
+      
+      // Sync to localStorage (immediate)
+      try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(e) {}
+      
+      // Trigger normal persist flow → markDirty('bills')+markDirty('stmts')
+      persistMainState();
+      
+      // Force flush ทันที (ไม่รอ debounce 1.5s)
+      if (typeof flushPersistState === 'function') flushPersistState();
+      
+      // ── Batch push delta — รวม bills + stmts ทุกตัวที่เพิ่ง match ──
+      // ใช้ uuid ตรวจ → ใช้ upsert API (สอดคล้องกับ pushMatchDelta)
+      const matchedBills = [];
+      const matchedStmts = [];
+      // Re-scan: หา bills/stmts ที่ match_method=auto_* ใน range
+      billList.forEach(b => {
+        if (!b.bill_uuid) return;
+        if (b.match_status !== 'matched') return;
+        const d = toISODate(b.date);
+        if (!d || d < dateFrom || d > dateTo) return;
+        // เก็บเฉพาะที่เพิ่ง match จาก auto run นี้ (matched_at ภายใน 30 วินาที)
+        const matchedAt = b.matched_at;
+        if (matchedAt && (Date.now() - new Date(matchedAt).getTime()) < 30000) {
+          matchedBills.push({ ...b, date: toISODate(b.date) || b.date });
+        }
+      });
+      uploadedStatements.forEach(s => {
+        if (!s.stmt_uuid) return;
+        if (s.match_status !== 'matched') return;
+        const sd = toISODate(s.date || s.trans_date);
+        if (!sd || sd < dateFrom || sd > dateTo) return;
+        const matchedAt = s.matched_at;
+        if (matchedAt && (Date.now() - new Date(matchedAt).getTime()) < 30000) {
+          matchedStmts.push({ ...s, date: toISODate(s.date) || s.date });
+        }
+      });
+      
+      // Group by year and push
+      const pushPromises = [];
+      if (matchedBills.length > 0) {
+        const byYear = {};
+        matchedBills.forEach(b => {
+          const y = String(new Date(b.date).getFullYear());
+          if (!byYear[y]) byYear[y] = [];
+          byYear[y].push(b);
+        });
+        Object.keys(byYear).forEach(year => {
+          pushPromises.push(
+            api('upsertBills', { year, records: byYear[year], deletes: [] })
+              .then(r => ({ type: 'bills', year, count: byYear[year].length, ok: r?.success !== false }))
+              .catch(e => ({ type: 'bills', year, ok: false, err: e.message }))
+          );
+        });
+      }
+      if (matchedStmts.length > 0) {
+        const byYear = {};
+        matchedStmts.forEach(s => {
+          const y = String(new Date(s.date).getFullYear());
+          if (!byYear[y]) byYear[y] = [];
+          byYear[y].push(s);
+        });
+        Object.keys(byYear).forEach(year => {
+          pushPromises.push(
+            api('upsertStatements', { year, records: byYear[year], deletes: [] })
+              .then(r => ({ type: 'stmts', year, count: byYear[year].length, ok: r?.success !== false }))
+              .catch(e => ({ type: 'stmts', year, ok: false, err: e.message }))
+          );
+        });
+      }
+      
+      // ⭐ Wait for push to complete BEFORE allowing background pull to overwrite
+      let pushSummary = '';
+      if (pushPromises.length > 0) {
+        try {
+          const results = await Promise.all(pushPromises);
+          const allOk = results.every(r => r.ok);
+          if (allOk) {
+            console.log('[auto-match] cloud push OK:', results);
+            // Mark clean → fp will recompute and skip full push (ของเหมือน cloud แล้ว)
+            if (window.syncManager?.markClean) {
+              window.syncManager.markClean('bills');
+              window.syncManager.markClean('stmts');
+            }
+            pushSummary = `\n☁️ Synced ${results.reduce((s,r)=>s+(r.count||0),0)} records to cloud`;
+          } else {
+            const fails = results.filter(r => !r.ok);
+            console.warn('[auto-match] cloud push partial fail:', fails);
+            // Mark dirty → syncManager retry full sync
+            if (window.syncManager?.markDirty) {
+              window.syncManager.markDirty('bills');
+              window.syncManager.markDirty('stmts');
+            }
+            pushSummary = `\n⚠️ Cloud sync บางส่วนล้มเหลว — จะ retry อัตโนมัติ`;
+          }
+        } catch (err) {
+          console.error('[auto-match] cloud push error:', err);
+          pushSummary = `\n⚠️ Cloud sync error — จะ retry อัตโนมัติ`;
+          // Fallback: markDirty
+          if (window.syncManager?.markDirty) {
+            window.syncManager.markDirty('bills');
+            window.syncManager.markDirty('stmts');
+          }
+        }
+      }
+      
+      // Final UI update
+      let msg = `✅ Auto Match ${fmtDate(dateFrom)} → ${fmtDate(dateTo)}\n\n`;
+      msg += `💰 เงินเข้า match: ${matched}\n`;
+      msg += `💸 เงินออก match: ${matchedExp}\n`;
+      const totalNoMatch = noMatch + skippedNeg;
+      msg += `✗ ไม่เจอคู่: ${totalNoMatch}\n\n`;
+      msg += `(Stmt ในช่วง: ${stmtsInRange} · Bills: ${billsInRange} รับ + ${expBillsInRange} จ่าย)`;
+      msg += pushSummary;
+      
+      // ── Diagnostic: ถ้ามี stmt ไม่ match → แสดง 3 ตัวอย่าง + เหตุผล ──
+      if (totalNoMatch > 0) {
+        const unmatchedStmts = uploadedStatements.filter(s => {
+          if (s.match_status === 'matched') return false;
+          const sd = toISODate(s.date || s.trans_date);
+          return sd && sd >= dateFrom && sd <= dateTo && Number(s.amount);
+        });
+        
+        if (unmatchedStmts.length > 0) {
+          msg += `\n\n━━ ตัวอย่าง Stmt ที่ match ไม่เจอ ━━`;
+          const samples = unmatchedStmts.slice(0, 3);
+          samples.forEach(stmt => {
+            const sd = toISODate(stmt.date || stmt.trans_date);
+            const sa = Number(stmt.amount || 0);
+            msg += `\n\n📌 ${fmtDate(sd)} · ${sa > 0 ? '+' : ''}${fmtNum(sa)} (${stmt.bank||'?'})`;
+            
+            // หาเหตุผลที่ไม่ match
+            // 1. หา bill วันเดียวกัน + ยอดเดียวกัน (ผ่าน filter หรือไม่)
+            const sameAmtSameDate = billList.filter(b => {
+              const bd = toISODate(b.date);
+              return bd === sd && k2(billMatchAmount(b)) === k2(sa);
             });
             
-            if (unmatchedStmts.length > 0) {
-              msg += `\n\n━━ ตัวอย่าง Stmt ที่ match ไม่เจอ ━━`;
-              const samples = unmatchedStmts.slice(0, 3);
-              samples.forEach(stmt => {
-                const sd = toISODate(stmt.date || stmt.trans_date);
-                const sa = Number(stmt.amount || 0);
-                msg += `\n\n📌 ${fmtDate(sd)} · ${sa > 0 ? '+' : ''}${fmtNum(sa)} (${stmt.bank||'?'})`;
-                
-                // หาเหตุผลที่ไม่ match
-                // 1. หา bill วันเดียวกัน + ยอดเดียวกัน (ผ่าน filter หรือไม่)
-                const sameAmtSameDate = billList.filter(b => {
-                  const bd = toISODate(b.date);
-                  return bd === sd && k2(billMatchAmount(b)) === k2(sa);
-                });
-                
-                if (sameAmtSameDate.length > 0) {
+            if (sameAmtSameDate.length > 0) {
                   msg += `\n  เจอบิล ${sameAmtSameDate.length} รายการวันเดียวยอดเดียวกัน แต่:`;
                   sameAmtSameDate.slice(0, 2).forEach(b => {
                     const reasons = [];
@@ -15639,12 +15867,10 @@ async function renderMatching(el) {
           alert(msg);
           uploadedStatements = getAllStatements();
           render();
-        };
-      };
+        }
+      }
+      render();
     }
-  }
-  render();
-}
 
 // ── Data Management ─────────────────────────────────────────
 function renderData(el) {
