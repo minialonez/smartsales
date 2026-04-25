@@ -1425,33 +1425,35 @@ window.buildCompactMetaRows = function() {
   const user = (window.currentUser && window.currentUser.display_name) || 'Admin';
   const rows = [];
   
+  // ⭐ Helper: ตรวจว่า dateISO เป็นวันอาทิตย์หรือไม่ — ร้านปิด ไม่ควรมีข้อมูล
+  const isSunday = (dateISO) => {
+    try {
+      const dt = new Date(dateISO);
+      return !isNaN(dt) && dt.getUTCDay() === 0; // ใช้ UTC กัน timezone shift
+    } catch(_) { return false; }
+  };
+  
   if (mainSummary && mainSummary.__byDate) {
     Object.keys(mainSummary.__byDate).forEach(function(dateISO) {
       const dayLabels = mainSummary.__byDate[dateISO] || {};
       const flat = {};
-      Object.keys(dayLabels).forEach(function(label) {
-        const prefix = LABEL_TO_KEY[label] || label;
-        // ⭐ Sanitize: skip empty label (ข้อมูลเสีย)
-        if (!prefix || !String(prefix).trim()) return;
-        const stations = dayLabels[label] || {};
-        Object.keys(stations).forEach(function(station) {
-          // ⭐ Sanitize: skip empty station
-          if (!station || !String(station).trim()) return;
-          const v = Number(stations[station]);
-          // ⭐ Include 0 — ถ้า user ลบยอดเป็น 0 ต้อง push เพื่อทับ cloud
-          // (เดิม skip 0 → cloud ยังค้างค่าเก่า → pull กลับ = data corruption)
-          if (isNaN(v)) return;
-          flat[prefix + '_' + station] = v;
+      // ⭐ ถ้าเป็น Sunday → ส่ง row ว่าง → cloud ลบ data ของวันนี้
+      if (!isSunday(dateISO)) {
+        Object.keys(dayLabels).forEach(function(label) {
+          const prefix = LABEL_TO_KEY[label] || label;
+          if (!prefix || !String(prefix).trim()) return;
+          const stations = dayLabels[label] || {};
+          Object.keys(stations).forEach(function(station) {
+            if (!station || !String(station).trim()) return;
+            const v = Number(stations[station]);
+            if (isNaN(v)) return;
+            flat[prefix + '_' + station] = v;
+          });
         });
-      });
-      // ⭐ สร้าง row เสมอ ถึงแม้ flat ว่าง — ให้ backend update row เก่า (data_json = "{}")
-      //    (เดิม skip row ว่าง → cloud ค้าง row เดิม → user ลบไม่ sync)
-      // ⚠️ ใช้ ISO format (yyyy-mm-dd) แทน dd/mm/yyyy เพื่อกัน Google Sheets parse ผิด
-      //    Sheets parse "02/03/2026" เป็น mm/dd/yyyy (US format) → date เพี้ยน
-      //    ISO ไม่ ambiguous → preserve string เสมอ
+      }
       rows.push({
         meta_uuid: dateISO + '|summary',
-        date: dateISO,  // yyyy-mm-dd string (Sheets won't auto-convert)
+        date: dateISO,
         meta_type: 'summary',
         data_json: JSON.stringify(flat),
         updated_at: nowStr,
@@ -1464,18 +1466,18 @@ window.buildCompactMetaRows = function() {
     Object.keys(cashCount.__byDate).forEach(function(dateISO) {
       const dayCash = cashCount.__byDate[dateISO] || {};
       const filtered = {};
-      Object.keys(dayCash).forEach(function(k) {
-        // ⭐ Sanitize: skip empty key
-        if (!k || !String(k).trim()) return;
-        const v = Number(dayCash[k]);
-        if (isNaN(v)) return;
-        // Cash denomination: 0 = ไม่มีธนบัตรเลย → push ก็ OK (consistent)
-        filtered[k] = v;
-      });
-      // ⭐ สร้าง row เสมอ (เหมือน summary) — กัน cloud ค้างตอนลบ + ใช้ ISO ป้องกัน Sheets แปลง
+      // ⭐ Sunday → ส่งว่าง (ลบ cloud)
+      if (!isSunday(dateISO)) {
+        Object.keys(dayCash).forEach(function(k) {
+          if (!k || !String(k).trim()) return;
+          const v = Number(dayCash[k]);
+          if (isNaN(v)) return;
+          filtered[k] = v;
+        });
+      }
       rows.push({
         meta_uuid: dateISO + '|cash_count',
-        date: dateISO,  // yyyy-mm-dd
+        date: dateISO,
         meta_type: 'cash_count',
         data_json: JSON.stringify(filtered),
         updated_at: nowStr,
@@ -1521,6 +1523,12 @@ window.parseCompactMetaRows = function(rows) {
       }
     }
     if (!dateISO) { skippedJunk++; return; }
+    
+    // ⭐ Skip วันอาทิตย์ — ร้านปิด ไม่ควรมีข้อมูล (auto-cleanup)
+    try {
+      const dt = new Date(dateISO);
+      if (!isNaN(dt) && dt.getUTCDay() === 0) { skippedJunk++; return; }
+    } catch(_){}
     
     let data;
     try {
@@ -2412,6 +2420,47 @@ syncManager.init();
 window.syncManager = syncManager;
 
 function persistMainState() {
+  // ⭐ Normalize date formats เป็น ISO ทั้งหมด — กัน 2 formats ปนกัน
+  //    Bug ที่เคยเจอ: bills 617/9632 = dd/mm/yyyy, ที่เหลือ ISO → match/dedup/sort พัง
+  //                 stmts 7088/8096 = dd/mm/yyyy, ที่เหลือ ISO
+  //    Fix: ก่อน save → toISODate() ทุกตัว → consistent
+  try {
+    if (typeof toISODate === 'function') {
+      let normBills = 0, normStmts = 0;
+      billList.forEach(b => {
+        if (b.date) {
+          const iso = toISODate(b.date);
+          if (iso && iso !== b.date) { b.date = iso; normBills++; }
+        }
+        // pay_date, due_date ก็ normalize ด้วย
+        if (b.pay_date) {
+          const iso = toISODate(b.pay_date);
+          if (iso && iso !== b.pay_date) b.pay_date = iso;
+        }
+        if (b.due_date) {
+          const iso = toISODate(b.due_date);
+          if (iso && iso !== b.due_date) b.due_date = iso;
+        }
+      });
+      Object.values(statementsByBank || {}).forEach(arr => {
+        if (!Array.isArray(arr)) return;
+        arr.forEach(s => {
+          if (s.date) {
+            const iso = toISODate(s.date);
+            if (iso && iso !== s.date) { s.date = iso; normStmts++; }
+          }
+          if (s.trans_date) {
+            const iso = toISODate(s.trans_date);
+            if (iso && iso !== s.trans_date) s.trans_date = iso;
+          }
+        });
+      });
+      if (normBills > 0 || normStmts > 0) {
+        console.log(`[normalize] bills:${normBills} stmts:${normStmts} → ISO`);
+      }
+    }
+  } catch(e) { console.warn('[normalize] error:', e.message); }
+  
   // Bump version → invalidate ทุก cache ที่ check _stateVersion
   _stateVersion++;
   // Invalidate validation cache ทันที (sync) — เพื่อให้ validateAll() re-run ถูกต้อง
@@ -2883,6 +2932,43 @@ async function restoreMainState() {
         uploadedStatements = getAllStatements();
       }
     }
+    
+    // ⭐ One-shot date normalize: เปลี่ยนทุก date field เป็น ISO format (yyyy-mm-dd)
+    //    Bug: bills/stmts มี dd/mm/yyyy ปนกับ ISO → match/sort/dedup พัง
+    //    ตัวอย่าง: bills 617/9632 = dd/mm/yyyy, ที่เหลือ ISO
+    //    Fix: pass through toISODate() ครั้งเดียวตอน load → consistent
+    let normDateBills = 0, normDateStmts = 0;
+    if (typeof toISODate === 'function') {
+      billList.forEach(b => {
+        if (b.date) {
+          const iso = toISODate(b.date);
+          if (iso && iso !== b.date) { b.date = iso; normDateBills++; }
+        }
+        if (b.pay_date) {
+          const iso = toISODate(b.pay_date);
+          if (iso && iso !== b.pay_date) b.pay_date = iso;
+        }
+        if (b.due_date) {
+          const iso = toISODate(b.due_date);
+          if (iso && iso !== b.due_date) b.due_date = iso;
+        }
+      });
+      Object.values(statementsByBank || {}).forEach(arr => {
+        if (!Array.isArray(arr)) return;
+        arr.forEach(s => {
+          if (s.date) {
+            const iso = toISODate(s.date);
+            if (iso && iso !== s.date) { s.date = iso; normDateStmts++; }
+          }
+          if (s.trans_date) {
+            const iso = toISODate(s.trans_date);
+            if (iso && iso !== s.trans_date) s.trans_date = iso;
+          }
+        });
+      });
+    }
+    if (normDateBills > 0) console.log(`[restore] Normalized ${normDateBills} bill dates → ISO`);
+    if (normDateStmts > 0) console.log(`[restore] Normalized ${normDateStmts} stmt dates → ISO`);
     
     // ⭐ One-shot normalize: matched_bills ที่เคยเก็บเป็น string → convert เป็น array
     // กัน bug: `s.matched_bills.join is not a function` ตอน fingerprint compute
@@ -6641,6 +6727,16 @@ async function renderMain(el) {
     // Summary cells (cashIn/cashOut/returns/sales/drawer)
     el.querySelectorAll('.sum-cell').forEach(inp => {
       inp.addEventListener('input', debounce(() => {
+        // ⭐ ตรวจวันอาทิตย์ — ร้านปิด ไม่ควรกรอกข้อมูล
+        try {
+          const dt = new Date(selectedDate);
+          if (!isNaN(dt) && dt.getUTCDay() === 0) {
+            toast('⚠️ วันอาทิตย์ — ร้านปิด ไม่สามารถบันทึกข้อมูลได้', 'warn', 4000);
+            inp.value = '';
+            return;
+          }
+        } catch(_){}
+        
         const key = inp.dataset.k;
         const value = parseFloat(inp.value) || 0;
         mainSummary[key] = value;
@@ -6674,6 +6770,16 @@ async function renderMain(el) {
     // Cash counting cells — บันทึกลง cashCount ของวันที่เลือก
     el.querySelectorAll('.cash-cell').forEach(inp => {
       inp.addEventListener('input', debounce(() => {
+        // ⭐ ตรวจวันอาทิตย์
+        try {
+          const dt = new Date(selectedDate);
+          if (!isNaN(dt) && dt.getUTCDay() === 0) {
+            toast('⚠️ วันอาทิตย์ — ร้านปิด ไม่สามารถบันทึกข้อมูลได้', 'warn', 4000);
+            inp.value = '';
+            return;
+          }
+        } catch(_){}
+        
         const dayCash = getCashForDate(selectedDate);
         const k = inp.dataset.denom + '_' + inp.dataset.station;
         dayCash[k] = parseInt(inp.value) || 0;
@@ -16151,35 +16257,112 @@ function renderData(el) {
     });
     
     document.getElementById('btn-backup-json')?.addEventListener('click', () => {
+      // ── Helper: clean junk ก่อน export (ไม่ filter Sunday — user ทำงานวันอาทิตย์ได้) ──
+      // ขยะที่ filter ออก:
+      //   1. Summary: label "" หรือ station "" (data corruption gate)
+      //   2. CashCount: dict ว่างเปล่า {}
+      //   ⭐ Sunday เก็บไว้ตามที่ user input — ไม่กรอง
+      
+      const cleanMainSummary = { __byDate: {} };
+      Object.entries(mainSummary?.__byDate || {}).forEach(([d, dd]) => {
+        if (!dd || typeof dd !== 'object') return;
+        const cleaned = {};
+        Object.entries(dd).forEach(([label, stations]) => {
+          if (!label || !String(label).trim()) return;
+          if (!stations || typeof stations !== 'object') return;
+          const cleanStations = {};
+          Object.entries(stations).forEach(([st, v]) => {
+            if (!st || !String(st).trim()) return;
+            cleanStations[st] = Number(v) || 0;
+          });
+          if (Object.keys(cleanStations).length > 0) cleaned[label] = cleanStations;
+        });
+        if (Object.keys(cleaned).length > 0) cleanMainSummary.__byDate[d] = cleaned;
+      });
+      Object.keys(mainSummary || {}).forEach(k => {
+        if (k !== '__byDate') cleanMainSummary[k] = mainSummary[k];
+      });
+      
+      const cleanCashCount = { __byDate: {} };
+      Object.entries(cashCount?.__byDate || {}).forEach(([d, dd]) => {
+        if (!dd || typeof dd !== 'object') return;
+        const cleaned = {};
+        Object.entries(dd).forEach(([k, v]) => {
+          if (!k || !String(k).trim()) return;
+          const num = Number(v);
+          if (!isNaN(num)) cleaned[k] = num;
+        });
+        if (Object.keys(cleaned).length > 0) cleanCashCount.__byDate[d] = cleaned;
+      });
+      
+      // ⭐ Normalize date formats ใน bills + stmts ให้เป็น ISO ก่อน export
+      // กัน 2 format ปนกัน (dd/mm/yyyy + yyyy-mm-dd) ที่ทำให้ match/sort/dedup พัง
+      const cleanBills = billList.map(b => {
+        const out = { ...b };
+        if (out.date && typeof toISODate === 'function') {
+          const iso = toISODate(out.date);
+          if (iso) out.date = iso;
+        }
+        if (out.pay_date && typeof toISODate === 'function') {
+          const iso = toISODate(out.pay_date);
+          if (iso) out.pay_date = iso;
+        }
+        if (out.due_date && typeof toISODate === 'function') {
+          const iso = toISODate(out.due_date);
+          if (iso) out.due_date = iso;
+        }
+        return out;
+      });
+      const cleanStmtsByBank = {};
+      Object.entries(statementsByBank || {}).forEach(([bank, arr]) => {
+        if (!Array.isArray(arr)) return;
+        cleanStmtsByBank[bank] = arr.map(s => {
+          const out = { ...s };
+          if (out.date && typeof toISODate === 'function') {
+            const iso = toISODate(out.date);
+            if (iso) out.date = iso;
+          }
+          if (out.trans_date && typeof toISODate === 'function') {
+            const iso = toISODate(out.trans_date);
+            if (iso) out.trans_date = iso;
+          }
+          return out;
+        });
+      });
+      
+      const junkSummaryCount = Object.keys(mainSummary?.__byDate||{}).length - Object.keys(cleanMainSummary.__byDate).length;
+      const junkCashCount = Object.keys(cashCount?.__byDate||{}).length - Object.keys(cleanCashCount.__byDate).length;
+      
       const backup = {
         version: 'SmartFinance-v2',
         exported_at: new Date().toISOString(),
         exported_by: currentUser?.display_name || 'Admin',
-        // Core collections
-        billList: billList,
+        // Core collections (cleaned + ISO dates)
+        billList: cleanBills,
         paymentList: paymentList,
         spTempList: spTempList,
         cashflowList: cashflowList,
-        statementsByBank: statementsByBank,
-        mainSummary: mainSummary,
-        cashCount: cashCount,
-        // ⭐ Extended collections
+        statementsByBank: cleanStmtsByBank,
+        mainSummary: cleanMainSummary,
+        cashCount: cleanCashCount,
+        // Extended collections
         supplierList: supplierList || [],
         supplierPayments: supplierPayments || [],
         ppReport: ppReport || {},
         transferLog: transferLog || { vatTransfers: [], novatTransfers: [] },
         customerList: customerList || [],
-        // Metadata สำหรับ verify
+        // Metadata
         _counts: {
-          bills: billList.length,
-          stmts: getAllStatements().length,
+          bills: cleanBills.length,
+          stmts: Object.values(cleanStmtsByBank).reduce((s,a)=>s+(a?.length||0),0),
           payments: paymentList.length,
           spTemps: spTempList.length,
           cashflow: cashflowList.length,
           suppliers: (supplierList||[]).length,
           supplierPayments: (supplierPayments||[]).length,
-          metaSummary: Object.keys(mainSummary?.__byDate||{}).length,
-          metaCashCount: Object.keys(cashCount?.__byDate||{}).length,
+          metaSummary: Object.keys(cleanMainSummary.__byDate).length,
+          metaCashCount: Object.keys(cleanCashCount.__byDate).length,
+          _filtered: { summaryJunk: junkSummaryCount, cashCountEmpty: junkCashCount },
         },
       };
       const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
@@ -16189,7 +16372,10 @@ function renderData(el) {
       a.download = `SmartFinance_Backup_${todayISO()}_${Date.now()}.json`;
       a.click();
       URL.revokeObjectURL(url);
-      toast(`Backup สำเร็จ — ${backup._counts.bills} bills · ${backup._counts.stmts} stmts · ${backup._counts.metaSummary} meta dates`, 'success', 5000);
+      const filteredMsg = (junkSummaryCount + junkCashCount > 0) 
+        ? ` · กรองขยะ ${junkSummaryCount + junkCashCount} วัน` 
+        : '';
+      toast(`Backup สำเร็จ — ${backup._counts.bills} bills · ${backup._counts.stmts} stmts · ${backup._counts.metaSummary} meta dates${filteredMsg}`, 'success', 5000);
     });
     
     // ── Restore JSON ──
