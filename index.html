@@ -1444,17 +1444,19 @@ window.buildCompactMetaRows = function() {
           flat[prefix + '_' + station] = v;
         });
       });
-      if (Object.keys(flat).length > 0) {
-        const dateDisplay = typeof fmtDate === 'function' ? fmtDate(dateISO) : dateISO;
-        rows.push({
-          meta_uuid: dateISO + '|summary',
-          date: dateDisplay,
-          meta_type: 'summary',
-          data_json: JSON.stringify(flat),
-          updated_at: nowStr,
-          updated_by: user,
-        });
-      }
+      // ⭐ สร้าง row เสมอ ถึงแม้ flat ว่าง — ให้ backend update row เก่า (data_json = "{}")
+      //    (เดิม skip row ว่าง → cloud ค้าง row เดิม → user ลบไม่ sync)
+      // ⚠️ ใช้ ISO format (yyyy-mm-dd) แทน dd/mm/yyyy เพื่อกัน Google Sheets parse ผิด
+      //    Sheets parse "02/03/2026" เป็น mm/dd/yyyy (US format) → date เพี้ยน
+      //    ISO ไม่ ambiguous → preserve string เสมอ
+      rows.push({
+        meta_uuid: dateISO + '|summary',
+        date: dateISO,  // yyyy-mm-dd string (Sheets won't auto-convert)
+        meta_type: 'summary',
+        data_json: JSON.stringify(flat),
+        updated_at: nowStr,
+        updated_by: user,
+      });
     });
   }
   
@@ -1470,17 +1472,15 @@ window.buildCompactMetaRows = function() {
         // Cash denomination: 0 = ไม่มีธนบัตรเลย → push ก็ OK (consistent)
         filtered[k] = v;
       });
-      if (Object.keys(filtered).length > 0) {
-        const dateDisplay = typeof fmtDate === 'function' ? fmtDate(dateISO) : dateISO;
-        rows.push({
-          meta_uuid: dateISO + '|cash_count',
-          date: dateDisplay,
-          meta_type: 'cash_count',
-          data_json: JSON.stringify(filtered),
-          updated_at: nowStr,
-          updated_by: user,
-        });
-      }
+      // ⭐ สร้าง row เสมอ (เหมือน summary) — กัน cloud ค้างตอนลบ + ใช้ ISO ป้องกัน Sheets แปลง
+      rows.push({
+        meta_uuid: dateISO + '|cash_count',
+        date: dateISO,  // yyyy-mm-dd
+        meta_type: 'cash_count',
+        data_json: JSON.stringify(filtered),
+        updated_at: nowStr,
+        updated_by: user,
+      });
     });
   }
   return rows;
@@ -1500,15 +1500,27 @@ window.parseCompactMetaRows = function(rows) {
   rows.forEach(function(r) {
     if (!VALID_META_TYPES.includes(r.meta_type)) { skippedJunk++; return; }
     
-    let dateISO = r.date;
-    if (/^\d{1,2}\/\d{1,2}\/\d{4}/.test(String(r.date))) {
-      const parts = String(r.date).split('/');
-      let y = Number(parts[2]); if (y > 2400) y -= 543;
-      dateISO = y + '-' + String(parts[1]).padStart(2,'0') + '-' + String(parts[0]).padStart(2,'0');
+    // ⭐ CRITICAL: ใช้ meta_uuid เป็น source of truth ของวันที่
+    //    Format: "2026-03-02|summary" → dateISO = "2026-03-02"
+    //    เหตุผล: Google Sheets อาจ auto-parse "02/03/2026" เป็น Date (mm/dd/yyyy = US format)
+    //            แล้ว return เป็น "2026-02-03" → date column สลับวันกับเดือนสำหรับวัน ≤ 12
+    //    Bug: 02/03/2026 (2 มี.ค.) ใน Sheets → กลายเป็น 3 ก.พ. → ทำให้ฟิลด์ date เพี้ยน
+    let dateISO = '';
+    const uuidStr = String(r.meta_uuid || '');
+    const uuidMatch = uuidStr.match(/^(\d{4}-\d{2}-\d{2})\|/);
+    if (uuidMatch) {
+      dateISO = uuidMatch[1];
+    } else {
+      // Fallback: ถ้าไม่มี uuid (legacy row) → ใช้ date column
+      if (/^\d{1,2}\/\d{1,2}\/\d{4}/.test(String(r.date))) {
+        const parts = String(r.date).split('/');
+        let y = Number(parts[2]); if (y > 2400) y -= 543;
+        dateISO = y + '-' + String(parts[1]).padStart(2,'0') + '-' + String(parts[0]).padStart(2,'0');
+      } else if (/^\d{4}-\d{2}-\d{2}/.test(String(r.date))) {
+        dateISO = String(r.date).substring(0, 10);
+      }
     }
-    if (/^\d{4}-\d{2}-\d{2}/.test(String(dateISO))) {
-      dateISO = String(dateISO).substring(0, 10);
-    }
+    if (!dateISO) { skippedJunk++; return; }
     
     let data;
     try {
