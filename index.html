@@ -7177,8 +7177,11 @@ function openSpTempPartialEditModal(no, idx, onChange) {
   if (!t || !t.partials || !t.partials[idx]) { toast('ไม่พบ partial', 'warn'); return; }
   const pr = t.partials[idx];
   
+  const isMatched = !!pr.stmt_ref;
+  const matchedStmt = isMatched ? getAllStatements().find(s => s.ref_no === pr.stmt_ref) : null;
+  
   openModal(`✎ แก้ไข Partial #${idx + 1} ของ ${no}`, `
-    <div class="flex-col gap-3" style="min-width:400px">
+    <div class="flex-col gap-3" style="min-width:460px;max-width:560px">
       <div class="flex gap-2">
         <div class="input-group flex-1">
           <label>จำนวน</label>
@@ -7203,9 +7206,39 @@ function openSpTempPartialEditModal(no, idx, onChange) {
           <input class="input" id="epr-bank" value="${pr.bank||''}" placeholder="KTB / BBL / ...">
         </div>
       </div>
+      
+      <!-- ⭐ Match section -->
+      <div style="padding:10px;background:var(--bg2);border-radius:6px;border-left:3px solid ${isMatched ? 'var(--success)' : 'var(--warn)'}">
+        <div class="flex justify-between items-center" style="margin-bottom:6px">
+          <div style="font-weight:600;font-size:.85rem;color:${isMatched ? 'var(--success)' : 'var(--text)'}">
+            🔗 ${isMatched ? 'ผูกกับ Statement แล้ว' : 'ผูกกับ Statement'}
+          </div>
+          ${isMatched ? `
+            <button class="btn btn-ghost btn-xs" id="epr-unmatch" style="color:var(--danger);font-size:.7rem">✕ ยกเลิก match</button>
+          ` : `
+            <button class="btn btn-primary btn-xs" id="epr-match" style="font-size:.72rem">🔍 หา Statement</button>
+          `}
+        </div>
+        ${isMatched && matchedStmt ? `
+          <div class="text-xs" style="color:var(--text)">
+            <div>📅 ${fmtDate(matchedStmt.date)} ${matchedStmt.time||''} · ${matchedStmt.bank}</div>
+            <div style="font-family:monospace">Ref: ${matchedStmt.ref_no}</div>
+            <div>ยอด: <b style="color:var(--success)">฿${fmtNum(Math.abs(Number(matchedStmt.amount)||0))}</b>
+              ${Math.abs(Math.abs(Number(matchedStmt.amount)||0) - Number(pr.amount||0)) > 0.01 
+                ? `<span style="color:var(--warn)">(ต่าง ฿${fmtNum(Math.abs(Number(matchedStmt.amount)||0) - Number(pr.amount||0))})</span>` 
+                : '<span style="color:var(--success)">(ตรง)</span>'}
+            </div>
+          </div>
+        ` : isMatched ? `
+          <div class="text-xs text-muted">Ref: ${pr.stmt_ref} <span style="color:var(--warn)">(ไม่พบ stmt นี้แล้ว)</span></div>
+        ` : `
+          <div class="text-xs text-muted">ยังไม่ผูก — กดปุ่มเพื่อหา statement ที่ตรงยอดและวันที่</div>
+        `}
+      </div>
+      
       <div class="input-group">
-        <label>Stmt ref</label>
-        <input class="input" id="epr-stmt-ref" value="${pr.stmt_ref||''}" placeholder="เลข ref จาก statement">
+        <label>Stmt ref (หากกรอกเอง)</label>
+        <input class="input" id="epr-stmt-ref" value="${pr.stmt_ref||''}" placeholder="เลข ref จาก statement" ${isMatched ? 'readonly style="background:var(--bg2)"' : ''}>
       </div>
       <div class="input-group">
         <label>หมายเหตุ</label>
@@ -7220,6 +7253,34 @@ function openSpTempPartialEditModal(no, idx, onChange) {
     </div>
   `);
   
+  // Match button → open stmt picker
+  document.getElementById('epr-match')?.addEventListener('click', () => {
+    openSpTempPartialMatchModal(no, idx, onChange);
+  });
+  
+  // Unmatch button
+  document.getElementById('epr-unmatch')?.addEventListener('click', () => {
+    if (!confirm('ยกเลิก match กับ statement?')) return;
+    // Cleanup stmt side
+    if (pr.stmt_ref) {
+      const stmt = getAllStatements().find(s => s.ref_no === pr.stmt_ref);
+      if (stmt && stmt.match_station === 'SP-TEMP' && stmt.match_bill === `${no}#${idx + 1}`) {
+        stmt.match_status = 'unmatched';
+        delete stmt.match_station;
+        delete stmt.match_bill;
+        delete stmt.matched_bills;
+        delete stmt.match_method;
+        syncManager.markDirty('stmts');
+      }
+    }
+    pr.stmt_ref = '';
+    t.updated_at = new Date().toISOString();
+    markDirtySpTemps();
+    closeModal();
+    toast('ยกเลิก match แล้ว', 'success');
+    if (onChange) onChange();
+  });
+  
   document.getElementById('epr-save')?.addEventListener('click', () => {
     const amt = Number(document.getElementById('epr-amount').value) || 0;
     if (amt <= 0) { toast('กรอกจำนวน', 'error'); return; }
@@ -7228,7 +7289,8 @@ function openSpTempPartialEditModal(no, idx, onChange) {
     pr.date = document.getElementById('epr-date').value;
     pr.method = document.getElementById('epr-method').value;
     pr.bank = document.getElementById('epr-bank').value.trim();
-    pr.stmt_ref = document.getElementById('epr-stmt-ref').value.trim();
+    // ถ้ายังไม่ matched — อนุญาตแก้ stmt_ref เอง
+    if (!isMatched) pr.stmt_ref = document.getElementById('epr-stmt-ref').value.trim();
     pr.notes = document.getElementById('epr-notes').value;
     
     t.updated_at = new Date().toISOString();
@@ -7241,6 +7303,18 @@ function openSpTempPartialEditModal(no, idx, onChange) {
   
   document.getElementById('epr-delete')?.addEventListener('click', () => {
     if (!confirm(`ลบ partial #${idx + 1}?`)) return;
+    // Cleanup stmt side
+    if (pr.stmt_ref) {
+      const stmt = getAllStatements().find(s => s.ref_no === pr.stmt_ref);
+      if (stmt && stmt.match_station === 'SP-TEMP' && stmt.match_bill === `${no}#${idx + 1}`) {
+        stmt.match_status = 'unmatched';
+        delete stmt.match_station;
+        delete stmt.match_bill;
+        delete stmt.matched_bills;
+        delete stmt.match_method;
+        syncManager.markDirty('stmts');
+      }
+    }
     t.partials.splice(idx, 1);
     t.updated_at = new Date().toISOString();
     recomputeSpTempStatus(t);
@@ -7249,6 +7323,154 @@ function openSpTempPartialEditModal(no, idx, onChange) {
     toast(`ลบแล้ว`, 'success');
     if (onChange) onChange();
   });
+}
+
+// ⭐ Modal: Match partial with statement (picker)
+function openSpTempPartialMatchModal(no, idx, onChange) {
+  const t = spTempList.find(x => x.no === no);
+  if (!t || !t.partials || !t.partials[idx]) return;
+  const pr = t.partials[idx];
+  
+  const prAmt = Math.abs(Number(pr.amount)||0);
+  const prDateISO = toISODate(pr.date);
+  const prBank = (pr.bank||'').toUpperCase();
+  
+  // Filter candidates: unmatched stmts, amount close, date ±3 days
+  const allStmts = getAllStatements();
+  const candidates = allStmts.filter(s => {
+    if (s.match_status === 'matched') return false;
+    const sAmt = Math.abs(Number(s.amount)||0);
+    // Amount must match (±0.01)
+    if (Math.abs(sAmt - prAmt) > 0.01) return false;
+    // Direction: partial = income → stmt should be +
+    if (Number(s.amount) < 0) return false;
+    // Date ±3 days
+    if (prDateISO) {
+      const sDateISO = toISODate(s.date);
+      if (sDateISO) {
+        const diff = Math.abs((new Date(prDateISO) - new Date(sDateISO)) / 86400000);
+        if (diff > 3) return false;
+      }
+    }
+    return true;
+  });
+  
+  // Score + sort: bank match first, then date closest
+  candidates.forEach(s => {
+    let score = 0;
+    if (prBank && String(s.bank||'').toUpperCase().includes(prBank)) score += 100;
+    if (prBank && String(s.bank||'').toUpperCase() === prBank) score += 200;
+    const sDateISO = toISODate(s.date);
+    if (sDateISO === prDateISO) score += 50;
+    s._matchScore = score;
+  });
+  candidates.sort((a, b) => (b._matchScore||0) - (a._matchScore||0));
+  
+  // Also allow showing ALL unmatched (fallback) — toggle
+  let showAll = false;
+  
+  function renderList() {
+    const list = showAll 
+      ? allStmts.filter(s => s.match_status !== 'matched' && Number(s.amount) > 0)
+                .sort((a,b) => Math.abs(Math.abs(Number(a.amount)||0) - prAmt) - Math.abs(Math.abs(Number(b.amount)||0) - prAmt))
+                .slice(0, 50)
+      : candidates;
+    
+    const listHtml = list.length === 0 ? `
+      <div style="padding:20px;text-align:center;color:var(--text2)">
+        ไม่เจอ statement ที่ตรงยอด ${fmtNum(prAmt)} ± 3 วัน<br>
+        <button class="btn btn-outline btn-xs mt-2" id="epr-show-all">ดู statement ทั้งหมดที่ยังไม่ match</button>
+      </div>
+    ` : list.map(s => {
+      const sAmt = Math.abs(Number(s.amount)||0);
+      const diff = sAmt - prAmt;
+      const diffClass = Math.abs(diff) < 0.01 ? 'success' : 'warn';
+      return `
+        <div class="epr-stmt-row" data-ref="${s.ref_no||''}" style="padding:10px;border-bottom:1px solid var(--border);cursor:pointer;display:flex;gap:10px;align-items:center;transition:background .12s" onmouseenter="this.style.background='var(--bg2)'" onmouseleave="this.style.background=''">
+          <div style="flex:1;font-size:.82rem">
+            <div class="flex gap-2 items-center" style="flex-wrap:wrap">
+              <span class="badge badge-info" style="font-size:.65rem">${s.bank||'-'}</span>
+              <span style="color:var(--text)">${fmtDate(s.date)} ${s.time||''}</span>
+              ${toISODate(s.date) === prDateISO ? '<span class="badge badge-success" style="font-size:.6rem">วันเดียวกัน</span>' : ''}
+            </div>
+            <div class="text-xs" style="font-family:monospace;margin-top:2px;color:var(--text2)">${(s.ref_no||'').substring(0,50)}</div>
+            ${s.description ? `<div class="text-xs text-muted">${String(s.description).substring(0,60)}</div>` : ''}
+          </div>
+          <div style="text-align:right;white-space:nowrap">
+            <div style="font-weight:700;color:var(--success);font-size:.9rem">฿${fmtNum(sAmt)}</div>
+            ${Math.abs(diff) > 0.01 ? `<div class="text-xs" style="color:var(--${diffClass})">${diff > 0 ? '+' : ''}${fmtNum(diff)}</div>` : '<div class="text-xs" style="color:var(--success)">ตรง</div>'}
+          </div>
+        </div>
+      `;
+    }).join('');
+    
+    const container = document.getElementById('epr-stmt-list');
+    if (container) container.innerHTML = listHtml;
+    
+    // Wire rows
+    document.querySelectorAll('.epr-stmt-row').forEach(row => {
+      row.addEventListener('click', () => {
+        const ref = row.dataset.ref;
+        const stmt = allStmts.find(s => s.ref_no === ref);
+        if (!stmt) return;
+        // Apply match
+        pr.stmt_ref = stmt.ref_no;
+        // Auto-fill bank ถ้า partial ยังว่าง
+        if (!pr.bank && stmt.bank) pr.bank = stmt.bank;
+        // Update stmt side
+        stmt.match_status = 'matched';
+        stmt.match_station = 'SP-TEMP';
+        stmt.match_bill = `${no}#${idx + 1}`;
+        stmt.matched_bills = [`${no}#${idx + 1}`];
+        stmt.match_method = 'manual_sp_temp';
+        stmt.matched_at = new Date().toISOString();
+        
+        t.updated_at = new Date().toISOString();
+        recomputeSpTempStatus(t);
+        markDirtySpTemps();
+        syncManager.markDirty('stmts');
+        closeModal();
+        toast(`✓ ผูก ${no}#${idx + 1} กับ ${stmt.bank} ${fmtDate(stmt.date)}`, 'success');
+        if (onChange) onChange();
+      });
+    });
+    
+    document.getElementById('epr-show-all')?.addEventListener('click', () => {
+      showAll = true;
+      renderList();
+    });
+  }
+  
+  openModal(`🔍 หา Statement สำหรับ Partial #${idx + 1}`, `
+    <div style="min-width:560px;max-width:700px">
+      <div style="padding:10px;background:var(--bg2);border-radius:6px;font-size:.83rem;margin-bottom:10px">
+        <div class="flex justify-between">
+          <div><b>${no}</b> · ${t.cust_name || '-'}</div>
+          <div><b style="color:var(--success)">฿${fmtNum(prAmt)}</b> · ${fmtDate(pr.date)} · ${pr.bank||'ไม่ระบุ bank'}</div>
+        </div>
+      </div>
+      <div class="flex justify-between items-center mb-2">
+        <div class="text-xs text-dim">
+          Statements ที่ยอดตรง ${fmtNum(prAmt)} ± 3 วัน
+        </div>
+        <button class="btn btn-ghost btn-xs" id="epr-show-all-top" style="font-size:.7rem">ดูทั้งหมดที่ยอดตรง</button>
+      </div>
+      <div id="epr-stmt-list" style="max-height:400px;overflow-y:auto;border:1px solid var(--border);border-radius:6px">
+        <div style="padding:20px;text-align:center;color:var(--text2)">กำลังโหลด...</div>
+      </div>
+      <div class="flex gap-2 mt-3">
+        <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ยกเลิก</button>
+      </div>
+    </div>
+  `);
+  
+  document.getElementById('epr-show-all-top')?.addEventListener('click', () => {
+    showAll = !showAll;
+    document.getElementById('epr-show-all-top').textContent = showAll ? '← ดูเฉพาะที่ใกล้เคียง' : 'ดูทั้งหมดที่ยอดตรง';
+    renderList();
+  });
+  
+  setTimeout(renderList, 50);
 }
 
 // Modal: Create new SP-TEMP
@@ -7727,18 +7949,22 @@ function renderSpSectionsForDate(opts) {
                       <th style="text-align:right;padding:3px">จำนวน</th>
                       <th style="text-align:left;padding:3px">วิธี</th>
                       <th style="text-align:left;padding:3px">ธนาคาร</th>
+                      <th style="text-align:center;padding:3px">Match</th>
                       <th style="width:30px"></th>
                     </tr></thead>
-                    <tbody>${(t.partials || []).map((pr, i) => `
-                      <tr class="main-sp-partial-row" data-no="${t.no}" data-idx="${i}" style="cursor:pointer" title="คลิกเพื่อแก้ไข">
+                    <tbody>${(t.partials || []).map((pr, i) => {
+                      const matched = !!pr.stmt_ref;
+                      return `
+                      <tr class="main-sp-partial-row" data-no="${t.no}" data-idx="${i}" style="cursor:pointer" title="คลิกเพื่อแก้ไข/match">
                         <td style="padding:3px;color:var(--text3)">${i + 1}</td>
                         <td style="padding:3px">${fmtDate(pr.date)}</td>
                         <td style="padding:3px;text-align:right;font-weight:600;color:var(--success)">฿${fmtNum(pr.amount)}</td>
                         <td style="padding:3px">${pr.method || '-'}</td>
                         <td style="padding:3px">${pr.bank || '-'}</td>
+                        <td style="padding:3px;text-align:center">${matched ? '<span class="badge badge-success" style="font-size:.6rem">🔗 matched</span>' : '<span class="text-muted" style="font-size:.7rem">-</span>'}</td>
                         <td style="padding:3px;text-align:right"><button class="main-sp-del-partial" data-no="${t.no}" data-idx="${i}" style="background:none;border:none;color:var(--danger);cursor:pointer">✕</button></td>
                       </tr>
-                    `).join('')}</tbody>
+                    `}).join('')}</tbody>
                   </table>
                 </div>
               ` : ''}
