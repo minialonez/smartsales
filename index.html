@@ -5734,6 +5734,24 @@ async function renderMain(el) {
       // Unmatch statements
       let stmtCount = 0;
       stmtsToUnmatch.forEach(s => {
+        // ⚡ ถ้า stmt ผูกกับ SP-TEMP partial → clear stmt_ref ใน spTempList ด้วย
+        const stmtRef = s.ref_no;
+        if (stmtRef) {
+          spTempList.forEach(t => {
+            let touched = false;
+            (t.partials || []).forEach(pr => {
+              if (pr.stmt_ref === stmtRef) {
+                delete pr.stmt_ref;
+                touched = true;
+              }
+            });
+            if (touched) {
+              t.updated_at = new Date().toISOString();
+              recomputeSpTempStatus(t);
+              markDirtySpTemps();
+            }
+          });
+        }
         s.match_status = 'unmatched';
         delete s.match_station;
         delete s.match_bill;
@@ -14902,6 +14920,25 @@ async function renderMatching(el) {
             };
           });
         
+        // ── SP-TEMP partials as candidates (income only — ลูกค้าจ่ายเข้า) ──
+        // แสดง partial ที่ยังไม่ผูก stmt (stmt_ref ว่าง) เท่านั้น
+        const spTempCandidates = [];
+        (spTempList || []).forEach(t => {
+          if (t.status === 'graduated' || t.status === 'cancelled') return;
+          (t.partials || []).forEach((pr, idx) => {
+            if (pr.stmt_ref) return; // ผูกแล้ว — ข้าม
+            spTempCandidates.push({
+              bill_no: `${t.no}#${idx + 1}`,
+              amount: Math.abs(Number(pr.amount) || 0), // income (+)
+              date: pr.date,
+              station: '⚡ SP-TEMP',
+              type: `จ่ายลด ${t.customer || '-'}`,
+              remarks1: `${pr.bank || ''} · งวด ${idx + 1}/${t.partials.length}`,
+              _spTempPartial: { temp: t, partial: pr, partialIdx: idx },
+            });
+          });
+        });
+        
         // ยอดตรง ±5% หรือ ±1 บาท (ใช้ absolute รองรับเงินเข้า/ออก)
         const absStmt = Math.abs(stmtAmt);
         
@@ -14968,6 +15005,12 @@ async function renderMatching(el) {
           ...spCandidates.filter(sp => {
             if (stmtAmt > 0) return false;
             const amtDiff = Math.abs(Math.abs(Number(sp.amount)) - absStmt);
+            return amtDiff < 1 || amtDiff < absStmt * 0.05;
+          }),
+          // SP-TEMP partials → always income (in) — ลูกค้าจ่ายลด
+          ...spTempCandidates.filter(c => {
+            if (stmtAmt < 0) return false;
+            const amtDiff = Math.abs(Math.abs(Number(c.amount)) - absStmt);
             return amtDiff < 1 || amtDiff < absStmt * 0.05;
           }),
         ];
@@ -15116,7 +15159,12 @@ async function renderMatching(el) {
               String(Math.abs(sp.amount)).includes(s) ||
               (sp._supplierPayment?.cheque_no||'').toLowerCase().includes(s) ||
               (sp._supplierPayment?.pp_no||'').toLowerCase().includes(s));
-            list = [...fromBills, ...fromCashflow, ...fromSp];
+            const fromSpTemp = spTempCandidates.filter(c =>
+              (c.bill_no||'').toLowerCase().includes(s) ||
+              (c.remarks1||'').toLowerCase().includes(s) ||
+              (c.type||'').toLowerCase().includes(s) ||
+              String(Math.abs(c.amount)).includes(s));
+            list = [...fromBills, ...fromCashflow, ...fromSp, ...fromSpTemp];
           } else {
             list = candidates.slice(0, 30);
           }
@@ -15138,7 +15186,9 @@ async function renderMatching(el) {
                 : `<span class="badge" style="background:rgba(138,92,246,.15);color:#8a5cf6;font-size:.65rem">🏭 SP</span>`)
               : b._cashflow 
                 ? `<span class="badge" style="background:var(--info-bg);color:var(--info);font-size:.65rem">💰 CF</span>`
-                : `<span class="badge badge-muted" style="font-size:.65rem">📄 Bill</span>`;
+                : b._spTempPartial
+                  ? `<span class="badge" style="background:rgba(244,180,26,.15);color:var(--warn);font-size:.65rem">⚡ SP-TEMP</span>`
+                  : `<span class="badge badge-muted" style="font-size:.65rem">📄 Bill</span>`;
             return `
               <div class="mm-item" data-di="${i}" style="padding:10px;border-bottom:1px solid var(--border);cursor:pointer;display:flex;align-items:center;gap:10px">
                 <input type="checkbox" class="mm-chk" data-di="${i}" style="width:18px;height:18px;cursor:pointer;accent-color:var(--info)">
@@ -15247,6 +15297,13 @@ async function renderMatching(el) {
               } else if (match._cashflow) {
                 match._cashflow.match_status = 'matched';
                 match._cashflow.match_stmt_ref = stmt.ref_no || '';
+              } else if (match._spTempPartial) {
+                const { temp: t, partial: pr } = match._spTempPartial;
+                pr.stmt_ref = stmt.ref_no || '';
+                if (!pr.bank && stmt.bank) pr.bank = stmt.bank;
+                t.updated_at = new Date().toISOString();
+                recomputeSpTempStatus(t);
+                markDirtySpTemps();
               } else {
                 match.match_status = 'matched';
                 match.confirmation = stmt.bank || '';
@@ -15351,6 +15408,20 @@ async function renderMatching(el) {
               : []);
         
         billNumbersToUnmatch.forEach(bn => {
+          // ⚡ SP-TEMP partial pattern: SP-TEMP-XXXX#N → clear partial.stmt_ref
+          const spTempMatch = String(bn).match(/^(SP-TEMP-\d+)#(\d+)$/);
+          if (spTempMatch) {
+            const [, no, idxStr] = spTempMatch;
+            const t = spTempList.find(x => x.no === no);
+            const pr = t?.partials?.[Number(idxStr) - 1];
+            if (t && pr) {
+              delete pr.stmt_ref;
+              t.updated_at = new Date().toISOString();
+              recomputeSpTempStatus(t);
+              markDirtySpTemps();
+            }
+            return;
+          }
           const bill = billList.find(b => b.bill_no === bn);
           if (bill && !bill.paid_by_sp) {
             bill.match_status = 'pending';
