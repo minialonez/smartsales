@@ -1821,6 +1821,7 @@ const syncManager = {
           // ⭐ Pass deleted uuids ด้วย — backend จะลบ row ที่ uuid ตรงกัน
           const delUuids = [...this.deletedBillUuids];
           let deleteSent = false;
+          let totalDeleted = 0; // ⭐ ติดตามจำนวนที่ backend ลบจริง
           for (const yr of Object.keys(billsByYr)) {
             // Chunk 500 ต่อ request
             const chunks = billsByYr[yr];
@@ -1833,19 +1834,40 @@ const syncManager = {
                 deletes: isFirstChunk ? delUuids : [],
               });
               if (r?.success === false) throw new Error(r.error || 'upsertBills API error');
-              if (isFirstChunk) deleteSent = true;
+              if (isFirstChunk) {
+                deleteSent = true;
+                // ⭐ track จำนวนที่ลบจริง (จาก backend response)
+                totalDeleted = Number(r?.data?.deleted) || 0;
+              }
             }
           }
           // ถ้าไม่มี bill เหลือ (ลบหมดทั้ง year) → push delete-only ไปเลย
           if (Object.keys(billsByYr).length === 0 && delUuids.length > 0) {
             const curYr = String(new Date().getFullYear());
-            await api('upsertBills', { year: curYr, records: [], deletes: delUuids });
+            const r = await api('upsertBills', { year: curYr, records: [], deletes: delUuids });
+            totalDeleted = Number(r?.data?.deleted) || 0;
           }
-          // Clear tracked deletes เฉพาะเมื่อ push สำเร็จ
+          // ⭐ Clear tracked deletes เฉพาะถ้าลบสำเร็จครบ
+          //    ถ้า partial (e.g., uuid ไม่อยู่ใน cloud sheet) → keep tracked → retry next push
+          //    ป้องกัน "ลบแล้วกลับมา" จาก partial delete failure
           if (delUuids.length > 0) {
-            this.deletedBillUuids.clear();
-            try { localStorage.removeItem('sf_deleted_bill_uuids'); } catch(_){}
-            console.log(`[sync] Deleted ${delUuids.length} bills from cloud`);
+            if (totalDeleted >= delUuids.length) {
+              // ลบครบ → clear tracked
+              this.deletedBillUuids.clear();
+              try { localStorage.removeItem('sf_deleted_bill_uuids'); } catch(_){}
+              console.log(`[sync] Deleted ${totalDeleted}/${delUuids.length} bills from cloud ✓`);
+            } else {
+              // ⚠️ ลบไม่ครบ — keep uuids ที่ยัง track ไว้ → retry next push
+              // (อาจเกิดจาก uuid mismatch ระหว่าง local กับ cloud, race condition, partial backend fail)
+              console.warn(`[sync] Bills delete partial: ${totalDeleted}/${delUuids.length} → keep tracked uuids for retry`);
+              // schedule push อีก 10s ลอง delete ที่ค้าง
+              setTimeout(() => {
+                if (this.deletedBillUuids.size > 0) {
+                  this.dirty.add('bills');
+                  this._schedulePush();
+                }
+              }, 10000);
+            }
           }
           this._fpCache.bills = fp;
         } else if (type === 'stmts') {
@@ -1893,6 +1915,7 @@ const syncManager = {
           // ⭐ Pass deleted stmt uuids
           const delStmtUuids = [...this.deletedStmtUuids];
           let stmtDeleteSent = false;
+          let totalDeletedStmts = 0;
           for (const yr of Object.keys(stmtsByYr)) {
             const chunks = stmtsByYr[yr];
             for (let i = 0; i < chunks.length; i += 500) {
@@ -1903,17 +1926,32 @@ const syncManager = {
                 deletes: isFirstChunk ? delStmtUuids : [],
               });
               if (r?.success === false) throw new Error(r.error || 'upsertStatements API error');
-              if (isFirstChunk) stmtDeleteSent = true;
+              if (isFirstChunk) {
+                stmtDeleteSent = true;
+                totalDeletedStmts = Number(r?.data?.deleted) || 0;
+              }
             }
           }
           if (Object.keys(stmtsByYr).length === 0 && delStmtUuids.length > 0) {
             const curYr = String(new Date().getFullYear());
-            await api('upsertStatements', { year: curYr, records: [], deletes: delStmtUuids });
+            const r = await api('upsertStatements', { year: curYr, records: [], deletes: delStmtUuids });
+            totalDeletedStmts = Number(r?.data?.deleted) || 0;
           }
+          // ⭐ Verify before clear (เหมือน bills)
           if (delStmtUuids.length > 0) {
-            this.deletedStmtUuids.clear();
-            try { localStorage.removeItem('sf_deleted_stmt_uuids'); } catch(_){}
-            console.log(`[sync] Deleted ${delStmtUuids.length} stmts from cloud`);
+            if (totalDeletedStmts >= delStmtUuids.length) {
+              this.deletedStmtUuids.clear();
+              try { localStorage.removeItem('sf_deleted_stmt_uuids'); } catch(_){}
+              console.log(`[sync] Deleted ${totalDeletedStmts}/${delStmtUuids.length} stmts from cloud ✓`);
+            } else {
+              console.warn(`[sync] Stmts delete partial: ${totalDeletedStmts}/${delStmtUuids.length} → keep tracked uuids for retry`);
+              setTimeout(() => {
+                if (this.deletedStmtUuids.size > 0) {
+                  this.dirty.add('stmts');
+                  this._schedulePush();
+                }
+              }, 10000);
+            }
           }
           this._fpCache.stmts = fp;
         } else if (type === 'payments') {
