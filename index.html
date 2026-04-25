@@ -1351,7 +1351,12 @@ function getAllStatements() {
   Object.keys(statementsByBank).forEach(bank => {
     all.push(...statementsByBank[bank]);
   });
-  all.sort((a, b) => (parseThaiDate(a.date) || 0) - (parseThaiDate(b.date) || 0));
+  // ⭐ ใช้ toISODate (handle ISO + dd/mm/yyyy + Date obj) แทน parseThaiDate
+  all.sort((a, b) => {
+    const da = toISODate(a.date) || '';
+    const db = toISODate(b.date) || '';
+    return da.localeCompare(db);
+  });
   return all;
 }
 
@@ -6580,6 +6585,12 @@ async function renderMain(el) {
           if (b.type === 'Cash' && b.match_status === 'pending') {
             b.match_status = 'matched';
             if (!b.pay_date) b.pay_date = b.date;
+          }
+          
+          // ⭐ Auto-set paid: ถ้ากรอก pay_date + status ยังไม่ใช่ paid/matched → set เป็น paid
+          // (user confirmed: กรอก pay_date = ถือว่าจ่ายแล้ว)
+          if (b.pay_date && b.match_status !== 'paid' && b.match_status !== 'matched' && b.match_status !== 'void' && b.match_status !== 'bounced') {
+            b.match_status = 'paid';
           }
           
           persistMainState();
@@ -12202,6 +12213,175 @@ async function renderDashboard(el) {
 
 // ⭐ Open modal showing pending bills (cheque or transfer/card) with action buttons
 // kind = 'cheque' | 'transfer'
+// ⭐ Phase A: Auto-link bills (SR/SC/OR/JR) to customers by exact name match
+// Scans billList, matches remarks1 → customers.cust_name (exact), sets cust_id
+// Updates remarks1 format to "(cust_id) cust_name"
+// Returns: { matched, skipped, notFound: [remarks_strings] }
+window.autoLinkBillsToCustomers = async function(opts = {}) {
+  const { dryRun = false } = opts;
+  
+  // Ensure customerList loaded
+  if (!Array.isArray(customerList) || customerList.length === 0) {
+    try {
+      const res = await api('getCustomers', {});
+      if (res?.success && Array.isArray(res.data)) customerList = res.data;
+    } catch(e) {
+      return { error: 'โหลดรายชื่อลูกค้าไม่ได้: ' + e.message };
+    }
+  }
+  if (!customerList.length) return { error: 'ไม่มีข้อมูลลูกค้า' };
+  
+  // Build name → customer lookup (keep first occurrence; dedup by cust_id ก่อนแล้วค่อย map)
+  // คำนวณชื่อ normalize (trim + ลบช่องว่างซ้ำ) เพื่อลด false-miss
+  const normalize = (s) => String(s||'').replace(/\s+/g, ' ').trim();
+  const nameToCust = {};
+  customerList.forEach(c => {
+    const k = normalize(c.cust_name);
+    if (k && !nameToCust[k]) nameToCust[k] = c;
+  });
+  
+  // Target prefixes (user explicit): SR, SC, OR, JR — ไม่รวม SP, SS, OS, JS
+  const TARGET_PREFIXES = ['SR','SC','OR','JR'];
+  
+  let matched = 0, alreadyLinked = 0, noRemarks = 0;
+  const notFoundMap = {};  // normalized remarks → count
+  const updatedBills = []; // เก็บ reference เพื่อ markDirty
+  
+  billList.forEach(b => {
+    const prefix = String(b.bill_no || '').substring(0, 2).toUpperCase();
+    if (!TARGET_PREFIXES.includes(prefix)) return;
+    
+    // Skip ถ้า linked อยู่แล้ว
+    if (b.cust_id) { alreadyLinked++; return; }
+    
+    const remarks = normalize(b.remarks1);
+    if (!remarks) { noRemarks++; return; }
+    
+    // Extract name ถ้า remarks1 มี format "(CODE) ชื่อ" อยู่แล้ว
+    let nameToLookup = remarks;
+    const m = remarks.match(/^\(([^)]+)\)\s*(.+)$/);
+    if (m) nameToLookup = normalize(m[2]);
+    
+    const cust = nameToCust[nameToLookup];
+    if (cust) {
+      if (!dryRun) {
+        b.cust_id = cust.cust_id;
+        b.customer = cust.cust_name;
+        // Update remarks1 to "(cust_id) cust_name" format
+        if (!m) b.remarks1 = `(${cust.cust_id}) ${cust.cust_name}`;
+        updatedBills.push(b);
+      }
+      matched++;
+    } else {
+      notFoundMap[nameToLookup] = (notFoundMap[nameToLookup] || 0) + 1;
+    }
+  });
+  
+  const notFound = Object.entries(notFoundMap)
+    .sort((a,b) => b[1]-a[1])
+    .map(([name, count]) => ({ name, count }));
+  
+  if (!dryRun && matched > 0) {
+    persistMainState();
+    syncManager.markDirty('bills');
+    invalidateBillsCache?.();
+  }
+  
+  return { matched, alreadyLinked, noRemarks, notFound, totalScanned: updatedBills.length + alreadyLinked + noRemarks + notFound.reduce((s,x)=>s+x.count, 0) };
+};
+
+// UI: Modal ให้ run auto-link + ดูผล
+window.openAutoLinkModal = async function() {
+  openModal('🔗 Auto-link บิลลูกหนี้กับลูกค้า', `
+    <div style="min-width:500px;max-width:700px">
+      <div style="padding:12px;background:var(--bg2);border-radius:6px;font-size:.85rem;margin-bottom:12px">
+        <b>วิธีการทำงาน:</b><br>
+        • สแกนบิล <b>SR / SC / OR / JR</b> ที่ยังไม่มี <code>cust_id</code><br>
+        • เทียบ <code>remarks1</code> (ชื่อลูกค้า) กับ master customers — <b>ชื่อต้องตรงเป๊ะ</b><br>
+        • ถ้าเจอ → ใส่ <code>cust_id</code> + format <code>remarks1</code> เป็น <code>(CUSTID) ชื่อลูกค้า</code><br>
+        • ถ้าไม่เจอ → บอก list + จำนวน ให้ user แก้ด้วยมือ<br>
+        • <b>ไม่แตะ SP, SS, OS, JS</b>
+      </div>
+      <div id="autolink-status" style="padding:20px;text-align:center;color:var(--text2)">
+        กำลังสแกน...
+      </div>
+      <div class="flex gap-2 mt-3">
+        <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ปิด</button>
+      </div>
+    </div>
+  `);
+  
+  // Run dry-run first to preview
+  setTimeout(async () => {
+    const statusEl = document.getElementById('autolink-status');
+    if (!statusEl) return;
+    
+    const preview = await window.autoLinkBillsToCustomers({ dryRun: true });
+    if (preview.error) {
+      statusEl.innerHTML = `<div style="color:var(--danger)">❌ ${preview.error}</div>`;
+      return;
+    }
+    
+    const { matched, alreadyLinked, noRemarks, notFound } = preview;
+    
+    statusEl.innerHTML = `
+      <div style="text-align:left">
+        <div class="flex gap-3 flex-wrap mb-3">
+          <div style="flex:1;min-width:120px;padding:10px;background:rgba(63,196,143,.1);border-radius:6px;text-align:center">
+            <div style="font-size:1.8rem;font-weight:700;color:var(--success)">${matched}</div>
+            <div class="text-xs text-dim">จะ link ได้</div>
+          </div>
+          <div style="flex:1;min-width:120px;padding:10px;background:rgba(79,156,249,.1);border-radius:6px;text-align:center">
+            <div style="font-size:1.8rem;font-weight:700;color:var(--info)">${alreadyLinked}</div>
+            <div class="text-xs text-dim">linked แล้ว</div>
+          </div>
+          <div style="flex:1;min-width:120px;padding:10px;background:rgba(239,87,87,.1);border-radius:6px;text-align:center">
+            <div style="font-size:1.8rem;font-weight:700;color:var(--danger)">${notFound.length}</div>
+            <div class="text-xs text-dim">ไม่เจอ (ชื่อ)</div>
+          </div>
+          <div style="flex:1;min-width:120px;padding:10px;background:rgba(170,170,170,.1);border-radius:6px;text-align:center">
+            <div style="font-size:1.8rem;font-weight:700;color:var(--text2)">${noRemarks}</div>
+            <div class="text-xs text-dim">ไม่มี remarks</div>
+          </div>
+        </div>
+        
+        ${notFound.length > 0 ? `
+          <div class="font-semi mb-2">🔍 ชื่อที่ไม่เจอในระบบ (Top 30):</div>
+          <div style="max-height:250px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:4px">
+            ${notFound.slice(0, 30).map(x => `
+              <div style="padding:6px 10px;display:flex;justify-content:space-between;gap:10px;border-bottom:1px solid var(--border);font-size:.85rem">
+                <span style="flex:1">${x.name}</span>
+                <span class="badge badge-warn" style="font-size:.7rem">${x.count} บิล</span>
+              </div>
+            `).join('')}
+          </div>
+          ${notFound.length > 30 ? `<div class="text-xs text-muted" style="margin-top:4px">... อีก ${notFound.length - 30} รายการ</div>` : ''}
+        ` : ''}
+        
+        <div class="flex gap-2 mt-4">
+          ${matched > 0 ? `
+            <button class="btn btn-primary btn-sm flex-1" id="autolink-apply">
+              ✓ Apply — link ${matched} บิล
+            </button>
+          ` : `
+            <div class="text-sm text-muted" style="padding:10px;text-align:center;flex:1">ไม่มีบิลให้ link — ทุกบิลที่ตรงชื่อถูก link หมดแล้ว</div>
+          `}
+        </div>
+      </div>
+    `;
+    
+    document.getElementById('autolink-apply')?.addEventListener('click', async () => {
+      const btn = document.getElementById('autolink-apply');
+      if (btn) { btn.disabled = true; btn.textContent = '⏳ กำลังอัปเดต...'; }
+      const result = await window.autoLinkBillsToCustomers({ dryRun: false });
+      toast(`✓ Link สำเร็จ ${result.matched} บิล — กำลัง sync ไป cloud...`, 'success', 4000);
+      closeModal();
+      // Trigger sync push
+      setTimeout(() => syncManager._flushPush?.(), 500);
+    });
+  }, 100);
+};
+
 window.openPendingBillsModal = function(kind) {
   const today = todayISO();
   let bills, title, subtitle;
@@ -13355,11 +13535,18 @@ async function renderMatching(el) {
     }
     
     // Sort by date (default ASC, toggle-able via button)
+    // ⭐ ใช้ toISODate → string compare (handle ทั้ง ISO + dd/mm/yyyy + Date obj)
+    // ก่อนหน้านี้ใช้ parseThaiDate ซึ่งไม่รองรับ ISO → BBL NW/BBL/TTB sort ไม่ได้
     const _order = getSortOrder('statement');
     data.sort((a, b) => {
-      const da = parseThaiDate(a.date) || 0;
-      const db = parseThaiDate(b.date) || 0;
-      return _order === 'asc' ? da - db : db - da;
+      const da = toISODate(a.date) || '';
+      const db = toISODate(b.date) || '';
+      // tiebreaker: time (HH:MM)
+      const ta = String(a.time || '00:00').substring(0, 5);
+      const tb = String(b.time || '00:00').substring(0, 5);
+      const ka = da + ' ' + ta;
+      const kb = db + ' ' + tb;
+      return _order === 'asc' ? ka.localeCompare(kb) : kb.localeCompare(ka);
     });
     
     // Truncate for render (หลัง filter แล้ว — ไม่ตัดข้อมูลที่ต้องการ)
@@ -14631,6 +14818,17 @@ function renderData(el) {
           </div>
         </div>
         <div id="sync-status" class="text-xs text-muted mt-2" style="display:none"></div>
+      </div>
+      
+      <!-- ⭐ Auto-link bills to customers -->
+      <div class="card mb-3" style="border:1.5px solid var(--info);background:rgba(79,156,249,.04)">
+        <div class="flex justify-between items-center">
+          <div>
+            <div class="font-semi" style="color:var(--info)">🔗 Auto-link บิลลูกหนี้กับลูกค้า (Phase A)</div>
+            <div class="text-xs text-muted mt-1">เชื่อมบิล <b>SR/SC/OR/JR</b> เข้ากับ <code>cust_id</code> จากชื่อใน remarks1 · จำเป็นต้องทำก่อนใช้หน้า "ติดตามหนี้" แบบใหม่</div>
+          </div>
+          <button class="btn btn-primary btn-sm" onclick="openAutoLinkModal()">🔗 เริ่ม Auto-link</button>
+        </div>
       </div>
       
       <!-- Rebuild Local from Cloud — กรณีข้อมูล local ซ้ำแต่ cloud ถูกต้อง -->
