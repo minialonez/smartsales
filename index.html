@@ -1611,9 +1611,10 @@ window.parseCompactMetaRows = function(rows) {
     'returns': 'ยอดคืนสินค้า', 'cashDrawer': 'Cash Drawer',
     'transfer': 'Transfer', 'card': 'Card', 'cheque': 'Cheque', 'refund': 'Refund',
   };
-  const VALID_META_TYPES = ['summary', 'cash_count'];
+  const VALID_META_TYPES = ['summary', 'cash_count', 'locks'];
   const summary = { __byDate: {} };
   const cash = { __byDate: {} };
+  const lockedDates = {};
   let skippedJunk = 0;
   
   rows.forEach(function(r) {
@@ -1621,6 +1622,7 @@ window.parseCompactMetaRows = function(rows) {
     
     // ⭐ CRITICAL: ใช้ meta_uuid เป็น source of truth ของวันที่
     //    Format: "2026-03-02|summary" → dateISO = "2026-03-02"
+    //    Format: "2026-01-01|locks"   → dateISO = "2026-01-01" (year anchor — actual dates อยู่ใน data_json)
     //    เหตุผล: Google Sheets อาจ auto-parse "02/03/2026" เป็น Date (mm/dd/yyyy = US format)
     //            แล้ว return เป็น "2026-02-03" → date column สลับวันกับเดือนสำหรับวัน ≤ 12
     //    Bug: 02/03/2026 (2 มี.ค.) ใน Sheets → กลายเป็น 3 ก.พ. → ทำให้ฟิลด์ date เพี้ยน
@@ -1643,10 +1645,13 @@ window.parseCompactMetaRows = function(rows) {
     if (!dateISO) { skippedJunk++; return; }
     
     // ⭐ Skip วันอาทิตย์ — ร้านปิด ไม่ควรมีข้อมูล (auto-cleanup)
-    try {
-      const dt = new Date(dateISO);
-      if (!isNaN(dt) && dt.getUTCDay() === 0) { skippedJunk++; return; }
-    } catch(_){}
+    //    EXCEPTION: locks rows ใช้ date เป็น year anchor (yyyy-01-01) ไม่ใช่วันจริง — ไม่ skip
+    if (r.meta_type !== 'locks') {
+      try {
+        const dt = new Date(dateISO);
+        if (!isNaN(dt) && dt.getUTCDay() === 0) { skippedJunk++; return; }
+      } catch(_){}
+    }
     
     let data;
     try {
@@ -1675,11 +1680,16 @@ window.parseCompactMetaRows = function(rows) {
         cleaned[k] = Number(data[k]) || 0;
       });
       if (Object.keys(cleaned).length > 0) cash.__byDate[dateISO] = cleaned;
+    } else if (r.meta_type === 'locks') {
+      // data = { 'yyyy-mm-dd': true, ... } — keys เป็น locked dates
+      Object.keys(data).forEach(function(d) {
+        if (data[d] === true) lockedDates[d] = true;
+      });
     }
   });
   
   if (skippedJunk > 0) console.warn(`[parseMeta] Skipped ${skippedJunk} junk rows`);
-  return { summary: summary, cashCount: cash };
+  return { summary: summary, cashCount: cash, lockedDates: lockedDates };
 };
 
 // ═══════════════════════════════════════════════════════════════════
@@ -6016,7 +6026,7 @@ async function renderMain(el) {
     
     return `<tr>
       <td style="text-align:right;font-weight:700">${allSum?fmtNum(allSum):'-'}</td>
-      <td style="font-weight:600;color:${color}">${label}</td>
+      <td style="font-weight:600;color:${color}">${label}${editable && key === 'cashIn' && !_locked && allSum > 0 ? `<button class="btn-reset-cashin" type="button" title="เคลียร์ 'นำเงินเข้า' ของวัน ${selectedDate} → re-enter ใหม่" style="margin-left:8px;padding:1px 7px;font-size:.7rem;border:1px solid var(--border);background:transparent;color:var(--text2);border-radius:4px;cursor:pointer;vertical-align:middle">🗑️ reset</button>` : ''}</td>
       ${cellParts.join('')}
     </tr>`;
   }
@@ -7685,6 +7695,35 @@ async function renderMain(el) {
           renderKeepScroll();
         });
       });
+    });
+
+    // 🗑️ Reset cashIn ของวันที่เลือก — re-enter ใหม่ (ตัวเลือก B)
+    el.querySelector('.btn-reset-cashin')?.addEventListener('click', () => {
+      if (isDateLocked(selectedDate)) {
+        toast(`🔒 ${fmtDate(selectedDate)} ถูก lock — ปลด lock ก่อน`, 'warn', 3000);
+        return;
+      }
+      if (!confirm(`เคลียร์ "นำเงินเข้า" ของวัน ${fmtDate(selectedDate)} ทุกช่อง?\n\n— ค่าทั้งหมด (Front1-4 + Invoice) จะกลายเป็น 0\n— กรอกใหม่เองได้ทันที\n— กระทบเฉพาะวันนี้ (วันอื่นไม่แตะ)`)) return;
+      const STATIONS = ['Front1','Front2','Front3','Front4','Invoice','Order','Payment','Invoice Credit','Order Credit'];
+      let cleared = 0;
+      STATIONS.forEach(st => {
+        const fk = 'cashIn_' + st;
+        if (mainSummary[fk] !== undefined && mainSummary[fk] !== 0) {
+          delete mainSummary[fk]; cleared++;
+        }
+        if (mainSummary.__byDate?.[selectedDate]?.['นำเงินเข้า']?.[st] !== undefined) {
+          delete mainSummary.__byDate[selectedDate]['นำเงินเข้า'][st];
+          cleared++;
+        }
+      });
+      // ลบ key 'นำเงินเข้า' ทั้งก้อนถ้าว่างหมด
+      if (mainSummary.__byDate?.[selectedDate]?.['นำเงินเข้า'] && Object.keys(mainSummary.__byDate[selectedDate]['นำเงินเข้า']).length === 0) {
+        delete mainSummary.__byDate[selectedDate]['นำเงินเข้า'];
+      }
+      persistMainState();
+      if (window.syncManager?.markDirty) syncManager.markDirty('meta');
+      toast(`✓ เคลียร์ cashIn ของ ${fmtDate(selectedDate)} แล้ว (${cleared} ช่อง) — re-enter ได้เลย`, 'success', 3500);
+      render();
     });
 
     // Summary cells (cashIn/cashOut/returns/sales/drawer)
@@ -16891,7 +16930,7 @@ function renderData(el) {
         ${statCard('Statement', totalStmts, '', 'var(--purple)', ICONS.file)}
       </div>
       
-      <!-- Sync from Cloud Section -->
+      <!-- Sync from Cloud Section (รวม Rebuild mode ผ่าน checkbox) -->
       <div class="card mb-3" style="border:1.5px solid var(--success);background:rgba(45,212,160,.04)">
         <div class="flex justify-between items-center">
           <div>
@@ -16908,7 +16947,21 @@ function renderData(el) {
             <button class="btn btn-primary btn-sm" id="btn-sync-cloud">☁️ ดึงข้อมูล</button>
           </div>
         </div>
+        <!-- Rebuild mode toggle (advanced) -->
+        <div style="margin-top:10px;padding-top:10px;border-top:1px dashed var(--border)">
+          <label class="flex items-center gap-2" style="cursor:pointer">
+            <input type="checkbox" id="chk-sync-rebuild" style="cursor:pointer;width:16px;height:16px">
+            <span class="text-xs">
+              <strong style="color:var(--danger)">🔄 ล้าง local ก่อน Sync (Rebuild mode)</strong>
+              — ใช้เมื่อข้อมูล local <strong>ซ้ำ</strong> หรือ <strong>พัง</strong> · 
+              <strong style="color:var(--warn)">⚠️ ข้อมูลที่ยังไม่ sync จะหาย — Backup JSON ก่อนทำ</strong>
+            </span>
+          </label>
+        </div>
         <div id="sync-status" class="text-xs text-muted mt-2" style="display:none"></div>
+        <!-- Hidden Rebuild button (เก็บไว้ให้ event handler เดิมทำงาน — chk-sync-rebuild จะ trigger ผ่าน .click()) -->
+        <button id="btn-rebuild-local" style="display:none">hidden</button>
+        <div id="rebuild-status" class="text-xs text-muted mt-2" style="display:none;font-family:monospace;max-height:250px;overflow-y:auto;padding:10px;background:var(--surface2);border-radius:6px;white-space:pre-wrap"></div>
       </div>
       
       <!-- ⭐ Auto-link bills to customers -->
@@ -16922,22 +16975,6 @@ function renderData(el) {
         </div>
       </div>
       
-      <!-- Rebuild Local from Cloud — กรณีข้อมูล local ซ้ำแต่ cloud ถูกต้อง -->
-      <div class="card mb-3" style="border:1.5px solid var(--danger);background:rgba(239,87,87,.04)">
-        <div class="flex justify-between items-center">
-          <div>
-            <div class="font-semi" style="color:var(--danger)">🔄 Rebuild Local จาก Cloud (ล้าง local → pull ใหม่)</div>
-            <div class="text-xs text-muted mt-1">
-              ใช้เมื่อ <strong>ข้อมูลใน Sheet (cloud) ถูกต้อง</strong> แต่ <strong>local ซ้ำกันเยอะ</strong> — ระบบจะล้าง billList + statements ของ local ทิ้ง แล้ว pull มาจาก Sheet ใหม่<br>
-              <strong style="color:var(--warn)">⚠️ ข้อมูลที่ยังไม่ได้ sync จะหาย — Backup JSON ก่อนทำ</strong>
-            </div>
-          </div>
-          <div class="flex gap-2 items-center">
-            <button class="btn btn-sm" id="btn-rebuild-local" style="background:var(--danger);color:#fff;border:none">🔄 Rebuild Local</button>
-          </div>
-        </div>
-        <div id="rebuild-status" class="text-xs text-muted mt-2" style="display:none;font-family:monospace;max-height:250px;overflow-y:auto;padding:10px;background:var(--surface2);border-radius:6px;white-space:pre-wrap"></div>
-      </div>
       
       <!-- Sheet Health Check -->
       <div class="card mb-3" style="border:1.5px solid var(--info);background:rgba(79,156,249,.04)">
@@ -17381,6 +17418,14 @@ function renderData(el) {
     });
     
     document.getElementById('btn-sync-cloud')?.addEventListener('click', async () => {
+      // ⭐ Rebuild mode: ถ้า checkbox ติ๊ก → trigger rebuild handler แทน sync
+      if (document.getElementById('chk-sync-rebuild')?.checked) {
+        const rebuildBtn = document.getElementById('btn-rebuild-local');
+        if (rebuildBtn) {
+          rebuildBtn.click();
+          return;
+        }
+      }
       const yearsCount = Number(document.getElementById('sync-years').value) || 2;
       const now = new Date();
       const years = [];
