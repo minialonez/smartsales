@@ -15541,28 +15541,20 @@ async function renderMatching(el) {
     const visibleData = data.length > MAX_ROWS ? data.slice(0, MAX_ROWS) : data;
     const isTruncated = data.length > MAX_ROWS;
 
-    // Bank counts
-    const bankCounts = {
-      KTB: (statementsByBank.KTB || []).length,
-      KBANK: (statementsByBank.KBANK || []).length,
-      'BBL NW': (statementsByBank['BBL NW'] || []).length,
-      BBL: (statementsByBank.BBL || []).length,
-      TTB: (statementsByBank.TTB || []).length,
-    };
-
-    const allStmts = uploadedStatements;
-    const totalMatched = allStmts.filter(s=>s.match_status==='matched').length;
-    const totalUnmatched = allStmts.length - totalMatched;
-    const filteredMatched = data.filter(s=>s.match_status==='matched').length;
-    const filteredUnmatched = data.length - filteredMatched;
-    
-    // Count in/out (ใช้ data ที่ผ่าน bank+match filter แล้ว เพื่อให้ count ตามบริบท)
-    const dataBeforeDir = (() => {
+    // ⭐ Smart counts: each filter group shows counts after applying OTHER active filters
+    //   (cumulative — แต่ไม่นับ self filter เพื่อให้ user เห็นว่ากดสลับมาจะได้กี่ตัว)
+    const _applyAllExcept = (excludes) => {
       let d = uploadedStatements.length > 0 ? [...uploadedStatements] : [];
-      if (bankFilter !== 'ALL') d = d.filter(s => s.bank === bankFilter);
-      if (matchFilter === 'matched') d = d.filter(s => s.match_status === 'matched');
-      else if (matchFilter === 'unmatched') d = d.filter(s => s.match_status !== 'matched');
-      if (dateFrom || dateTo) {
+      if (!excludes.has('bank') && bankFilter !== 'ALL') d = d.filter(s => s.bank === bankFilter);
+      if (!excludes.has('match')) {
+        if (matchFilter === 'matched') d = d.filter(s => s.match_status === 'matched');
+        else if (matchFilter === 'unmatched') d = d.filter(s => s.match_status !== 'matched');
+      }
+      if (!excludes.has('dir')) {
+        if (dirFilter === 'in') d = d.filter(s => Number(s.amount||0) > 0);
+        else if (dirFilter === 'out') d = d.filter(s => Number(s.amount||0) < 0);
+      }
+      if (!excludes.has('date') && (dateFrom || dateTo)) {
         d = d.filter(s => {
           const dt = toISODate(s.date || s.trans_date);
           if (!dt) return true;
@@ -15571,8 +15563,36 @@ async function renderMatching(el) {
           return true;
         });
       }
+      if (!excludes.has('amount') && amountSearch.trim()) {
+        const needle = amountSearch.trim().replace(/,/g, '');
+        d = d.filter(s => {
+          const abs = Math.abs(Number(s.amount||0));
+          return String(abs).includes(needle) || abs.toFixed(2).includes(needle);
+        });
+      }
       return d;
-    })();
+    };
+    
+    // Bank pills: filter เฉพาะ match+dir+date+amount
+    const dataForBank = _applyAllExcept(new Set(['bank']));
+    const bankCounts = {
+      KTB: dataForBank.filter(s => s.bank === 'KTB').length,
+      KBANK: dataForBank.filter(s => s.bank === 'KBANK').length,
+      'BBL NW': dataForBank.filter(s => s.bank === 'BBL NW').length,
+      BBL: dataForBank.filter(s => s.bank === 'BBL').length,
+      TTB: dataForBank.filter(s => s.bank === 'TTB').length,
+    };
+    
+    // Status pills: filter เฉพาะ bank+dir+date+amount
+    const dataForMatch = _applyAllExcept(new Set(['match']));
+    const allStmts = uploadedStatements; // for fp/global comparison only
+    const totalMatched = dataForMatch.filter(s => s.match_status === 'matched').length;
+    const totalUnmatched = dataForMatch.length - totalMatched;
+    const filteredMatched = data.filter(s=>s.match_status==='matched').length;
+    const filteredUnmatched = data.length - filteredMatched;
+    
+    // Direction pills: filter เฉพาะ bank+match+date+amount
+    const dataBeforeDir = _applyAllExcept(new Set(['dir']));
     const countIn = dataBeforeDir.filter(s => Number(s.amount||0) > 0).length;
     const countOut = dataBeforeDir.filter(s => Number(s.amount||0) < 0).length;
     const sumIn = dataBeforeDir.filter(s => Number(s.amount||0) > 0).reduce((a,s)=>a+Number(s.amount||0),0);
