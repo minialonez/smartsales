@@ -1682,6 +1682,108 @@ window.parseCompactMetaRows = function(rows) {
   return { summary: summary, cashCount: cash };
 };
 
+// ═══════════════════════════════════════════════════════════════════
+// V2 SCHEMA COMPAT HELPERS — Bank-split statements (Phase D, 26/4/26)
+// ═══════════════════════════════════════════════════════════════════
+// หลัง MIGRATE_splitStatementsByBank — stmts_YYYY ถูก split เป็น stmts_<BANK>_YYYY
+// helpers เหล่านี้:
+//   - ลอง v2_upsertStatementsByBank / v2_getAllStatementsByYear ก่อน
+//   - ถ้า backend ยังไม่ deploy v2 → fallback เป็น legacy (upsertStatements / getStatementsWithUuid)
+//   - cache ใน window.__v2StmtsAvailable เพื่อไม่ต้อง retry ทุก call
+function _v2CanonicalBank(raw) {
+  let b = String(raw || '').trim().toUpperCase();
+  b = b.replace(/\s+/g, '_').replace(/-/g, '_');
+  if (b === 'BBLNW') return 'BBL_NW';
+  if (b === 'KASIKORN' || b === 'KASIKORNBANK') return 'KBANK';
+  if (b === 'TMB' || b === 'THANACHART') return 'TTB';
+  if (['KTB','KBANK','BBL_NW','BBL','TTB'].includes(b)) return b;
+  return null;
+}
+window.__v2StmtsAvailable = undefined; // undefined=untested, true=v2 OK, false=fallback legacy
+
+async function pushStatementsCompat(year, records, deletes) {
+  records = records || [];
+  deletes = deletes || [];
+  if (window.__v2StmtsAvailable !== false) {
+    try {
+      const byBank = {};
+      let hasUnknownBank = false;
+      for (const s of records) {
+        const canonical = _v2CanonicalBank(s.bank);
+        if (!canonical) { hasUnknownBank = true; break; }
+        if (!byBank[canonical]) byBank[canonical] = [];
+        byBank[canonical].push(s);
+      }
+      if (hasUnknownBank) throw new Error('UNSUPPORTED_BANK');
+      // กำหนด bank ที่ต้อง touch
+      // - มี records: split per-bank
+      // - ไม่มี records แต่มี deletes: ส่ง delete ไปทุก bank (uuid อาจอยู่ที่ bank ไหนก็ได้)
+      const banksToTouch = records.length > 0
+        ? Object.keys(byBank)
+        : (deletes.length > 0 ? ['KTB','KBANK','BBL_NW','BBL','TTB'] : []);
+      let totalDel = 0, first = true;
+      for (const bank of banksToTouch) {
+        const bankRecs = byBank[bank] || [];
+        const bankDels = (records.length > 0)
+          ? (first ? deletes : [])
+          : deletes;
+        if (bankRecs.length === 0 && bankDels.length === 0) continue;
+        const r = await api('v2_upsertStatementsByBank', {
+          year: year, bank: bank, records: bankRecs, deletes: bankDels
+        });
+        if (r?.success === false) {
+          if (/not handled|unknown action|no route|not found/i.test(String(r.error || ''))) {
+            window.__v2StmtsAvailable = false;
+            throw new Error('V2_NOT_DEPLOYED');
+          }
+          throw new Error(r.error || 'v2_upsertStatementsByBank failed');
+        }
+        if (records.length > 0 && first) totalDel = Number(r?.data?.deleted) || 0;
+        else if (records.length === 0) totalDel += Number(r?.data?.deleted) || 0;
+        first = false;
+      }
+      window.__v2StmtsAvailable = true;
+      return { success: true, totalDeleted: totalDel };
+    } catch (e) {
+      if (e.message === 'V2_NOT_DEPLOYED') {
+        console.warn('[v2 stmts] not deployed → using legacy upsertStatements');
+      } else if (e.message !== 'UNSUPPORTED_BANK' && window.__v2StmtsAvailable !== false) {
+        console.warn('[v2 stmts] push error → fallback legacy:', e.message);
+      }
+    }
+  }
+  // Legacy fallback
+  const r = await api('upsertStatements', { year, records, deletes });
+  if (r?.success === false) throw new Error(r.error || 'upsertStatements API error');
+  return { success: true, totalDeleted: Number(r?.data?.deleted) || 0 };
+}
+
+async function pullStatementsCompat(year) {
+  if (window.__v2StmtsAvailable !== false) {
+    try {
+      const r = await api('v2_getAllStatementsByYear', { year });
+      if (r?.success === false) {
+        if (/not handled|unknown action|no route|not found/i.test(String(r.error || ''))) {
+          window.__v2StmtsAvailable = false;
+          throw new Error('V2_NOT_DEPLOYED');
+        }
+        throw new Error(r.error || 'v2_getAllStatementsByYear failed');
+      }
+      window.__v2StmtsAvailable = true;
+      return Array.isArray(r?.data?.records) ? r.data.records : [];
+    } catch (e) {
+      if (e.message !== 'V2_NOT_DEPLOYED' && window.__v2StmtsAvailable !== false) {
+        console.warn('[v2 stmts] pull error → fallback legacy:', e.message);
+      }
+    }
+  }
+  const r = await api('getStatementsWithUuid', { year });
+  if (r?.success === false) throw new Error(r.error || 'getStatementsWithUuid failed');
+  return Array.isArray(r?.data?.rows) ? r.data.rows : [];
+}
+window.pushStatementsCompat = pushStatementsCompat;
+window.pullStatementsCompat = pullStatementsCompat;
+
 const syncManager = {
   enabled: true,            // toggle ผ่าน localStorage['sf_sync_enabled']
   pushDelayMs: 5000,        // debounce 5s หลัง mutation สุดท้าย
@@ -2062,22 +2164,21 @@ const syncManager = {
             const chunks = stmtsByYr[yr];
             for (let i = 0; i < chunks.length; i += 500) {
               const isFirstChunk = !stmtDeleteSent && i === 0;
-              const r = await api('upsertStatements', {
-                year: yr,
-                records: chunks.slice(i, i + 500),
-                deletes: isFirstChunk ? delStmtUuids : [],
-              });
-              if (r?.success === false) throw new Error(r.error || 'upsertStatements API error');
+              const result = await pushStatementsCompat(
+                yr,
+                chunks.slice(i, i + 500),
+                isFirstChunk ? delStmtUuids : []
+              );
               if (isFirstChunk) {
                 stmtDeleteSent = true;
-                totalDeletedStmts = Number(r?.data?.deleted) || 0;
+                totalDeletedStmts = result.totalDeleted || 0;
               }
             }
           }
           if (Object.keys(stmtsByYr).length === 0 && delStmtUuids.length > 0) {
             const curYr = String(new Date().getFullYear());
-            const r = await api('upsertStatements', { year: curYr, records: [], deletes: delStmtUuids });
-            totalDeletedStmts = Number(r?.data?.deleted) || 0;
+            const result = await pushStatementsCompat(curYr, [], delStmtUuids);
+            totalDeletedStmts = result.totalDeleted || 0;
           }
           // ⭐ Verify before clear (เหมือน bills)
           if (delStmtUuids.length > 0) {
@@ -2341,9 +2442,9 @@ const syncManager = {
       
       for (const y of years) {
         try {
-          const r = await api('getStatementsWithUuid', { year: y });
-          if (r?.success && Array.isArray(r.data?.rows) && r.data.rows.length > 0) {
-            r.data.rows.forEach(s => {
+          const items = await pullStatementsCompat(y);
+          if (Array.isArray(items) && items.length > 0) {
+            items.forEach(s => {
               normalizeStmt(s);
               const uuid = s.stmt_uuid;
               // ⭐ Skip uuids ที่ local ลบไปแล้ว
@@ -16621,8 +16722,8 @@ async function renderMatching(el) {
         });
         Object.keys(byYear).forEach(year => {
           pushPromises.push(
-            api('upsertStatements', { year, records: byYear[year], deletes: [] })
-              .then(r => ({ type: 'stmts', year, count: byYear[year].length, ok: r?.success !== false }))
+            pushStatementsCompat(year, byYear[year], [])
+              .then(() => ({ type: 'stmts', year, count: byYear[year].length, ok: true }))
               .catch(e => ({ type: 'stmts', year, ok: false, err: e.message }))
           );
         });
@@ -17055,13 +17156,13 @@ function renderData(el) {
         // Pull stmts per year
         for (const y of years) {
           try {
-            const r = await api('getStatementsWithUuid', { year: y });
-            if (r?.success && Array.isArray(r.data?.rows)) {
-              r.data.rows.forEach(s => {
+            const items = await pullStatementsCompat(y);
+            if (Array.isArray(items)) {
+              items.forEach(s => {
                 if (!tempStmts[s.bank]) tempStmts[s.bank] = [];
                 tempStmts[s.bank].push(s);
               });
-              tsLog(`   ✓ Stmts ${y}: ${r.data.rows.length} rows`);
+              tsLog(`   ✓ Stmts ${y}: ${items.length} rows`);
             }
           } catch(err) {
             tsLog(`   ❌ Stmts ${y}: ${err.message}`);
@@ -17296,9 +17397,8 @@ function renderData(el) {
         for (const y of years) {
           try {
             statusEl.textContent = `กำลังดึง Statements ปี ${y}...`;
-            // ⭐ ใช้ new schema
-            const r = await api('getStatementsWithUuid', { year: y });
-            const items = (r?.success && Array.isArray(r.data?.rows)) ? r.data.rows : [];
+            // ⭐ ใช้ v2 (bank-split) → fallback legacy
+            const items = await pullStatementsCompat(y);
             const seenStmtKeys = new Set();
             Object.values(statementsByBank).forEach(arr => {
               (arr||[]).forEach(s => seenStmtKeys.add(`${s.bank}|${s.date}|${s.time}|${s.amount}|${s.ref_no||''}`));
