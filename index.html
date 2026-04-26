@@ -2284,23 +2284,32 @@ const syncManager = {
           // Meta สำคัญมาก — ใช้ full JSON fingerprint (หนักแต่คุ้ม กันบวม sheet)
           // ⭐ Include __lockedDates ใน fp — เปลี่ยน lock = trigger push
           const fp = this._fp({summary: mainSummary, cash_count: cashCount, locks: mainSummary?.__lockedDates || {}});
-          if (fp === this._fpCache.meta) { results.skipped++; continue; }
+          
+          // ⭐ DEBUG (26/4/26): trace meta push flow
+          console.log('[meta push] fp:', fp.substring(0, 30), '| cached:', String(this._fpCache.meta || 'null').substring(0, 30));
+          
+          if (fp === this._fpCache.meta) {
+            console.log('[meta push] SKIPPED — fp matches cache (no changes detected)');
+            results.skipped++;
+            continue;
+          }
           
           // ⭐ SELECTIVE PUSH: ถ้ามี dirtyUuids.meta (Set ของ dateISO) → push เฉพาะวันที่แก้
           //    เพื่อลด payload จาก ~267 → จำนวนวันที่แก้จริง (เช่น 1-3 วัน)
           //    Fallback: ถ้าไม่มี dirty dates → push ทั้งหมด (full save)
           const dirtyMetaDates = (this.dirtyUuids?.meta) || null;
           const useFilter = dirtyMetaDates && dirtyMetaDates.size > 0;
-          if (useFilter) {
-            console.log(`[push] selective meta: ${dirtyMetaDates.size} dates`);
-          }
+          console.log('[meta push] dirtyDates:', dirtyMetaDates ? [...dirtyMetaDates] : null, '| useFilter:', useFilter);
           
           // ── Push via compact upsertMeta (1 row per day per meta_type) ──
           // meta_uuid = dateISO + '|' + meta_type → stable key → upsert แทน append
           // ⭐ buildCompactMetaRows เป็น window-global guaranteed (define ตั้งแต่ parse time)
           const metaRows = window.buildCompactMetaRows(useFilter ? dirtyMetaDates : null);
+          console.log('[meta push] built', metaRows.length, 'rows', metaRows.length > 0 ? '| sample uuid:' + metaRows[0].meta_uuid + ' date:' + metaRows[0].date : '');
+          
           if (metaRows.length === 0) {
             // ไม่มีอะไรต้อง push — clear dirty + skip
+            console.warn('[meta push] SKIPPED — 0 rows built. __byDate keys:', Object.keys(mainSummary.__byDate || {}).slice(0, 5));
             if (this.dirtyUuids?.meta) this.dirtyUuids.meta.clear();
             this._fpCache.meta = fp;
             results.skipped++;
@@ -2309,18 +2318,30 @@ const syncManager = {
           const byYear = {};
           metaRows.forEach(function(row) {
             const parts = String(row.date).split('/');
-            let y = parts.length === 3 ? parts[2] : String(new Date().getFullYear());
+            // ⭐ FIX: support both ISO 'yyyy-mm-dd' and Thai 'dd/mm/yyyy'
+            let y;
+            if (parts.length === 3) {
+              y = parts[2]; // dd/mm/yyyy
+            } else {
+              const isoMatch = String(row.date).match(/^(\d{4})-\d{2}-\d{2}/);
+              y = isoMatch ? isoMatch[1] : String(new Date().getFullYear());
+            }
             if (Number(y) > 2400) y = String(Number(y) - 543);
             if (!byYear[y]) byYear[y] = [];
             byYear[y].push(row);
           });
+          console.log('[meta push] groups by year:', Object.keys(byYear).map(y => `${y}:${byYear[y].length}`).join(', '));
+          
           for (const y of Object.keys(byYear)) {
+            console.log(`[meta push] → upsertMeta year=${y} records=${byYear[y].length}`);
             const r = await api('upsertMeta', { year: y, records: byYear[y], deletes: [] });
+            console.log(`[meta push] ← response:`, r?.success === false ? `FAIL: ${r.error}` : `OK updated:${r?.data?.updated || '?'} inserted:${r?.data?.inserted || '?'} skipped:${r?.data?.skipped || '?'}`);
             if (r?.success === false) throw new Error(r.error || 'API error');
           }
           this._fpCache.meta = fp;
           // ⭐ Clear dirty dates หลัง push สำเร็จ
           if (this.dirtyUuids?.meta) this.dirtyUuids.meta.clear();
+          console.log('[meta push] DONE — cleared dirtyUuids.meta');
         }
         results.ok++;
       } catch(err) {
