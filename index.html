@@ -361,9 +361,10 @@ async function api(action, params = {}) {
 async function pushMatchDelta(bill, stmt) {
   // ⛔ AUTO-PUSH DISABLED — match/unmatch ใช้ markDirty อย่างเดียว
   // user ต้องกด "บันทึก" ถึงจะ push ขึ้น Sheet
+  // ⭐ ส่ง uuid เพื่อ selective push (push เฉพาะ row ที่แก้)
   if (window.syncManager?.markDirty) {
-    if (bill) window.syncManager.markDirty('bills');
-    if (stmt) window.syncManager.markDirty('stmts');
+    if (bill) window.syncManager.markDirty('bills', bill.bill_uuid);
+    if (stmt) window.syncManager.markDirty('stmts', stmt.stmt_uuid);
   }
   return; // no immediate API call
 }
@@ -1673,18 +1674,24 @@ const syncManager = {
   //   - stmts (saveStatements): APPEND ล้วน → เหมือนกัน
   // → Bills/Stmts ใช้ pullFromCloud ดึงจาก cloud ได้ + push ผ่าน
   //   ปุ่ม "save daily" manual (หน้า Main) ที่มี logic replace-safe
-  markDirty(type) {
+  // ⭐ Selective dirty tracking — track per-uuid (ไม่ใช่ทั้ง type)
+  // เก่า: dirty=Set(['bills']) → push ทั้ง 9000 บิล
+  // ใหม่: dirtyBillUuids=Set(['abc','xyz']) → push 2 บิล
+  // → ลด payload + atomic per-record + ไม่กระทบวันอื่น
+  markDirty(type, uuid) {
     if (!this.enabled) return;
-    // NO_ARG_TYPES = types ที่จะ dirty อัตโนมัติเมื่อเรียก markDirty() ไม่มี arg
-    //   (ไม่รวม bills/stmts เพราะ volume ใหญ่ — ต้องเรียก markDirty('bills') ชัดเจน)
     const NO_ARG_TYPES = ['payments', 'sp_temps', 'cashflow', 'suppliers', 'meta'];
-    // ALL_TYPES = types ที่ยอมรับถ้าเรียก markDirty(type) ชัดเจน
     const ALL_TYPES = [...NO_ARG_TYPES, 'bills', 'stmts'];
     if (type) {
-      // Explicit type → allow if in ALL_TYPES (รวม bills/stmts)
-      if (ALL_TYPES.includes(type)) this.dirty.add(type);
+      if (!ALL_TYPES.includes(type)) return;
+      this.dirty.add(type);
+      // ⭐ ถ้ามี uuid → track per-record
+      if (uuid) {
+        if (!this.dirtyUuids) this.dirtyUuids = {};
+        if (!this.dirtyUuids[type]) this.dirtyUuids[type] = new Set();
+        this.dirtyUuids[type].add(uuid);
+      }
     } else {
-      // No arg → dirty เฉพาะ NO_ARG_TYPES (ข้าม bills/stmts เพื่อกัน push ทุก tick)
       NO_ARG_TYPES.forEach(t => this.dirty.add(t));
     }
     this._schedulePush();
@@ -1830,9 +1837,18 @@ const syncManager = {
                 : 'b-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
             }
           });
+          // ⭐ SELECTIVE PUSH: ถ้ามี dirtyUuids ของ bills → push เฉพาะ uuid ที่ dirty
+          //    เพื่อลด payload จาก 9000 → จำนวนที่แก้จริง (เช่น 50 รายการ)
+          const dirtyBillUuids = (this.dirtyUuids?.bills) || null;
+          const billsToPush = (dirtyBillUuids && dirtyBillUuids.size > 0)
+            ? billList.filter(b => dirtyBillUuids.has(b.bill_uuid))
+            : billList; // fallback: push ทั้งหมด ถ้าไม่ได้ track per-uuid
+          if (dirtyBillUuids?.size > 0) {
+            console.log(`[push] selective bills: ${billsToPush.length}/${billList.length} records`);
+          }
           // Group by year (bills ของปีไหนไปปีนั้น)
           const billsByYr = {};
-          billList.forEach(b => {
+          billsToPush.forEach(b => {
             const d = String(b.date || '').trim();
             let m = d.match(/^\d{1,2}\/\d{1,2}\/(\d{4})/) || d.match(/^(\d{4})-\d{2}-\d{2}/);
             let y = m ? m[1] : String(new Date().getFullYear());
@@ -1895,6 +1911,8 @@ const syncManager = {
             }
           }
           this._fpCache.bills = fp;
+          // ⭐ เคลียร์ dirty uuids ของ bills หลัง push สำเร็จ
+          if (this.dirtyUuids?.bills) this.dirtyUuids.bills.clear();
         } else if (type === 'stmts') {
           const allStmts = getAllStatements();
           if (allStmts.length === 0) continue;
@@ -1927,8 +1945,16 @@ const syncManager = {
                 : 's-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
             }
           });
+          // ⭐ SELECTIVE PUSH for stmts
+          const dirtyStmtUuids = (this.dirtyUuids?.stmts) || null;
+          const stmtsToPush = (dirtyStmtUuids && dirtyStmtUuids.size > 0)
+            ? allStmts.filter(s => dirtyStmtUuids.has(s.stmt_uuid))
+            : allStmts;
+          if (dirtyStmtUuids?.size > 0) {
+            console.log(`[push] selective stmts: ${stmtsToPush.length}/${allStmts.length} records`);
+          }
           const stmtsByYr = {};
-          allStmts.forEach(s => {
+          stmtsToPush.forEach(s => {
             const d = String(s.date || s.trans_date || '').trim();
             let m = d.match(/^\d{1,2}\/\d{1,2}\/(\d{4})/) || d.match(/^(\d{4})-\d{2}-\d{2}/);
             let y = m ? m[1] : String(new Date().getFullYear());
@@ -1979,6 +2005,8 @@ const syncManager = {
             }
           }
           this._fpCache.stmts = fp;
+          // ⭐ เคลียร์ dirty uuids ของ stmts หลัง push สำเร็จ
+          if (this.dirtyUuids?.stmts) this.dirtyUuids.stmts.clear();
         } else if (type === 'payments') {
           if (paymentList.length === 0) continue;
           const fp = this._fp({n: paymentList.length, first: paymentList[0]?.sp_no, last: paymentList[paymentList.length-1]?.sp_no});
@@ -7459,6 +7487,10 @@ async function renderMain(el) {
           return;
         }
         billList[idx][field] = inp.value;
+        // ⭐ Mark this specific bill as dirty for selective push
+        if (window.syncManager?.markDirty) {
+          window.syncManager.markDirty('bills', billList[idx].bill_uuid);
+        }
         
         // ── Surgical update: อัปเดตแค่ pay_date cell + status badge ใน row นี้ ──
         // ไม่ re-render ทั้งหน้า → ไม่มี scroll bounce
