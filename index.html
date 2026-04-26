@@ -1920,7 +1920,9 @@ const syncManager = {
   // ใหม่: dirtyBillUuids=Set(['abc','xyz']) → push 2 บิล
   // → ลด payload + atomic per-record + ไม่กระทบวันอื่น
   markDirty(type, uuid) {
-    if (!this.enabled) return;
+    // ⭐ Manual save only — markDirty ทำงานเสมอ (ไม่ขึ้นกับ enabled flag)
+    // user กดปุ่มบันทึก = trigger _flushPush manually → push ขึ้น cloud
+    // (auto-push debounce ถูกปิดที่ _schedulePush แล้ว)
     const NO_ARG_TYPES = ['payments', 'sp_temps', 'cashflow', 'suppliers', 'meta'];
     const ALL_TYPES = [...NO_ARG_TYPES, 'bills', 'stmts'];
     if (type) {
@@ -2028,8 +2030,9 @@ const syncManager = {
   },
   
   async _flushPush() {
-    if (!this.enabled || this.dirty.size === 0) return;
-    if (this.status === 'pushing') return; // อย่า concurrent push
+    // ⭐ Manual save: ทำงานเสมอเมื่อถูกเรียก (ไม่สน enabled flag)
+    if (this.dirty.size === 0) return { ok: 0, fail: 0, skipped: 0, errors: [] };
+    if (this.status === 'pushing') return { ok: 0, fail: 0, skipped: 0, errors: ['already pushing'] };
     
     const types = Array.from(this.dirty);
     this.dirty.clear();
@@ -2967,7 +2970,9 @@ function validateBill(b, idx, allBills) {
   }
   if (b.type === 'Transfer' && !b.bank) {
     // ข้ามสำหรับบิลที่ import มา (JSON/Smart/Summary ไม่มี bank field — ปกติ)
-    if (b.source === 'manual') {
+    // ⭐ ข้ามถ้า match แล้ว — bank รู้ได้จาก statement ที่ match ไป (ไม่ต้องบังคับให้ user กรอก)
+    const isMatched = b.match_status === 'matched' || b.match_status === 'paid' || b.paid_by_sp;
+    if (b.source === 'manual' && !isMatched) {
       issues.push({ level:'warn', billIdx:idx, field:'bank', msg:`${billNo}: Type=Transfer แต่ยังไม่ได้เลือก Bank` });
     }
   }
@@ -7124,6 +7129,10 @@ async function renderMain(el) {
       
       // Mark everything dirty + force flush (push ทันที ไม่รอ debounce 5s)
       try {
+        // ⭐ Clear stuck flags ก่อน save (กรณี pull fail ทำให้ค้าง)
+        syncManager._inPull = false;
+        syncManager.status = 'idle';
+        
         syncManager.markDirty('bills');
         syncManager.markDirty('stmts');
         syncManager.markDirty('meta');
@@ -7136,13 +7145,15 @@ async function renderMain(el) {
         const result = await syncManager._flushPush();
         
         const stats = result || {};
-        const pushed = stats.pushed || 0;
-        const errors = stats.errors || 0;
+        const pushed = stats.ok || stats.pushed || 0;
+        const errors = (stats.errors && stats.errors.length) || stats.fail || 0;
+        const skipped = stats.skipped || 0;
+        console.log('[save] flush result:', JSON.stringify(stats));
         
         if (errors > 0) {
           toast(`⚠️ บันทึก ${pushed} ประเภท แต่มี error ${errors} (ดู console)`, 'warn', 6000);
         } else {
-          toast(`✅ บันทึกสำเร็จ — ${bills.length} บิล + ${Object.values(statementsByBank).reduce((s,a)=>s+(a?.length||0),0)} statements`, 'success', 4000);
+          toast(`✅ บันทึกสำเร็จ — push ${pushed} ประเภท${skipped > 0 ? ` (skip ${skipped})` : ''}`, 'success', 4000);
         }
       } catch (err) {
         console.error('Save error:', err);
