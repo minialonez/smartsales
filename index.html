@@ -2259,10 +2259,19 @@ const syncManager = {
           this._fpCache.payments = fp;
         } else if (type === 'sp_temps') {
           // spTempList เล็ก (ชั่วคราว) — push เสมอเมื่อ dirty + fingerprint skip
-          const fp = this._fp({n: spTempList.length, paids: spTempList.map(t => (t.partials||[]).length), links: spTempList.map(t => t.linked_sp||'')});
+          // ⭐ รวม deleted nos ใน fp → ถ้าลบ → fp เปลี่ยน → push (ไม่ skip)
+          const delNos = window.deletedSpTempNos ? [...window.deletedSpTempNos] : [];
+          const fp = this._fp({n: spTempList.length, paids: spTempList.map(t => (t.partials||[]).length), links: spTempList.map(t => t.linked_sp||''), del: delNos});
           if (fp === this._fpCache.sp_temps) { results.skipped++; continue; }
-          const r = await api('saveSpTemps', { records: spTempList, created_by: by });
+          const r = await api('saveSpTemps', { records: spTempList, deletes: delNos, created_by: by });
           if (r?.success === false) throw new Error(r.error || 'API error');
+          // ⭐ Clear deleted nos หลัง push สำเร็จ
+          if (delNos.length > 0 && window.deletedSpTempNos) {
+            const deleted = Number(r?.data?.deleted) || 0;
+            console.log(`[push] sp_temps deleted from cloud: ${deleted}/${delNos.length}`);
+            window.deletedSpTempNos.clear();
+            try { localStorage.removeItem('sf_deleted_sp_temp_nos'); } catch(_){}
+          }
           this._fpCache.sp_temps = fp;
         } else if (type === 'cashflow') {
           if (cashflowList.length === 0) continue;
@@ -2304,6 +2313,84 @@ const syncManager = {
           const useFilter = dirtyMetaDates && dirtyMetaDates.size > 0;
           console.log('[meta push] dirtyDates:', dirtyMetaDates ? [...dirtyMetaDates] : null, '| useFilter:', useFilter);
           
+          // ⭐ PULL-MERGE: ก่อน push → pull cloud rows ของ dirty dates → merge fields ที่ user ไม่ได้แก้
+          //    แก้ปัญหา multi-user race: A กรอก Front2=3000, B แก้ Front1=6000 → push ของ A ไม่ทับ Front1=6000
+          //    Logic: cloud field ที่ user ไม่ได้ modify → ใช้ cloud (sync), field ที่ user modify → keep local
+          if (useFilter) {
+            try {
+              const userMods = window._userModifiedMetaFields || new Set();
+              const datesArr = [...dirtyMetaDates];
+              // Group dates by year (pull per year)
+              const datesByYear = {};
+              datesArr.forEach(d => {
+                const y = String(d).substring(0, 4);
+                if (!datesByYear[y]) datesByYear[y] = [];
+                datesByYear[y].push(d);
+              });
+              
+              for (const yr of Object.keys(datesByYear)) {
+                const targetDates = new Set(datesByYear[yr]);
+                const r = await api('getMetaWithUuid', { year: yr });
+                if (r?.success === false || !Array.isArray(r?.data?.rows)) continue;
+                
+                let mergedCount = 0;
+                r.data.rows.forEach(row => {
+                  const uuid = String(row.meta_uuid || '');
+                  const m = uuid.match(/^(\d{4}-\d{2}-\d{2})\|(summary|cash_count)$/);
+                  if (!m) return;
+                  const dateIso = m[1];
+                  const metaType = m[2];
+                  if (!targetDates.has(dateIso)) return;
+                  
+                  let cloudData;
+                  try { cloudData = typeof row.data_json === 'string' ? JSON.parse(row.data_json) : (row.data_json || {}); }
+                  catch(_) { return; }
+                  if (!cloudData || typeof cloudData !== 'object') return;
+                  
+                  if (metaType === 'summary') {
+                    // Merge cloud summary fields → local __byDate[dateIso]
+                    const KEY_TO_LABEL = {
+                      cashIn: 'นำเงินเข้า', sales: 'ยอดขาย', cashOut: 'นำเงินออก',
+                      returns: 'ยอดคืนสินค้า', cashDrawer: 'Cash Drawer',
+                      transfer: 'Transfer', card: 'Card', cheque: 'Cheque', refund: 'Refund',
+                    };
+                    if (!mainSummary.__byDate) mainSummary.__byDate = {};
+                    if (!mainSummary.__byDate[dateIso]) mainSummary.__byDate[dateIso] = {};
+                    Object.keys(cloudData).forEach(flatKey => {
+                      // flatKey: 'cashIn_Front1' → field='cashIn' station='Front1'
+                      const idx = flatKey.indexOf('_');
+                      if (idx <= 0) return;
+                      const field = flatKey.substring(0, idx);
+                      const station = flatKey.substring(idx + 1);
+                      const label = KEY_TO_LABEL[field] || field;
+                      const userKey = `${dateIso}|summary|${flatKey}`;
+                      // ถ้า user แก้ field นี้ใน session → keep local, ไม่ใช้ cloud
+                      if (userMods.has(userKey)) return;
+                      // ใช้ cloud → update local
+                      if (!mainSummary.__byDate[dateIso][label]) mainSummary.__byDate[dateIso][label] = {};
+                      mainSummary.__byDate[dateIso][label][station] = Number(cloudData[flatKey]) || 0;
+                      mergedCount++;
+                    });
+                  } else if (metaType === 'cash_count') {
+                    if (!cashCount.__byDate) cashCount.__byDate = {};
+                    if (!cashCount.__byDate[dateIso]) cashCount.__byDate[dateIso] = {};
+                    Object.keys(cloudData).forEach(k => {
+                      const userKey = `${dateIso}|cash_count|${k}`;
+                      if (userMods.has(userKey)) return;
+                      cashCount.__byDate[dateIso][k] = Number(cloudData[k]) || 0;
+                      mergedCount++;
+                    });
+                  }
+                });
+                if (mergedCount > 0) console.log(`[meta push] merged ${mergedCount} fields from cloud (year ${yr})`);
+              }
+              // Persist merged state
+              if (typeof persistMainState === 'function') persistMainState();
+            } catch (mergeErr) {
+              console.warn('[meta push] merge failed → push local as-is:', mergeErr.message);
+            }
+          }
+          
           // ── Push via compact upsertMeta (1 row per day per meta_type) ──
           // meta_uuid = dateISO + '|' + meta_type → stable key → upsert แทน append
           // ⭐ buildCompactMetaRows เป็น window-global guaranteed (define ตั้งแต่ parse time)
@@ -2342,9 +2429,10 @@ const syncManager = {
             if (r?.success === false) throw new Error(r.error || 'API error');
           }
           this._fpCache.meta = fp;
-          // ⭐ Clear dirty dates หลัง push สำเร็จ
+          // ⭐ Clear dirty dates + user-modified fields หลัง push สำเร็จ
           if (this.dirtyUuids?.meta) this.dirtyUuids.meta.clear();
-          console.log('[meta push] DONE — cleared dirtyUuids.meta');
+          if (window._userModifiedMetaFields) window._userModifiedMetaFields.clear();
+          console.log('[meta push] DONE — cleared dirtyUuids.meta + _userModifiedMetaFields');
         }
         results.ok++;
       } catch(err) {
@@ -7843,6 +7931,9 @@ async function renderMain(el) {
             if (!mainSummary.__byDate[selectedDate]) mainSummary.__byDate[selectedDate] = {};
             if (!mainSummary.__byDate[selectedDate][thLabel]) mainSummary.__byDate[selectedDate][thLabel] = {};
             mainSummary.__byDate[selectedDate][thLabel][station] = value;
+            // ⭐ Track user-modified field (สำหรับ pull-merge-push: field นี้ local wins ไม่ใช้ cloud ทับ)
+            if (!window._userModifiedMetaFields) window._userModifiedMetaFields = new Set();
+            window._userModifiedMetaFields.add(`${selectedDate}|summary|${field}_${station}`);
           }
         }
         
@@ -7900,6 +7991,9 @@ async function renderMain(el) {
         const dayCash = getCashForDate(selectedDate);
         const k = inp.dataset.denom + '_' + inp.dataset.station;
         dayCash[k] = parseInt(inp.value) || 0;
+        // ⭐ Track user-modified field (per-denom_station for cash_count)
+        if (!window._userModifiedMetaFields) window._userModifiedMetaFields = new Set();
+        window._userModifiedMetaFields.add(`${selectedDate}|cash_count|${k}`);
         persistMainState();
         // ⭐ Explicit markDirty('meta', selectedDate) — selective push (cash count of this day only)
         if (window.syncManager?.markDirty) syncManager.markDirty('meta', selectedDate);
@@ -8301,6 +8395,21 @@ function markDirtySpTemps() {
   
   persistMainState();
   if (window.syncManager) syncManager.markDirty('sp_temps');
+}
+
+// ⭐ Track SP-TEMP deletions — push to backend ตอน save
+window.deletedSpTempNos = window.deletedSpTempNos || new Set();
+try {
+  const _stored = localStorage.getItem('sf_deleted_sp_temp_nos');
+  if (_stored) JSON.parse(_stored).forEach(n => window.deletedSpTempNos.add(n));
+} catch(_){}
+
+function trackSpTempDelete(no) {
+  if (!no) return;
+  window.deletedSpTempNos.add(String(no));
+  try {
+    localStorage.setItem('sf_deleted_sp_temp_nos', JSON.stringify([...window.deletedSpTempNos]));
+  } catch(_){}
 }
 
 // Check for overpayment and auto-rollover
@@ -9600,6 +9709,7 @@ function renderSpSectionsForDate(opts) {
       e.stopPropagation();
       const no = btn.dataset.no;
       if (!confirm(`ลบ ${no} ทั้งหมด?`)) return;
+      trackSpTempDelete(no);
       spTempList = spTempList.filter(x => x.no !== no);
       markDirtySpTemps();
       if (onChange) onChange();
@@ -9981,6 +10091,7 @@ async function renderPayments(el) {
         e.stopPropagation();
         const tempNo = btn.dataset.no;
         if (!confirm(`ลบ ${tempNo} ทั้งหมด?`)) return;
+        trackSpTempDelete(tempNo);
         spTempList = spTempList.filter(x => x.no !== tempNo);
         markDirtySpTemps();
         render();
