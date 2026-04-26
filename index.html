@@ -4987,6 +4987,18 @@ async function renderMain(el) {
     // Priority 3: mainSummary fallback (import จาก JSON)
     return Number(mainSummary['cashDrawer_' + station]) || 0;
   }
+  
+  // Pure: cash from bills only (no counted-cash override) — สำหรับ summary diff display
+  // ใช้เฉพาะใน "ระบบคำนวณ (จากบิล Cash)" เพื่อหลีกเลี่ยง double count
+  // เพราะ counted cash ของ Invoice = lump รวม Invoice+Order+Payment แล้ว
+  function calcCashFromBillsPure(station) {
+    return getBillsForSelectedDate().filter(b => {
+      const st = (b.station || '').trim();
+      const ty = (b.type || '').trim();
+      const no = b.bill_no || '';
+      return st === station && ty === 'Cash' && (isCashDrawerBill(no) || !no);
+    }).reduce((s, b) => s + (Number(b.amount) || 0), 0);
+  }
   function calcAutoValue(type, station) {
     // Transfer/Card/Cheque/Refund row: รวมเฉพาะบิลที่ matched แล้ว
     // → Sum row จะโชว์ diff ทันทีถ้ามีบิลยังไม่ match
@@ -5044,13 +5056,13 @@ async function renderMain(el) {
     // field: 'cashIn' | 'sales' | 'cashOut' | 'returns' | ...
     // station: 'Front1' | ...
     
-    // ⭐ Guard: cashIn มีเฉพาะ station ที่มี input UI
-    //    — Order/Payment ไม่มี (Invoice cell merged รวม 3 stations แล้ว)
-    //    — Invoice Credit/Order Credit ไม่มี cashIn input
-    //    ค่า stored ที่ค้างที่ station เหล่านี้ → ignore
-    if (field === 'cashIn') {
-      const CASH_IN_INPUT_STATIONS = ['Front1','Front2','Front3','Front4','Invoice'];
-      if (!CASH_IN_INPUT_STATIONS.includes(station)) return 0;
+    // ⭐ Guard: cashIn/cashOut/returns ใช้ UI input cell merged เดียวกัน (Invoice colspan=3)
+    //    — Order/Payment ไม่มี input ของตัวเอง (รวมอยู่ใน Invoice cell แล้ว)
+    //    — Invoice Credit/Order Credit ไม่มี input
+    //    ค่า stored ที่ค้างที่ station เหล่านี้ → ignore (ป้องกัน stale data ทำให้ Sum ผิด)
+    if (field === 'cashIn' || field === 'cashOut' || field === 'returns') {
+      const MERGED_INPUT_STATIONS = ['Front1','Front2','Front3','Front4','Invoice'];
+      if (!MERGED_INPUT_STATIONS.includes(station)) return 0;
     }
     
     // 1) ลอง flat key ก่อน (ถูก set ตอน date change)
@@ -5580,7 +5592,7 @@ async function renderMain(el) {
                 <td style="font-weight:800">ระบบคำนวณ (จากบิล Cash)</td>
                 <td></td>
                 <td style="text-align:right;font-weight:600;color:var(--purple)">
-                  ฿${fmtNum(['Invoice','Order','Payment'].reduce((s,st)=>s+calcCashFromBills(st),0))}
+                  ฿${fmtNum(['Invoice','Order','Payment'].reduce((s,st)=>s+calcCashFromBillsPure(st),0))}
                 </td>
               </tr>
               <tr style="background:var(--surface2);border-top:1px solid var(--border)">
@@ -5588,7 +5600,7 @@ async function renderMain(el) {
                 <td></td>
                 ${(() => {
                   const counted = calcCashDrawer('Invoice');
-                  const system = ['Invoice','Order','Payment'].reduce((s,st)=>s+calcCashFromBills(st),0);
+                  const system = ['Invoice','Order','Payment'].reduce((s,st)=>s+calcCashFromBillsPure(st),0);
                   const diff = counted - system;
                   const isOk = Math.abs(diff) < 0.01 && (counted > 0 || system > 0);
                   const content = (counted === 0 && system === 0) ? '-' : (isOk ? '✓ ตรง' : fmtNum(diff));
