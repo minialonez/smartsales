@@ -16964,6 +16964,18 @@ function renderData(el) {
         <div id="rebuild-status" class="text-xs text-muted mt-2" style="display:none;font-family:monospace;max-height:250px;overflow-y:auto;padding:10px;background:var(--surface2);border-radius:6px;white-space:pre-wrap"></div>
       </div>
       
+      <!-- ⭐ Normalize date columns in cloud sheets -->
+      <div class="card mb-3" style="border:1.5px solid var(--purple);background:rgba(139,92,246,.04)">
+        <div class="flex justify-between items-center">
+          <div>
+            <div class="font-semi" style="color:var(--purple)">📅 Normalize วันที่ใน Cloud Sheets</div>
+            <div class="text-xs text-muted mt-1">แก้ format วันที่ใน sheet ทุก column ที่ปนกัน (<code>01/02/2026</code> + <code>2026-01-13</code>) → <b>YYYY-MM-DD</b> consistent ทุกแถว · ครอบคลุม meta + bills + 5 stmts banks</div>
+          </div>
+          <button class="btn btn-sm" id="btn-normalize-dates" style="background:var(--purple);color:#fff;border:none">📅 Normalize</button>
+        </div>
+        <div id="normalize-status" class="text-xs text-muted mt-2" style="display:none;font-family:monospace;max-height:250px;overflow-y:auto;padding:10px;background:var(--surface2);border-radius:6px;white-space:pre-wrap"></div>
+      </div>
+      
       <!-- ⭐ Auto-link bills to customers -->
       <div class="card mb-3" style="border:1.5px solid var(--info);background:rgba(79,156,249,.04)">
         <div class="flex justify-between items-center">
@@ -17415,6 +17427,61 @@ function renderData(el) {
       
       btn.disabled = false;
       btn.textContent = '🔄 Rebuild Local';
+    });
+    
+    // ── 📅 Normalize Date Columns in Cloud Sheets ──
+    document.getElementById('btn-normalize-dates')?.addEventListener('click', async () => {
+      const btn = document.getElementById('btn-normalize-dates');
+      const statusEl = document.getElementById('normalize-status');
+      const yearStr = String(new Date().getFullYear());
+      
+      const ok = confirm(
+        `📅 Normalize วันที่ใน Cloud Sheets ปี ${yearStr}\n\n` +
+        `จะแก้ทุก sheet ต่อไปนี้:\n` +
+        `  • meta_${yearStr}\n` +
+        `  • bills_${yearStr}\n` +
+        `  • stmts_KTB_${yearStr} / KBANK / BBL_NW / BBL / TTB\n\n` +
+        `แปลงทุก format → YYYY-MM-DD (ISO)\n` +
+        `⚠️ Backup ก่อนรัน (export JSON) เผื่อมีปัญหา\n\n` +
+        `เริ่มเลย?`
+      );
+      if (!ok) return;
+      
+      btn.disabled = true;
+      btn.textContent = '⏳ กำลัง normalize...';
+      statusEl.style.display = 'block';
+      statusEl.textContent = 'เริ่ม normalize วันที่...\n';
+      
+      try {
+        const r = await api('v2_normalizeDates', { year: yearStr, user: (currentUser?.username || 'admin') });
+        if (r?.success === false) throw new Error(r.error || 'normalize failed');
+        const d = r?.data || {};
+        let log = `✓ เสร็จเรียบร้อย — ปี ${d.year}\n`;
+        log += `Sheets ที่ประมวลผล: ${d.sheets_processed}\n`;
+        log += `แถวที่เปลี่ยน format: ${d.total_changed}\n`;
+        log += `แถวที่ parse ไม่ได้: ${d.total_unparseable}\n\n`;
+        log += `รายละเอียด:\n`;
+        (d.report || []).forEach(r => {
+          if (r.status === 'ok') {
+            log += `  ✓ ${r.sheet}: ${r.rows} แถว, เปลี่ยน ${r.changed}, parse ไม่ได้ ${r.unparseable}\n`;
+          } else {
+            log += `  · ${r.sheet}: ${r.status}\n`;
+          }
+        });
+        statusEl.textContent = log;
+        toast(`📅 Normalize สำเร็จ — เปลี่ยน ${d.total_changed} แถว`, 'success', 4500);
+        
+        // Pull cloud มา local ใหม่ ให้ตรงกับที่ normalize แล้ว
+        if (d.total_changed > 0) {
+          statusEl.textContent += `\n💡 แนะนำ: กด "🔄 Rebuild Local" เพื่อ pull วันที่ใหม่ลง local`;
+        }
+      } catch (e) {
+        statusEl.textContent = `❌ Error: ${e.message}`;
+        toast('Normalize ล้มเหลว: ' + e.message, 'error', 6000);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '📅 Normalize';
+      }
     });
     
     document.getElementById('btn-sync-cloud')?.addEventListener('click', async () => {
