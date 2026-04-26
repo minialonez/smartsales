@@ -17219,6 +17219,29 @@ function renderData(el) {
         <div id="normalize-status" class="text-xs text-muted mt-2" style="display:none;font-family:monospace;max-height:250px;overflow-y:auto;padding:10px;background:var(--surface2);border-radius:6px;white-space:pre-wrap"></div>
       </div>
       
+      <!-- ⭐ Phase 1: Migrate Transfer Schema (drop nickname + add uuid + dc_pm + net) -->
+      <div class="card mb-3" style="border:1.5px solid var(--warn);background:rgba(245,166,35,.04)">
+        <div class="flex justify-between items-center">
+          <div>
+            <div class="font-semi" style="color:var(--warn)">🔄 Migrate Transfer Schema (Phase 1)</div>
+            <div class="text-xs text-muted mt-1">
+              ปรับ schema ของ <code>transfer_master_vat/novat</code> + <code>transfer_log_vat/novat</code> + <code>transfer_checks</code>:<br>
+              • ลบ <b>nickname</b> column<br>
+              • เพิ่ม <b>tm_uuid / tl_uuid</b> (PK)<br>
+              • เพิ่ม <b>deduct_dc_pm</b> + <b>net</b> column ใน log (เดิมไม่มี)<br>
+              • Recompute <code>deduct_total = ship + dc_pm + claim + other</code><br>
+              • Dedupe master ที่ <code>(name, account_no)</code> ซ้ำ<br>
+              • Backup ทุกชีทก่อน (ชื่อ <code>*_backup_yyyymmdd_hhmmss</code>)
+            </div>
+          </div>
+          <div class="flex gap-2">
+            <button class="btn btn-outline btn-sm" id="btn-migrate-tl-dryrun" style="color:var(--warn);border-color:var(--warn)">🧪 Dry-run</button>
+            <button class="btn btn-sm" id="btn-migrate-tl-apply" style="background:var(--warn);color:#1a1d27;border:none">⚡ Apply</button>
+          </div>
+        </div>
+        <div id="migrate-tl-status" class="text-xs text-muted mt-2" style="display:none;font-family:monospace;max-height:280px;overflow-y:auto;padding:10px;background:var(--surface2);border-radius:6px;white-space:pre-wrap"></div>
+      </div>
+      
       <!-- ⭐ Auto-link bills to customers -->
       <div class="card mb-3" style="border:1.5px solid var(--info);background:rgba(79,156,249,.04)">
         <div class="flex justify-between items-center">
@@ -17726,6 +17749,72 @@ function renderData(el) {
         btn.textContent = '📅 Normalize';
       }
     });
+    
+    // ── 🔄 Migrate Transfer Schema (Phase 1) ──
+    async function _runMigrateTransfer(dryRun) {
+      const statusEl = document.getElementById('migrate-tl-status');
+      const btnDry = document.getElementById('btn-migrate-tl-dryrun');
+      const btnApp = document.getElementById('btn-migrate-tl-apply');
+      
+      if (!dryRun) {
+        if (!confirm('⚠️ จะ migrate Transfer Schema จริง (ไม่ใช่ dry-run)\n\n' +
+                     '• ลบ column nickname ออกจาก master/log/checks\n' +
+                     '• เพิ่ม uuid + deduct_dc_pm + net columns\n' +
+                     '• Backup ทุกชีทก่อน (เป็น *_backup_yyyymmdd_hhmmss)\n\n' +
+                     'ยืนยัน?')) return;
+      }
+      
+      btnDry.disabled = true;
+      btnApp.disabled = true;
+      const origText = dryRun ? btnDry.textContent : btnApp.textContent;
+      (dryRun ? btnDry : btnApp).textContent = '⏳ กำลังประมวลผล...';
+      statusEl.style.display = 'block';
+      statusEl.style.color = 'var(--info)';
+      statusEl.textContent = `${dryRun ? '🧪 Dry-run' : '⚡ Apply'} — กำลังประมวลผล...`;
+      
+      try {
+        const r = await api('v2_migrateTransferSchema', { dryRun });
+        if (r?.success === false) throw new Error(r.error || 'API error');
+        const d = r?.data || r;
+        
+        let log = `${dryRun ? '🧪 DRY-RUN' : '✅ APPLIED'} — ${dryRun ? 'จำลอง' : 'เสร็จเรียบร้อย'}\n\n`;
+        Object.keys(d.sheets || {}).forEach(name => {
+          const s = d.sheets[name];
+          if (s.skipped) {
+            log += `· ${name}: SKIPPED — ${s.skipped}\n`;
+          } else if (s.error) {
+            log += `❌ ${name}: ERROR — ${s.error}\n`;
+          } else {
+            log += `✓ ${name}\n`;
+            log += `    เก่า: ${s.old_rows} แถว × ${s.old_cols} คอลัมน์\n`;
+            log += `    ใหม่: ${s.new_rows} แถว × ${s.new_cols} คอลัมน์`;
+            if (s.duplicates_removed) log += ` (ลบซ้ำ ${s.duplicates_removed})`;
+            log += `\n`;
+            if (s.backup) log += `    💾 backup: ${s.backup}\n`;
+          }
+        });
+        if (d.errors && d.errors.length) {
+          log += `\n⚠️ Errors:\n${d.errors.join('\n')}\n`;
+        }
+        if (!dryRun) {
+          log += `\n💡 แนะนำ: ตรวจ sheet ใน Google Sheets ว่า schema เปลี่ยนตาม + กด "🔄 Rebuild Local" เพื่อ pull schema ใหม่ลง local`;
+        }
+        statusEl.textContent = log;
+        statusEl.style.color = (d.errors && d.errors.length) ? 'var(--warn)' : 'var(--success)';
+        toast(`${dryRun ? 'Dry-run' : 'Migrate'} เสร็จ`, 'success', 3500);
+      } catch (e) {
+        statusEl.style.color = 'var(--danger)';
+        statusEl.textContent = `❌ Error: ${e.message}`;
+        toast('Migrate ล้มเหลว: ' + e.message, 'error', 6000);
+      } finally {
+        btnDry.disabled = false;
+        btnApp.disabled = false;
+        btnDry.textContent = '🧪 Dry-run';
+        btnApp.textContent = '⚡ Apply';
+      }
+    }
+    document.getElementById('btn-migrate-tl-dryrun')?.addEventListener('click', () => _runMigrateTransfer(true));
+    document.getElementById('btn-migrate-tl-apply')?.addEventListener('click', () => _runMigrateTransfer(false));
     
     document.getElementById('btn-sync-cloud')?.addEventListener('click', async () => {
       // ⭐ Rebuild mode: ถ้า checkbox ติ๊ก → trigger rebuild handler แทน sync
