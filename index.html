@@ -1804,16 +1804,21 @@ async function pullStatementsCompat(year) {
       // ⭐ Backend returns data.banks = { KTB: [...], KBANK: [...], BBL_NW: [...], BBL: [...], TTB: [...] }
       //   each row has `bank` field already injected by v2GetStatementsByBank
       //   → flatten into single array (preserves per-row bank info)
+      //   ⚠ Map underscore canonical 'BBL_NW' → display 'BBL NW' (space) ใช้ทั่ว frontend
       // Fallback to data.records if older backend version returns flat array
-      if (Array.isArray(r?.data?.records)) return r.data.records;
+      const _normalizeBankToDisplay = (b) => (b === 'BBL_NW' || b === 'BBLNW') ? 'BBL NW' : b;
+      if (Array.isArray(r?.data?.records)) {
+        return r.data.records.map(s => ({ ...s, bank: _normalizeBankToDisplay(s.bank) }));
+      }
       const banks = r?.data?.banks || {};
       const out = [];
       Object.keys(banks).forEach(b => {
         const arr = banks[b];
+        const displayBank = _normalizeBankToDisplay(b);
         if (Array.isArray(arr)) {
           for (let i = 0; i < arr.length; i++) {
-            // ensure bank field is set (defense — backend should already inject it)
-            if (!arr[i].bank) arr[i].bank = b;
+            // ensure bank field is set + normalized to display form
+            arr[i].bank = displayBank;
             out.push(arr[i]);
           }
         }
@@ -3439,6 +3444,27 @@ async function restoreMainState() {
         statementsByBank = JSON.parse(savedStmts);
         uploadedStatements = getAllStatements();
       }
+    }
+    
+    // ⭐ One-shot fix: consolidate 'BBL_NW' (V2 underscore canonical) → 'BBL NW' (UI display)
+    //    Bug: pull v2 ใส่ key 'BBL_NW' ขณะที่ UI ทุกที่ใช้ 'BBL NW' → 947 stmts หายจาก UI
+    if (statementsByBank && Array.isArray(statementsByBank.BBL_NW) && statementsByBank.BBL_NW.length > 0) {
+      const dst = Array.isArray(statementsByBank['BBL NW']) ? statementsByBank['BBL NW'] : [];
+      const seen = new Set(dst.map(s => `${s.date||''}|${s.time||''}|${s.amount||0}|${s.ref_no||''}`));
+      let merged = 0;
+      statementsByBank.BBL_NW.forEach(s => {
+        const k = `${s.date||''}|${s.time||''}|${s.amount||0}|${s.ref_no||''}`;
+        if (!seen.has(k)) { 
+          s.bank = 'BBL NW'; // normalize bank field on each row
+          dst.push(s); 
+          seen.add(k); 
+          merged++; 
+        }
+      });
+      statementsByBank['BBL NW'] = dst;
+      delete statementsByBank.BBL_NW;
+      console.log(`[restore] Consolidated BBL_NW → 'BBL NW': merged ${merged} stmts (total ${dst.length})`);
+      uploadedStatements = getAllStatements();
     }
     
     // ⭐ One-shot date normalize: เปลี่ยนทุก date field เป็น ISO format (yyyy-mm-dd)
