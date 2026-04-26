@@ -359,87 +359,13 @@ async function api(action, params = {}) {
 // ใช้ตอน confirm match/unmatch — ไม่บล็อก UI (.catch แทน await)
 // ถ้า fail → syncManager จะ retry แบบ full array ครั้งถัดไป (graceful fallback)
 async function pushMatchDelta(bill, stmt) {
-  try {
-    // ⭐ CRITICAL: Mark dirty IMMEDIATELY (before async API call)
-    // เหตุผล: delta push ใช้เวลา 1-3s — ระหว่างนั้น poll pull อาจ trigger
-    //   pull merge L2169/L2247: if (!dirty.has(...)) → cloud-wins → REVERT match!
-    // ต้อง mark dirty ตอนนี้ → pull จะ skip merge ของ type นี้
-    // markClean ตอน delta สำเร็จจะ clear dirty ภายหลัง
-    if (window.syncManager?.markDirty) {
-      if (bill) window.syncManager.markDirty('bills');
-      if (stmt) window.syncManager.markDirty('stmts');
-    }
-    
-    // Determine year from bill or stmt date
-    const billYear = bill ? String(new Date(toISODate(bill.date) || bill.date).getFullYear()) : null;
-    const stmtYear = stmt ? String(new Date(toISODate(stmt.date) || stmt.date).getFullYear()) : null;
-    
-    const promises = [];
-    
-    // Push bill if has uuid (ถ้าไม่มี uuid = old data, ปล่อยให้ syncManager handle)
-    if (bill && bill.bill_uuid && billYear) {
-      const billRec = { ...bill, date: toISODate(bill.date) || bill.date };
-      promises.push(
-        api('upsertBills', { year: billYear, records: [billRec], deletes: [] })
-          .then(r => ({ type: 'bill', ok: r?.success !== false, r }))
-          .catch(e => ({ type: 'bill', ok: false, err: e.message }))
-      );
-    }
-    
-    // Push stmt if has uuid
-    if (stmt && stmt.stmt_uuid && stmtYear) {
-      const stmtRec = { ...stmt, date: toISODate(stmt.date) || stmt.date };
-      promises.push(
-        api('upsertStatements', { year: stmtYear, records: [stmtRec], deletes: [] })
-          .then(r => ({ type: 'stmt', ok: r?.success !== false, r }))
-          .catch(e => ({ type: 'stmt', ok: false, err: e.message }))
-      );
-    }
-    
-    if (promises.length === 0) {
-      console.log('[delta] skipped — no uuid on bill/stmt');
-      return;
-    }
-    
-    const results = await Promise.all(promises);
-    const allOk = results.every(r => r.ok);
-    
-    if (allOk) {
-      console.log('[delta] push OK —', results.map(r => r.type).join(' + '));
-      // ⭐ DON'T markClean: ทำให้ race condition
-      //   ถ้า user match อันใหม่ระหว่าง delta push → markClean ทับ fp รวม state ใหม่
-      //   → next push skip → cloud ขาด → pull cloud-wins → revert match ใหม่
-      //   วิธีถูก: ปล่อย dirty flag + fp ทำงานตามปกติ
-      //   - dirty='stmts' จาก markDirty บรรทัดบนยังคงอยู่ (ถ้ามี match ใหม่)
-      //   - syncManager poll cycle ถัดไป compute fp → ถ้า state ตรงกับ cloud → fp matches cache → skip
-      //   - ถ้า state เปลี่ยนใหม่ → fp ต่าง → push เพิ่มเติม
-      //
-      // เคลียร์ dirty ที่เพิ่ง mark เฉพาะ type ที่ push success
-      // ⭐ แต่ — เคลียร์เฉพาะถ้าไม่มี match/edit ใหม่หลัง markDirty
-      //    วิธีง่าย: เคลียร์ dirty ทันทีที่ delta push ไม่ทันแน่ → ไม่เคลียร์เลย
-      //    เพราะ syncManager push full ครั้งถัดไปยังไง fp จะ skip ถ้า state ตรง cloud อยู่แล้ว
-      //    → ไม่เสียอะไร แค่ตรวจ fp ทีละ field (cheap operation)
-      //
-      // (no-op intentional)
-    } else {
-      const fails = results.filter(r => !r.ok);
-      console.warn('[delta] push partial fail —', fails);
-      // Mark dirty เพื่อให้ syncManager retry
-      if (window.syncManager?.markDirty) {
-        fails.forEach(f => {
-          if (f.type === 'bill') window.syncManager.markDirty('bills');
-          if (f.type === 'stmt') window.syncManager.markDirty('stmts');
-        });
-      }
-    }
-  } catch (err) {
-    console.warn('[delta] push error (will retry via full sync):', err);
-    // Fallback: mark dirty
-    if (window.syncManager?.markDirty) {
-      window.syncManager.markDirty('bills');
-      window.syncManager.markDirty('stmts');
-    }
+  // ⛔ AUTO-PUSH DISABLED — match/unmatch ใช้ markDirty อย่างเดียว
+  // user ต้องกด "บันทึก" ถึงจะ push ขึ้น Sheet
+  if (window.syncManager?.markDirty) {
+    if (bill) window.syncManager.markDirty('bills');
+    if (stmt) window.syncManager.markDirty('stmts');
   }
+  return; // no immediate API call
 }
 
 // ── Date Helpers (dd/mm/yyyy เสมอ) ──
@@ -1692,35 +1618,22 @@ const syncManager = {
       const dStmts = JSON.parse(localStorage.getItem('sf_deleted_stmt_uuids') || '[]');
       if (Array.isArray(dStmts)) this.deletedStmtUuids = new Set(dStmts);
     } catch(_){}
-    // ⭐ Start auto-pull polling (multi-device sync)
-    this._startPollPull();
-    // Pull เมื่อ user กลับมาจาก tab อื่น
-    document.addEventListener('visibilitychange', () => {
-      if (!document.hidden && this.enabled) {
-        const age = Date.now() - (this.lastPullAt || 0);
-        if (age > 30000) this._backgroundPull(); // เกิน 30s = pull
-      }
-    });
+    // ⛔ AUTO-SYNC DISABLED — manual save/refresh only
+    // เดิม: this._startPollPull() + visibilitychange auto-pull
+    // ใหม่: ใช้ปุ่ม "บันทึก" และ "🔄 Refresh" เท่านั้น
+    //       ป้องกัน race condition + ตัวเลขเปลี่ยนเอง + multi-device conflict
   },
   
-  // ⭐ Poll pull every 90s to sync changes from other devices
+  // ⛔ DISABLED: poll pull (auto-sync from other devices)
+  // Manual refresh button = หน้าที่นี้แทน
   _startPollPull() {
-    if (this._pollTimer) clearInterval(this._pollTimer);
-    this._pollTimer = setInterval(() => {
-      if (!this.enabled) return;
-      if (document.hidden) return; // ไม่ pull ถ้า tab ไม่ active (ประหยัด API)
-      if (this.status === 'pushing' || this.status === 'pulling') return;
-      this._backgroundPull();
-    }, 90 * 1000); // 90 วินาที
+    // no-op — kept for compat (อาจมี code เรียก)
+    return;
   },
   
-  // Background pull (ไม่ interrupt UI, silent fail)
+  // ⛔ DISABLED: background pull
   async _backgroundPull() {
-    try {
-      await this.pullFromCloud(1, 'force'); // 1 ปี เท่านั้น (เร็ว)
-    } catch(e) {
-      console.warn('[sync] background pull failed:', e.message);
-    }
+    return; // no-op — kept for compat
   },
   
   // ⭐ เรียกจาก code ที่ลบ bill/stmt → track uuid + schedule push
@@ -1778,8 +1691,11 @@ const syncManager = {
   },
   
   _schedulePush() {
-    if (this.pushTimer) clearTimeout(this.pushTimer);
-    this.pushTimer = setTimeout(() => this._flushPush(), this.pushDelayMs);
+    // ⛔ AUTO-PUSH DISABLED — push happens only via "บันทึก" button (calls _flushPush directly)
+    // เดิม: setTimeout 5s → _flushPush
+    // ใหม่: no-op — ค้าง dirty flag ไว้ จนกว่าจะกดปุ่มบันทึก
+    if (this.pushTimer) { clearTimeout(this.pushTimer); this.pushTimer = null; }
+    return;
   },
   
   // Push dirty data to backend (ส่งเป็น batch)
@@ -2549,13 +2465,18 @@ const syncManager = {
     if (this.status === 'pushing') return { text: '☁ กำลังบันทึก…', color: 'var(--info)' };
     if (this.status === 'pulling') return { text: '☁ กำลังดึงข้อมูล…', color: 'var(--info)' };
     if (this.status === 'error') return { text: '⚠ Sync ผิดพลาด', color: 'var(--warn)' };
-    if (this.dirty.size > 0) return { text: `⏳ รอบันทึก (${this.dirty.size})`, color: 'var(--warn)' };
+    if (this.dirty.size > 0) return { text: `● มี ${this.dirty.size} ที่ยังไม่ได้บันทึก`, color: 'var(--warn)' };
     if (this.lastPushAt > 0) {
       const ago = Math.round((Date.now() - this.lastPushAt) / 1000);
       const agoStr = ago < 60 ? `${ago}s` : ago < 3600 ? `${Math.round(ago/60)}m` : `${Math.round(ago/3600)}h`;
-      return { text: `☁ Synced ${agoStr} ที่แล้ว`, color: 'var(--success)' };
+      return { text: `✓ บันทึก ${agoStr} ที่แล้ว`, color: 'var(--success)' };
     }
-    return { text: '☁ Ready', color: 'var(--text3)' };
+    if (this.lastPullAt > 0) {
+      const ago = Math.round((Date.now() - this.lastPullAt) / 1000);
+      const agoStr = ago < 60 ? `${ago}s` : ago < 3600 ? `${Math.round(ago/60)}m` : `${Math.round(ago/3600)}h`;
+      return { text: `↻ ดึงข้อมูล ${agoStr} ที่แล้ว`, color: 'var(--success)' };
+    }
+    return { text: '☁ Manual mode (กดบันทึก/Refresh)', color: 'var(--text3)' };
   },
 };
 syncManager.init();
@@ -2666,7 +2587,16 @@ function flushPersistState() {
   }
 }
 // ป้องกันข้อมูลหายเมื่อปิด tab ระหว่าง debounce timer
-window.addEventListener('beforeunload', flushPersistState);
+window.addEventListener('beforeunload', (e) => {
+  flushPersistState();
+  // ⚠️ เตือนก่อนปิดถ้ามี unsaved changes
+  if (window.syncManager?.dirty?.size > 0) {
+    const msg = 'มีการแก้ไขที่ยังไม่ได้บันทึก — แน่ใจหรือไม่ที่จะออก?';
+    e.preventDefault();
+    e.returnValue = msg;
+    return msg;
+  }
+});
 
 // ══════════════════════════════════════════════════════════════
 // VALIDATION SYSTEM — ตรวจสอบความสมบูรณ์ของข้อมูล
@@ -5184,7 +5114,8 @@ async function renderMain(el) {
           <button class="btn btn-sm" id="btn-unlock-day" ${!isDateLocked(selectedDate)?'disabled':''} style="${!isDateLocked(selectedDate)?'background:rgba(45,212,160,.08);border:1px solid rgba(45,212,160,.3);color:rgba(45,212,160,.4);cursor:not-allowed':'background:var(--success);color:#fff;border:1px solid var(--success);font-weight:700;box-shadow:0 0 0 2px rgba(45,212,160,.2)'}" title="ปลด Lock วันนี้">🔓 Unlock</button>
           <button class="btn btn-outline btn-sm" id="btn-bulk-lock" title="Lock/Unlock หลายวันพร้อมกัน" style="border:1px dashed var(--text2);color:var(--text2)">📅 Bulk</button>
           <button class="btn btn-outline btn-sm" id="btn-check-issues">🔍 ตรวจสอบ</button>
-          <button class="btn btn-success btn-sm" id="btn-save-main">${ICONS.check} บันทึก</button>
+          <button class="btn btn-outline btn-sm" id="btn-refresh-cloud" title="ดึงข้อมูลล่าสุดจาก Sheet (ทับ local)">🔄 Refresh</button>
+          <button class="btn btn-success btn-sm" id="btn-save-main" style="position:relative">${ICONS.check} บันทึก<span id="dirty-dot" style="display:none;position:absolute;top:-4px;right:-4px;width:10px;height:10px;background:var(--warn);border-radius:50%;border:2px solid var(--bg);box-shadow:0 0 6px var(--warn)"></span></button>
         </div>
       </div>
       
@@ -6635,6 +6566,43 @@ async function renderMain(el) {
     document.getElementById('val-status-bar')?.addEventListener('click', () => {
       document.getElementById('btn-check-issues')?.click();
     });
+    
+    // ── 🔄 Refresh from Cloud — ดึงข้อมูลล่าสุดจาก Sheet ──
+    document.getElementById('btn-refresh-cloud')?.addEventListener('click', async () => {
+      // เตือนถ้ามี unsaved changes
+      const hasDirty = window.syncManager?.dirty?.size > 0;
+      if (hasDirty) {
+        if (!confirm(
+          '⚠️ มีการแก้ไขที่ยังไม่ได้บันทึก\n\n' +
+          'การ Refresh จะดึงข้อมูลใหม่จาก Sheet และทับการแก้ไขปัจจุบัน\n\n' +
+          'ต้องการดำเนินการต่อ? (ควรกด "บันทึก" ก่อน)'
+        )) return;
+      }
+      const btn = document.getElementById('btn-refresh-cloud');
+      const old = btn.innerHTML;
+      btn.disabled = true; btn.innerHTML = '⏳ กำลังดึง...';
+      try {
+        await syncManager.pullFromCloud(2, 'force');
+        // เคลียร์ dirty หลัง pull (เพราะ local = cloud แล้ว)
+        syncManager.dirty.clear();
+        toast('✅ ดึงข้อมูลใหม่จาก Sheet สำเร็จ', 'success', 3000);
+        render();
+      } catch (e) {
+        toast('❌ ดึงข้อมูลไม่สำเร็จ: ' + e.message, 'error', 5000);
+      } finally {
+        btn.disabled = false; btn.innerHTML = old;
+        updateDirtyDot();
+      }
+    });
+    
+    // ── อัพเดต dot indicator ที่ปุ่มบันทึก เมื่อมี unsaved ──
+    function updateDirtyDot() {
+      const dot = document.getElementById('dirty-dot');
+      if (!dot) return;
+      dot.style.display = (window.syncManager?.dirty?.size > 0) ? 'block' : 'none';
+    }
+    updateDirtyDot();
+    setInterval(updateDirtyDot, 2000);
     
     document.getElementById('btn-save-main')?.addEventListener('click', async () => {
       // ── Pre-save validation ──
