@@ -1627,20 +1627,36 @@ window.parseCompactMetaRows = function(rows) {
     //            แล้ว return เป็น "2026-02-03" → date column สลับวันกับเดือนสำหรับวัน ≤ 12
     //    Bug: 02/03/2026 (2 มี.ค.) ใน Sheets → กลายเป็น 3 ก.พ. → ทำให้ฟิลด์ date เพี้ยน
     let dateISO = '';
-    const uuidStr = String(r.meta_uuid || '');
-    const uuidMatch = uuidStr.match(/^(\d{4}-\d{2}-\d{2})\|/);
-    if (uuidMatch) {
-      dateISO = uuidMatch[1];
-    } else {
-      // Fallback: ถ้าไม่มี uuid (legacy row) → ใช้ date column
-      // ⚠️ Thai dd/mm/yyyy ปลอดภัย — convert ตรง
-      // ⚠️ ISO yyyy-mm-dd ไม่ปลอดภัย — Sheets อาจ swap เดือนกับวัน → SKIP
-      if (/^\d{1,2}\/\d{1,2}\/\d{4}/.test(String(r.date))) {
+    // ⭐ FIX (26/4/26): Trust col date FIRST, then uuid
+    //   เดิม: trust uuid → ถ้า uuid swap day↔month จะ self-perpetuate (read swap → __byDate[wrong] → save swap back)
+    //   ใหม่: pull col_date (Date object) → ปลอดภัยกว่า → uuid ใช้แค่ fallback
+    
+    // Try col_date first — Apps Script Date / ISO string / dd/mm/yyyy Thai
+    if (r.date) {
+      // Date object → ISO directly
+      if (r.date instanceof Date && !isNaN(r.date.getTime())) {
+        const y = r.date.getFullYear();
+        const m = r.date.getMonth() + 1;
+        const d = r.date.getDate();
+        dateISO = y + '-' + String(m).padStart(2,'0') + '-' + String(d).padStart(2,'0');
+      }
+      // ISO string yyyy-mm-dd
+      else if (/^\d{4}-\d{2}-\d{2}/.test(String(r.date))) {
+        dateISO = String(r.date).substring(0, 10);
+      }
+      // Thai dd/mm/yyyy
+      else if (/^\d{1,2}\/\d{1,2}\/\d{4}/.test(String(r.date))) {
         const parts = String(r.date).split('/');
         let y = Number(parts[2]); if (y > 2400) y -= 543;
         dateISO = y + '-' + String(parts[1]).padStart(2,'0') + '-' + String(parts[0]).padStart(2,'0');
       }
-      // ❌ ไม่ fallback ไป ISO substring (เพราะอาจถูก Sheets swap แล้ว)
+    }
+    
+    // Fallback: uuid prefix (for legacy rows without date col)
+    if (!dateISO) {
+      const uuidStr = String(r.meta_uuid || '');
+      const uuidMatch = uuidStr.match(/^(\d{4}-\d{2}-\d{2})\|/);
+      if (uuidMatch) dateISO = uuidMatch[1];
     }
     if (!dateISO) { skippedJunk++; return; }
     
