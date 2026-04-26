@@ -12579,6 +12579,471 @@ function parseMonthlyCheck(sheet) {
   return records;
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// Transfer Log V2 — pull/push helpers (Phase 2)
+// ═══════════════════════════════════════════════════════════════════
+
+// Field mapping: V2 schema (net_amount, tl_uuid) ↔ legacy (amount, transfer_amount, id)
+function _tlNormalize(rec) {
+  // Convert any incoming row → canonical V2 shape
+  const r = { ...rec };
+  // Backfill new fields from legacy if missing
+  if (r.net_amount == null && (r.transfer_amount != null || r.amount != null)) {
+    r.net_amount = Number(r.transfer_amount ?? r.amount) || 0;
+  }
+  if (r.amount_billed == null && r.amount != null) {
+    r.amount_billed = Number(r.amount) || 0;
+  }
+  if (!r.tl_uuid && r.id) r.tl_uuid = r.id;
+  // Ensure deduct fields are numeric
+  ['deduct_shipping','deduct_dc_pm','deduct_claim','deduct_other','deduct_total','amount_billed','net_amount']
+    .forEach(k => { r[k] = Number(r[k]) || 0; });
+  return r;
+}
+
+function _tmNormalize(s) {
+  const r = { ...s };
+  if (!r.tm_uuid && r.id) r.tm_uuid = r.id;
+  return r;
+}
+
+// Cash auto-match: from_bank='Cash' → match immediately (no stmt needed)
+function _tlAutoMatchCash(rec) {
+  const fb = String(rec.from_bank || '').trim().toLowerCase();
+  if (fb === 'cash' || fb === 'เงินสด') {
+    rec.match_status = 'matched_cash';
+    if (!rec.stmt_ref) rec.stmt_ref = 'CASH-' + String(rec.transfer_date || '').substring(0, 10);
+  }
+  return rec;
+}
+
+async function pullTransferFromCloud() {
+  const [logResp, masterResp] = await Promise.all([
+    api('v2_getTransferLog', {}),
+    api('v2_getTransferMaster', {}),
+  ]);
+  if (logResp?.success === false) throw new Error(logResp.error || 'pullTransferLog failed');
+  if (masterResp?.success === false) throw new Error(masterResp.error || 'pullTransferMaster failed');
+  
+  const logData = logResp.data || logResp;
+  const masterData = masterResp.data || masterResp;
+  
+  transferLog.vatTransfers = (logData.vat || []).map(_tlNormalize);
+  transferLog.novatTransfers = (logData.novat || []).map(_tlNormalize);
+  transferLog.vatSuppliers = (masterData.vat || []).map(_tmNormalize);
+  transferLog.novatSuppliers = (masterData.novat || []).map(_tmNormalize);
+  
+  persistMainState();
+  return {
+    vatTL: transferLog.vatTransfers.length,
+    novatTL: transferLog.novatTransfers.length,
+    vatMaster: transferLog.vatSuppliers.length,
+    novatMaster: transferLog.novatSuppliers.length,
+  };
+}
+
+async function pushTransferLogRow(rec, sheet) {
+  // sheet = 'vat' | 'novat' ; rec must have tl_uuid (auto-gen if missing)
+  if (!rec.tl_uuid) {
+    rec.tl_uuid = (typeof crypto !== 'undefined' && crypto.randomUUID) 
+      ? crypto.randomUUID() 
+      : 'tl-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
+  }
+  _tlAutoMatchCash(rec); // apply Cash rule
+  const r = await api('v2_upsertTransferLog', { sheet, records: [rec] });
+  if (r?.success === false) throw new Error(r.error || 'upsert failed');
+  return rec; // return enriched (with uuid + match)
+}
+
+async function deleteTransferLogRow(uuid, sheet) {
+  const r = await api('v2_upsertTransferLog', { sheet, records: [], deletes: [uuid] });
+  if (r?.success === false) throw new Error(r.error || 'delete failed');
+  return r.data;
+}
+
+async function pushTransferMasterRow(rec, sheet) {
+  if (!rec.tm_uuid) {
+    rec.tm_uuid = (typeof crypto !== 'undefined' && crypto.randomUUID) 
+      ? crypto.randomUUID() 
+      : 'tm-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
+  }
+  const r = await api('v2_upsertTransferMaster', { sheet, records: [rec] });
+  if (r?.success === false) throw new Error(r.error || 'upsert failed');
+  return rec;
+}
+
+async function deleteTransferMasterRow(uuid, sheet) {
+  const r = await api('v2_upsertTransferMaster', { sheet, records: [], deletes: [uuid] });
+  if (r?.success === false) throw new Error(r.error || 'delete failed');
+  return r.data;
+}
+
+// ── Add/Edit TL Modal ──
+function openTransferLogModal(opts = {}) {
+  const { existing = null, sheet = 'vat', onSave } = opts;
+  const isEdit = !!existing;
+  const allMasters = [
+    ...(transferLog.vatSuppliers || []).map(s => ({ ...s, _vat: 'VAT' })),
+    ...(transferLog.novatSuppliers || []).map(s => ({ ...s, _vat: 'NOVAT' })),
+  ];
+  const existingBanks = [...new Set([
+    ...transferLog.vatTransfers, ...transferLog.novatTransfers
+  ].map(t => t.from_bank).filter(Boolean))];
+  const existingCats = [...new Set([
+    ...transferLog.vatTransfers, ...transferLog.novatTransfers
+  ].map(t => t.category).filter(Boolean))].sort();
+  
+  const r = existing ? _tlNormalize(existing) : {
+    tl_uuid: '',
+    seq: 0,
+    transfer_date: new Date().toISOString().substring(0, 10),
+    category: existingCats[0] || 'ต้นทุน',
+    supplier_name: '',
+    supplier_bank: '',
+    supplier_account: '',
+    invoice_no: '',
+    receipt_no: '',
+    amount_billed: 0,
+    deduct_shipping: 0,
+    deduct_dc_pm: 0,
+    deduct_claim: 0,
+    deduct_other: 0,
+    deduct_total: 0,
+    net_amount: 0,
+    from_bank: '',
+    vat: sheet === 'vat' ? 'VAT' : 'NOVAT',
+    pp_no: '',
+    match_status: 'pending',
+    stmt_ref: '',
+  };
+  
+  const modal = document.createElement('div');
+  modal.className = 'modal-overlay';
+  modal.innerHTML = `
+    <div class="modal-card" style="max-width:720px">
+      <div class="modal-head">
+        <h3>${isEdit ? '✏️ แก้ไข Transfer Log' : '➕ เพิ่ม Transfer Log'} 
+          <span class="badge" style="background:${r.vat==='VAT'?'#4f9cf922':'#8e44ad22'};color:${r.vat==='VAT'?'#4f9cf9':'#8e44ad'}">${r.vat}</span>
+        </h3>
+        <button class="btn-close" data-close>&times;</button>
+      </div>
+      <div class="modal-body" style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+        <div>
+          <label class="text-xs text-muted">วันที่โอน</label>
+          <input type="date" class="input" id="tl-m-date" value="${r.transfer_date || ''}">
+        </div>
+        <div>
+          <label class="text-xs text-muted">ประเภท (category)</label>
+          <input class="input" id="tl-m-cat" value="${r.category || ''}" list="tl-m-cat-list" placeholder="ต้นทุน, ค่าขนส่ง, ฯลฯ">
+          <datalist id="tl-m-cat-list">${existingCats.map(c=>`<option value="${c}">`).join('')}</datalist>
+        </div>
+        
+        <div style="grid-column:1/-1">
+          <label class="text-xs text-muted">ชื่อบริษัท / ผู้รับโอน <span style="color:var(--info)">(พิมพ์เลือก master)</span></label>
+          <input class="input" id="tl-m-sup-name" value="${r.supplier_name || ''}" list="tl-m-sup-list" placeholder="ค้นหาจาก Master Supplier">
+          <datalist id="tl-m-sup-list">
+            ${allMasters.map(s => `<option value="${s.name||''}" data-uuid="${s.tm_uuid||''}" data-bank="${s.bank||''}" data-acct="${s.account_no||''}" data-vat="${s._vat||''}">${s.bank||''} ${s.account_no||''}</option>`).join('')}
+          </datalist>
+        </div>
+        <div>
+          <label class="text-xs text-muted">ธนาคารผู้รับ</label>
+          <input class="input" id="tl-m-sup-bank" value="${r.supplier_bank || ''}">
+        </div>
+        <div>
+          <label class="text-xs text-muted">บัญชีผู้รับ</label>
+          <input class="input" id="tl-m-sup-acct" value="${r.supplier_account || ''}">
+        </div>
+        
+        <div>
+          <label class="text-xs text-muted">เลข Invoice</label>
+          <input class="input" id="tl-m-inv" value="${r.invoice_no || ''}">
+        </div>
+        <div>
+          <label class="text-xs text-muted">เลขใบเสร็จ</label>
+          <input class="input" id="tl-m-rec" value="${r.receipt_no || ''}">
+        </div>
+        
+        <div style="grid-column:1/-1;border-top:1px solid var(--border);padding-top:10px;margin-top:5px">
+          <div class="text-xs font-semi text-muted mb-1">ยอดเงิน</div>
+        </div>
+        <div>
+          <label class="text-xs text-muted">ยอดแจ้ง (amount_billed)</label>
+          <input type="number" step="0.01" class="input" id="tl-m-billed" value="${r.amount_billed}">
+        </div>
+        <div>
+          <label class="text-xs text-muted">ค่าขนส่ง (ship)</label>
+          <input type="number" step="0.01" class="input tl-m-ded" id="tl-m-ship" value="${r.deduct_shipping}">
+        </div>
+        <div>
+          <label class="text-xs text-muted">DC/PM</label>
+          <input type="number" step="0.01" class="input tl-m-ded" id="tl-m-dcpm" value="${r.deduct_dc_pm}">
+        </div>
+        <div>
+          <label class="text-xs text-muted">เคลม (claim)</label>
+          <input type="number" step="0.01" class="input tl-m-ded" id="tl-m-claim" value="${r.deduct_claim}">
+        </div>
+        <div>
+          <label class="text-xs text-muted">อื่นๆ (other)</label>
+          <input type="number" step="0.01" class="input tl-m-ded" id="tl-m-other" value="${r.deduct_other}">
+        </div>
+        <div>
+          <label class="text-xs text-muted">รวมหัก (auto)</label>
+          <input type="number" step="0.01" class="input" id="tl-m-total" value="${r.deduct_total}" readonly style="background:var(--surface2);color:var(--danger)">
+        </div>
+        <div style="grid-column:1/-1;background:rgba(34,197,94,.08);padding:8px;border-radius:6px;border:1px solid rgba(34,197,94,.3)">
+          <label class="text-xs font-semi" style="color:var(--success)">💰 ยอดสุทธิที่ต้องโอน (net_amount = billed − total)</label>
+          <input type="number" step="0.01" class="input" id="tl-m-net" value="${r.net_amount}" readonly style="background:transparent;font-size:1.1rem;font-weight:700;color:var(--success);border:none">
+        </div>
+        
+        <div style="grid-column:1/-1;border-top:1px solid var(--border);padding-top:10px;margin-top:5px">
+          <div class="text-xs font-semi text-muted mb-1">การชำระ</div>
+        </div>
+        <div>
+          <label class="text-xs text-muted">โอนจาก (from_bank) <span style="color:var(--info)">— "Cash"=เงินสด match อัตโนมัติ</span></label>
+          <input class="input" id="tl-m-from" value="${r.from_bank || ''}" list="tl-m-from-list" placeholder="KTB / KBANK / BBL NW / Cash / ...">
+          <datalist id="tl-m-from-list">
+            <option value="Cash">เงินสด (auto-match)</option>
+            ${existingBanks.map(b=>`<option value="${b}">`).join('')}
+          </datalist>
+        </div>
+        <div>
+          <label class="text-xs text-muted">เลข PP</label>
+          <input class="input" id="tl-m-pp" value="${r.pp_no || ''}">
+        </div>
+      </div>
+      <div class="modal-foot" style="display:flex;justify-content:space-between;gap:10px">
+        <div>
+          ${isEdit ? `<button class="btn btn-outline btn-sm" id="tl-m-del" style="color:var(--danger);border-color:var(--danger)">🗑 ลบ</button>` : ''}
+        </div>
+        <div class="flex gap-2">
+          <button class="btn btn-ghost" data-close>ยกเลิก</button>
+          <button class="btn btn-primary" id="tl-m-save">${isEdit ? '💾 บันทึก' : '➕ เพิ่ม'}</button>
+        </div>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+  
+  // Auto-recompute total + net on deduct/billed change
+  function recompute() {
+    const billed = Number(document.getElementById('tl-m-billed').value) || 0;
+    const ship = Number(document.getElementById('tl-m-ship').value) || 0;
+    const dcpm = Number(document.getElementById('tl-m-dcpm').value) || 0;
+    const claim = Number(document.getElementById('tl-m-claim').value) || 0;
+    const other = Number(document.getElementById('tl-m-other').value) || 0;
+    const total = ship + dcpm + claim + other;
+    const net = billed - total;
+    document.getElementById('tl-m-total').value = total.toFixed(2);
+    document.getElementById('tl-m-net').value = net.toFixed(2);
+  }
+  ['tl-m-billed','tl-m-ship','tl-m-dcpm','tl-m-claim','tl-m-other'].forEach(id => {
+    document.getElementById(id).addEventListener('input', recompute);
+  });
+  
+  // Auto-fill bank/account from supplier dropdown
+  document.getElementById('tl-m-sup-name').addEventListener('input', e => {
+    const v = e.target.value.trim();
+    const m = allMasters.find(s => s.name === v);
+    if (m) {
+      document.getElementById('tl-m-sup-bank').value = m.bank || '';
+      document.getElementById('tl-m-sup-acct').value = m.account_no || '';
+    }
+  });
+  
+  function close() { modal.remove(); }
+  modal.querySelectorAll('[data-close]').forEach(b => b.addEventListener('click', close));
+  modal.addEventListener('click', e => { if (e.target === modal) close(); });
+  
+  if (isEdit) {
+    document.getElementById('tl-m-del').addEventListener('click', async () => {
+      if (!confirm('ลบรายการนี้?')) return;
+      try {
+        await deleteTransferLogRow(r.tl_uuid, sheet);
+        // remove from local state
+        const arr = sheet === 'vat' ? transferLog.vatTransfers : transferLog.novatTransfers;
+        const idx = arr.findIndex(x => x.tl_uuid === r.tl_uuid);
+        if (idx >= 0) arr.splice(idx, 1);
+        persistMainState();
+        toast('ลบสำเร็จ', 'success');
+        close();
+        if (onSave) onSave({ deleted: true });
+      } catch (e) { toast('ลบล้มเหลว: ' + e.message, 'error'); }
+    });
+  }
+  
+  document.getElementById('tl-m-save').addEventListener('click', async () => {
+    const billed = Number(document.getElementById('tl-m-billed').value) || 0;
+    const ship = Number(document.getElementById('tl-m-ship').value) || 0;
+    const dcpm = Number(document.getElementById('tl-m-dcpm').value) || 0;
+    const claim = Number(document.getElementById('tl-m-claim').value) || 0;
+    const other = Number(document.getElementById('tl-m-other').value) || 0;
+    const total = ship + dcpm + claim + other;
+    const net = billed - total;
+    
+    const rec = {
+      tl_uuid: r.tl_uuid || '',
+      seq: r.seq || 0,
+      transfer_date: document.getElementById('tl-m-date').value,
+      category: document.getElementById('tl-m-cat').value.trim(),
+      supplier_name: document.getElementById('tl-m-sup-name').value.trim(),
+      supplier_bank: document.getElementById('tl-m-sup-bank').value.trim(),
+      supplier_account: document.getElementById('tl-m-sup-acct').value.trim(),
+      invoice_no: document.getElementById('tl-m-inv').value.trim(),
+      receipt_no: document.getElementById('tl-m-rec').value.trim(),
+      amount_billed: billed,
+      deduct_shipping: ship,
+      deduct_dc_pm: dcpm,
+      deduct_claim: claim,
+      deduct_other: other,
+      deduct_total: total,
+      net_amount: net,
+      from_bank: document.getElementById('tl-m-from').value.trim(),
+      vat: r.vat,
+      pp_no: document.getElementById('tl-m-pp').value.trim(),
+      match_status: r.match_status || 'pending',
+      stmt_ref: r.stmt_ref || '',
+    };
+    
+    if (!rec.transfer_date) { toast('ใส่วันที่โอน', 'warn'); return; }
+    if (!rec.supplier_name) { toast('ใส่ชื่อผู้รับโอน', 'warn'); return; }
+    if (rec.amount_billed <= 0) { toast('ยอดแจ้งต้อง > 0', 'warn'); return; }
+    
+    const btn = document.getElementById('tl-m-save');
+    btn.disabled = true;
+    btn.textContent = '⏳ กำลังบันทึก...';
+    try {
+      const saved = await pushTransferLogRow(rec, sheet);
+      // Update local state
+      const arr = sheet === 'vat' ? transferLog.vatTransfers : transferLog.novatTransfers;
+      const idx = arr.findIndex(x => x.tl_uuid === saved.tl_uuid);
+      if (idx >= 0) arr[idx] = saved;
+      else arr.push(saved);
+      persistMainState();
+      toast(isEdit ? 'บันทึกสำเร็จ' : 'เพิ่มรายการสำเร็จ', 'success');
+      close();
+      if (onSave) onSave({ saved });
+    } catch (e) {
+      toast('บันทึกล้มเหลว: ' + e.message, 'error');
+      btn.disabled = false;
+      btn.textContent = isEdit ? '💾 บันทึก' : '➕ เพิ่ม';
+    }
+  });
+}
+
+// ── Add/Edit Master Supplier Modal ──
+function openTransferMasterModal(opts = {}) {
+  const { existing = null, sheet = 'vat', onSave } = opts;
+  const isEdit = !!existing;
+  const r = existing ? _tmNormalize(existing) : {
+    tm_uuid: '',
+    seq: 0,
+    name: '',
+    bank: '',
+    account_no: '',
+    note: '',
+    vat: sheet === 'vat' ? 'VAT' : 'NOVAT',
+  };
+  
+  const modal = document.createElement('div');
+  modal.className = 'modal-overlay';
+  modal.innerHTML = `
+    <div class="modal-card" style="max-width:520px">
+      <div class="modal-head">
+        <h3>${isEdit ? '✏️ แก้ไข Master Supplier' : '➕ เพิ่ม Master Supplier'}
+          <span class="badge" style="background:${r.vat==='VAT'?'#4f9cf922':'#8e44ad22'};color:${r.vat==='VAT'?'#4f9cf9':'#8e44ad'}">${r.vat}</span>
+        </h3>
+        <button class="btn-close" data-close>&times;</button>
+      </div>
+      <div class="modal-body" style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+        <div style="grid-column:1/-1">
+          <label class="text-xs text-muted">ชื่อบริษัท / ชื่อผู้รับโอน</label>
+          <input class="input" id="tm-m-name" value="${r.name || ''}">
+        </div>
+        <div>
+          <label class="text-xs text-muted">ธนาคาร</label>
+          <input class="input" id="tm-m-bank" value="${r.bank || ''}">
+        </div>
+        <div>
+          <label class="text-xs text-muted">เลขบัญชี</label>
+          <input class="input" id="tm-m-acct" value="${r.account_no || ''}">
+        </div>
+        <div style="grid-column:1/-1">
+          <label class="text-xs text-muted">หมายเหตุ</label>
+          <input class="input" id="tm-m-note" value="${r.note || ''}">
+        </div>
+      </div>
+      <div class="modal-foot" style="display:flex;justify-content:space-between;gap:10px">
+        <div>
+          ${isEdit ? `<button class="btn btn-outline btn-sm" id="tm-m-del" style="color:var(--danger);border-color:var(--danger)">🗑 ลบ</button>` : ''}
+        </div>
+        <div class="flex gap-2">
+          <button class="btn btn-ghost" data-close>ยกเลิก</button>
+          <button class="btn btn-primary" id="tm-m-save">${isEdit ? '💾 บันทึก' : '➕ เพิ่ม'}</button>
+        </div>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+  
+  function close() { modal.remove(); }
+  modal.querySelectorAll('[data-close]').forEach(b => b.addEventListener('click', close));
+  modal.addEventListener('click', e => { if (e.target === modal) close(); });
+  
+  if (isEdit) {
+    document.getElementById('tm-m-del').addEventListener('click', async () => {
+      if (!confirm('ลบ Master นี้?')) return;
+      try {
+        await deleteTransferMasterRow(r.tm_uuid, sheet);
+        const arr = sheet === 'vat' ? transferLog.vatSuppliers : transferLog.novatSuppliers;
+        const idx = arr.findIndex(x => x.tm_uuid === r.tm_uuid);
+        if (idx >= 0) arr.splice(idx, 1);
+        persistMainState();
+        toast('ลบสำเร็จ', 'success');
+        close();
+        if (onSave) onSave({ deleted: true });
+      } catch (e) { toast('ลบล้มเหลว: ' + e.message, 'error'); }
+    });
+  }
+  
+  document.getElementById('tm-m-save').addEventListener('click', async () => {
+    const rec = {
+      tm_uuid: r.tm_uuid || '',
+      seq: r.seq || 0,
+      name: document.getElementById('tm-m-name').value.trim(),
+      bank: document.getElementById('tm-m-bank').value.trim(),
+      account_no: document.getElementById('tm-m-acct').value.trim(),
+      note: document.getElementById('tm-m-note').value.trim(),
+      vat: r.vat,
+    };
+    if (!rec.name) { toast('ใส่ชื่อ', 'warn'); return; }
+    
+    const btn = document.getElementById('tm-m-save');
+    btn.disabled = true;
+    btn.textContent = '⏳ กำลังบันทึก...';
+    try {
+      const saved = await pushTransferMasterRow(rec, sheet);
+      const arr = sheet === 'vat' ? transferLog.vatSuppliers : transferLog.novatSuppliers;
+      const idx = arr.findIndex(x => x.tm_uuid === saved.tm_uuid);
+      if (idx >= 0) arr[idx] = saved;
+      else arr.push(saved);
+      persistMainState();
+      toast(isEdit ? 'บันทึกสำเร็จ' : 'เพิ่ม Master สำเร็จ', 'success');
+      close();
+      if (onSave) onSave({ saved });
+    } catch (e) {
+      toast('บันทึกล้มเหลว: ' + e.message, 'error');
+      btn.disabled = false;
+      btn.textContent = isEdit ? '💾 บันทึก' : '➕ เพิ่ม';
+    }
+  });
+}
+
+window.openTransferLogModal = openTransferLogModal;
+window.openTransferMasterModal = openTransferMasterModal;
+window.pullTransferFromCloud = pullTransferFromCloud;
+window.pushTransferLogRow = pushTransferLogRow;
+window.pushTransferMasterRow = pushTransferMasterRow;
+
 async function renderTransferLog(el) {
   let tab = 'transfers'; // transfers | suppliers | checks
   let filterVat = 'ALL';
@@ -12635,11 +13100,11 @@ async function renderTransferLog(el) {
     const visibleData = _t.visible;
     
     // Stats — ใช้ transfer_amount (ยอดโอนจริง = amount - หัก) ไม่ใช่ amount (ยอดตามใบแจ้งยอด)
-    const totalAmount = data.reduce((s,t) => s + Number(t.transfer_amount ?? t.amount ?? 0), 0);
+    const totalAmount = data.reduce((s,t) => s + Number(t.net_amount ?? t.transfer_amount ?? t.amount ?? 0), 0);
     const vatCount = transferLog.vatTransfers.length;
     const novatCount = transferLog.novatTransfers.length;
-    const vatAmount = transferLog.vatTransfers.reduce((s,t)=>s + Number(t.transfer_amount ?? t.amount ?? 0),0);
-    const novatAmount = transferLog.novatTransfers.reduce((s,t)=>s + Number(t.transfer_amount ?? t.amount ?? 0),0);
+    const vatAmount = transferLog.vatTransfers.reduce((s,t)=>s + Number(t.net_amount ?? t.transfer_amount ?? t.amount ?? 0),0);
+    const novatAmount = transferLog.novatTransfers.reduce((s,t)=>s + Number(t.net_amount ?? t.transfer_amount ?? t.amount ?? 0),0);
     const matchedPP = data.filter(t => t.pp_no).length;
     const matchedStmt = data.filter(t => t.match_status === 'stmt_matched').length;
     
@@ -12653,7 +13118,11 @@ async function renderTransferLog(el) {
           <p class="text-sm text-dim" style="margin-top:2px">รวม VAT + NOVAT · เชื่อมกับ PP Report + Supplier Payments + Statement</p>
         </div>
         <div class="flex gap-2 flex-wrap">
-          <button class="btn btn-primary btn-sm" id="btn-tl-import">${ICONS.download} Import ไฟล์ JKN</button>
+          <button class="btn btn-success btn-sm" id="btn-tl-pull-cloud" title="ดึง Transfer Log + Master จาก Cloud Sheets">🔄 ดึงจาก Cloud</button>
+          <button class="btn btn-primary btn-sm" id="btn-tl-add-vat">➕ เพิ่ม VAT</button>
+          <button class="btn btn-primary btn-sm" id="btn-tl-add-novat" style="background:#8e44ad">➕ เพิ่ม NOVAT</button>
+          <span style="border-left:1px solid var(--border);height:24px;align-self:center"></span>
+          <button class="btn btn-outline btn-sm" id="btn-tl-import">${ICONS.download} Import JKN</button>
           <label class="btn btn-outline btn-sm" style="cursor:pointer" title="Import JSON ที่ convert ไว้แล้ว">
             📂 Import JSON
             <input type="file" id="btn-tl-import-json" accept=".json" style="display:none">
@@ -12730,25 +13199,30 @@ async function renderTransferLog(el) {
                 </td></tr>` :
                 visibleData.map((t, idx) => {
                   const vatColor = t.vat === 'VAT' ? '#4f9cf9' : '#8e44ad';
-                  const matchIcon = t.match_status === 'stmt_matched' ? '✓✓' : t.pp_no ? '✓' : '⏳';
-                  const matchColor = t.match_status === 'stmt_matched' ? 'var(--success)' : t.pp_no ? 'var(--info)' : 'var(--text3)';
-                  return `<tr>
+                  const ms = String(t.match_status || '').toLowerCase();
+                  const matchIcon = ms === 'matched_cash' ? '💵' : ms === 'stmt_matched' || ms === 'matched' ? '✓✓' : t.pp_no ? '✓' : '⏳';
+                  const matchColor = ms === 'matched_cash' ? '#22c55e' : (ms === 'stmt_matched' || ms === 'matched') ? 'var(--success)' : t.pp_no ? 'var(--info)' : 'var(--text3)';
+                  const sh = t.vat === 'NOVAT' ? 'novat' : 'vat';
+                  const billed = Number(t.amount_billed ?? t.amount ?? 0);
+                  const total = Number(t.deduct_total || 0);
+                  const net = Number(t.net_amount ?? t.transfer_amount ?? (billed - total));
+                  return `<tr data-tl-uuid="${t.tl_uuid||''}" data-tl-sheet="${sh}" title="คลิกเพื่อแก้ไข">
                     <td class="text-xs text-muted">${idx+1}</td>
                     <td style="text-align:center"><span class="badge" style="background:${vatColor}22;color:${vatColor};font-size:.7rem;font-weight:700">${t.vat==='VAT'?'V':'N'}</span></td>
                     <td class="text-xs">${fmtDate(t.transfer_date)}</td>
                     <td class="text-xs">${t.category||'-'}</td>
-                    <td class="font-semi text-sm" style="color:var(--text)">${t.nickname||'-'}</td>
+                    <td class="font-semi text-sm" style="color:var(--text)">${t.supplier_name||'-'}</td>
                     <td>
                       <div class="text-sm">${t.supplier_name||'-'}</div>
                       ${t.supplier_account ? `<div class="text-xs text-muted" style="font-family:var(--mono)">${t.supplier_bank||''} ${t.supplier_account}</div>` : ''}
                     </td>
                     <td class="text-xs" style="font-family:var(--mono)">${t.invoice_no||'-'}</td>
-                    <td style="text-align:right">฿${fmtNum(t.amount||0)}</td>
-                    <td style="text-align:right;color:${t.deduct_total>0?'var(--danger)':'var(--text3)'}">${t.deduct_total>0?'-':''}฿${fmtNum(t.deduct_total||0)}</td>
-                    <td style="text-align:right;font-weight:700;color:var(--success)">฿${fmtNum(t.transfer_amount ?? t.amount ?? 0)}</td>
+                    <td style="text-align:right">฿${fmtNum(billed)}</td>
+                    <td style="text-align:right;color:${total>0?'var(--danger)':'var(--text3)'}">${total>0?'-':''}฿${fmtNum(total)}</td>
+                    <td style="text-align:right;font-weight:700;color:var(--success)">฿${fmtNum(net)}</td>
                     <td class="text-xs">${t.from_bank||'-'}</td>
                     <td class="text-xs" style="font-family:var(--mono);font-weight:600">${t.pp_no||'-'}</td>
-                    <td style="text-align:center">
+                    <td style="text-align:center" title="${ms||'pending'}">
                       <span style="color:${matchColor};font-weight:600">${matchIcon}</span>
                     </td>
                   </tr>`;
@@ -12779,6 +13253,47 @@ async function renderTransferLog(el) {
     el.querySelectorAll('.pill[data-fv]').forEach(btn => {
       btn.addEventListener('click', () => { filterVat = btn.dataset.fv; render(); });
     });
+    
+    // ── Phase 2: Pull from Cloud ──
+    document.getElementById('btn-tl-pull-cloud')?.addEventListener('click', async () => {
+      const btn = document.getElementById('btn-tl-pull-cloud');
+      btn.disabled = true;
+      const orig = btn.textContent;
+      btn.textContent = '⏳ ดึง...';
+      try {
+        const r = await pullTransferFromCloud();
+        toast(`ดึงสำเร็จ: TL ${r.vatTL+r.novatTL} · Master ${r.vatMaster+r.novatMaster}`, 'success', 4000);
+        render();
+      } catch (e) {
+        toast('ดึงล้มเหลว: ' + e.message, 'error', 6000);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = orig;
+      }
+    });
+    
+    // ── Phase 2: Add VAT/NOVAT ──
+    document.getElementById('btn-tl-add-vat')?.addEventListener('click', () => {
+      openTransferLogModal({ sheet: 'vat', onSave: () => render() });
+    });
+    document.getElementById('btn-tl-add-novat')?.addEventListener('click', () => {
+      openTransferLogModal({ sheet: 'novat', onSave: () => render() });
+    });
+    
+    // ── Phase 2: Click row → edit modal ──
+    el.querySelectorAll('tr[data-tl-uuid]').forEach(tr => {
+      tr.style.cursor = 'pointer';
+      tr.addEventListener('click', e => {
+        if (e.target.closest('button,input,a,select')) return;
+        const uuid = tr.dataset.tlUuid;
+        const sh = tr.dataset.tlSheet;
+        const arr = sh === 'vat' ? transferLog.vatTransfers : transferLog.novatTransfers;
+        const existing = arr.find(t => t.tl_uuid === uuid);
+        if (existing) {
+          openTransferLogModal({ existing, sheet: sh, onSave: () => render() });
+        }
+      });
+    });
   }
   
   function renderSuppliersTab() {
@@ -12797,10 +13312,14 @@ async function renderTransferLog(el) {
     el.innerHTML = `
       <div class="flex justify-between items-center mb-3">
         <div>
-          <div class="page-title">📋 Master Supplier — จากไฟล์ JKN</div>
-          <p class="text-sm text-dim" style="margin-top:2px">DropdownVat (${transferLog.vatSuppliers.length}) + DropdownNoVat (${transferLog.novatSuppliers.length})</p>
+          <div class="page-title">📋 Master Supplier</div>
+          <p class="text-sm text-dim" style="margin-top:2px">VAT (${transferLog.vatSuppliers.length}) + NOVAT (${transferLog.novatSuppliers.length})</p>
         </div>
-        <button class="btn btn-primary btn-sm" id="btn-tl-sync-sup">${ICONS.check} Sync เข้า "จ่ายเจ้าหนี้"</button>
+        <div class="flex gap-2 flex-wrap">
+          <button class="btn btn-primary btn-sm" id="btn-tm-add-vat">➕ เพิ่ม VAT</button>
+          <button class="btn btn-primary btn-sm" id="btn-tm-add-novat" style="background:#8e44ad">➕ เพิ่ม NOVAT</button>
+          <button class="btn btn-outline btn-sm" id="btn-tl-sync-sup">${ICONS.check} Sync → "จ่ายเจ้าหนี้"</button>
+        </div>
       </div>
       
       <div class="flex gap-2 mb-3">
@@ -12823,22 +13342,21 @@ async function renderTransferLog(el) {
               <tr>
                 <th style="width:40px">#</th>
                 <th>VAT</th>
-                <th>ชื่อเรียก</th>
-                <th>ชื่อบริษัท / บัญชี</th>
+                <th>ชื่อบริษัท</th>
                 <th>ธนาคาร</th>
                 <th>เลขที่บัญชี</th>
                 <th>หมายเหตุ</th>
               </tr>
             </thead>
             <tbody>
-              ${data.length === 0 ? '<tr><td colspan="7" style="text-align:center;padding:30px">ไม่มีข้อมูล</td></tr>' :
+              ${data.length === 0 ? '<tr><td colspan="6" style="text-align:center;padding:30px">ไม่มีข้อมูล — กด "ดึงจาก Cloud" หรือ "เพิ่ม"</td></tr>' :
                 data.map((s, i) => {
                   const vatColor = s.vat === 'VAT' ? '#4f9cf9' : '#8e44ad';
-                  return `<tr>
+                  const sh = s.vat === 'NOVAT' ? 'novat' : 'vat';
+                  return `<tr data-tm-uuid="${s.tm_uuid||''}" data-tm-sheet="${sh}" style="cursor:pointer" title="คลิกเพื่อแก้ไข">
                     <td class="text-xs text-muted">${i+1}</td>
                     <td><span class="badge" style="background:${vatColor}22;color:${vatColor};font-size:.7rem">${s.vat}</span></td>
-                    <td class="font-semi">${s.nickname||'-'}</td>
-                    <td>${s.name||'-'}</td>
+                    <td class="font-semi">${s.name||'-'}</td>
                     <td class="text-xs">${s.bank||'-'}</td>
                     <td class="text-xs" style="font-family:var(--mono)">${s.account_no||'-'}</td>
                     <td class="text-xs text-muted">${s.note||''}</td>
@@ -12857,12 +13375,33 @@ async function renderTransferLog(el) {
       btn.addEventListener('click', () => { filterVat = btn.dataset.fv; render(); });
     });
     
-    // Sync to Supplier Master
+    // Phase 2: Add Master VAT/NOVAT
+    document.getElementById('btn-tm-add-vat')?.addEventListener('click', () => {
+      openTransferMasterModal({ sheet: 'vat', onSave: () => render() });
+    });
+    document.getElementById('btn-tm-add-novat')?.addEventListener('click', () => {
+      openTransferMasterModal({ sheet: 'novat', onSave: () => render() });
+    });
+    
+    // Phase 2: Click row → edit Master
+    el.querySelectorAll('tr[data-tm-uuid]').forEach(tr => {
+      tr.addEventListener('click', e => {
+        if (e.target.closest('button,input,a,select')) return;
+        const uuid = tr.dataset.tmUuid;
+        const sh = tr.dataset.tmSheet;
+        const arr = sh === 'vat' ? transferLog.vatSuppliers : transferLog.novatSuppliers;
+        const existing = arr.find(s => s.tm_uuid === uuid);
+        if (existing) {
+          openTransferMasterModal({ existing, sheet: sh, onSave: () => render() });
+        }
+      });
+    });
+    
+    // Sync to Supplier Master (legacy)
     document.getElementById('btn-tl-sync-sup')?.addEventListener('click', () => {
       if (allSups.length === 0) { toast('ไม่มีข้อมูลให้ sync', 'error'); return; }
       let added = 0, updated = 0;
       allSups.forEach(s => {
-        // Check if already exists by nickname or account
         const existing = supplierList.find(x => 
           (x.code && x.code === s.nickname) || 
           (x.name && x.name === s.name) ||
