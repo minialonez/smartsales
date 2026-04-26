@@ -8490,11 +8490,19 @@ function wireRemarks1Autocomplete(input) {
       return;
     }
     
-    const matches = customerList.filter(c => {
+    // ⭐ Dedupe by cust_code — customerList อาจมี duplicates
+    const seen = new Set();
+    const matches = [];
+    for (const c of customerList) {
       const code = String(c.cust_code||c.cust_id||'').toLowerCase();
       const name = String(c.cust_name||'').toLowerCase();
-      return code.includes(q) || name.includes(q);
-    }).slice(0, 15);
+      if (!code.includes(q) && !name.includes(q)) continue;
+      const key = code || name;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      matches.push(c);
+      if (matches.length >= 15) break;
+    }
     
     if (matches.length === 0) {
       drop.innerHTML = '<div style="padding:10px 12px;color:var(--text3);font-size:.85rem;background:var(--surface,#1a1f2e)">ไม่พบลูกค้า — กรอกเองได้</div>';
@@ -8558,11 +8566,19 @@ function spTempWireCustomerInput(id) {
   function doSearch(q) {
     q = String(q||'').toLowerCase().trim();
     if (!q) { drop.style.display = 'none'; return; }
-    const matches = customerList.filter(c => {
+    // ⭐ Dedupe by cust_code — customerList อาจมี duplicates จากหลาย source (sheet + import)
+    const seen = new Set();
+    const matches = [];
+    for (const c of customerList) {
       const code = String(c.cust_code||c.cust_id||'').toLowerCase();
       const name = String(c.cust_name||'').toLowerCase();
-      return code.includes(q) || name.includes(q);
-    }).slice(0, 20);
+      if (!code.includes(q) && !name.includes(q)) continue;
+      const key = code || name; // ใช้ code ก่อน, fallback name
+      if (seen.has(key)) continue;
+      seen.add(key);
+      matches.push(c);
+      if (matches.length >= 20) break;
+    }
     
     if (matches.length === 0) {
       drop.innerHTML = '<div style="padding:10px 12px;color:var(--text3);font-size:.85rem;background:var(--bg)">ไม่พบลูกค้า — กรอกเองได้</div>';
@@ -13560,9 +13576,6 @@ const NAV_ITEMS = [
   { id:'dashboard', icon:'home',    label:'แดชบอร์ด' },
   { id:'main',      icon:'dollar',  label:'Main' },
   { id:'payments',  icon:'card',    label:'Payments (SP)' },
-  { id:'cashflow',  icon:'bar',     label:'เงินเข้าออก' },
-  { id:'supplier',  icon:'card',    label:'จ่ายเจ้าหนี้ (PP)' },
-  { id:'pprpt',     icon:'file',    label:'PP Report' },
   { id:'transferlog', icon:'pulse', label:'Transfer Log' },
   { id:'sp_recon',  icon:'check',   label:'📥 ตรวจ SP (ลูกหนี้)' },
   { id:'pp_recon',  icon:'check',   label:'📤 ตรวจ PP (เจ้าหนี้)' },
@@ -13980,9 +13993,6 @@ async function renderDashboard(el) {
     
     <!-- Quick Actions -->
     <div class="flex gap-2 flex-wrap mb-4">
-      <button class="btn btn-success btn-sm" onclick="openQuickPaymentModal()" style="background:var(--success);color:#fff">💰 รับชำระเร็ว</button>
-      <button class="btn btn-primary btn-sm" onclick="navigateTo('cashflow');setTimeout(()=>document.getElementById('btn-add-deposit')?.click(),200)">🏦 ฝากเงิน</button>
-      <button class="btn btn-outline btn-sm" onclick="navigateTo('supplier');setTimeout(()=>document.getElementById('btn-add-payment')?.click(),200)" style="color:var(--danger);border-color:var(--danger)">🏭 จ่ายเจ้าหนี้</button>
       <button class="btn btn-outline btn-sm" onclick="navigateTo('main')">📊 หน้า Main</button>
       <button class="btn btn-outline btn-sm" onclick="navigateTo('matching')">🔍 Matching</button>
     </div>
@@ -14047,27 +14057,6 @@ async function renderDashboard(el) {
               <div class="text-xs text-dim">Statement ยังไม่ match</div>
               <div style="font-size:1.4rem;font-weight:700;color:var(--danger)">${unmatchedStmts.length}</div>
               <div class="text-xs text-muted">฿${fmtNum(unmatchedStmts.reduce((s,x)=>s+Number(x.amount||0),0))}</div>
-            </div>
-          ` : ''}
-          ${cashflowPending.length > 0 ? `
-            <div style="padding:12px;background:rgba(79,156,249,.08);border-radius:8px;min-width:200px;flex:1;cursor:pointer" onclick="navigateTo('cashflow')">
-              <div class="text-xs text-dim">เงินเข้า-ออก รอ Match</div>
-              <div style="font-size:1.4rem;font-weight:700;color:var(--info)">${cashflowPending.length}</div>
-              <div class="text-xs text-muted">ฝาก/จ่าย Supplier/โอน</div>
-            </div>
-          ` : ''}
-          ${supplierPendingPay.length > 0 ? `
-            <div style="padding:12px;background:rgba(239,87,87,.08);border-radius:8px;min-width:200px;flex:1;cursor:pointer" onclick="navigateTo('supplier')">
-              <div class="text-xs text-dim">Supplier รอโอน</div>
-              <div style="font-size:1.4rem;font-weight:700;color:var(--danger)">${supplierPendingPay.length}</div>
-              <div class="text-xs text-muted">฿${fmtNum(supplierPendingPay.reduce((s,p)=>s+Number(p.amount||0),0))}</div>
-            </div>
-          ` : ''}
-          ${supplierUnmatched.length > 0 ? `
-            <div style="padding:12px;background:rgba(245,166,35,.08);border-radius:8px;min-width:200px;flex:1;cursor:pointer" onclick="navigateTo('supplier')">
-              <div class="text-xs text-dim">PP โอนแล้ว รอ Match</div>
-              <div style="font-size:1.4rem;font-weight:700;color:var(--warn)">${supplierUnmatched.length}</div>
-              <div class="text-xs text-muted">฿${fmtNum(supplierUnmatched.reduce((s,p)=>s+Number(p.amount||0),0))}</div>
             </div>
           ` : ''}
         </div>
