@@ -172,9 +172,90 @@ tr.row-danger td{background:rgba(239,87,87,.06);border-left:3px solid var(--dang
 
 /* ── Responsive ── */
 @media(max-width:768px){
-  #sidebar{position:fixed;z-index:100;left:-230px;transition:left .2s}
+  #sidebar{position:fixed;z-index:100;left:-230px;transition:left .2s;width:230px}
   #sidebar.mobile-open{left:0}
-  #main{padding:16px}
+  #main{padding:12px}
+  
+  /* Hamburger overlay เมื่อเปิด sidebar */
+  #sidebar-overlay{
+    display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:99;
+  }
+  #sidebar.mobile-open ~ #sidebar-overlay{display:block}
+  
+  /* Header buttons → vertical stack */
+  .flex.gap-2.flex-wrap{gap:6px}
+  .btn-sm{padding:6px 10px;font-size:.78rem;min-height:36px}
+  
+  /* Tables → horizontal scroll */
+  .table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  table{font-size:.78rem !important}
+  th,td{padding:6px 8px !important;white-space:nowrap}
+  
+  /* Modals → fullscreen-ish */
+  .modal{padding:12px !important;max-width:100% !important;max-height:95vh}
+  
+  /* Date button on Main = larger tap target */
+  #main-date-btn{min-width:auto;padding:8px 14px;min-height:40px;font-size:.85rem}
+  
+  /* Tabs */
+  .main-tab-btn{padding:10px 14px !important;font-size:.85rem !important}
+  
+  /* Inputs สูงขึ้นพอ tap */
+  .input{min-height:38px}
+  
+  /* Cards layout vertical */
+  .card-flat{padding:10px}
+  
+  /* Dashboard cards horizontal scroll */
+  .dashboard-cards{display:flex;overflow-x:auto;gap:10px;padding-bottom:8px}
+  .dashboard-cards > *{flex:0 0 80%;min-width:280px}
+}
+
+/* Hamburger button (only mobile) — fixed position */
+#mobile-hamburger{
+  display:none;
+  position:fixed;top:10px;left:10px;z-index:101;
+  background:var(--surface);border:1px solid var(--border);
+  width:42px;height:42px;border-radius:8px;
+  align-items:center;justify-content:center;cursor:pointer;
+  color:var(--text);font-size:1.4rem;
+  box-shadow:0 2px 8px rgba(0,0,0,.3);
+}
+@media(max-width:768px){
+  #mobile-hamburger{display:inline-flex}
+  #main{padding-top:60px !important} /* ให้พื้นที่กับ hamburger */
+}
+
+/* ── ⚡ Pending Sync Indicator ── */
+.dirty-row {
+  border-left: 3px solid var(--warn) !important;
+  background: rgba(245,166,35,.04) !important;
+}
+.dirty-badge {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  background: var(--warn);
+  border-radius: 50%;
+  box-shadow: 0 0 6px var(--warn);
+  margin-left: 4px;
+  vertical-align: middle;
+  animation: dirty-pulse 1.8s ease-in-out infinite;
+}
+@keyframes dirty-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.5; transform: scale(0.85); }
+}
+.dirty-count-pill {
+  display: inline-block;
+  background: var(--warn);
+  color: #1a1d27;
+  font-size: 0.7rem;
+  font-weight: 700;
+  padding: 1px 7px;
+  border-radius: 9px;
+  margin-left: 4px;
+  vertical-align: middle;
 }
 </style>
 </head>
@@ -230,6 +311,12 @@ tr.row-danger td{background:rgba(239,87,87,.06);border-left:3px solid var(--dang
     </div>
   </aside>
 
+  <!-- Sidebar overlay (mobile only — tap to close sidebar) -->
+  <div id="sidebar-overlay" onclick="toggleSidebar(false)"></div>
+
+  <!-- Mobile-only hamburger (fixed position, doesn't get wiped by re-render) -->
+  <button id="mobile-hamburger" onclick="toggleSidebar()" title="เมนู" aria-label="เปิดเมนู">☰</button>
+
   <!-- Main Content -->
   <main id="main"></main>
 </div>
@@ -253,6 +340,10 @@ const API_URL = 'https://script.google.com/macros/s/AKfycbxKFt7Dcq1PPyYEy_zEwTuu
 
 let currentUser = null;
 let currentPage = 'dashboard';
+// ⭐ Main page tabs: 'daily' | 'stmts'
+let mainTab = (() => {
+  try { return localStorage.getItem('sf_main_tab') || 'daily'; } catch(_) { return 'daily'; }
+})();
 
 // ── API Helper — auto GET/POST: GET สำหรับ read, POST สำหรับ write ใหญ่ๆ ──
 // Apps Script handleRequest() parse e.postData.contents เป็น JSON อยู่แล้ว
@@ -2042,7 +2133,8 @@ const syncManager = {
           this._fpCache.suppliers = fp;
         } else if (type === 'meta') {
           // Meta สำคัญมาก — ใช้ full JSON fingerprint (หนักแต่คุ้ม กันบวม sheet)
-          const fp = this._fp({summary: mainSummary, cash_count: cashCount});
+          // ⭐ Include __lockedDates ใน fp — เปลี่ยน lock = trigger push
+          const fp = this._fp({summary: mainSummary, cash_count: cashCount, locks: mainSummary?.__lockedDates || {}});
           if (fp === this._fpCache.meta) { results.skipped++; continue; }
           
           // ── Push via compact upsertMeta (1 row per day per meta_type) ──
@@ -2447,6 +2539,17 @@ const syncManager = {
                     mergeFields(cashCount.__byDate[d], v);
                   });
                 }
+                // ⭐ Merge lockedDates from cloud (UNION — cloud lock + local lock = locked)
+                //    Reason: lock เป็น authoritative state — ถ้า admin lock ที่ device อื่น
+                //    device นี้ต้องเห็น lock ทันทีหลัง refresh (ไม่งั้น แก้แล้ว push ทับได้)
+                //    แต่ unlock ต้อง explicit (user กดเอง) — ดังนั้นไม่ลบ local locks ออก
+                if (parsed.lockedDates && Object.keys(parsed.lockedDates).length > 0) {
+                  if (!mainSummary.__lockedDates) mainSummary.__lockedDates = {};
+                  Object.keys(parsed.lockedDates).forEach(d => {
+                    mainSummary.__lockedDates[d] = true;
+                  });
+                  console.log(`[sync] Lock dates merged: ${Object.keys(mainSummary.__lockedDates).length} total`);
+                }
                 handled = true;
                 console.log(`[sync] Meta ${y}: ${r.data.rows.length} rows via getMetaWithUuid (new schema)`);
               }
@@ -2509,6 +2612,24 @@ const syncManager = {
 };
 syncManager.init();
 window.syncManager = syncManager;
+
+// ⭐ Pending-sync helpers — ตรวจว่า record ยังไม่ได้ push ขึ้น cloud
+//    ใช้ใน UI แสดง ⚡ badge บน rows ที่ dirty
+window.isDirtyBill = function(uuid) {
+  if (!uuid) return false;
+  return syncManager.dirtyUuids?.bills?.has(uuid) || false;
+};
+window.isDirtyStmt = function(uuid) {
+  if (!uuid) return false;
+  return syncManager.dirtyUuids?.stmts?.has(uuid) || false;
+};
+window.dirtyCounts = function() {
+  return {
+    bills: syncManager.dirtyUuids?.bills?.size || 0,
+    stmts: syncManager.dirtyUuids?.stmts?.size || 0,
+    types: syncManager.dirty?.size || 0,
+  };
+};
 
 function persistMainState() {
   // ⭐ Normalize date formats เป็น ISO ทั้งหมด — กัน 2 formats ปนกัน
@@ -4656,6 +4777,22 @@ function openQuickMatchModal(b) {
 }
 
 // ── Render Main Page (Summary + Bill List + Change Counting) ──
+// ⭐ Render Statements tab inside Main page
+//    Reuses renderMatching() with pre-set date filter = selectedDate
+async function renderMainStmtsTab(el) {
+  // Pre-set date filter hint (consumed by renderMatching on first render)
+  window.__matchingPrefill = {
+    dateFrom: window.__mainSelectedDate || '',
+    dateTo: window.__mainSelectedDate || '',
+  };
+  
+  // Embed matching page directly
+  if (typeof renderMatching === 'function') {
+    return renderMatching(el);
+  }
+  el.innerHTML = '<div style="padding:24px;text-align:center;color:var(--text2)">⚠️ Matching component not loaded</div>';
+}
+
 async function renderMain(el) {
   // ⭐ Consume filter hint จาก dashboard card click (ถ้ามี)
   const hint = window.__mainFilterHint;
@@ -4665,6 +4802,7 @@ async function renderMain(el) {
   let filterType = hint?.filterType || 'ALL';
   let filterMatch = hint?.filterMatch || 'ALL';  // ALL | unmatched | matched | pending
   let filterBillSearch = ''; // ค้นหาเลขบิล/confirmation/remarks
+  let filterPendingOnly = false; // ⚡ แสดงเฉพาะที่ยังไม่ sync
   // ⭐ ถ้า hint.showAll → เปิด date range ครอบทั้งหมด เพื่อเห็นบิลจากทุกวัน
   let filterDateFrom = hint?.showAll ? '2000-01-01' : '';
   let filterDateTo = hint?.showAll ? '2099-12-31' : '';
@@ -4990,6 +5128,11 @@ async function renderMain(el) {
     if (filterType !== 'ALL') data = data.filter(b => b.type === filterType);
     if (hidePaid) data = data.filter(b => b.match_status !== 'paid');
     
+    // ⭐ Filter ⚡ pending sync only (ทั้ง billList ไม่จำกัดวันที่)
+    if (filterPendingOnly) {
+      data = billList.filter(b => isDirtyBill(b.bill_uuid));
+    }
+    
     // ── Filter by match status ──
     //   "ยังไม่ match" = Type ใน [Transfer, Card, Cheque, Refund] หรือ Type ว่าง
     //   (Type=Cash ไม่ต้อง match — ไม่แสดงในกลุ่มนี้ เพราะ auto matched แล้ว)
@@ -5143,8 +5286,31 @@ async function renderMain(el) {
           <button class="btn btn-outline btn-sm" id="btn-bulk-lock" title="Lock/Unlock หลายวันพร้อมกัน" style="border:1px dashed var(--text2);color:var(--text2)">📅 Bulk</button>
           <button class="btn btn-outline btn-sm" id="btn-check-issues">🔍 ตรวจสอบ</button>
           <button class="btn btn-outline btn-sm" id="btn-refresh-cloud" title="ดึงข้อมูลล่าสุดจาก Sheet (ทับ local)">🔄 Refresh</button>
-          <button class="btn btn-success btn-sm" id="btn-save-main" style="position:relative">${ICONS.check} บันทึก<span id="dirty-dot" style="display:none;position:absolute;top:-4px;right:-4px;width:10px;height:10px;background:var(--warn);border-radius:50%;border:2px solid var(--bg);box-shadow:0 0 6px var(--warn)"></span></button>
+          <button class="btn btn-success btn-sm" id="btn-save-main" style="position:relative">${ICONS.check} บันทึก<span id="dirty-count-badge" style="display:none;background:var(--warn);color:#1a1d27;font-size:.7rem;font-weight:700;padding:1px 6px;border-radius:9px;margin-left:6px"></span></button>
         </div>
+      </div>
+      
+      <!-- ── Tab control: Daily / Statements ── -->
+      <div class="flex gap-1 mb-3" style="border-bottom:2px solid var(--border);padding:0 4px">
+        ${(() => {
+          const stmtsTodayCount = (() => {
+            try {
+              const all = (typeof getAllStatements === 'function') ? getAllStatements() : [];
+              return all.filter(s => toISODate(s.date) === selectedDate).length;
+            } catch(_) { return 0; }
+          })();
+          const stmtsDirty = (window.dirtyCounts ? dirtyCounts() : {stmts:0}).stmts;
+          const isDaily = mainTab === 'daily';
+          const isStmts = mainTab === 'stmts';
+          return `
+            <button class="main-tab-btn" data-tab="daily" style="padding:10px 20px;background:${isDaily?'var(--surface)':'transparent'};color:${isDaily?'var(--primary)':'var(--text2)'};border:none;border-bottom:3px solid ${isDaily?'var(--primary)':'transparent'};font-weight:${isDaily?'700':'500'};font-size:.95rem;cursor:pointer;transition:all .15s">
+              📋 Daily Summary
+            </button>
+            <button class="main-tab-btn" data-tab="stmts" style="padding:10px 20px;background:${isStmts?'var(--surface)':'transparent'};color:${isStmts?'var(--primary)':'var(--text2)'};border:none;border-bottom:3px solid ${isStmts?'var(--primary)':'transparent'};font-weight:${isStmts?'700':'500'};font-size:.95rem;cursor:pointer;transition:all .15s">
+              💳 Statements (${stmtsTodayCount})${stmtsDirty>0?`<span style="margin-left:6px;background:var(--warn);color:#1a1d27;padding:1px 6px;border-radius:8px;font-size:.7rem;font-weight:700">⚡${stmtsDirty}</span>`:''}
+            </button>
+          `;
+        })()}
       </div>
       
       ${isDateLocked(selectedDate) ? `
@@ -5170,6 +5336,7 @@ async function renderMain(el) {
         </div>`;
       })()}
 
+      ${mainTab === 'daily' ? `
       <!-- ═══════ SECTION 1: Summary Table (ส่วนบน) ═══════ -->
       <div class="card-flat mb-3">
         <div class="table-wrap" style="overflow-x:auto">
@@ -5348,8 +5515,14 @@ async function renderMain(el) {
       ` : ''}
       
       <div class="flex justify-between items-center mb-2">
-        <div class="font-semi">📋 Bill List (${billList.length} รายการ${filterDateFrom||filterDateTo?` · กรอง ${filterDateFrom||'…'} → ${filterDateTo||'…'}`:''}${filterBillSearch?` · <span style="color:var(--info)">🔍 ค้น "${filterBillSearch}" = ${data.length}</span>`:''})</div>
+        <div class="font-semi">📋 Bill List (${billList.length} รายการ${filterDateFrom||filterDateTo?` · กรอง ${filterDateFrom||'…'} → ${filterDateTo||'…'}`:''}${filterBillSearch?` · <span style="color:var(--info)">🔍 ค้น "${filterBillSearch}" = ${data.length}</span>`:''}${filterPendingOnly?` · <span style="color:var(--warn)">⚡ Pending = ${data.length}</span>`:''})</div>
         <div class="flex gap-2 flex-wrap">
+          ${(() => {
+            const dCount = (window.dirtyCounts ? dirtyCounts() : { bills: 0 }).bills;
+            return dCount > 0
+              ? `<button class="btn btn-sm" id="btn-toggle-pending-only" style="${filterPendingOnly?'background:var(--warn);color:#1a1d27;font-weight:700':'background:transparent;border:1px solid var(--warn);color:var(--warn);font-weight:600'}" title="แสดงเฉพาะบิลที่ยังไม่ได้บันทึก">⚡ Pending (${dCount})</button>`
+              : '';
+          })()}
           <div style="position:relative">
             <input type="text" class="input" id="filter-bill-search" value="${filterBillSearch.replace(/"/g,'&quot;')}" placeholder="🔍 ค้นเลขบิล / confirmation / remarks / ยอด..." style="width:280px;font-size:.8rem;padding-right:28px">
             ${filterBillSearch?`<button id="btn-clear-bill-search" title="ล้างค้นหา" style="position:absolute;right:6px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--danger);cursor:pointer;font-size:1.1rem;line-height:1">✕</button>`:''}
@@ -5481,9 +5654,14 @@ async function renderMain(el) {
                     statusBadge = `<br><span class="badge badge-danger" style="margin-top:2px">⚠ ยัง Match ไม่เจอ</span>`;
                   }
                   
-                  return `<tr data-idx="${realIdx}" style="${rowStyle}">
+                  // ⭐ Pending sync indicator
+                  const _isDirty = isDirtyBill(b.bill_uuid);
+                  const _dirtyClass = _isDirty ? ' dirty-row' : '';
+                  const _dirtyMark = _isDirty ? '<span class="dirty-badge" title="ยังไม่ได้บันทึก (กดปุ่ม 💾 บันทึก)"></span>' : '';
+                  
+                  return `<tr data-idx="${realIdx}" class="${_dirtyClass}" style="${rowStyle}">
                     <td style="text-align:center"><input type="checkbox" class="chk-bill" data-idx="${realIdx}"></td>
-                    <td class="text-xs text-muted">${idx+1} <span class="badge ${badgeCls}" style="margin-left:4px">${badgeText}</span>${statusBadge}</td>
+                    <td class="text-xs text-muted">${idx+1}${_dirtyMark} <span class="badge ${badgeCls}" style="margin-left:4px">${badgeText}</span>${statusBadge}</td>
                     <td style="font-weight:600;color:var(--text)">${b.bill_no||'-'}${isPaid&&b.paid_by_sp?`<br><span class="text-xs" style="color:var(--success)">← ${b.paid_by_sp}</span>`:''}</td>
                     <td style="position:relative"><input type="date" class="input bl-cell" data-field="date" value="${toISODate(b.date)}" style="padding:3px 6px;font-size:.78rem;width:130px">
                       <button class="btn-copy-down" data-idx="${realIdx}" data-field="date" title="คัดลอกลงทุกแถวที่เหลือ (Ctrl+↓)" style="background:none;border:1px solid var(--border);color:var(--text2);padding:0 6px;margin-left:2px;border-radius:4px;cursor:pointer;font-size:.75rem">⬇️</button>
@@ -5585,6 +5763,12 @@ async function renderMain(el) {
 
       <!-- ═══════ SECTION 4: SP Payments (merged from Payments page) ═══════ -->
       <div id="main-sp-section" style="margin-top:16px"></div>
+      ` : ''}
+      
+      ${mainTab === 'stmts' ? `
+      <!-- ═══════ TAB: Statements (รวม Matching เดิม) ═══════ -->
+      <div id="main-stmts-section"></div>
+      ` : ''}
     `;
 
     bindMainEvents();
@@ -5769,6 +5953,23 @@ async function renderMain(el) {
 
   // ── Bind events ──
   function bindMainEvents() {
+    // ⭐ Tab switcher
+    document.querySelectorAll('.main-tab-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const newTab = btn.dataset.tab;
+        if (newTab === mainTab) return;
+        mainTab = newTab;
+        try { localStorage.setItem('sf_main_tab', mainTab); } catch(_) {}
+        render();
+      });
+    });
+    
+    // ⭐ Render Statements tab content (only when active)
+    if (mainTab === 'stmts') {
+      const stmtsEl = document.getElementById('main-stmts-section');
+      if (stmtsEl) renderMainStmtsTab(stmtsEl);
+    }
+    
     // Buttons
     document.getElementById('btn-gen-smart')?.addEventListener('click', () => {
       if (blockIfLocked(selectedDate, 'Smart import')) return;
@@ -6224,6 +6425,11 @@ async function renderMain(el) {
         }
       });
     }
+    document.getElementById('btn-toggle-pending-only')?.addEventListener('click', () => {
+      filterPendingOnly = !filterPendingOnly;
+      render();
+    });
+    
     document.getElementById('btn-clear-bill-search')?.addEventListener('click', () => {
       filterBillSearch = '';
       render();
@@ -6623,11 +6829,24 @@ async function renderMain(el) {
       }
     });
     
-    // ── อัพเดต dot indicator ที่ปุ่มบันทึก เมื่อมี unsaved ──
+    // ── อัพเดต count badge ที่ปุ่มบันทึก เมื่อมี unsaved ──
     function updateDirtyDot() {
-      const dot = document.getElementById('dirty-dot');
-      if (!dot) return;
-      dot.style.display = (window.syncManager?.dirty?.size > 0) ? 'block' : 'none';
+      const badge = document.getElementById('dirty-count-badge');
+      if (!badge) return;
+      const counts = window.dirtyCounts ? dirtyCounts() : { bills: 0, stmts: 0, types: 0 };
+      const total = counts.bills + counts.stmts;
+      if (total > 0) {
+        badge.style.display = 'inline-block';
+        badge.textContent = '⚡ ' + total;
+        badge.title = `ยังไม่ได้บันทึก: ${counts.bills} บิล, ${counts.stmts} statements`;
+      } else if (counts.types > 0) {
+        // มี dirty type อื่น (meta/cashflow/etc.) ที่ไม่ได้ track per-uuid
+        badge.style.display = 'inline-block';
+        badge.textContent = '●';
+        badge.title = 'มีการเปลี่ยนแปลงที่ยังไม่ได้บันทึก';
+      } else {
+        badge.style.display = 'none';
+      }
     }
     updateDirtyDot();
     setInterval(updateDirtyDot, 2000);
@@ -12895,6 +13114,27 @@ function doLogout() {
   document.getElementById('login-pass').value = '';
 }
 
+// ⭐ Mobile sidebar toggle
+function toggleSidebar(forceState) {
+  const sidebar = document.getElementById('sidebar');
+  if (!sidebar) return;
+  const overlay = document.getElementById('sidebar-overlay');
+  const isOpen = sidebar.classList.contains('mobile-open');
+  const newState = (forceState === undefined) ? !isOpen : !!forceState;
+  sidebar.classList.toggle('mobile-open', newState);
+  if (overlay) overlay.style.display = newState ? 'block' : 'none';
+}
+window.toggleSidebar = toggleSidebar;
+// Auto-close sidebar เมื่อ navigate (mobile)
+const _origNavigateTo_forSidebar = window.navigateTo;
+// (ใช้ event delegation: คลิก sidebar nav item ใดๆ → close)
+document.addEventListener('click', function(e) {
+  const navItem = e.target.closest('#sidebar-nav .nav-item');
+  if (navItem && window.innerWidth < 768) {
+    setTimeout(() => toggleSidebar(false), 150);
+  }
+});
+
 // ── Check saved login ──
 // defer saved-login check until all declarations are ready
 function checkSavedLogin() {
@@ -12921,7 +13161,6 @@ const NAV_ITEMS = [
   { id:'supplier',  icon:'card',    label:'จ่ายเจ้าหนี้ (PP)' },
   { id:'pprpt',     icon:'file',    label:'PP Report' },
   { id:'transferlog', icon:'pulse', label:'Transfer Log' },
-  { id:'matching',  icon:'pulse',   label:'Matching' },
   { id:'sp_recon',  icon:'check',   label:'📥 ตรวจ SP (ลูกหนี้)' },
   { id:'pp_recon',  icon:'check',   label:'📤 ตรวจ PP (เจ้าหนี้)' },
   { id:'debt',      icon:'card',    label:'ติดตามหนี้' },
@@ -13087,6 +13326,14 @@ async function loadMetaFromBackend() {
           }
         });
       }
+      
+      // ── Merge lockedDates (UNION) ──
+      if (parsed.lockedDates && Object.keys(parsed.lockedDates).length > 0) {
+        if (!mainSummary.__lockedDates) mainSummary.__lockedDates = {};
+        Object.keys(parsed.lockedDates).forEach(function(d) {
+          mainSummary.__lockedDates[d] = true;
+        });
+      }
     }
     
     persistMainState();
@@ -13113,6 +13360,12 @@ function renderNav() {
 function navigateTo(page) {
   // Backward compat: billlist → main
   if (page === 'billlist') page = 'main';
+  // ⭐ Matching menu ถูกลบแล้ว — redirect ไป Main + เปิด tab Statements
+  if (page === 'matching') {
+    page = 'main';
+    mainTab = 'stmts';
+    try { localStorage.setItem('sf_main_tab', 'stmts'); } catch(_) {}
+  }
   currentPage = page;
   renderNav();
   const main = document.getElementById('main');
@@ -14970,6 +15223,13 @@ async function renderMatching(el) {
   let bankFilter = 'ALL', matchFilter = 'ALL';
   let dirFilter = 'ALL'; // 'ALL' | 'in' | 'out'
   let dateFrom = '', dateTo = '';
+  // ⭐ Consume prefill จาก renderMainStmtsTab (one-shot)
+  const _prefill = window.__matchingPrefill;
+  if (_prefill) {
+    if (_prefill.dateFrom) dateFrom = _prefill.dateFrom;
+    if (_prefill.dateTo) dateTo = _prefill.dateTo;
+    delete window.__matchingPrefill;
+  }
   let amountSearch = ''; // ค้นหายอดเงิน (partial match)
   const bankColors = { KTB:'#00a4e4', KBANK:'#138f2d', 'BBL NW':'#ff7b00', BBL:'#1e3a7b', TTB:'#ff0066' };
 
@@ -15125,12 +15385,18 @@ async function renderMatching(el) {
               ${data.length ? visibleData.map((s,i)=>{
                 const isMatched = s.match_status === 'matched';
                 const isManual = s.match_method === 'manual';
+                // ⭐ Pending sync indicator
+                const _isDirty = (typeof isDirtyStmt === 'function') && isDirtyStmt(s.stmt_uuid);
+                // 🔒 Lock indicator — stmt date อยู่ในวัน lock?
+                const _stmtDateISO = (typeof toISODate === 'function') ? toISODate(s.date) : '';
+                const _isLocked = (typeof isDateLocked === 'function') && isDateLocked(_stmtDateISO);
                 const rowStyle = isMatched 
                   ? 'background:rgba(45,212,160,.06)' 
                   : 'background:rgba(239,87,87,.06);border-left:3px solid var(--danger)';
+                const _classes = (_isDirty ? ' dirty-row' : '');
                 return `
-                <tr style="${rowStyle}" data-stmt-idx="${i}">
-                  <td><span class="badge" style="background:${(bankColors[s.bank]||'#555')}22;color:${bankColors[s.bank]||'#aaa'}">${s.bank}</span></td>
+                <tr class="${_classes}" style="${rowStyle}" data-stmt-idx="${i}">
+                  <td><span class="badge" style="background:${(bankColors[s.bank]||'#555')}22;color:${bankColors[s.bank]||'#aaa'}">${s.bank}</span>${_isDirty?'<span class="dirty-badge" title="ยังไม่ได้บันทึก"></span>':''}${_isLocked?' <span title="วันนี้ถูก lock — แก้ไขไม่ได้ แต่ matching ทำได้" style="color:var(--danger);font-size:.85rem">🔒</span>':''}</td>
                   <td>${fmtDate(s.date)}</td>
                   <td>${fmtStmtTime(s.time)}</td>
                   <td class="text-xs" style="font-family:var(--mono)">${s.ref_no}</td>
@@ -17798,6 +18064,30 @@ function renderData(el) {
         });
       }
       
+      // ⭐ Locked Dates: 1 row รวมทุกวันที่ lock (ใน data_json)
+      //    Format: { "2026-04-25": true, "2026-04-26": true, ... }
+      //    เก็บ row เดียวต่อปี (ใช้ year ของวันแรก หรือปีปัจจุบันถ้าไม่มี)
+      if (mainSummary && mainSummary.__lockedDates && Object.keys(mainSummary.__lockedDates).length > 0) {
+        // group by year
+        const byYear = {};
+        Object.keys(mainSummary.__lockedDates).forEach(function(d) {
+          if (!mainSummary.__lockedDates[d]) return; // เฉพาะที่ true
+          const y = String(d).substring(0, 4);
+          if (!byYear[y]) byYear[y] = {};
+          byYear[y][d] = true;
+        });
+        Object.keys(byYear).forEach(function(year) {
+          rows.push({
+            meta_uuid: year + '-01-01|locks',
+            date: '01/01/' + year,
+            meta_type: 'locks',
+            data_json: JSON.stringify(byYear[year]),
+            updated_at: nowStr,
+            updated_by: user,
+          });
+        });
+      }
+      
       return rows;
     }
     
@@ -17808,9 +18098,10 @@ function renderData(el) {
         'returns': 'ยอดคืนสินค้า', 'cashDrawer': 'Cash Drawer',
         'transfer': 'Transfer', 'card': 'Card', 'cheque': 'Cheque', 'refund': 'Refund',
       };
-      const VALID_META_TYPES = ['summary', 'cash_count'];
+      const VALID_META_TYPES = ['summary', 'cash_count', 'locks'];
       const summary = { __byDate: {} };
       const cash = { __byDate: {} };
+      const lockedDates = {}; // ⭐ NEW
       let skippedJunk = 0;
       
       rows.forEach(function(r) {
@@ -17863,6 +18154,11 @@ function renderData(el) {
           });
         } else if (r.meta_type === 'cash_count') {
           cash.__byDate[dateISO] = data;
+        } else if (r.meta_type === 'locks') {
+          // data = { 'yyyy-mm-dd': true, ... }
+          Object.keys(data).forEach(function(d) {
+            if (data[d] === true) lockedDates[d] = true;
+          });
         }
       });
       
@@ -17870,7 +18166,7 @@ function renderData(el) {
         console.warn(`[parseMeta] Skipped ${skippedJunk} junk rows (shifted-column legacy data)`);
       }
       
-      return { summary: summary, cashCount: cash };
+      return { summary: summary, cashCount: cash, lockedDates: lockedDates };
     }
     
     // Expose to window scope so syncManager (global) + other code can access
