@@ -1770,7 +1770,24 @@ async function pullStatementsCompat(year) {
         throw new Error(r.error || 'v2_getAllStatementsByYear failed');
       }
       window.__v2StmtsAvailable = true;
-      return Array.isArray(r?.data?.records) ? r.data.records : [];
+      // ⭐ Backend returns data.banks = { KTB: [...], KBANK: [...], BBL_NW: [...], BBL: [...], TTB: [...] }
+      //   each row has `bank` field already injected by v2GetStatementsByBank
+      //   → flatten into single array (preserves per-row bank info)
+      // Fallback to data.records if older backend version returns flat array
+      if (Array.isArray(r?.data?.records)) return r.data.records;
+      const banks = r?.data?.banks || {};
+      const out = [];
+      Object.keys(banks).forEach(b => {
+        const arr = banks[b];
+        if (Array.isArray(arr)) {
+          for (let i = 0; i < arr.length; i++) {
+            // ensure bank field is set (defense — backend should already inject it)
+            if (!arr[i].bank) arr[i].bank = b;
+            out.push(arr[i]);
+          }
+        }
+      });
+      return out;
     } catch (e) {
       if (e.message !== 'V2_NOT_DEPLOYED' && window.__v2StmtsAvailable !== false) {
         console.warn('[v2 stmts] pull error → fallback legacy:', e.message);
