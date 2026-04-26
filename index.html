@@ -2262,13 +2262,19 @@ const syncManager = {
           // ⭐ รวม deleted nos ใน fp → ถ้าลบ → fp เปลี่ยน → push (ไม่ skip)
           const delNos = window.deletedSpTempNos ? [...window.deletedSpTempNos] : [];
           const fp = this._fp({n: spTempList.length, paids: spTempList.map(t => (t.partials||[]).length), links: spTempList.map(t => t.linked_sp||''), del: delNos});
-          if (fp === this._fpCache.sp_temps) { results.skipped++; continue; }
+          console.log('[sp_temps push] records:', spTempList.length, '| deletes:', delNos.length, delNos.length > 0 ? delNos : '');
+          if (fp === this._fpCache.sp_temps) { 
+            console.log('[sp_temps push] SKIPPED — fp matches cache');
+            results.skipped++; 
+            continue; 
+          }
           const r = await api('saveSpTemps', { records: spTempList, deletes: delNos, created_by: by });
+          console.log('[sp_temps push] response:', r?.success === false ? `FAIL: ${r.error}` : `OK updated:${r?.data?.updated} inserted:${r?.data?.inserted} deleted:${r?.data?.deleted} total:${r?.data?.total_rows}`);
           if (r?.success === false) throw new Error(r.error || 'API error');
           // ⭐ Clear deleted nos หลัง push สำเร็จ
           if (delNos.length > 0 && window.deletedSpTempNos) {
             const deleted = Number(r?.data?.deleted) || 0;
-            console.log(`[push] sp_temps deleted from cloud: ${deleted}/${delNos.length}`);
+            console.log(`[sp_temps push] cleared deletedSpTempNos (deleted ${deleted}/${delNos.length} on cloud)`);
             window.deletedSpTempNos.clear();
             try { localStorage.removeItem('sf_deleted_sp_temp_nos'); } catch(_){}
           }
