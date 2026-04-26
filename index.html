@@ -12822,7 +12822,7 @@ function openTransferLogModal(opts = {}) {
       </div>
     </div>
   `;
-  document.body.appendChild(modal);
+  document.body.appendChild(modal); requestAnimationFrame(() => modal.classList.add("open"));
   
   // Auto-recompute total + net on deduct/billed change
   function recompute() {
@@ -12983,7 +12983,7 @@ function openTransferMasterModal(opts = {}) {
       </div>
     </div>
   `;
-  document.body.appendChild(modal);
+  document.body.appendChild(modal); requestAnimationFrame(() => modal.classList.add("open"));
   
   function close() { modal.remove(); }
   modal.querySelectorAll('[data-close]').forEach(b => b.addEventListener('click', close));
