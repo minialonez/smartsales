@@ -9542,6 +9542,18 @@ function renderSpSectionsForDate(opts) {
     if (matchDate(t.date)) return true;
     // เผื่อ partials ตกในวันที่เลือก → ยังแสดง (เข้าจัดการได้)
     return (t.partials || []).some(pr => matchDate(pr.date));
+  }).sort((a, b) => {
+    // ⭐ Sort by cust_name asc (Thai locale) — ลูกค้าเดียวกันจะติดกัน
+    //   tie-break: cust_code, แล้ว no (SP-TEMP-XXXX)
+    const an = String(a.cust_name || '').trim();
+    const bn = String(b.cust_name || '').trim();
+    if (an && !bn) return -1;
+    if (!an && bn) return 1;
+    const c1 = an.localeCompare(bn, 'th');
+    if (c1 !== 0) return c1;
+    const c2 = String(a.cust_code || '').localeCompare(String(b.cust_code || ''));
+    if (c2 !== 0) return c2;
+    return String(a.no || '').localeCompare(String(b.no || ''));
   });
   const pays = paymentList.filter(p => matchDate(p.date));
 
@@ -9619,19 +9631,31 @@ function renderSpSectionsForDate(opts) {
                       <th style="text-align:center;padding:3px">Match</th>
                       <th style="width:30px"></th>
                     </tr></thead>
-                    <tbody>${(t.partials || []).map((pr, i) => {
+                    <tbody>${(() => {
+                      // ⭐ Sort partials by date asc — แต่เก็บ original index ไว้สำหรับ data-idx
+                      //   data-idx ต้องเป็น index ใน t.partials ตัวจริง (ไม่ใช่ index หลัง sort)
+                      const indexed = (t.partials || []).map((pr, originalIdx) => ({ pr, originalIdx }));
+                      indexed.sort((a, b) => {
+                        const da = String(a.pr.date || '');
+                        const db = String(b.pr.date || '');
+                        if (da && !db) return -1;
+                        if (!da && db) return 1;
+                        return da.localeCompare(db);
+                      });
+                      return indexed.map(({ pr, originalIdx }, displayI) => {
                       const matched = !!pr.stmt_ref;
                       return `
-                      <tr class="main-sp-partial-row" data-no="${t.no}" data-idx="${i}" style="cursor:pointer" title="คลิกเพื่อแก้ไข/match">
-                        <td style="padding:3px;color:var(--text3)">${i + 1}</td>
+                      <tr class="main-sp-partial-row" data-no="${t.no}" data-idx="${originalIdx}" style="cursor:pointer" title="คลิกเพื่อแก้ไข/match">
+                        <td style="padding:3px;color:var(--text3)">${displayI + 1}</td>
                         <td style="padding:3px">${fmtDate(pr.date)}</td>
                         <td style="padding:3px;text-align:right;font-weight:600;color:var(--success)">฿${fmtNum(pr.amount)}</td>
                         <td style="padding:3px">${pr.method || '-'}</td>
                         <td style="padding:3px">${pr.bank || '-'}</td>
                         <td style="padding:3px;text-align:center">${matched ? '<span class="badge badge-success" style="font-size:.6rem">🔗 matched</span>' : '<span class="text-muted" style="font-size:.7rem">-</span>'}</td>
-                        <td style="padding:3px;text-align:right"><button class="main-sp-del-partial" data-no="${t.no}" data-idx="${i}" style="background:none;border:none;color:var(--danger);cursor:pointer">✕</button></td>
+                        <td style="padding:3px;text-align:right"><button class="main-sp-del-partial" data-no="${t.no}" data-idx="${originalIdx}" style="background:none;border:none;color:var(--danger);cursor:pointer">✕</button></td>
                       </tr>
-                    `}).join('')}</tbody>
+                    `}).join('');
+                    })()}</tbody>
                   </table>
                 </div>
               ` : ''}
