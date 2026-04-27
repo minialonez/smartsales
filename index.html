@@ -2626,8 +2626,8 @@ const syncManager = {
                         });
                         return; // skip full merge
                       }
-                      const localMatched = localBill.match_status === 'paid' || localBill.match_status === 'paid';
-                      const cloudMatched = b.match_status === 'paid' || b.match_status === 'paid';
+                      const localMatched = localBill.match_status === 'paid';
+                      const cloudMatched = b.match_status === 'paid';
                       if (localMatched && !cloudMatched) {
                         const localMatchedAt = localBill.matched_at ? new Date(localBill.matched_at).getTime() : 0;
                         const cloudUpdatedAt = b.updated_at ? new Date(b.updated_at).getTime() : 0;
@@ -3197,7 +3197,7 @@ function validateBill(b, idx, allBills) {
   if (b.type === 'Transfer' && !b.bank) {
     // ข้ามสำหรับบิลที่ import มา (JSON/Smart/Summary ไม่มี bank field — ปกติ)
     // ⭐ ข้ามถ้า match แล้ว — bank รู้ได้จาก statement ที่ match ไป (ไม่ต้องบังคับให้ user กรอก)
-    const isMatched = b.match_status === 'paid' || b.match_status === 'paid' || b.paid_by_sp;
+    const isMatched = b.match_status === 'paid' || b.paid_by_sp;
     if (b.source === 'manual' && !isMatched) {
       issues.push({ level:'warn', billIdx:idx, field:'bank', msg:`${billNo}: Type=Transfer แต่ยังไม่ได้เลือก Bank` });
     }
@@ -4634,7 +4634,7 @@ function openQuickMatchModal(b) {
       // อย่าซ้ำตัวเอง
       if (x === b) return false;
       // Status: เอาเฉพาะที่ match ได้
-      if (['matched','paid','void','bounced'].includes(x.match_status)) return false;
+      if (['paid','void','bounced'].includes(x.match_status)) return false;
       if (x.paid_by_sp) return false;
       // Type ต้อง match ได้ (Transfer/Cheque/Card)
       if (!['Transfer','Cheque','Card'].includes(x.type)) return false;
@@ -4657,7 +4657,7 @@ function openQuickMatchModal(b) {
     return billList.filter(x => {
       if (!x || x === b) return false;
       // Status guard: ไม่เอา matched/paid/void แต่ยังโชว์ pending/awaiting_clear/bounced
-      if (['matched','paid','void'].includes(x.match_status)) return false;
+      if (['paid','void'].includes(x.match_status)) return false;
       if (x.paid_by_sp) return false;
       // Type ต้อง match ได้
       if (!['Transfer','Cheque','Card'].includes(x.type)) return false;
@@ -5392,7 +5392,7 @@ async function renderMain(el) {
       const ty = (b.type || '').trim();
       if (st !== station || ty !== type) return false;
       // Filter: เฉพาะบิลที่ match แล้ว (matched, paid, paid_by_sp)
-      const isMatched = b.match_status === 'paid' || b.match_status === 'paid' || b.paid_by_sp;
+      const isMatched = b.match_status === 'paid' || b.paid_by_sp;
       return isMatched;
     }).reduce((s, b) => s + (Number(b.amount) || 0), 0);
   }
@@ -5636,7 +5636,7 @@ async function renderMain(el) {
     //   (Type=Cash ไม่ต้อง match — ไม่แสดงในกลุ่มนี้ เพราะ auto matched แล้ว)
     const MATCHABLE_TYPES_FILTER = ['Transfer', 'Card', 'Cheque', 'Refund', '', null, undefined];
     const isUnmatchedCandidate = (b) => {
-      const isMatched = b.match_status === 'paid' || b.match_status === 'paid';
+      const isMatched = b.match_status === 'paid';
       const isVoid = b.match_status === 'void';
       const isBounced = b.match_status === 'bounced';
       if (isMatched || isVoid || isBounced) return false;
@@ -5650,7 +5650,7 @@ async function renderMain(el) {
     if (filterMatch === 'unmatched') {
       data = data.filter(isUnmatchedCandidate);
     } else if (filterMatch === 'matched') {
-      data = data.filter(b => b.match_status === 'paid' || b.match_status === 'paid');
+      data = data.filter(b => b.match_status === 'paid');
     } else if (filterMatch === 'pending') {
       data = data.filter(b => !b.match_status || b.match_status === 'pending');
     }
@@ -5663,7 +5663,7 @@ async function renderMain(el) {
       if (hidePaid) data = data.filter(b => b.match_status !== 'paid');
       // ⭐ Bug fix: apply filterMatch ใน date range branch ด้วย (เดิมลืม → แสดง matched ปน)
       if (filterMatch === 'unmatched') data = data.filter(isUnmatchedCandidate);
-      else if (filterMatch === 'matched') data = data.filter(b => b.match_status === 'paid' || b.match_status === 'paid');
+      else if (filterMatch === 'matched') data = data.filter(b => b.match_status === 'paid');
       else if (filterMatch === 'pending') data = data.filter(b => !b.match_status || b.match_status === 'pending');
       data = data.filter(b => {
         const bd = toISODate(b.date);
@@ -5685,7 +5685,7 @@ async function renderMain(el) {
         if (hidePaid) data = data.filter(b => b.match_status !== 'paid');
         // Match status filter
         if (filterMatch === 'unmatched') data = data.filter(isUnmatchedCandidate);
-        else if (filterMatch === 'matched') data = data.filter(b => b.match_status === 'paid' || b.match_status === 'paid');
+        else if (filterMatch === 'matched') data = data.filter(b => b.match_status === 'paid');
         else if (filterMatch === 'pending') data = data.filter(b => !b.match_status || b.match_status === 'pending');
       }
       const q = filterBillSearch.toLowerCase().trim();
@@ -6103,7 +6103,7 @@ async function renderMain(el) {
                   
                   // ── Row status (สีไฮไลต์ตามสถานะ) ──
                   const isVoid = b.match_status === 'void';
-                  const isPaid = !isVoid && (b.match_status === 'paid' || b.match_status === 'paid');
+                  const isPaid = !isVoid && (b.match_status === 'paid');
                   const isAwaitingClear = !isVoid && !isPaid && (
                     b.match_status === 'awaiting_clear' || 
                     (b.type === 'Cheque' && b.match_status !== 'paid' && b.match_status !== 'bounced' && !b.confirmation)
@@ -8067,7 +8067,7 @@ async function renderMain(el) {
           
           // ⭐ Auto-set paid: ถ้ากรอก pay_date + status ยังไม่ใช่ paid/matched → set เป็น paid
           // (user confirmed: กรอก pay_date = ถือว่าจ่ายแล้ว)
-          if (b.pay_date && b.match_status !== 'paid' && b.match_status !== 'paid' && b.match_status !== 'void' && b.match_status !== 'bounced') {
+          if (b.pay_date && b.match_status !== 'paid' && b.match_status !== 'void' && b.match_status !== 'bounced') {
             b.match_status = 'paid';
           }
           
@@ -15135,12 +15135,12 @@ async function renderDashboard(el) {
     return t === 'Transfer' || t === 'Card' || t === 'Cheque';
   });
   const matchedBills = matchableBills.filter(b => 
-    b.match_status === 'paid' || b.match_status === 'paid' || !!b.matched_stmt_ref
+    b.match_status === 'paid' || !!b.matched_stmt_ref
   );
   
   // ⭐ Debt — กว้างขึ้น: Credit station OR credit note prefix OR unmatched credit sale
   const creditBills = billList.filter(b => {
-    if (b.match_status === 'paid' || b.match_status === 'paid' || b.match_status === 'void') return false;
+    if (b.match_status === 'paid' || b.match_status === 'void') return false;
     if (b.paid_by_sp) return false;
     const st = String(b.station||'');
     const prefix = String(b.bill_no||'').substring(0,2).toUpperCase();
@@ -18070,7 +18070,7 @@ async function renderMatching(el) {
       
       function canMatch(b) {
         if (!MATCHABLE_TYPES.includes(b.type || '')) return false;
-        if (b.match_status === 'paid' || b.match_status === 'paid' || b.match_status === 'void') return false;
+        if (b.match_status === 'paid' || b.match_status === 'void') return false;
         return true;
       }
       
@@ -20772,7 +20772,7 @@ function renderReports(el) {
     let bills = billList.filter(b => 
       inRange(b.date) && 
       b.match_status !== 'void' &&
-      (b.match_status === 'paid' || b.match_status === 'paid')
+      (b.match_status === 'paid')
     );
     if (stationFilter !== 'ALL') bills = bills.filter(b => b.station === stationFilter);
     
