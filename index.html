@@ -2611,7 +2611,8 @@ const syncManager = {
                   // ⭐ UPDATE existing — multi-device sync
                   // เครื่องอื่นอาจแก้ record นี้ → merge cloud data เข้า local
                   // ยกเว้นถ้า local อยู่ใน dirty state (กำลังจะ push) → trust local
-                  if (!this.dirty.has('bills')) {
+                  // ⭐ mode='force' (user กด Refresh confirm "ทับการแก้ไข") → override dirty check
+                  if (mode === 'force' || !this.dirty.has('bills')) {
                     const idx = billList.findIndex(x => x.bill_uuid === uuid);
                     if (idx >= 0) {
                       // ⭐ Match-state guard: ถ้า local matched + matched_at ใหม่กว่า cloud updated_at → skip
@@ -2712,7 +2713,8 @@ const syncManager = {
                   stats.stmts++;
                 } else {
                   // ⭐ UPDATE existing — multi-device sync
-                  if (!this.dirty.has('stmts')) {
+                  // ⭐ mode='force' (user กด Refresh confirm "ทับการแก้ไข") → override dirty check
+                  if (mode === 'force' || !this.dirty.has('stmts')) {
                     // หา stmt เดิม (search ทุก bank เพราะอาจย้าย bank ได้)
                     let found = null;
                     for (const bk of Object.keys(statementsByBank)) {
@@ -2799,7 +2801,7 @@ const syncManager = {
           const stmt = stmtByBillNo[b.bill_no];
           if (stmt && b.match_status !== 'paid' && b.match_status !== 'void') {
             b.match_status = 'paid';
-            if (!b.matched_stmt_ref) b.matched_stmt_ref = stmt.ref_no || '';
+            if (!b.matched_stmt_ref) { b.matched_stmt_ref = stmt.ref_no || ''; b.matched_stmt_uuid = stmt.stmt_uuid || ''; }
             if (!b.confirmation && stmt.ref_no) b.confirmation = stmt.ref_no;
             healedBills++;
           }
@@ -2888,7 +2890,8 @@ const syncManager = {
       //          → pull จะไม่ทับ → local ยังเห็น 1000 → data corruption ข้ามเครื่อง
       // Fix: "cloud-wins" ยกเว้นถ้า local กำลัง dirty (กำลังจะ push เอง)
       //      ถ้า local ไม่ dirty → ข้อมูล cloud = source of truth
-      const localDirty = this.dirty.has('meta');
+      // ⭐ mode='force' (user กด Refresh confirm "ทับการแก้ไข") → override dirty check
+      const localDirty = (mode !== 'force') && this.dirty.has('meta');
       const isEmpty = (v) => v === null || v === undefined || v === '';
       const mergeFields = (target, source) => {
         let added = 0;
@@ -2990,7 +2993,10 @@ const syncManager = {
       this.lastPullAt = Date.now();
       localStorage.setItem('sf_sync_last_pull', String(this.lastPullAt));
       this.stats.pulled += Object.values(stats).filter(v => typeof v === 'number').reduce((a,b)=>a+b,0);
-      this.status = stats.errors.length ? 'error' : 'idle';
+      // ⭐ Partial errors (เช่น sheet ปีก่อนไม่มี / collection อื่นล้มเหลว) ≠ full sync error
+      //   ถ้า pull loop จบโดยไม่ throw → ถือว่า OK; เก็บ error message ไว้ใน lastError ดูได้
+      //   status='error' จะ trigger เฉพาะเมื่อ outer try/catch จับ exception จริง (line ล่าง)
+      this.status = 'idle';
       this.lastError = stats.errors[0] || null;
       this._inPull = false;  // ⭐ Clear flag
       // ⭐ Update fingerprint cache ให้ตรงกับ state ปัจจุบัน
@@ -3876,6 +3882,7 @@ async function restoreMainState() {
         b.confirmation = stmt.bank || '';
         b.pay_date = b.date;
         b.matched_stmt_ref = stmt.ref_no || '';
+        b.matched_stmt_uuid = stmt.stmt_uuid || '';
         statusSynced++;
       }
       // ถ้าบิล matched อยู่แล้วแต่ขาด confirmation → เติม
@@ -4564,7 +4571,11 @@ function quickUnmatchBill(b) {
   let unmatchedStmt = null;  // ⭐ hoist out for delta push
   if (stmtRef) {
     const allStmts = getAllStatements();
-    const stmt = allStmts.find(s => s.ref_no === stmtRef);
+    // ⭐ Prefer stmt_uuid (PK) — กัน case ที่ ref_no ซ้ำกัน (ราชการใช้ ref เดียวกันทั้งวัน)
+    let stmt = b.matched_stmt_uuid 
+      ? allStmts.find(s => s.stmt_uuid === b.matched_stmt_uuid)
+      : null;
+    if (!stmt) stmt = allStmts.find(s => s.ref_no === stmtRef);
     if (stmt) {
       stmt.match_status = 'unpaid';
       // ⭐ ตั้ง '' / [] แทน delete — กัน backend preserve ค่าเก่า ใน Sheet
@@ -4587,6 +4598,7 @@ function quickUnmatchBill(b) {
   b.confirmation = '';
   b.pay_date = '';
   b.matched_stmt_ref = '';
+  b.matched_stmt_uuid = '';
   b.matched_at = '';
   
   try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(_){}
@@ -4612,7 +4624,7 @@ function openQuickMatchModal(b) {
   
   // State ของ modal
   let selectedBank = billBank || 'ALL';
-  let selectedStmtRef = '';
+  let selectedStmtUuid = '';
   let dateWindow = 'day';           // day | day3 | day7 (เดิม = day, ขยายได้ถ้าไม่เจอ)
   let billSearchQuery = '';          // ← NEW: ค้นหาบิล (bypass date+bank filter)
   // Multi-bill: Set ของ bill references (ใช้ object ref แทน bill_no เพื่อกัน bill_no ว่างหรือซ้ำ)
@@ -4791,11 +4803,11 @@ function openQuickMatchModal(b) {
     // เงื่อนไข: (1) เลือกบิลอย่างน้อย 1 (2) เลือก stmt (3) ถ้ามี diff → reason ต้องไม่ว่าง
     const confirmBtn = document.getElementById('qm-confirm');
     if (confirmBtn) {
-      const hasBasics = selectedStmtRef && selectedBills.size > 0;
+      const hasBasics = selectedStmtUuid && selectedBills.size > 0;
       let diff = 0;
       let stmtAbs = 0;
       if (hasBasics) {
-        const stmt = getAllStatements().find(s => s.ref_no === selectedStmtRef);
+        const stmt = getAllStatements().find(s => s.stmt_uuid === selectedStmtUuid);
         if (stmt) {
           stmtAbs = Math.abs(Number(stmt.amount)||0);
           diff = stmtAbs - targetSum;  // + = ลูกค้าโอนเกิน (stmt > bills)
@@ -4859,8 +4871,8 @@ function openQuickMatchModal(b) {
     const container = document.getElementById('qm-bill-list');
     if (!container) return;
     const targetSum = getSelectedSum();
-    const stmtAbs = selectedStmtRef ? (() => {
-      const s = getAllStatements().find(x => x.ref_no === selectedStmtRef);
+    const stmtAbs = selectedStmtUuid ? (() => {
+      const s = getAllStatements().find(x => x.stmt_uuid === selectedStmtUuid);
       return s ? Math.abs(Number(s.amount)||0) : 0;
     })() : 0;
     
@@ -4968,7 +4980,7 @@ function openQuickMatchModal(b) {
       const absAmt = Math.abs(Number(s.amount)||0);
       const diff = Math.abs(absAmt - targetSum);
       const isExact = diff < 0.01;
-      const isSelected = s.ref_no === selectedStmtRef;
+      const isSelected = s.stmt_uuid === selectedStmtUuid;
       const dir = Number(s.amount) >= 0 ? '+' : '−';
       const dirColor = Number(s.amount) >= 0 ? 'var(--success)' : 'var(--danger)';
       
@@ -4989,7 +5001,7 @@ function openQuickMatchModal(b) {
       }
       
       return `
-        <div class="qm-item" data-ref="${s.ref_no||''}" 
+        <div class="qm-item" data-ref="${s.stmt_uuid||''}" 
              style="padding:10px 12px;cursor:pointer;transition:all .15s;${bg};${border};${extraStyle};border-radius:6px;margin-bottom:4px;position:relative">
           ${isSelected ? '<div style="position:absolute;top:-8px;right:8px;background:var(--info);color:#fff;padding:2px 8px;border-radius:10px;font-size:.7rem;font-weight:700">✓ เลือกแล้ว</div>' : ''}
           <div class="flex justify-between items-center">
@@ -5016,7 +5028,7 @@ function openQuickMatchModal(b) {
       el.addEventListener('click', () => {
         // Toggle: คลิกซ้ำ → ยกเลิก
         const newRef = el.dataset.ref;
-        selectedStmtRef = (selectedStmtRef === newRef) ? '' : newRef;
+        selectedStmtUuid = (selectedStmtUuid === newRef) ? '' : newRef;
         updateUI();
       });
     });
@@ -5133,7 +5145,7 @@ function openQuickMatchModal(b) {
     p.addEventListener('click', () => {
       selectedBank = p.dataset.bank;
       document.querySelectorAll('#qm-bank-pills .pill').forEach(x => x.classList.toggle('active', x.dataset.bank === selectedBank));
-      selectedStmtRef = '';
+      selectedStmtUuid = '';
       updateUI();
     });
   });
@@ -5143,7 +5155,7 @@ function openQuickMatchModal(b) {
     p.addEventListener('click', () => {
       dateWindow = p.dataset.dw;
       document.querySelectorAll('#qm-date-pills .pill').forEach(x => x.classList.toggle('active', x.dataset.dw === dateWindow));
-      selectedStmtRef = '';
+      selectedStmtUuid = '';
       updateUI();
     });
   });
@@ -5181,10 +5193,10 @@ function openQuickMatchModal(b) {
   // Confirm: ผูก statement เดียว ↔ หลาย bills
   document.getElementById('qm-confirm')?.addEventListener('click', () => {
     if (selectedBills.size === 0) { toast('ต้องเลือกอย่างน้อย 1 บิล', 'warn'); return; }
-    if (!selectedStmtRef) { toast('ต้องเลือก statement', 'warn'); return; }
+    if (!selectedStmtUuid) { toast('ต้องเลือก statement', 'warn'); return; }
     
     const allStmts = getAllStatements();
-    const stmt = allStmts.find(s => s.ref_no === selectedStmtRef);
+    const stmt = allStmts.find(s => s.stmt_uuid === selectedStmtUuid);
     if (!stmt) { toast('ไม่พบ statement', 'error'); return; }
     
     const billArr = Array.from(selectedBills);
@@ -5205,6 +5217,7 @@ function openQuickMatchModal(b) {
       x.confirmation = stmt.bank || '';
       x.pay_date = stmtDateISO;  // overwrite always (เดิม: if (!x.pay_date) ทำให้บิลที่มี pay_date เดิมอยู่แล้วไม่อัปเดตเป็นวันโอน)
       x.matched_stmt_ref = stmt.ref_no || '';
+      x.matched_stmt_uuid = stmt.stmt_uuid || '';
       x.matched_at = now;
     });
     
@@ -6694,6 +6707,7 @@ async function renderMain(el) {
         b.confirmation = '';
         b.pay_date = '';
         b.matched_stmt_ref = '';
+        b.matched_stmt_uuid = '';
         b.matched_at = '';
         billCount++;
       });
@@ -7343,10 +7357,17 @@ async function renderMain(el) {
       btn.innerHTML = monthScope ? `⏳ ${monthScope}...` : '⏳ ทั้งปี...';
       try {
         const t0 = Date.now();
+        // ⭐ User confirmed "ทับการแก้ไขปัจจุบัน" → clear dirty ก่อน pull
+        //    (ถ้า clear หลัง pull → pullFromCloud ยังเห็น dirty → skip merge cloud → ข้อมูลใหม่ไม่มา)
+        if (hasDirty) {
+          syncManager.dirty.clear();
+          if (syncManager.dirtyUuids) {
+            syncManager.dirtyUuids.bills?.clear();
+            syncManager.dirtyUuids.stmts?.clear();
+          }
+        }
         await syncManager.pullFromCloud(2, 'force', { monthScope });
         const elapsed = Math.round((Date.now() - t0) / 100) / 10;
-        // เคลียร์ dirty หลัง pull (เพราะ local = cloud แล้ว)
-        syncManager.dirty.clear();
         toast(`✅ ดึง${monthScope?'เดือน '+monthScope:'ทั้งปี'}สำเร็จ (${elapsed}s)`, 'success', 3000);
         render();
       } catch (e) {
@@ -8367,6 +8388,7 @@ async function renderMain(el) {
               b.match_status = 'pending';
               b.pay_date = '';
               b.matched_stmt_ref = '';
+              b.matched_stmt_uuid = '';
               b.matched_at = '';
               toast(`↩ ยกเลิก matched — ${b.bill_no||'(ไม่มีเลข)'}`, 'info');
             }
@@ -8405,6 +8427,7 @@ async function renderMain(el) {
               b.match_status = 'pending';
               b.pay_date = '';
               b.matched_stmt_ref = '';
+              b.matched_stmt_uuid = '';
               toast(`↩ ต้องใส่ confirmation ก่อนจึงจะ matched`, 'info');
             }
           } else {
@@ -8413,6 +8436,7 @@ async function renderMain(el) {
               b.match_status = 'pending';
               b.pay_date = '';
               b.matched_stmt_ref = '';
+              b.matched_stmt_uuid = '';
               toast(`↩ Type "${b.type||'(ว่าง)'}" ไม่ต้อง match → pending`, 'info');
             }
           }
@@ -9303,7 +9327,7 @@ function openSpTempPartialMatchModal(no, idx, onChange) {
       const diff = sAmt - prAmt;
       const diffClass = Math.abs(diff) < 0.01 ? 'success' : 'warn';
       return `
-        <div class="epr-stmt-row" data-ref="${s.ref_no||''}" style="padding:10px;border-bottom:1px solid var(--border);cursor:pointer;display:flex;gap:10px;align-items:center;transition:background .12s" onmouseenter="this.style.background='var(--bg2)'" onmouseleave="this.style.background=''">
+        <div class="epr-stmt-row" data-ref="${s.stmt_uuid||''}" style="padding:10px;border-bottom:1px solid var(--border);cursor:pointer;display:flex;gap:10px;align-items:center;transition:background .12s" onmouseenter="this.style.background='var(--bg2)'" onmouseleave="this.style.background=''">
           <div style="flex:1;font-size:.82rem">
             <div class="flex gap-2 items-center" style="flex-wrap:wrap">
               <span class="badge badge-info" style="font-size:.65rem">${s.bank||'-'}</span>
@@ -17696,6 +17720,7 @@ async function renderMatching(el) {
                 match.confirmation = stmt.bank || '';
                 match.pay_date = match.date;
                 match.matched_stmt_ref = stmt.ref_no || '';
+                match.matched_stmt_uuid = stmt.stmt_uuid || '';
                 match.matched_at = new Date().toISOString();
               }
             });
@@ -17794,12 +17819,17 @@ async function renderMatching(el) {
               ? String(stmt.match_bill).split(' + ').map(s => s.split(' (')[0].trim()).filter(Boolean)
               : []);
         
-        // ⭐ Find bills LINKED TO THIS STMT first (by matched_stmt_ref) — เพื่อ handle case ที่ bill_no ซ้ำ
-        //    (เช่น "SP-XXX" มีหลายบิล แต่ที่ match อยู่กับ stmt นี้คืออันที่ matched_stmt_ref ตรง)
-        const linkedBills = billList.filter(b => 
-          b.matched_stmt_ref === stmt.ref_no && 
-          (b.match_status === 'paid' || b.match_status === 'matched')
-        );
+        // ⭐ Find bills LINKED TO THIS STMT first — กัน case bill_no ซ้ำ + ref_no ซ้ำ
+        //    Priority: matched_stmt_uuid (PK) > matched_stmt_ref (string)
+        //    (ราชการใช้ ref เดียวทั้งวัน — uuid กัน mismatch ได้)
+        const linkedBills = billList.filter(b => {
+          if (b.match_status !== 'paid' && b.match_status !== 'matched') return false;
+          if (stmt.stmt_uuid && b.matched_stmt_uuid) {
+            return b.matched_stmt_uuid === stmt.stmt_uuid;
+          }
+          // Fallback: ref_no match (legacy bills ที่ยังไม่มี matched_stmt_uuid)
+          return b.matched_stmt_ref === stmt.ref_no;
+        });
         
         billNumbersToUnmatch.forEach(bn => {
           // ⚡ SP-TEMP partial pattern: SP-TEMP-XXXX#N → clear partial.stmt_ref
@@ -17833,6 +17863,7 @@ async function renderMatching(el) {
             bill.confirmation = '';
             bill.pay_date = '';
             bill.matched_stmt_ref = '';
+            bill.matched_stmt_uuid = '';
             bill.matched_at = '';
           }
         });
@@ -17846,6 +17877,7 @@ async function renderMatching(el) {
           bill.confirmation = '';
           bill.pay_date = '';
           bill.matched_stmt_ref = '';
+          bill.matched_stmt_uuid = '';
           bill.matched_at = '';
         });
         
@@ -17960,6 +17992,7 @@ async function renderMatching(el) {
           b.confirmation = '';
           b.pay_date = '';
           b.matched_stmt_ref = '';
+          b.matched_stmt_uuid = '';
           b.matched_at = '';
           unmatchedBills++;
         });
@@ -18230,6 +18263,7 @@ async function renderMatching(el) {
           bill.confirmation = stmt.bank || '';
           bill.pay_date = bill.date;
           bill.matched_stmt_ref = stmt.ref_no || '';
+          bill.matched_stmt_uuid = stmt.stmt_uuid || '';
           bill.matched_at = new Date().toISOString();
           
           stmt.match_status = 'paid';
