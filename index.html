@@ -4622,9 +4622,15 @@ function quickUnmatchBill(b) {
   
   toast(`ยกเลิก match สำเร็จ${stmtCleared?' — statement กลับเป็น pending แล้ว':' (ไม่เจอ statement ผูกอยู่)'}`, 'success');
   
-  // Re-render หน้า Main
+  // Re-render หน้า Main — preserve scroll/focus เพื่อให้ user match/unmatch ต่อได้ทันที
   const mainEl = document.getElementById('main');
-  if (mainEl && typeof currentPage !== 'undefined' && currentPage === 'main') navigateTo('main');
+  if (mainEl && typeof currentPage !== 'undefined' && currentPage === 'main') {
+    if (typeof window.renderMainKeepScroll === 'function') {
+      window.renderMainKeepScroll();
+    } else {
+      navigateTo('main');
+    }
+  }
 }
 
 // Open Quick Match modal: เลือก statement วันเดียวกัน + ธนาคารเดียวกัน
@@ -5282,8 +5288,14 @@ function openQuickMatchModal(b) {
       'success', 4000
     );
     
-    // Re-render
-    if (typeof currentPage !== 'undefined' && currentPage === 'main') navigateTo('main');
+    // Re-render — preserve scroll/focus เพื่อให้ user match ต่อได้ทันที
+    if (typeof currentPage !== 'undefined' && currentPage === 'main') {
+      if (typeof window.renderMainKeepScroll === 'function') {
+        window.renderMainKeepScroll();
+      } else {
+        navigateTo('main');
+      }
+    }
   });
 }
 
@@ -6363,8 +6375,9 @@ async function renderMain(el) {
       });
     });
   }
-
-  // ── Helper: สร้าง row ที่กรอกเอง (cashIn, cashOut, returns) ──
+  // ⭐ Expose renderKeepScroll → other top-level functions (Quick Match modal etc.) เรียกใช้ได้
+  //    หลัง render Main เสร็จ → window.renderMainKeepScroll จะ work ตลอดที่ user อยู่ Main
+  window.renderMainKeepScroll = renderKeepScroll;
   function buildSumRow(key, label, color, editable) {
     const _getVal = (s) => {
       const stored = mainSummary[key+'_'+s];
