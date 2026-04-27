@@ -9820,7 +9820,35 @@ function markDirtySpTemps() {
   if (max > 0) localStorage.setItem('sf_spTempCounter', String(max));
   
   persistMainState();
-  if (window.syncManager) syncManager.markDirty('sp_temps');
+  if (window.syncManager) {
+    syncManager.markDirty('sp_temps');
+    // ⭐ AUTO-PUSH for sp_temps — debounced 2s
+    //   small data + frequent edits → auto-sync ดีกว่ารอ user กด save
+    if (window._spTempAutoPushTimer) clearTimeout(window._spTempAutoPushTimer);
+    window._spTempAutoPushTimer = setTimeout(async () => {
+      if (!syncManager.dirty.has('sp_temps')) return;
+      if (syncManager.status === 'pushing') {
+        // กำลัง push อยู่ → ลองอีกที 2s ข้างหน้า
+        window._spTempAutoPushTimer = setTimeout(() => markDirtySpTemps(), 2000);
+        return;
+      }
+      try {
+        console.log('[sp_temps auto-push] firing...');
+        const r = await syncManager._flushPush();
+        const ok = r?.ok || 0;
+        const errs = (r?.errors && r.errors.length) || 0;
+        if (errs > 0) {
+          console.warn('[sp_temps auto-push] errors:', r.errors);
+          if (typeof toast === 'function') toast('⚠ Auto-sync error — กด ✓ บันทึก เพื่อลองใหม่', 'warn', 4000);
+        } else if (ok > 0) {
+          console.log('[sp_temps auto-push] success');
+          if (typeof toast === 'function') toast('☁️ ซิงค์ขึ้น cloud แล้ว', 'info', 1500);
+        }
+      } catch (e) {
+        console.error('[sp_temps auto-push] failed:', e);
+      }
+    }, 2000);
+  }
 }
 
 // ⭐ Track SP-TEMP deletions — push to backend ตอน save
