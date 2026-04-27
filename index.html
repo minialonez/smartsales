@@ -3672,6 +3672,18 @@ async function restoreMainState() {
           delete t.unassigned_partials;
         }
         
+        // ⭐ Normalize match_status ทุก partial หลัง migrate (auto-fix Cash unpaid → paid)
+        if (typeof window._normalizeMatchStatus === 'function') {
+          (t.partials||[]).forEach(p => window._normalizeMatchStatus(p));
+        } else {
+          // _normalizeMatchStatus ยังไม่ define → inline same logic
+          (t.partials||[]).forEach(p => {
+            const tp = String(p.type||'').toLowerCase().trim();
+            if (tp === 'cash') { p.match_status = 'paid'; p.matched_stmt_uuid = ''; }
+            else { p.match_status = p.matched_stmt_uuid ? 'paid' : 'unpaid'; }
+          });
+        }
+        
         // Migrate cust_name → customer
         if (!t.customer && t.cust_name) t.customer = t.cust_name;
         // Migrate t.date → t.date_created
@@ -8786,6 +8798,23 @@ function _isPartialActuallyPaid(p) {
 }
 window._isPartialActuallyPaid = _isPartialActuallyPaid;
 
+// ⭐ Sync match_status field ให้ตรงกับ business rule
+//   Cash → match_status='paid' (no stmt needed)
+//   Transfer/Cheque → match_status='paid' เฉพาะ matched_stmt_uuid มีค่า
+//   เรียกหลังเปลี่ยน type หรือ matched_stmt_uuid
+function _normalizeMatchStatus(p) {
+  if (!p) return;
+  const type = String(p.type || '').toLowerCase().trim();
+  if (type === 'cash') {
+    p.match_status = 'paid';
+    p.matched_stmt_uuid = ''; // Cash ไม่ต้อง match stmt
+  } else {
+    // Transfer / Cheque
+    p.match_status = p.matched_stmt_uuid ? 'paid' : 'unpaid';
+  }
+}
+window._normalizeMatchStatus = _normalizeMatchStatus;
+
 // Total paid = Σ partials ที่ "นับว่าจ่ายจริง" (Cash always / Transfer+Cheque ต้อง matched)
 //   ⭐ partials อยู่ที่ระดับ SP-TEMP (มี sb_no field) — ไม่ใช่ระดับบิล
 function spTempPaidTotal(t) {
@@ -8953,6 +8982,9 @@ function spTempAddPartialWithCarryover(t, partial, options) {
   
   if (!t.partials) t.partials = [];
   
+  // ⭐ Normalize match_status ก่อน push
+  if (typeof _normalizeMatchStatus === 'function') _normalizeMatchStatus(partial);
+  
   const sb = String(partial.sb_no || '').trim();
   
   // Unassigned (no SB) — just add, no carryover
@@ -9007,6 +9039,7 @@ function spTempAddPartialWithCarryover(t, partial, options) {
     rolled_from_sb: sb,
     rolled_from_partial_uuid: partial.partial_uuid,
   };
+  if (typeof _normalizeMatchStatus === 'function') _normalizeMatchStatus(carryover);
   
   // Recursively check next SB (cap depth)
   if (nextSb && maxDepth > 0) {
@@ -9223,7 +9256,7 @@ function spTempGroupFlat(flatRows) {
     if (partialUuid) {
       const existsP = t.partials.find(p => p.partial_uuid === partialUuid);
       if (!existsP) {
-        t.partials.push({
+        const newPartial = {
           partial_uuid: partialUuid,
           sb_no: sbNo,
           type: row.type || '',
@@ -9236,7 +9269,12 @@ function spTempGroupFlat(flatRows) {
           due_date: row.due_date || '',
           match_status: row.match_status || 'unpaid',
           matched_stmt_uuid: String(row.matched_stmt_uuid || '').trim()
-        });
+        };
+        // ⭐ Auto-fix legacy data: Cash with unpaid → normalize to paid
+        if (typeof window._normalizeMatchStatus === 'function') {
+          window._normalizeMatchStatus(newPartial);
+        }
+        t.partials.push(newPartial);
       }
     }
   });
@@ -10285,6 +10323,7 @@ function openSpTempPartialEditModal(no, partialUuid, onChange) {
     pr.remarks1 = document.getElementById('epr-rem1').value.trim();
     pr.remarks2 = document.getElementById('epr-rem2').value.trim();
     pr.due_date = pr.type === 'Cheque' ? document.getElementById('epr-due-date').value : '';
+    _normalizeMatchStatus(pr); // sync match_status ตาม type
     
     t.updated_at = new Date().toISOString();
     recomputeSpTempStatus(t);
@@ -10820,6 +10859,7 @@ function openPartialModal(tempNo, sbNoDefault, _ignored) {
       match_status: 'unpaid',
       matched_stmt_uuid: ''
     };
+    _normalizeMatchStatus(partial); // Cash = paid auto
     
     // ⭐ Add with auto-carryover if overpay
     const result = spTempAddPartialWithCarryover(t, partial);
