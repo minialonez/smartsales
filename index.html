@@ -2664,7 +2664,8 @@ const syncManager = {
         } catch(err) { stats.errors.push(`Bills ${y}: ${err.message}`); console.warn('[sync] Bills', y, err); }
       }
       
-      // ── Stmts: UUID-based pull ──      const seenStmtUuids = new Set();
+      // ── Stmts: UUID-based pull ──
+      const seenStmtUuids = new Set();
       Object.values(statementsByBank).forEach(arr => {
         (arr||[]).forEach(s => { if (s.stmt_uuid) seenStmtUuids.add(s.stmt_uuid); });
       });
