@@ -7029,6 +7029,8 @@ async function renderMain(el) {
         }
         
         const confirmation = document.getElementById('ab-confirmation').value.trim();
+        // ⭐ Cash type → auto matched (เงินสด = เข้าลิ้นชักแล้ว ไม่ต้องผ่านธนาคาร)
+        const isCash = type === 'Cash';
         
         const newBill = {
           bill_uuid: (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : 'b-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10),
@@ -7044,13 +7046,14 @@ async function renderMain(el) {
           transfer_fee: transferFee,
           card_fee: cardFee,
           // Confirmation & status
-          confirmation: confirmation,
-          pay_date: confirmation ? document.getElementById('ab-date').value : '',
+          confirmation: isCash ? '' : confirmation,                                // Cash: ไม่มี confirmation
+          pay_date: isCash ? document.getElementById('ab-date').value 
+                    : (confirmation ? document.getElementById('ab-date').value : ''),
           remarks1: document.getElementById('ab-remarks').value,
           remarks2: '',
           bank: '', // ช่อง manual ปล่อยว่าง
           due_date: document.getElementById('ab-due').value,
-          match_status: confirmation ? 'matched' : 'pending',
+          match_status: isCash ? 'matched' : (confirmation ? 'matched' : 'pending'),  // Cash → matched auto
           source: 'manual',
         };
         billList.push(newBill);
@@ -7868,10 +7871,16 @@ async function renderMain(el) {
             b.wht_enabled = false;
           }
           
-          // Auto-matched rule: Cash type without confirmation → still matched
-          if (b.type === 'Cash' && b.match_status === 'pending') {
-            b.match_status = 'matched';
+          // Auto-matched rule: Cash type → match อัตโนมัติ ทุกกรณีที่ไม่ใช่ paid/matched/void/bounced
+          //   เงินสด = เข้าลิ้นชักทันที ไม่ต้องผ่าน statement
+          if (b.type === 'Cash') {
+            if (b.match_status !== 'matched' && b.match_status !== 'paid' && 
+                b.match_status !== 'void' && b.match_status !== 'bounced') {
+              b.match_status = 'matched';
+            }
             if (!b.pay_date) b.pay_date = b.date;
+            // Cash ไม่ต้องมี confirmation
+            b.confirmation = '';
           }
           
           // ⭐ Auto-set paid: ถ้ากรอก pay_date + status ยังไม่ใช่ paid/matched → set เป็น paid
@@ -14197,6 +14206,33 @@ function showApp() {
   // โหลด meta data จาก backend (กันกรณีล้าง localStorage)
   loadMetaFromBackend().catch(err => console.warn('loadMeta failed:', err));
   
+  // ⭐ Auto-load customer master (สำคัญ: remarks1 autocomplete ต้องใช้)
+  //    Cache ใน localStorage 24h — ลด round-trip + พร้อมใช้ทันทีหลัง refresh
+  (async () => {
+    try {
+      const cached = safeStorage.get('sf_customers_cache');
+      const cachedAt = Number(safeStorage.get('sf_customers_cache_ts')) || 0;
+      const isStale = !cached || (Date.now() - cachedAt) > 24 * 60 * 60 * 1000;
+      if (cached && !isStale) {
+        const arr = JSON.parse(cached);
+        if (Array.isArray(arr) && arr.length > 0) {
+          customerList = arr;
+          console.log(`[customers] loaded from cache: ${arr.length}`);
+        }
+      }
+      // Refresh from cloud (background) — ใช้ cache ก่อน, update ทีหลัง
+      const res = await api('getCustomers', {});
+      if (res?.success && Array.isArray(res.data)) {
+        customerList = res.data;
+        safeStorage.set('sf_customers_cache', JSON.stringify(res.data));
+        safeStorage.set('sf_customers_cache_ts', String(Date.now()));
+        console.log(`[customers] refreshed from cloud: ${res.data.length}`);
+      }
+    } catch (e) {
+      console.warn('[customers] auto-load failed:', e.message);
+    }
+  })();
+  
   // Hybrid sync: auto-pull ถ้า local ว่าง (เช่น เครื่องใหม่/browser ใหม่)
   // จะ skip อัตโนมัติถ้ามี local data + lastPull ภายใน 30 นาที
   setTimeout(() => {
@@ -18051,10 +18087,13 @@ function renderData(el) {
       
       try {
         // ── Step 1: Pull to TEMP variables (ไม่แตะ local) ──
-        tsLog('☁️ [1/3] Pull จาก cloud (ยังไม่แตะ local)...');
+        // ⭐ ใช้ year selection จาก dropdown เดียวกับ Sync (default 2 ถ้าไม่เจอ dropdown)
+        const yearsCount = Number(document.getElementById('sync-years')?.value) || 2;
+        tsLog(`☁️ [1/3] Pull จาก cloud ${yearsCount} ปี (ยังไม่แตะ local)...`);
         const now = new Date();
         const years = [];
-        for (let i = 0; i < 3; i++) years.push(String(now.getFullYear() - i));
+        for (let i = 0; i < yearsCount; i++) years.push(String(now.getFullYear() - i));
+        tsLog(`   📅 ปี: ${years.join(', ')}`);
         
         const tempBills = [];
         const tempStmts = {};
