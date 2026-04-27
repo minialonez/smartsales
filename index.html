@@ -3338,29 +3338,29 @@ function validateAll() {
   });
   
   // ── แจ้งเตือน Due Date / เช็ครอเคลียร์ ──
-  // เตือนวัน due date เลย (today >= due_date) สำหรับ:
-  // 1. บิลเช็ค (Type=Cheque) ที่มี expected_clear_date หรือ due_date
+  // เตือนวัน due_date เลย (today >= due_date) สำหรับ:
+  // 1. บิลเช็ค (Type=Cheque) ที่มี due_date — เก็บวันที่เช็คใน due_date
   // 2. ทุกบิลที่มี due_date (เช่น SR/OR เครดิต)
   const today = todayISO();
   
-  // 1) เช็ครอเคลียร์: expected_clear_date ถึงหรือเลยแล้ว
+  // 1) เช็ครอเคลียร์ (Type=Cheque) — ใช้ due_date เป็นวันเช็ค
   const chequesOverdue = billList.filter(b => 
-    b.type === 'Cheque' && b.expected_clear_date && toISODate(b.expected_clear_date) <= today &&
-    b.match_status !== 'paid' && b.match_status !== 'bounced' && b.match_status !== 'paid'
+    b.type === 'Cheque' && b.due_date && toISODate(b.due_date) <= today &&
+    b.match_status !== 'paid' && b.match_status !== 'bounced'
   );
   chequesOverdue.forEach(b => {
     const dateTag = b.date ? `[${fmtDate(b.date)}] ` : '';
-    const clearDate = fmtDate(b.expected_clear_date);
-    const isPast = toISODate(b.expected_clear_date) < today;
+    const dueD = fmtDate(b.due_date);
+    const isPast = toISODate(b.due_date) < today;
     warnings.push({
       level: 'warn',
       category: 'cheque_due',
-      msg: `${dateTag}${b.bill_no||'เช็ค'}: ${isPast ? '⏰ เลยกำหนดเคลียร์' : '📅 ถึงกำหนดเคลียร์วันนี้'} (${clearDate}) ยอด ฿${fmtNum(b.amount)} — ตรวจสอบว่าเข้าหรือเด้ง`,
+      msg: `${dateTag}${b.bill_no||'เช็ค'}: ${isPast ? '⏰ เลยกำหนดเข้าเช็ค' : '📅 ถึงกำหนดเข้าเช็ควันนี้'} (${dueD}) ยอด ฿${fmtNum(b.amount)} — ตรวจสอบว่าเข้าหรือเด้ง`,
       billIdx: billList.indexOf(b),
     });
   });
   
-  // 2) บิลที่มี due_date ถึงหรือเลยแล้ว (SR/OR เครดิต ฯลฯ)
+  // 2) บิลที่มี due_date ถึงหรือเลยแล้ว (SR/OR เครดิต ฯลฯ — ไม่ใช่เช็ค)
   const dueDateBills = billList.filter(b => 
     b.due_date && toISODate(b.due_date) <= today &&
     b.type !== 'Cheque' && // เช็คจัดการข้างบนแล้ว
@@ -7021,7 +7021,7 @@ async function renderMain(el) {
               <input class="input" id="ab-confirmation" placeholder="KTB / KBANK / BBL / BBL NW">
             </div>
             <div class="input-group flex-1">
-              <label>Due Date</label>
+              <label>Due Date <span class="text-xs text-muted">(Cheque: วันเข้าเช็ค)</span></label>
               <input type="date" class="input" id="ab-due">
             </div>
           </div>
@@ -7869,7 +7869,7 @@ async function renderMain(el) {
                 <input class="input" id="eb-bank" value="${b.bank||''}">
               </div>
               <div class="input-group flex-1">
-                <label>Due Date</label>
+                <label>Due Date <span class="text-xs text-muted">(Cheque: วันเข้าเช็ค)</span></label>
                 <input type="date" class="input" id="eb-due-date" value="${toISODate(b.due_date)}">
               </div>
             </div>
@@ -15174,7 +15174,7 @@ async function renderDashboard(el) {
     b.match_status !== 'paid' && b.match_status !== 'bounced' && b.match_status !== 'paid' &&
     !b.matched_stmt_ref
   );
-  const chequesOverdue = chequesAwaitingClear.filter(b => b.expected_clear_date && toISODate(b.expected_clear_date) < today);
+  const chequesOverdue = chequesAwaitingClear.filter(b => b.due_date && toISODate(b.due_date) < today);
   const unmatchedStmts = getAllStatements().filter(s => s.match_status !== 'paid');
   const cashflowPending = (cashflowList||[]).filter(c => c.match_status !== 'paid' && (c.type === 'deposit' || c.type === 'supplier' || c.type === 'transfer'));
   const supplierPendingPay = (supplierPayments||[]).filter(p => p.status === 'pending' || p.status === 'scheduled');
@@ -15280,7 +15280,7 @@ async function renderDashboard(el) {
           <div style="margin-top:12px;padding:10px;background:rgba(239,87,87,.08);border-radius:8px">
             <div class="text-sm" style="color:var(--danger);font-weight:600">🚨 เช็คเลยกำหนดรอเคลียร์ ${chequesOverdue.length} ฉบับ:</div>
             <div class="text-xs text-muted mt-1">
-              ${chequesOverdue.slice(0,3).map(b => `${b.bill_no||'(ไม่มีเลข)'} (฿${fmtNum(b.amount)} ${fmtDate(b.expected_clear_date)})`).join(', ')}
+              ${chequesOverdue.slice(0,3).map(b => `${b.bill_no||'(ไม่มีเลข)'} (฿${fmtNum(b.amount)} ${fmtDate(b.due_date)})`).join(', ')}
               ${chequesOverdue.length>3?` และอีก ${chequesOverdue.length-3} ฉบับ`:''}
             </div>
           </div>
@@ -15741,8 +15741,8 @@ window.openPendingBillsModal = function(kind) {
   
   // Sort: overdue ก่อน, แล้วเรียงวันที่เก่าก่อน
   bills.sort((a, b) => {
-    const aDate = toISODate(a.expected_clear_date || a.date) || '';
-    const bDate = toISODate(b.expected_clear_date || b.date) || '';
+    const aDate = toISODate(a.due_date || a.date) || '';
+    const bDate = toISODate(b.due_date || b.date) || '';
     return aDate.localeCompare(bDate);
   });
   
@@ -15756,7 +15756,7 @@ window.openPendingBillsModal = function(kind) {
   const rowsHtml = bills.map((b, i) => {
     const amt = Math.abs(Number(b.amount)||0);
     const bDate = toISODate(b.date);
-    const clearDate = b.expected_clear_date ? toISODate(b.expected_clear_date) : null;
+    const clearDate = b.due_date ? toISODate(b.due_date) : null;
     const isOverdue = clearDate && clearDate < today;
     const daysOver = isOverdue ? Math.floor((new Date(today) - new Date(clearDate)) / 86400000) : 0;
     
@@ -15784,7 +15784,7 @@ window.openPendingBillsModal = function(kind) {
           </div>
           <div class="text-xs text-muted">
             ${fmtDate(b.date)}
-            ${clearDate ? ` · คาดเข้า ${fmtDate(b.expected_clear_date)}` : ''}
+            ${clearDate ? ` · คาดเข้า ${fmtDate(b.due_date)}` : ''}
             ${b.remarks1 ? ` · ${String(b.remarks1).substring(0,50)}` : ''}
           </div>
         </div>
@@ -20522,15 +20522,15 @@ async function renderAlerts(el) {
   // 2. เช็คเลยวันคาด
   billList.filter(b => 
     b.match_status !== 'void' && b.type === 'Cheque' && 
-    b.expected_clear_date && toISODate(b.expected_clear_date) < today &&
+    b.due_date && toISODate(b.due_date) < today &&
     b.match_status !== 'paid' && b.match_status !== 'bounced'
   ).forEach(b => {
-    const daysOver = Math.floor((new Date(today) - new Date(toISODate(b.expected_clear_date))) / 86400000);
+    const daysOver = Math.floor((new Date(today) - new Date(toISODate(b.due_date))) / 86400000);
     alerts.push({
       category: 'cheque',
       priority: 1,
       title: `เช็ค ${b.bill_no||'(ไม่มีเลข)'} เลยวันคาด ${daysOver} วัน`,
-      detail: `฿${fmtNum(b.amount)} · วันที่คาด ${fmtDate(b.expected_clear_date)}`,
+      detail: `฿${fmtNum(b.amount)} · วันที่คาด ${fmtDate(b.due_date)}`,
       meta: b.remarks1 || '',
       type: 'cheque_overdue',
       action: 'main',
