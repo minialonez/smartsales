@@ -11438,6 +11438,7 @@ async function renderPayments(el) {
         <div class="page-title">Payments (SP) — การชำระเงิน</div>
         <div class="flex gap-2">
           <input class="input" placeholder="ค้นหา SP / ลูกค้า" id="pay-search" value="${searchText}" style="width:240px">
+          <button class="btn btn-outline btn-sm" id="btn-refresh-pay" title="ดึงข้อมูล SP/SP-TEMP ล่าสุดจาก Sheet (ทับ local)">🔄 Refresh</button>
           <button class="btn btn-primary btn-sm" id="btn-import-sp">${ICONS.download} นำเข้า SP</button>
           <button class="btn btn-warn btn-sm" id="btn-add-temp-sp" style="background:var(--warn);color:#fff">${ICONS.plus} SP ชั่วคราว</button>
           <button class="btn btn-outline btn-sm" id="btn-clear-pay">ล้าง</button>
@@ -11773,6 +11774,74 @@ async function renderPayments(el) {
           render();
         });
       });
+    });
+    
+    document.getElementById('btn-refresh-pay')?.addEventListener('click', async () => {
+      const hasDirty = window.syncManager?.dirty?.size > 0;
+      if (hasDirty) {
+        if (!confirm(
+          '⚠️ มีการแก้ไขที่ยังไม่ได้บันทึก (อาจจะกำลัง auto-sync อยู่)\n\n' +
+          'การ Refresh จะดึงข้อมูลใหม่จาก Sheet และทับการแก้ไขปัจจุบัน\n\n' +
+          'ต้องการดำเนินการต่อ?'
+        )) return;
+      }
+      
+      const btn = document.getElementById('btn-refresh-pay');
+      const old = btn.innerHTML;
+      btn.disabled = true;
+      btn.innerHTML = '⏳ กำลังดึง...';
+      try {
+        // Cancel pending auto-push (กันชนกับ pull)
+        if (window._spTempAutoPushTimer) {
+          clearTimeout(window._spTempAutoPushTimer);
+          window._spTempAutoPushTimer = null;
+        }
+        // Clear dirty (user accepted overwrite)
+        if (hasDirty) syncManager.dirty.clear();
+        
+        // ⭐ Targeted pull: SP-TEMP + Payments เท่านั้น (ไม่ดึง bills/stmts หนัก)
+        const before = { sp: paymentList.length, temp: spTempList.length };
+        
+        // Pull SP-TEMPs (force mode → override local)
+        try {
+          const r = await api('getSpTemps');
+          if (r?.success && Array.isArray(r.data?.data || r.data)) {
+            const flat = r.data?.data || r.data;
+            const grouped = (typeof spTempGroupFlat === 'function') ? spTempGroupFlat(flat) : [];
+            // ⭐ REPLACE entire spTempList with cloud (force mode)
+            spTempList.length = 0;
+            grouped.forEach(t => spTempList.push(t));
+            persistMainState();
+          }
+        } catch(e) { console.warn('[refresh-pay] sp_temps:', e); }
+        
+        // Pull Payments (real SP)
+        try {
+          const r = await api('getPayments');
+          if (r?.success && Array.isArray(r.data?.data || r.data)) {
+            const items = r.data?.data || r.data;
+            paymentList.length = 0;
+            items.forEach(p => paymentList.push(p));
+            persistMainState();
+          }
+        } catch(e) { console.warn('[refresh-pay] payments:', e); }
+        
+        // Reset fp cache → next push จะส่งจริง (ไม่ skip)
+        if (syncManager._fpCache) {
+          delete syncManager._fpCache.sp_temps;
+          delete syncManager._fpCache.payments;
+        }
+        
+        const after = { sp: paymentList.length, temp: spTempList.length };
+        toast(`✅ Refresh สำเร็จ — SP ${after.sp} (${after.sp-before.sp>=0?'+':''}${after.sp-before.sp}) · SP-TEMP ${after.temp} (${after.temp-before.temp>=0?'+':''}${after.temp-before.temp})`, 'success', 3500);
+        render();
+      } catch (e) {
+        console.error('[refresh-pay] error:', e);
+        toast('❌ Refresh ไม่สำเร็จ: ' + (e?.message||e), 'error', 5000);
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = old;
+      }
     });
     
     document.getElementById('btn-clear-pay')?.addEventListener('click', () => {
