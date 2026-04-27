@@ -12592,7 +12592,7 @@ async function renderPPReport(el) {
                   const vatColor = p.vat === 'V' ? '#4f9cf9' : p.vat === 'N' ? '#8e44ad' : p.vat === 'MIX' ? 'var(--warn)' : p.vat === 'PX' ? 'var(--warn)' : 'var(--text3)';
                   // 3-way status: Supplier Payment (ระบบ) + Transfer Log (JKN file) + Statement Match
                   const spIcon = p.linked_sp 
-                    ? (p.sp_match_status === 'matched' ? '<span class="badge" style="background:var(--success-bg);color:var(--success);font-size:.65rem;padding:2px 5px" title="Matched กับ Statement">✓ SP</span>' 
+                    ? (p.sp_match_status === 'paid' ? '<span class="badge" style="background:var(--success-bg);color:var(--success);font-size:.65rem;padding:2px 5px" title="Matched กับ Statement">✓ SP</span>' 
                       : '<span class="badge" style="background:var(--info-bg);color:var(--info);font-size:.65rem;padding:2px 5px" title="มีในจ่ายเจ้าหนี้">🔗 SP</span>') 
                     : '<span class="badge" style="background:rgba(244,180,26,.15);color:var(--warn);font-size:.65rem;padding:2px 5px" title="ยังไม่อยู่ในจ่ายเจ้าหนี้">⚠ SP</span>';
                   const tlIcon = p.linked_transfer 
@@ -14143,8 +14143,8 @@ async function renderTransferLog(el) {
                   const diffColor = Math.abs(c.diff||0) < 0.01 ? 'var(--text3)' : 'var(--danger)';
                   let spBadge;
                   if (c.linked_sp) {
-                    const color = c.sp_match_status === 'matched' ? 'var(--success)' : 'var(--info)';
-                    const label = c.sp_match_status === 'matched' ? '✓ Matched' : '🔗 Linked';
+                    const color = c.sp_match_status === 'paid' ? 'var(--success)' : 'var(--info)';
+                    const label = c.sp_match_status === 'paid' ? '✓ Matched' : '🔗 Linked';
                     spBadge = `<span class="badge" style="background:${color}22;color:${color};font-size:.7rem">${label}</span>`;
                   } else if (c.pp_no) {
                     spBadge = `<span class="badge" style="background:rgba(244,180,26,.15);color:var(--warn);font-size:.7rem">⚠️ ไม่มี SP</span>`;
@@ -17375,7 +17375,7 @@ async function renderMatching(el) {
         
         const candidates = [
           ...billList.filter(b => {
-            if b.match_status === 'paid' return false;
+            if (b.match_status === 'paid') return false;
             if (!canMatchBill(b)) return false;
             const amtDiff = Math.abs(mmBillMatchAmt(b) - absStmt);
             return amtDiff < 1 || amtDiff < absStmt * 0.05;
