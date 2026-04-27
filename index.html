@@ -2312,8 +2312,10 @@ const syncManager = {
           const fp = this._fp({
             n: spTempList.length, 
             paids: spTempList.map(t => (t.partials||[]).length), 
-            bills: spTempList.map(t => (t.bills||[]).length),  // ⭐ track bills count
-            billHash: spTempList.map(t => (t.bills||[]).map(b => `${b.bill_no}|${b.amount}|${b.sb_no||''}`).join(',')), // ⭐ track bills content
+            bills: spTempList.map(t => (t.bills||[]).length),
+            billHash: spTempList.map(t => (t.bills||[]).map(b => `${b.bill_no}|${b.amount}|${b.sb_no||''}`).join(',')),
+            // ⭐ partialHash — track content ของ partial ทุก field สำคัญ (เคยแก้แล้วไม่ push เพราะ length เท่าเดิม)
+            partialHash: spTempList.map(t => (t.partials||[]).map(p => `${p.partial_uuid||''}|${p.date||''}|${p.amount||''}|${p.sb_no||''}|${p.matched_stmt_uuid||''}|${p.match_status||''}`).join(',')),
             links: spTempList.map(t => t.linked_sp||''), 
             del: delNos
           });
@@ -8677,6 +8679,298 @@ function spTempBillsSum(t) {
   return (t.bills || []).reduce((s, b) => s + (Number(b.amount) || 0), 0);
 }
 
+// ─── SB-level helpers (ใบวางบิล) ───
+// ใช้ sb_no เป็น merge key — bills ใน array มี sb_no per item อยู่แล้ว
+// partials ใน array มี sb_no per partial (แต่ละ partial = 1 SB)
+
+// Group bills by sb_no → return [{sb_no, bills: [...]}, ...] sorted by oldest bill date
+function spTempGroupBillsBySB(t) {
+  const groups = {};
+  (t.bills || []).forEach(b => {
+    const sb = String(b.sb_no || '').trim() || '(ไม่มีใบวางบิล)';
+    if (!groups[sb]) groups[sb] = { sb_no: sb, bills: [], earliestDate: '' };
+    groups[sb].bills.push(b);
+    const d = String(b.date || '');
+    if (!groups[sb].earliestDate || d < groups[sb].earliestDate) groups[sb].earliestDate = d;
+  });
+  return Object.values(groups).sort((a, b) => String(a.earliestDate).localeCompare(String(b.earliestDate)));
+}
+
+function spTempSBTotal(t, sb_no) {
+  return (t.bills || []).filter(b => String(b.sb_no||'').trim() === String(sb_no||'').trim())
+    .reduce((s, b) => s + (Number(b.amount)||0), 0);
+}
+function spTempSBPaid(t, sb_no) {
+  return (t.partials || []).filter(p => String(p.sb_no||'').trim() === String(sb_no||'').trim())
+    .reduce((s, p) => s + (Number(p.amount)||0), 0);
+}
+function spTempSBRemaining(t, sb_no) {
+  return Math.max(0, spTempSBTotal(t, sb_no) - spTempSBPaid(t, sb_no));
+}
+function spTempSBStatus(t, sb_no) {
+  const tot = spTempSBTotal(t, sb_no);
+  const pd = spTempSBPaid(t, sb_no);
+  if (tot <= 0) return 'pending';
+  if (pd <= 0) return 'pending';
+  if (pd >= tot - 0.01) return 'paid';
+  return 'partial';
+}
+
+// Generate partial_uuid (ใช้ผูก stmt match)
+function _genPartialUuid() {
+  return (typeof crypto !== 'undefined' && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : 'p-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
+}
+
+// Group SP-TEMP records by cust_code — ลูกค้าเดียวกันแสดงรวมกัน (active records เท่านั้น)
+function spTempGroupByCustomer() {
+  const groups = {};
+  spTempList.forEach(t => {
+    if (t.status === 'graduated' || t.status === 'cancelled') return;
+    const key = String(t.cust_code || '').trim() || ('NOCODE_' + t.no);
+    if (!groups[key]) groups[key] = [];
+    groups[key].push(t);
+  });
+  return groups;
+}
+
+window.spTempGroupBillsBySB = spTempGroupBillsBySB;
+window.spTempSBTotal = spTempSBTotal;
+window.spTempSBPaid = spTempSBPaid;
+window.spTempSBRemaining = spTempSBRemaining;
+window.spTempSBStatus = spTempSBStatus;
+window.spTempGroupByCustomer = spTempGroupByCustomer;
+
+// ─── V2 Rendering helpers — ใช้ร่วมได้ทั้ง Main + Payments page ───
+// SB grouping ใน tab "บิล" + Match button ใน tab "ชำระ"
+
+function renderSpTempBillsTabHtml(t) {
+  const sbGroups = spTempGroupBillsBySB(t);
+  if (sbGroups.length === 0) return '<div class="text-xs text-muted" style="padding:10px 0">ยังไม่มีบิล — กด "+ บิล" ด้านล่าง</div>';
+  
+  return sbGroups.map(g => {
+    const sbNo = g.sb_no;
+    const sbNoForData = sbNo === '(ไม่มีใบวางบิล)' ? '' : sbNo;
+    const tot = spTempSBTotal(t, sbNoForData);
+    const pd = spTempSBPaid(t, sbNoForData);
+    const rm = Math.max(0, tot - pd);
+    const pct = tot > 0 ? Math.round(pd / tot * 100) : 0;
+    const status = spTempSBStatus(t, sbNoForData);
+    const sbKey = t.no + '|' + sbNoForData;
+    const sbOpen = window.__sptSBOpen?.[sbKey];
+    
+    const statusBadge = status === 'paid' 
+      ? '<span class="badge badge-success" style="font-size:.65rem">จ่ายเต็ม</span>'
+      : status === 'partial' 
+        ? '<span class="badge badge-warn" style="font-size:.65rem">จ่ายบางส่วน</span>'
+        : '<span class="badge" style="background:var(--surface2);color:var(--text2);font-size:.65rem">รอชำระ</span>';
+    
+    const billsRows = g.bills.slice().sort((a,b) => String(a.date||'').localeCompare(String(b.date||''))).map(bill => {
+      const isNeg = (bill.type === 'JR' || bill.type === 'SC') || Number(bill.amount) < 0;
+      const typeColors = { OR: '#3b82f6', SR: '#22c55e', JR: '#ef4444', SC: '#ef4444' };
+      return `
+        <tr class="sptv2-bill-row" data-no="${t.no}" data-uuid="${bill.bill_uuid||''}" style="cursor:pointer;${isNeg?'background:rgba(239,87,87,.06)':''}" title="คลิกเพื่อแก้ไข">
+          <td style="padding:3px 4px;font-family:var(--mono);font-size:.7rem">${bill.bill_no||'-'}</td>
+          <td style="padding:3px 4px"><span style="background:${(typeColors[bill.type]||'#888')}22;color:${typeColors[bill.type]||'#888'};padding:1px 5px;border-radius:3px;font-size:.66rem;font-weight:600">${bill.type||'-'}</span></td>
+          <td style="padding:3px 4px">${fmtDate(bill.date)}</td>
+          <td style="padding:3px 4px;text-align:right;font-weight:600;color:${isNeg?'var(--danger)':'var(--success)'}">${isNeg?'−':''}฿${fmtNum(Math.abs(Number(bill.amount)||0))}</td>
+          <td style="padding:3px 4px;text-align:right"><button class="sptv2-del-bill" data-no="${t.no}" data-uuid="${bill.bill_uuid||''}" style="background:none;border:none;color:var(--danger);cursor:pointer;font-size:.85rem">✕</button></td>
+        </tr>`;
+    }).join('');
+    
+    return `
+      <div style="background:var(--surface2);border-radius:6px;padding:8px 10px;margin-bottom:6px">
+        <div class="sptv2-toggle-sb" data-key="${sbKey}" style="display:flex;align-items:center;gap:8px;cursor:pointer">
+          <span style="font-size:.75rem;min-width:14px">${sbOpen?'▼':'▶'}</span>
+          <span style="font-family:monospace;font-weight:600;font-size:.78rem">${sbNo === '(ไม่มีใบวางบิล)' ? '<span style="color:var(--text3);font-style:italic;font-weight:400">ไม่มี SB</span>' : sbNo}</span>
+          <span style="font-size:.7rem;color:var(--text2)">${g.bills.length} บิล</span>
+          ${statusBadge}
+        </div>
+        <div class="flex items-center gap-2" style="margin-top:5px;font-size:.72rem;flex-wrap:wrap">
+          <span style="color:var(--text2)">ยอด <b style="color:var(--text)">฿${fmtNum(tot)}</b></span>
+          <span style="color:var(--success)">จ่าย <b>฿${fmtNum(pd)}</b></span>
+          <span style="color:${rm>0?'var(--danger)':'var(--success)'}">เหลือ <b>฿${fmtNum(rm)}</b></span>
+          <span style="flex:1;min-width:80px;max-width:140px;height:4px;background:var(--bg);border-radius:2px;overflow:hidden">
+            <span style="display:block;height:100%;width:${Math.min(100,pct)}%;background:${pct>=100?'var(--success)':pct>0?'var(--warn)':'var(--text3)'};transition:width .3s"></span>
+          </span>
+          <span style="color:var(--text2);min-width:32px;text-align:right">${pct}%</span>
+          <button class="btn btn-primary btn-sm sptv2-add-pay-sb" data-no="${t.no}" data-sb="${sbNoForData}" style="padding:2px 10px;font-size:.7rem;font-weight:500">+ ชำระ</button>
+        </div>
+        ${sbOpen ? `
+          <div style="margin-top:8px;background:var(--bg);border-radius:4px;padding:6px 8px">
+            <table style="width:100%">
+              <thead><tr style="color:var(--text2);border-bottom:1px solid var(--border);font-size:.7rem">
+                <th style="text-align:left;padding:3px 4px;font-weight:500">เลขบิล</th>
+                <th style="text-align:left;padding:3px 4px;font-weight:500">ประเภท</th>
+                <th style="text-align:left;padding:3px 4px;font-weight:500">วันที่</th>
+                <th style="text-align:right;padding:3px 4px;font-weight:500">ยอด</th>
+                <th style="width:24px"></th>
+              </tr></thead>
+              <tbody>${billsRows}</tbody>
+            </table>
+          </div>
+        ` : ''}
+      </div>
+    `;
+  }).join('');
+}
+
+function renderSpTempPartialsTabHtml(t) {
+  if ((t.partials||[]).length === 0) {
+    return '<div class="text-xs text-muted" style="padding:10px 0">ยังไม่มีรายการชำระ — กด "+ ชำระ" ใน tab บิล</div>';
+  }
+  const indexed = (t.partials||[]).map((pr, originalIdx) => ({ pr, originalIdx }));
+  indexed.sort((a, b) => String(a.pr.date || '').localeCompare(String(b.pr.date || '')));
+  
+  return `
+    <table style="width:100%;font-size:.78rem">
+      <thead>
+        <tr style="color:var(--text2);border-bottom:1px solid var(--border)">
+          <th style="text-align:left;padding:4px;font-weight:500">วันที่</th>
+          <th style="text-align:left;padding:4px;font-weight:500">ใบวางบิล</th>
+          <th style="text-align:right;padding:4px;font-weight:500">จำนวน</th>
+          <th style="text-align:left;padding:4px;font-weight:500">วิธี</th>
+          <th style="text-align:left;padding:4px;font-weight:500">ธนาคาร</th>
+          <th style="text-align:left;padding:4px;font-weight:500">หมายเหตุ</th>
+          <th style="text-align:center;padding:4px;width:90px;font-weight:500">Match</th>
+          <th style="width:24px"></th>
+        </tr>
+      </thead>
+      <tbody>
+        ${indexed.map(({ pr, originalIdx }) => {
+          const matched = !!pr.matched_stmt_uuid || !!pr.stmt_ref;
+          return `
+          <tr class="sptv2-partial-row" data-no="${t.no}" data-idx="${originalIdx}" style="cursor:pointer" title="คลิกเพื่อแก้ไข">
+            <td style="padding:4px">${fmtDate(pr.date)}</td>
+            <td style="padding:4px;font-family:var(--mono);font-size:.7rem">${pr.sb_no || '<span style="color:var(--text3);font-style:italic">-</span>'}</td>
+            <td style="padding:4px;text-align:right;font-weight:600;color:var(--success)">฿${fmtNum(pr.amount)}</td>
+            <td style="padding:4px">${pr.method||'-'}</td>
+            <td style="padding:4px">${pr.bank||'-'}</td>
+            <td style="padding:4px;color:var(--text2)">${pr.notes||''}${pr._auto_split?' <span class="badge badge-info" style="font-size:.65rem">auto-split</span>':''}</td>
+            <td style="padding:4px;text-align:center">
+              ${matched 
+                ? '<span class="badge badge-success" style="font-size:.65rem">✓ matched</span>'
+                : `<button class="btn btn-primary btn-sm sptv2-partial-match" data-no="${t.no}" data-idx="${originalIdx}" style="padding:2px 8px;font-size:.7rem">🔗 Match</button>`}
+            </td>
+            <td style="padding:4px;text-align:right">
+              <button class="sptv2-del-partial" data-no="${t.no}" data-idx="${originalIdx}" style="background:none;border:none;color:var(--danger);cursor:pointer;font-size:.85rem">✕</button>
+            </td>
+          </tr>`;
+        }).join('')}
+      </tbody>
+    </table>
+  `;
+}
+
+// Wire events for V2 SP-TEMP rendering — ใช้ร่วมได้ทุก page
+// renderFn = function ที่ caller ใช้ re-render หลัง action
+function wireSpTempV2Events(container, renderFn) {
+  if (!container) return;
+  
+  container.querySelectorAll('.sptv2-toggle-sb').forEach(el => {
+    el.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const k = el.dataset.key;
+      if (!window.__sptSBOpen) window.__sptSBOpen = {};
+      window.__sptSBOpen[k] = !window.__sptSBOpen[k];
+      renderFn && renderFn();
+    });
+  });
+  
+  container.querySelectorAll('.sptv2-add-pay-sb').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const no = btn.dataset.no;
+      const sb = btn.dataset.sb || '';
+      openPartialModal(no, sb);
+    });
+  });
+  
+  container.querySelectorAll('.sptv2-partial-match').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const no = btn.dataset.no;
+      const idx = Number(btn.dataset.idx);
+      if (typeof openSpTempPartialMatchModal === 'function') {
+        openSpTempPartialMatchModal(no, idx, renderFn);
+      }
+    });
+  });
+  
+  container.querySelectorAll('.sptv2-partial-row').forEach(row => {
+    row.addEventListener('click', (e) => {
+      if (e.target.closest('button')) return;
+      const no = row.dataset.no;
+      const idx = Number(row.dataset.idx);
+      if (typeof openSpTempPartialEditModal === 'function') {
+        openSpTempPartialEditModal(no, idx, renderFn);
+      }
+    });
+  });
+  
+  container.querySelectorAll('.sptv2-del-partial').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const no = btn.dataset.no;
+      const idx = Number(btn.dataset.idx);
+      const t = spTempList.find(x => x.no === no);
+      if (!t || !t.partials) return;
+      if (!confirm(`ลบ partial #${idx+1}?`)) return;
+      const pr = t.partials[idx];
+      // Cleanup stmt-side ถ้า matched อยู่
+      if (pr && (pr.matched_stmt_uuid || pr.stmt_ref)) {
+        const stmt = pr.matched_stmt_uuid 
+          ? getAllStatements().find(s => s.stmt_uuid === pr.matched_stmt_uuid)
+          : getAllStatements().find(s => s.ref_no === pr.stmt_ref);
+        if (stmt && stmt.match_station === 'SP-TEMP' && String(stmt.match_bill||'').startsWith(no)) {
+          stmt.match_status = 'unpaid';
+          stmt.match_station = '';
+          stmt.match_bill = '';
+          stmt.matched_bills = [];
+          stmt.match_method = '';
+          syncManager.markDirty('stmts');
+        }
+      }
+      t.partials.splice(idx, 1);
+      t.updated_at = new Date().toISOString();
+      recomputeSpTempStatus(t);
+      markDirtySpTemps();
+      renderFn && renderFn();
+    });
+  });
+  
+  container.querySelectorAll('.sptv2-bill-row').forEach(row => {
+    row.addEventListener('click', (e) => {
+      if (e.target.closest('button')) return;
+      const no = row.dataset.no;
+      const uuid = row.dataset.uuid;
+      if (typeof openSpTempBillModal === 'function') {
+        openSpTempBillModal(no, uuid, renderFn);
+      }
+    });
+  });
+  
+  container.querySelectorAll('.sptv2-del-bill').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const no = btn.dataset.no;
+      const uuid = btn.dataset.uuid;
+      const t = spTempList.find(x => x.no === no);
+      if (!t) return;
+      if (!confirm(`ลบบิลนี้จาก ${no}?`)) return;
+      t.bills = (t.bills||[]).filter(b => b.bill_uuid !== uuid);
+      t.updated_at = new Date().toISOString();
+      markDirtySpTemps();
+      renderFn && renderFn();
+    });
+  });
+}
+
+window.renderSpTempBillsTabHtml = renderSpTempBillsTabHtml;
+window.renderSpTempPartialsTabHtml = renderSpTempPartialsTabHtml;
+window.wireSpTempV2Events = wireSpTempV2Events;
+
 function _genBillUuid() {
   return (typeof crypto !== 'undefined' && crypto.randomUUID) 
     ? crypto.randomUUID() 
@@ -9120,6 +9414,13 @@ function openSpTempPartialEditModal(no, idx, onChange) {
   
   openModal(`✎ แก้ไข Partial #${idx + 1} ของ ${no}`, `
     <div class="flex-col gap-3" style="min-width:460px;max-width:560px">
+      <div class="input-group">
+        <label>ตัดให้ใบวางบิล (SB) <span style="color:var(--text2);font-size:.7rem">— เลือกจากรายการ หรือพิมพ์ใหม่</span></label>
+        <input class="input" id="epr-sb-no" list="epr-sb-list" value="${pr.sb_no||''}" placeholder="SB-202604-XXXX" autocomplete="off">
+        <datalist id="epr-sb-list">
+          ${(typeof spTempGroupBillsBySB === 'function' ? spTempGroupBillsBySB(t) : []).map(g => `<option value="${g.sb_no}">฿${fmtNum(spTempSBTotal(t, g.sb_no))} · จ่าย ${fmtNum(spTempSBPaid(t, g.sb_no))} · เหลือ ${fmtNum(spTempSBRemaining(t, g.sb_no))}</option>`).join('')}
+        </datalist>
+      </div>
       <div class="flex gap-2">
         <div class="input-group flex-1">
           <label>จำนวน</label>
@@ -9244,6 +9545,7 @@ function openSpTempPartialEditModal(no, idx, onChange) {
     
     pr.amount = amt;
     pr.date = document.getElementById('epr-date').value;
+    pr.sb_no = (document.getElementById('epr-sb-no')?.value || '').trim();
     pr.method = document.getElementById('epr-method').value;
     pr.bank = document.getElementById('epr-bank').value.trim();
     // ⭐ Cheque-specific fields
@@ -9625,22 +9927,37 @@ function openSpTempModal() {
 }
 
 // Modal: Add partial to existing SP-TEMP
-function openPartialModal(tempNo) {
+function openPartialModal(tempNo, sbNoDefault) {
   const t = spTempList.find(x => x.no === tempNo);
   if (!t) return;
   const p = spTempProgress(t);
   
-  openModal(`+ Partial ใน ${tempNo}`, `
+  // ⭐ List ใบวางบิลทั้งหมดของ SP-TEMP นี้ — สำหรับ dropdown
+  const sbGroups = (typeof spTempGroupBillsBySB === 'function') ? spTempGroupBillsBySB(t) : [];
+  const defaultSb = String(sbNoDefault || '').trim();
+  // ถ้า user กดจาก SB เฉพาะ → pre-fill ยอดที่เหลือของ SB นั้น
+  const sbRem = defaultSb && (typeof spTempSBRemaining === 'function') ? spTempSBRemaining(t, defaultSb) : 0;
+  const amtPlaceholder = sbRem > 0 ? sbRem : p.remaining;
+  
+  openModal(`+ ชำระ ใน ${tempNo}${defaultSb?` · ${defaultSb}`:''}`, `
     <div class="flex-col gap-3" style="min-width:380px">
       <div style="padding:10px;background:var(--bg2);border-radius:6px;font-size:.85rem">
         ลูกค้า: <b>(${t.cust_code}) ${t.cust_name}</b><br>
         Expected: ${fmtNum(p.expected)} · Paid: ${fmtNum(p.paid)} · เหลือ: <b style="color:var(--warn)">${fmtNum(p.remaining)}</b>
       </div>
       
+      <div class="input-group">
+        <label>ตัดให้ใบวางบิล (SB) <span style="color:var(--text2);font-size:.7rem">— เลือกจากรายการ หรือพิมพ์ใหม่</span></label>
+        <input class="input" id="prt-sb-no" list="prt-sb-list" value="${defaultSb}" placeholder="SB-202604-XXXX" autocomplete="off">
+        <datalist id="prt-sb-list">
+          ${sbGroups.map(g => `<option value="${g.sb_no}">฿${fmtNum(spTempSBTotal(t, g.sb_no))} · จ่าย ${fmtNum(spTempSBPaid(t, g.sb_no))} · เหลือ ${fmtNum(spTempSBRemaining(t, g.sb_no))}</option>`).join('')}
+        </datalist>
+      </div>
+      
       <div class="flex gap-2">
         <div class="input-group flex-1">
           <label>จำนวน</label>
-          <input type="number" class="input" id="prt-amount" placeholder="${p.remaining}" step="0.01" autofocus>
+          <input type="number" class="input" id="prt-amount" placeholder="${amtPlaceholder}" step="0.01" autofocus>
         </div>
         <div class="input-group flex-1">
           <label>วันที่</label>
@@ -9661,7 +9978,6 @@ function openPartialModal(tempNo) {
           <input class="input" id="prt-bank">
         </div>
       </div>
-      <!-- ⭐ Cheque-only fields -->
       <div id="prt-cheque-extra" class="flex gap-2" style="display:none">
         <div class="input-group flex-1">
           <label>เลขเช็ค</label>
@@ -9673,7 +9989,7 @@ function openPartialModal(tempNo) {
         </div>
       </div>
       <div class="input-group">
-        <label>Stmt ref / หมายเหตุ</label>
+        <label>หมายเหตุ</label>
         <input class="input" id="prt-notes">
       </div>
       
@@ -9684,7 +10000,6 @@ function openPartialModal(tempNo) {
     </div>
   `);
   
-  // ⭐ Toggle Cheque fields ตาม method
   const $prtMethod = document.getElementById('prt-method');
   const $prtChqExtra = document.getElementById('prt-cheque-extra');
   function toggleChqExtra() {
@@ -9697,13 +10012,18 @@ function openPartialModal(tempNo) {
     const amt = Number(document.getElementById('prt-amount').value) || 0;
     if (amt <= 0) { toast('กรอกจำนวน', 'error'); return; }
     
+    const sbNo = (document.getElementById('prt-sb-no')?.value || '').trim();
     const method = document.getElementById('prt-method').value;
     const partial = {
+      partial_uuid: _genPartialUuid(),       // ⭐ PK สำหรับ match กับ stmt
       date: document.getElementById('prt-date').value,
+      sb_no: sbNo,                           // ⭐ ตัดให้ SB ใด
       amount: amt,
       method: method,
       bank: document.getElementById('prt-bank').value,
       stmt_ref: '',
+      matched_stmt_uuid: '',
+      match_status: 'unpaid',
       notes: document.getElementById('prt-notes').value,
     };
     if (method === 'Cheque') {
@@ -9713,7 +10033,6 @@ function openPartialModal(tempNo) {
     
     const check = spTempCheckRollover(t, partial);
     if (check.split) {
-      // Split: ส่วนที่พอดี → t, ส่วนเกิน → ใหม่
       t.partials.push(check.partialThis);
       t.updated_at = new Date().toISOString();
       recomputeSpTempStatus(t);
@@ -9735,12 +10054,13 @@ function openPartialModal(tempNo) {
       t.partials.push(partial);
       t.updated_at = new Date().toISOString();
       recomputeSpTempStatus(t);
-      toast(`เพิ่ม partial ${amt.toLocaleString()} สำเร็จ`, 'success');
+      toast(`เพิ่ม partial ${amt.toLocaleString()} สำเร็จ${sbNo?` (${sbNo})`:''}`, 'success');
     }
     
     markDirtySpTemps();
     closeModal();
     if (typeof currentPage !== 'undefined' && currentPage === 'payments') navigateTo('payments');
+    else if (typeof currentPage !== 'undefined' && currentPage === 'main' && typeof window.renderMainKeepScroll === 'function') window.renderMainKeepScroll();
   });
 }
 
@@ -10013,84 +10333,11 @@ function renderSpSectionsForDate(opts) {
                     <button class="main-sp-tab" data-no="${t.no}" data-tab="partials" style="padding:5px 10px;border:none;background:transparent;color:${(window.__sptTab?.[t.no]||'bills')==='partials'?'var(--info)':'var(--text2)'};border-bottom:2px solid ${(window.__sptTab?.[t.no]||'bills')==='partials'?'var(--info)':'transparent'};cursor:pointer;font-size:.75rem;font-weight:500">💵 ชำระ (${(t.partials||[]).length})</button>
                   </div>
                   ${((window.__sptTab?.[t.no]||'bills')==='bills') ? `
-                    ${(t.bills||[]).length > 0 ? `
-                      <table style="width:100%;font-size:.75rem">
-                        <thead><tr style="color:var(--text2);border-bottom:1px solid var(--border)">
-                          <th style="text-align:left;padding:3px">#</th>
-                          <th style="text-align:left;padding:3px">เลขบิล</th>
-                          <th style="text-align:left;padding:3px">ประเภท</th>
-                          <th style="text-align:left;padding:3px">วันที่</th>
-                          <th style="text-align:left;padding:3px">SB</th>
-                          <th style="text-align:right;padding:3px">ยอด</th>
-                          <th style="width:30px"></th>
-                        </tr></thead>
-                        <tbody>${(() => {
-                          const indexed = (t.bills || []).map((bill, oi) => ({ bill, oi }));
-                          indexed.sort((a,b) => String(a.bill.date||'').localeCompare(String(b.bill.date||'')));
-                          return indexed.map(({ bill, oi }, di) => {
-                            const isNeg = (bill.type === 'JR' || bill.type === 'SC') || Number(bill.amount) < 0;
-                            const typeColors = { OR: '#3b82f6', SR: '#22c55e', JR: '#ef4444', SC: '#ef4444' };
-                            return `
-                            <tr class="main-sp-bill-row" data-no="${t.no}" data-uuid="${bill.bill_uuid}" style="cursor:pointer;${isNeg?'background:rgba(239,87,87,.06)':''}" title="คลิกเพื่อแก้ไข">
-                              <td style="padding:3px;color:var(--text3)">${di+1}</td>
-                              <td style="padding:3px;font-family:var(--mono);font-size:.7rem">${bill.bill_no||'-'}</td>
-                              <td style="padding:3px"><span style="background:${(typeColors[bill.type]||'#888')}22;color:${typeColors[bill.type]||'#888'};padding:1px 6px;border-radius:3px;font-size:.65rem;font-weight:600">${bill.type||'-'}</span></td>
-                              <td style="padding:3px">${fmtDate(bill.date)}</td>
-                              <td style="padding:3px;font-family:var(--mono);font-size:.7rem;color:var(--text2)">${bill.sb_no||'<span style="color:var(--text3);font-style:italic">-</span>'}</td>
-                              <td style="padding:3px;text-align:right;font-weight:600;color:${isNeg?'var(--danger)':'var(--success)'}">${isNeg?'−':''}฿${fmtNum(Math.abs(Number(bill.amount)||0))}</td>
-                              <td style="padding:3px;text-align:right"><button class="main-sp-del-bill" data-no="${t.no}" data-uuid="${bill.bill_uuid}" style="background:none;border:none;color:var(--danger);cursor:pointer">✕</button></td>
-                            </tr>`;
-                          }).join('');
-                        })()}
-                          <tr style="border-top:1px solid var(--border);background:var(--surface2)">
-                            <td colspan="5" style="padding:5px 3px;color:var(--text2);font-size:.7rem">รวม ${(t.bills||[]).length} บิล</td>
-                            <td style="padding:5px 3px;text-align:right;font-weight:700;color:var(--text)">฿${fmtNum(spTempBillsSum(t))}</td>
-                            <td></td>
-                          </tr>
-                        </tbody>
-                      </table>
-                    ` : '<div class="text-xs text-muted" style="padding:8px 0">ยังไม่มีบิล — กดปุ่ม + บิล</div>'}
+                    ${renderSpTempBillsTabHtml(t)}
                     <div style="padding:6px 0;text-align:right">
                       <button class="btn btn-outline btn-sm main-sp-add-bill" data-no="${t.no}" style="padding:3px 10px;font-size:.7rem">+ บิล</button>
                     </div>
-                  ` : `
-                    ${(t.partials||[]).length > 0 ? `
-                      <table style="width:100%;font-size:.75rem">
-                        <thead><tr style="color:var(--text2);border-bottom:1px solid var(--border)">
-                          <th style="text-align:left;padding:3px">#</th>
-                          <th style="text-align:left;padding:3px">วันที่</th>
-                          <th style="text-align:right;padding:3px">จำนวน</th>
-                          <th style="text-align:left;padding:3px">วิธี</th>
-                          <th style="text-align:left;padding:3px">ธนาคาร</th>
-                          <th style="text-align:center;padding:3px">Match</th>
-                          <th style="width:30px"></th>
-                        </tr></thead>
-                        <tbody>${(() => {
-                          const indexed = (t.partials || []).map((pr, originalIdx) => ({ pr, originalIdx }));
-                          indexed.sort((a, b) => {
-                            const da = String(a.pr.date || '');
-                            const db = String(b.pr.date || '');
-                            if (da && !db) return -1;
-                            if (!da && db) return 1;
-                            return da.localeCompare(db);
-                          });
-                          return indexed.map(({ pr, originalIdx }, displayI) => {
-                          const matched = !!pr.stmt_ref;
-                          return `
-                          <tr class="main-sp-partial-row" data-no="${t.no}" data-idx="${originalIdx}" style="cursor:pointer" title="คลิกเพื่อแก้ไข/match">
-                            <td style="padding:3px;color:var(--text3)">${displayI + 1}</td>
-                            <td style="padding:3px">${fmtDate(pr.date)}</td>
-                            <td style="padding:3px;text-align:right;font-weight:600;color:var(--success)">฿${fmtNum(pr.amount)}</td>
-                            <td style="padding:3px">${pr.method || '-'}</td>
-                            <td style="padding:3px">${pr.bank || '-'}</td>
-                            <td style="padding:3px;text-align:center">${matched ? '<span class="badge badge-success" style="font-size:.6rem">🔗 matched</span>' : '<span class="text-muted" style="font-size:.7rem">-</span>'}</td>
-                            <td style="padding:3px;text-align:right"><button class="main-sp-del-partial" data-no="${t.no}" data-idx="${originalIdx}" style="background:none;border:none;color:var(--danger);cursor:pointer">✕</button></td>
-                          </tr>
-                        `}).join('');
-                        })()}</tbody>
-                      </table>
-                    ` : '<div class="text-xs text-muted" style="padding:8px 0">ยังไม่มีรายการชำระ</div>'}
-                  `}
+                  ` : renderSpTempPartialsTabHtml(t)}
                 </div>
               ` : ''}
             </div>
@@ -10262,25 +10509,6 @@ function renderSpSectionsForDate(opts) {
     });
   });
   
-  // ⭐ SP-TEMP: edit header (expected/customer)
-  container.querySelectorAll('.main-sp-edit-temp').forEach(btn => {
-    btn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const no = btn.dataset.no;
-      openSpTempEditModal(no, onChange);
-    });
-  });
-  
-  // ⭐ SP-TEMP: click partial row → edit partial
-  container.querySelectorAll('.main-sp-partial-row').forEach(row => {
-    row.addEventListener('click', (e) => {
-      if (e.target.closest('.main-sp-del-partial')) return;
-      const no = row.dataset.no;
-      const idx = Number(row.dataset.idx);
-      openSpTempPartialEditModal(no, idx, onChange);
-    });
-  });
-  
   // ⭐ SP-TEMP: tab switcher (Bills / Partials)
   container.querySelectorAll('.main-sp-tab').forEach(btn => {
     btn.addEventListener('click', (e) => {
@@ -10293,42 +10521,26 @@ function renderSpSectionsForDate(opts) {
     });
   });
   
-  // ⭐ SP-TEMP: click bill row → edit bill
-  container.querySelectorAll('.main-sp-bill-row').forEach(row => {
-    row.addEventListener('click', (e) => {
-      if (e.target.closest('.main-sp-del-bill')) return;
-      const no = row.dataset.no;
-      const uuid = row.dataset.uuid;
-      openSpTempBillModal(no, uuid, onChange);
+  // ⭐ V2: Wire SB toggle / + ชำระ / Match button / partial row → edit / bill row / delete
+  if (typeof wireSpTempV2Events === 'function') {
+    wireSpTempV2Events(container, onChange);
+  }
+  
+  // ⭐ SP-TEMP: edit header (expected/customer)
+  container.querySelectorAll('.main-sp-edit-temp').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const no = btn.dataset.no;
+      openSpTempEditModal(no, onChange);
     });
   });
   
-  // ⭐ SP-TEMP: + บิล button
+  // ⭐ SP-TEMP: + บิล button (เพิ่มบิลใหม่ใน SP-TEMP — ไม่ผ่าน SB grouping)
   container.querySelectorAll('.main-sp-add-bill').forEach(btn => {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
       const no = btn.dataset.no;
       openSpTempBillModal(no, null, onChange);
-    });
-  });
-  
-  // ⭐ SP-TEMP: ✕ delete bill
-  container.querySelectorAll('.main-sp-del-bill').forEach(btn => {
-    btn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const no = btn.dataset.no;
-      const uuid = btn.dataset.uuid;
-      const t = spTempList.find(x => x.no === no);
-      if (!t || !Array.isArray(t.bills)) return;
-      const bill = t.bills.find(b => b.bill_uuid === uuid);
-      if (!bill) return;
-      if (!confirm(`ลบบิล ${bill.bill_no || '(ไม่มีเลข)'} ออกจาก ${no}?`)) return;
-      t.bills = t.bills.filter(b => b.bill_uuid !== uuid);
-      t.updated_at = new Date().toISOString();
-      markDirtySpTemps();
-      persistMainState();
-      toast('ลบบิลแล้ว', 'success');
-      if (onChange) onChange();
     });
   });
 
@@ -10477,88 +10689,11 @@ async function renderPayments(el) {
                       <button class="pay-sp-tab" data-no="${t.no}" data-tab="partials" style="padding:5px 10px;border:none;background:transparent;color:${(window.__sptTab?.[t.no]||'bills')==='partials'?'var(--info)':'var(--text2)'};border-bottom:2px solid ${(window.__sptTab?.[t.no]||'bills')==='partials'?'var(--info)':'transparent'};cursor:pointer;font-size:.78rem;font-weight:500">💵 ชำระ (${(t.partials||[]).length})</button>
                     </div>
                     ${((window.__sptTab?.[t.no]||'bills')==='bills') ? `
-                      ${(t.bills||[]).length > 0 ? `
-                        <table style="width:100%;font-size:.8rem">
-                          <thead><tr style="color:var(--text2);border-bottom:1px solid var(--border)">
-                            <th style="text-align:left;padding:4px">#</th>
-                            <th style="text-align:left;padding:4px">เลขบิล</th>
-                            <th style="text-align:left;padding:4px">ประเภท</th>
-                            <th style="text-align:left;padding:4px">วันที่</th>
-                            <th style="text-align:left;padding:4px">SB</th>
-                            <th style="text-align:right;padding:4px">ยอด</th>
-                            <th style="width:30px"></th>
-                          </tr></thead>
-                          <tbody>${(() => {
-                            const indexed = (t.bills||[]).map((bill, oi) => ({ bill, oi }));
-                            indexed.sort((a,b) => String(a.bill.date||'').localeCompare(String(b.bill.date||'')));
-                            return indexed.map(({ bill, oi }, di) => {
-                              const isNeg = (bill.type === 'JR' || bill.type === 'SC') || Number(bill.amount) < 0;
-                              const typeColors = { OR: '#3b82f6', SR: '#22c55e', JR: '#ef4444', SC: '#ef4444' };
-                              return `
-                              <tr class="pay-sp-bill-row" data-no="${t.no}" data-uuid="${bill.bill_uuid}" style="cursor:pointer;${isNeg?'background:rgba(239,87,87,.06)':''}" title="คลิกเพื่อแก้ไข">
-                                <td style="padding:4px;color:var(--text3)">${di+1}</td>
-                                <td style="padding:4px;font-family:var(--mono);font-size:.75rem">${bill.bill_no||'-'}</td>
-                                <td style="padding:4px"><span style="background:${(typeColors[bill.type]||'#888')}22;color:${typeColors[bill.type]||'#888'};padding:1px 7px;border-radius:3px;font-size:.7rem;font-weight:600">${bill.type||'-'}</span></td>
-                                <td style="padding:4px">${fmtDate(bill.date)}</td>
-                                <td style="padding:4px;font-family:var(--mono);font-size:.75rem;color:var(--text2)">${bill.sb_no||'<span style="color:var(--text3);font-style:italic">-</span>'}</td>
-                                <td style="padding:4px;text-align:right;font-weight:600;color:${isNeg?'var(--danger)':'var(--success)'}">${isNeg?'−':''}฿${fmtNum(Math.abs(Number(bill.amount)||0))}</td>
-                                <td style="padding:4px;text-align:right"><button class="pay-sp-del-bill" data-no="${t.no}" data-uuid="${bill.bill_uuid}" style="background:none;border:none;color:var(--danger);cursor:pointer;font-size:.9rem">✕</button></td>
-                              </tr>`;
-                            }).join('');
-                          })()}
-                            <tr style="border-top:1px solid var(--border);background:var(--surface2)">
-                              <td colspan="5" style="padding:6px 4px;color:var(--text2);font-size:.75rem">รวม ${(t.bills||[]).length} บิล</td>
-                              <td style="padding:6px 4px;text-align:right;font-weight:700;color:var(--text)">฿${fmtNum(spTempBillsSum(t))}</td>
-                              <td></td>
-                            </tr>
-                          </tbody>
-                        </table>
-                      ` : '<div class="text-xs text-muted" style="padding:10px 0">ยังไม่มีบิล — กดปุ่ม + บิล</div>'}
+                      ${renderSpTempBillsTabHtml(t)}
                       <div style="padding:8px 0;text-align:right">
                         <button class="btn btn-outline btn-sm pay-sp-add-bill" data-no="${t.no}" style="padding:4px 12px;font-size:.75rem">+ บิล</button>
                       </div>
-                    ` : `
-                      ${(t.partials||[]).length > 0 ? `
-                        <table style="width:100%;font-size:.8rem">
-                          <thead>
-                            <tr style="color:var(--text2);border-bottom:1px solid var(--border)">
-                              <th style="text-align:left;padding:4px">#</th>
-                              <th style="text-align:left;padding:4px">วันที่</th>
-                              <th style="text-align:right;padding:4px">จำนวน</th>
-                              <th style="text-align:left;padding:4px">วิธี</th>
-                              <th style="text-align:left;padding:4px">ธนาคาร</th>
-                              <th style="text-align:left;padding:4px">หมายเหตุ</th>
-                              <th style="width:40px"></th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            ${(() => {
-                              const indexed = (t.partials||[]).map((pr, originalIdx) => ({ pr, originalIdx }));
-                              indexed.sort((a, b) => {
-                                const da = String(a.pr.date || '');
-                                const db = String(b.pr.date || '');
-                                if (da && !db) return -1;
-                                if (!da && db) return 1;
-                                return da.localeCompare(db);
-                              });
-                              return indexed.map(({ pr, originalIdx }, displayI) => `
-                              <tr class="pay-sp-partial-row" data-no="${t.no}" data-idx="${originalIdx}" style="cursor:pointer" title="คลิกเพื่อแก้ไข/match">
-                                <td style="padding:4px;color:var(--text3)">${displayI+1}</td>
-                                <td style="padding:4px">${fmtDate(pr.date)}</td>
-                                <td style="padding:4px;text-align:right;font-weight:600;color:var(--success)">฿${fmtNum(pr.amount)}</td>
-                                <td style="padding:4px">${pr.method||'-'}</td>
-                                <td style="padding:4px">${pr.bank||'-'}</td>
-                                <td style="padding:4px;color:var(--text2)">${pr.notes||pr.stmt_ref||''}${pr._auto_split?' <span class="badge badge-info" style="font-size:.65rem">auto-split</span>':''}</td>
-                                <td style="padding:4px;text-align:right">
-                                  <button class="btn-del-partial" data-no="${t.no}" data-idx="${originalIdx}" style="background:none;border:none;color:var(--danger);cursor:pointer;font-size:.9rem" title="ลบ partial">✕</button>
-                                </td>
-                              </tr>
-                            `).join('');
-                            })()}
-                          </tbody>
-                        </table>
-                      ` : '<div class="text-xs text-muted" style="padding:10px 0">ยังไม่มีรายการชำระ</div>'}
-                    `}
+                    ` : renderSpTempPartialsTabHtml(t)}
                   </div>
                 ` : ''}
               </div>
@@ -10748,42 +10883,17 @@ async function renderPayments(el) {
       });
     });
     
-    // ⭐ Click bill row → edit
-    el.querySelectorAll('.pay-sp-bill-row').forEach(row => {
-      row.addEventListener('click', (e) => {
-        if (e.target.closest('.pay-sp-del-bill')) return;
-        const no = row.dataset.no;
-        const uuid = row.dataset.uuid;
-        openSpTempBillModal(no, uuid, () => render());
-      });
-    });
+    // ⭐ V2: Wire SB toggle / + ชำระ / Match button / partial row → edit
+    if (typeof wireSpTempV2Events === 'function') {
+      wireSpTempV2Events(el, render);
+    }
     
-    // ⭐ + บิล button
+    // ⭐ + บิล button (เพิ่มบิลใหม่ใน SP-TEMP)
     el.querySelectorAll('.pay-sp-add-bill').forEach(btn => {
       btn.addEventListener('click', (e) => {
         e.stopPropagation();
         const no = btn.dataset.no;
         openSpTempBillModal(no, null, () => render());
-      });
-    });
-    
-    // ⭐ ✕ delete bill
-    el.querySelectorAll('.pay-sp-del-bill').forEach(btn => {
-      btn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        const no = btn.dataset.no;
-        const uuid = btn.dataset.uuid;
-        const t = spTempList.find(x => x.no === no);
-        if (!t || !Array.isArray(t.bills)) return;
-        const bill = t.bills.find(b => b.bill_uuid === uuid);
-        if (!bill) return;
-        if (!confirm(`ลบบิล ${bill.bill_no || '(ไม่มีเลข)'} ออกจาก ${no}?`)) return;
-        t.bills = t.bills.filter(b => b.bill_uuid !== uuid);
-        t.updated_at = new Date().toISOString();
-        markDirtySpTemps();
-        persistMainState();
-        toast('ลบบิลแล้ว', 'success');
-        render();
       });
     });
     
@@ -14596,6 +14706,13 @@ function toISODate(d) {
   if (iso) {
     let y = Number(iso[1]); if (y > 2400) y -= 543;
     return `${y}-${iso[2]}-${iso[3]}`;
+  }
+
+  // ⭐ yyyy/mm/dd (slash, year-first) — backend อาจเก็บ format นี้ใน sheet
+  const isoSlash = s.match(/^(\d{4})\/(\d{1,2})\/(\d{1,2})/);
+  if (isoSlash) {
+    let y = Number(isoSlash[1]); if (y > 2400) y -= 543;
+    return `${y}-${String(isoSlash[2]).padStart(2,'0')}-${String(isoSlash[3]).padStart(2,'0')}`;
   }
 
   // dd/mm/yyyy
