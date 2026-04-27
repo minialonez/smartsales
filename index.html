@@ -8723,12 +8723,12 @@ function _genPartialUuid() {
     : 'p-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
 }
 
-// Group SP-TEMP records by cust_code — ลูกค้าเดียวกันแสดงรวมกัน (active records เท่านั้น)
+// Group SP-TEMP records by customer — ลูกค้าเดียวกันแสดงรวมกัน (active records เท่านั้น)
 function spTempGroupByCustomer() {
   const groups = {};
   spTempList.forEach(t => {
     if (t.status === 'graduated' || t.status === 'cancelled') return;
-    const key = String(t.cust_code || '').trim() || ('NOCODE_' + t.no);
+    const key = String(t.cust_name || '').trim() || ('NOCUST_' + t.no);
     if (!groups[key]) groups[key] = [];
     groups[key].push(t);
   });
@@ -9166,18 +9166,25 @@ function spTempCheckRollover(t, newPartial) {
 }
 
 // Customer typeahead HTML
-function spTempCustomerInput(id, selectedCode, selectedName) {
+function spTempCustomerInput(id, selectedCustomer) {
+  // ⭐ ยุบ cust_code + cust_name → ช่องเดียว เก็บ "(code) name"
   return `
     <div style="position:relative">
       <input class="input" id="${id}-search" placeholder="🔍 ค้นหาลูกค้า (รหัส / ชื่อ)" 
-             value="${selectedCode ? `(${selectedCode}) ${selectedName||''}` : ''}" 
+             value="${selectedCustomer || ''}" 
              autocomplete="off" style="width:100%">
       <div id="${id}-drop" style="display:none;position:absolute;top:100%;left:0;right:0;background:var(--bg);border:1px solid var(--border);border-radius:6px;max-height:260px;overflow-y:auto;z-index:1000;box-shadow:0 8px 24px rgba(0,0,0,.6),0 0 0 1px rgba(255,255,255,.05);margin-top:4px"></div>
-      <input type="hidden" id="${id}-code" value="${selectedCode||''}">
-      <input type="hidden" id="${id}-name" value="${selectedName||''}">
+      <input type="hidden" id="${id}-customer" value="${selectedCustomer||''}">
     </div>
   `;
 }
+
+// Helper: extract code จาก customer string "(003-RUNG) ชื่อ" → "003-RUNG" (ใช้ตอน graduate)
+function extractCustCode(s) {
+  const m = String(s||'').match(/^\(([^)]+)\)/);
+  return m ? m[1].trim() : '';
+}
+window.extractCustCode = extractCustCode;
 
 // ── General customer autocomplete: wire ให้ input ใดๆ ──
 //   ใช้ใน Add Bill / Edit Bill / inline edit remarks1
@@ -9279,21 +9286,24 @@ function wireRemarks1Autocomplete(input) {
 function spTempWireCustomerInput(id) {
   const search = document.getElementById(id + '-search');
   const drop = document.getElementById(id + '-drop');
-  const codeInput = document.getElementById(id + '-code');
-  const nameInput = document.getElementById(id + '-name');
+  const customerInput = document.getElementById(id + '-customer');
   if (!search) return;
+  
+  // ⭐ Sync hidden field กับ search input ทุกครั้งที่ user พิมพ์เอง (กรณีไม่เลือกจาก dropdown)
+  search.addEventListener('input', () => {
+    if (customerInput) customerInput.value = search.value;
+  });
   
   function doSearch(q) {
     q = String(q||'').toLowerCase().trim();
     if (!q) { drop.style.display = 'none'; return; }
-    // ⭐ Dedupe by cust_code — customerList อาจมี duplicates จากหลาย source (sheet + import)
     const seen = new Set();
     const matches = [];
     for (const c of customerList) {
       const code = String(c.cust_code||c.cust_id||'').toLowerCase();
       const name = String(c.cust_name||'').toLowerCase();
       if (!code.includes(q) && !name.includes(q)) continue;
-      const key = code || name; // ใช้ code ก่อน, fallback name
+      const key = code || name;
       if (seen.has(key)) continue;
       seen.add(key);
       matches.push(c);
@@ -9309,7 +9319,8 @@ function spTempWireCustomerInput(id) {
     drop.innerHTML = matches.map(c => {
       const code = c.cust_code || c.cust_id || '';
       const name = c.cust_name || '';
-      return `<div class="sp-cust-opt" data-code="${code}" data-name="${name.replace(/"/g,'&quot;')}" 
+      const display = code ? `(${code}) ${name}` : name;
+      return `<div class="sp-cust-opt" data-customer="${display.replace(/"/g,'&quot;')}" 
               style="padding:8px 12px;cursor:pointer;border-bottom:1px solid var(--border);font-size:.85rem;background:var(--bg);color:var(--text)">
               <span style="font-family:monospace;color:var(--info)">${code}</span> · ${name}
               </div>`;
@@ -9320,11 +9331,9 @@ function spTempWireCustomerInput(id) {
       opt.addEventListener('mouseenter', () => opt.style.background = 'var(--bg2)');
       opt.addEventListener('mouseleave', () => opt.style.background = '');
       opt.addEventListener('click', () => {
-        const code = opt.dataset.code;
-        const name = opt.dataset.name;
-        search.value = `(${code}) ${name}`;
-        codeInput.value = code;
-        nameInput.value = name;
+        const customer = opt.dataset.customer;
+        search.value = customer;
+        if (customerInput) customerInput.value = customer;
         drop.style.display = 'none';
       });
     });
@@ -9353,7 +9362,7 @@ function openSpTempEditModal(no, onChange) {
       
       <div class="input-group">
         <label>ลูกค้า</label>
-        ${spTempCustomerInput('ets-cust', t.cust_code || '', t.cust_name || '')}
+        ${spTempCustomerInput('ets-cust', t.cust_name || '')}
       </div>
       
       <div class="input-group">
@@ -9381,17 +9390,15 @@ function openSpTempEditModal(no, onChange) {
   spTempWireCustomerInput('ets-cust');
   
   document.getElementById('ets-save')?.addEventListener('click', () => {
-    const code = document.getElementById('ets-cust-code').value.trim();
-    const name = document.getElementById('ets-cust-name').value.trim() || 
-                 document.getElementById('ets-cust-search').value.trim();
+    const customer = (document.getElementById('ets-cust-customer')?.value || 
+                      document.getElementById('ets-cust-search')?.value || '').trim();
     const expected = Number(document.getElementById('ets-expected').value) || 0;
     const opening = Number(document.getElementById('ets-opening').value) || 0;
     
-    if (!name) { toast('กรอกข้อมูลลูกค้า', 'error'); return; }
+    if (!customer) { toast('กรอกข้อมูลลูกค้า', 'error'); return; }
     if (expected <= 0) { toast('กรอก expected total', 'error'); return; }
     
-    t.cust_code = code;
-    t.cust_name = name;
+    t.cust_name = customer;
     t.expected_total = expected;
     t.opening_balance = opening;
     t.updated_at = new Date().toISOString();
@@ -9753,8 +9760,8 @@ function openSpTempModal() {
       
       <div class="input-group">
         <label>ลูกค้า *</label>
-        ${spTempCustomerInput('tsp-cust', '', '')}
-        <div class="text-xs text-muted mt-1">ค้นจาก customer master — ถ้าไม่เจอ กรอก code+ชื่อเอง</div>
+        ${spTempCustomerInput('tsp-cust', '')}
+        <div class="text-xs text-muted mt-1">ค้นจาก customer master — ถ้าไม่เจอ กรอกเองได้</div>
       </div>
       
       <div class="input-group">
@@ -9847,14 +9854,13 @@ function openSpTempModal() {
   });
   
   document.getElementById('tsp-confirm')?.addEventListener('click', () => {
-    const code = document.getElementById('tsp-cust-code').value.trim();
-    const name = document.getElementById('tsp-cust-name').value.trim() || 
-                 document.getElementById('tsp-cust-search').value.trim();
+    const customer = (document.getElementById('tsp-cust-customer')?.value ||
+                      document.getElementById('tsp-cust-search')?.value || '').trim();
     const expected = Number(document.getElementById('tsp-expected').value) || 0;
     const skipPartial = document.getElementById('tsp-skip-partial')?.checked || false;
     const pAmt = Number(document.getElementById('tsp-p-amount').value) || 0;
     
-    if (!name) { toast('กรอกข้อมูลลูกค้า', 'error'); return; }
+    if (!customer) { toast('กรอกข้อมูลลูกค้า', 'error'); return; }
     if (expected <= 0) { toast('กรอก expected total', 'error'); return; }
     // ⭐ Partial is optional — skip if checkbox ticked OR amount is 0
     const hasPartial = !skipPartial && pAmt > 0;
@@ -9877,7 +9883,7 @@ function openSpTempModal() {
     const newTemp = {
       sp_temp_uuid: (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : ('spt-' + Date.now() + '-' + Math.random().toString(36).slice(2,10)),
       no: tempNo, created_at: now, updated_at: now,
-      cust_code: code, cust_name: name,
+      cust_name: customer,
       expected_total: expected,
       opening_balance: opening,
       partials: [],
@@ -9902,8 +9908,8 @@ function openSpTempModal() {
         const nextTemp = {
           sp_temp_uuid: (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : ('spt-' + Date.now() + '-' + Math.random().toString(36).slice(2,10)),
           no: nextNo, created_at: now, updated_at: now,
-          cust_code: code, cust_name: name,
-          expected_total: 0, // ยังไม่รู้ → user แก้ทีหลัง
+          cust_name: customer,
+          expected_total: 0,
           partials: [check.partialNext],
           bills: [],
           status: 'open', linked_sp: '', parent_temp: tempNo, graduated_at: '',
@@ -9942,7 +9948,7 @@ function openPartialModal(tempNo, sbNoDefault) {
   openModal(`+ ชำระ ใน ${tempNo}${defaultSb?` · ${defaultSb}`:''}`, `
     <div class="flex-col gap-3" style="min-width:380px">
       <div style="padding:10px;background:var(--bg2);border-radius:6px;font-size:.85rem">
-        ลูกค้า: <b>(${t.cust_code}) ${t.cust_name}</b><br>
+        ลูกค้า: <b>${t.cust_name||'-'}</b><br>
         Expected: ${fmtNum(p.expected)} · Paid: ${fmtNum(p.paid)} · เหลือ: <b style="color:var(--warn)">${fmtNum(p.remaining)}</b>
       </div>
       
@@ -10042,7 +10048,7 @@ function openPartialModal(tempNo, sbNoDefault) {
       const nextTemp = {
         sp_temp_uuid: (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : ('spt-' + Date.now() + '-' + Math.random().toString(36).slice(2,10)),
         no: nextNo, created_at: nowStr, updated_at: nowStr,
-        cust_code: t.cust_code, cust_name: t.cust_name,
+        cust_name: t.cust_name,
         expected_total: 0,
         partials: [check.partialNext],
         bills: [],
@@ -10079,7 +10085,9 @@ function spTempFindGraduationCandidates(realSp) {
   
   return spTempList.filter(t => {
     if (t.status === 'graduated' || t.status === 'cancelled') return false;
-    if (t.cust_code !== effectiveCode) return false;
+    // ⭐ extract code จาก t.cust_name (string รวม "(code) name")
+    const tCode = extractCustCode(t.cust_name);
+    if (tCode !== effectiveCode) return false;
     const paid = spTempPaidTotal(t);
     return Math.abs(paid - amount) < 1; // ±1 บาท
   });
@@ -10099,13 +10107,14 @@ function spTempGraduate(tempNo, realSpNo, realSpDate) {
 // Manual graduate modal (กดจากปุ่ม 🎓 Graduate)
 function openGraduateTempModal(t) {
   const p = spTempProgress(t);
+  // ⭐ extract code จาก t.cust_name (string รวม)
+  const tCode = extractCustCode(t.cust_name);
   // หา SP ที่น่าจะ match จาก paymentList (ยังไม่ถูก graduate, cust เดียวกัน, ยอดใกล้)
   const candidates = paymentList.filter(sp => {
     if (/^SP-TEMP-/.test(sp.sp_no)) return false; // ข้าม SP-TEMP ด้วยกัน
-    // เช็คว่าไม่มี SP-TEMP อื่น graduate ไปที่ sp นี้แล้ว
     const alreadyLinked = spTempList.some(x => x.linked_sp === sp.sp_no);
     if (alreadyLinked) return false;
-    const codeMatch = !t.cust_code || !sp.cust_id || sp.cust_id === t.cust_code;
+    const codeMatch = !tCode || !sp.cust_id || sp.cust_id === tCode;
     const amtMatch = Math.abs(Number(sp.total||0) - p.paid) < 1;
     return codeMatch && amtMatch;
   });
@@ -10113,7 +10122,7 @@ function openGraduateTempModal(t) {
   openModal(`🎓 Graduate ${t.no}`, `
     <div class="flex-col gap-3" style="min-width:440px">
       <div style="padding:10px;background:var(--bg2);border-radius:6px;font-size:.85rem">
-        ลูกค้า: <b>${t.cust_code?`(${t.cust_code})`:''} ${t.cust_name}</b><br>
+        ลูกค้า: <b>${t.cust_name||'-'}</b><br>
         ยอดที่รับแล้ว: <b style="color:var(--success)">฿${fmtNum(p.paid)}</b> · Expected: ฿${fmtNum(p.expected)}
       </div>
       
@@ -10251,15 +10260,13 @@ function renderSpSectionsForDate(opts) {
     return (t.partials || []).some(pr => matchDate(pr.date));
   }).sort((a, b) => {
     // ⭐ Sort by cust_name asc (Thai locale) — ลูกค้าเดียวกันจะติดกัน
-    //   tie-break: cust_code, แล้ว no (SP-TEMP-XXXX)
+    //   tie-break: no (SP-TEMP-XXXX)
     const an = String(a.cust_name || '').trim();
     const bn = String(b.cust_name || '').trim();
     if (an && !bn) return -1;
     if (!an && bn) return 1;
     const c1 = an.localeCompare(bn, 'th');
     if (c1 !== 0) return c1;
-    const c2 = String(a.cust_code || '').localeCompare(String(b.cust_code || ''));
-    if (c2 !== 0) return c2;
     return String(a.no || '').localeCompare(String(b.no || ''));
   });
   const pays = paymentList.filter(p => matchDate(p.date));
@@ -10307,7 +10314,7 @@ function renderSpSectionsForDate(opts) {
                   <div class="flex items-center gap-2" style="flex-wrap:wrap">
                     <span style="font-weight:700;color:var(--warn);font-family:monospace;font-size:.82rem">${t.no}</span>
                     ${statusBadge}
-                    <span class="text-xs" style="color:var(--text)">${t.cust_code ? `(${t.cust_code})` : ''} ${t.cust_name || '-'}</span>
+                    <span class="text-xs" style="color:var(--text)">${t.cust_name || '-'}</span>
                   </div>
                   <div class="flex items-center gap-3" style="margin-top:4px;font-size:.75rem">
                     <span style="color:var(--text2)">Expected: <b style="color:var(--text)">฿${fmtNum(p.expected)}</b></span>
@@ -10663,7 +10670,7 @@ async function renderPayments(el) {
                       <span style="font-weight:700;color:var(--warn);font-family:monospace">${t.no}</span>
                       ${statusBadge}
                       <span class="text-xs" style="color:var(--text)">
-                        ${t.cust_code ? `(${t.cust_code})` : ''} ${t.cust_name||'-'}
+                        ${t.cust_name||'-'}
                       </span>
                     </div>
                     <div class="flex items-center gap-3" style="margin-top:6px;font-size:.8rem">
