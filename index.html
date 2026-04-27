@@ -2318,18 +2318,11 @@ const syncManager = {
               `${b.sb_no||''}|${b.bill_no||''}|${b.bill_type||''}|${b.bill_amount||0}`
             ).sort().join(',')),
             // hash partials (per bill + unassigned)
-            partialHash: spTempList.map(t => {
-              const ps = [];
-              (t.bills||[]).forEach(b => {
-                (b.partials||[]).forEach(p => {
-                  ps.push(`${p.partial_uuid||''}|${b.bill_no||''}|${p.amount||0}|${p.pay_date||''}|${p.match_status||''}|${p.matched_stmt_uuid||''}`);
-                });
-              });
-              (t.unassigned_partials||[]).forEach(p => {
-                ps.push(`U|${p.partial_uuid||''}|${p.amount||0}|${p.pay_date||''}|${p.match_status||''}`);
-              });
-              return ps.sort().join(',');
-            }),
+            partialHash: spTempList.map(t => 
+              (t.partials||[]).map(p => 
+                `${p.partial_uuid||''}|${p.sb_no||''}|${p.amount||0}|${p.pay_date||''}|${p.type||''}|${p.match_status||''}|${p.matched_stmt_uuid||''}`
+              ).sort().join(',')
+            ),
             master: spTempList.map(t => `${t.no}|${t.customer||''}|${t.expected_total||0}|${t.status||''}|${t.linked_sp||''}|${t.notes||''}`),
             del: delNos
           });
@@ -3597,16 +3590,46 @@ async function restoreMainState() {
     const savedSpTemps = safeStorage.get('sf_spTempList');
     if (savedSpTemps) { 
       try { spTempList = JSON.parse(savedSpTemps); } catch(_) { spTempList = []; } 
-      // ⭐ Ensure new schema arrays exist (migrate from old)
+      // ⭐ Migrate to flat schema: t.partials[] (with sb_no) — drop bills[].partials + unassigned_partials
       spTempList.forEach(t => {
         if (!Array.isArray(t.bills)) t.bills = [];
-        if (!Array.isArray(t.unassigned_partials)) t.unassigned_partials = [];
-        // Migrate old t.partials → t.unassigned_partials (no bill_no association)
-        if (Array.isArray(t.partials) && t.partials.length > 0) {
-          t.partials.forEach(p => {
-            t.unassigned_partials.push({
+        if (!Array.isArray(t.partials)) t.partials = [];
+        
+        // Migrate bills[].partials → t.partials (with sb_no from parent bill)
+        t.bills.forEach(b => {
+          if (Array.isArray(b.partials) && b.partials.length > 0) {
+            b.partials.forEach(p => {
+              t.partials.push({
+                partial_uuid: p.partial_uuid || (typeof crypto!=='undefined'&&crypto.randomUUID?crypto.randomUUID():('p-'+Date.now()+'-'+Math.random().toString(36).slice(2,10))),
+                sb_no: b.sb_no || '',
+                type: p.type || p.method || '',
+                amount: Number(p.amount) || 0,
+                pay_date: p.pay_date || p.date || '',
+                confirmation: p.confirmation || '',
+                remarks1: p.notes || p.remarks1 || '',
+                remarks2: p.remarks2 || '',
+                bank: p.bank || '',
+                due_date: p.due_date || p.cheque_due_date || '',
+                match_status: p.match_status || (p.matched_stmt_uuid || p.stmt_ref ? 'paid' : 'unpaid'),
+                matched_stmt_uuid: p.matched_stmt_uuid || '',
+                rolled_from_sb: p.rolled_from_sb || '',
+                rolled_from_partial_uuid: p.rolled_from_partial_uuid || ''
+              });
+            });
+          }
+          delete b.partials;  // schema ใหม่ไม่มี partials ในบิล
+          // Ensure bill metadata schema
+          if (!b.bill_type && b.type) { b.bill_type = b.type; delete b.type; }
+          if (!b.bill_amount && b.amount !== undefined) { b.bill_amount = b.amount; delete b.amount; }
+        });
+        
+        // Migrate t.unassigned_partials → t.partials (sb_no='')
+        if (Array.isArray(t.unassigned_partials)) {
+          t.unassigned_partials.forEach(p => {
+            t.partials.push({
               partial_uuid: p.partial_uuid || (typeof crypto!=='undefined'&&crypto.randomUUID?crypto.randomUUID():('p-'+Date.now()+'-'+Math.random().toString(36).slice(2,10))),
-              type: p.method || p.type || '',
+              sb_no: p.sb_no || '',
+              type: p.type || p.method || '',
               amount: Number(p.amount) || 0,
               pay_date: p.pay_date || p.date || '',
               confirmation: p.confirmation || '',
@@ -3615,17 +3638,14 @@ async function restoreMainState() {
               bank: p.bank || '',
               due_date: p.due_date || p.cheque_due_date || '',
               match_status: p.match_status || (p.matched_stmt_uuid || p.stmt_ref ? 'paid' : 'unpaid'),
-              matched_stmt_uuid: p.matched_stmt_uuid || ''
+              matched_stmt_uuid: p.matched_stmt_uuid || '',
+              rolled_from_sb: p.rolled_from_sb || '',
+              rolled_from_partial_uuid: p.rolled_from_partial_uuid || ''
             });
           });
-          delete t.partials;
+          delete t.unassigned_partials;
         }
-        // Ensure bill schema fields exist
-        t.bills.forEach(b => {
-          if (!Array.isArray(b.partials)) b.partials = [];
-          if (!b.bill_type && b.type) { b.bill_type = b.type; delete b.type; }
-          if (!b.bill_amount && b.amount !== undefined) { b.bill_amount = b.amount; delete b.amount; }
-        });
+        
         // Migrate cust_name → customer
         if (!t.customer && t.cust_name) t.customer = t.cust_name;
         // Migrate t.date → t.date_created
@@ -6800,18 +6820,7 @@ async function renderMain(el) {
         if (stmtRef) {
           spTempList.forEach(t => {
             let touched = false;
-            // bills[].partials
-            (t.bills || []).forEach(b => {
-              (b.partials || []).forEach(pr => {
-                if (pr.matched_stmt_uuid === s.stmt_uuid) {
-                  pr.matched_stmt_uuid = '';
-                  pr.match_status = 'unpaid';
-                  touched = true;
-                }
-              });
-            });
-            // unassigned partials
-            (t.unassigned_partials || []).forEach(pr => {
+            (t.partials || []).forEach(pr => {
               if (pr.matched_stmt_uuid === s.stmt_uuid) {
                 pr.matched_stmt_uuid = '';
                 pr.match_status = 'unpaid';
@@ -8733,22 +8742,43 @@ function genSpTempNo() {
 // ║       ]                                                             ║
 // ║     }                                                               ║
 // ║   ],                                                                ║
-// ║   unassigned_partials: [...partial],   // partials without bill     ║
+// ║   partials: [...partial],              // SB-level partials (with sb_no field) ║
 // ║   created_at, updated_at, created_by                                ║
 // ║ }                                                                   ║
 // ╚═══════════════════════════════════════════════════════════════════╝
 
 // ─── SP-TEMP level metric helpers ───
 
-// Total paid = Σ all partials (in bills + unassigned)
+// ⭐ Business rule: Cash = paid ทันที / Transfer + Cheque = paid เมื่อ matched กับ stmt
+function _isPartialActuallyPaid(p) {
+  if (!p) return false;
+  const type = String(p.type || '').toLowerCase().trim();
+  // Cash = paid ทันที (รับเงินสดแล้ว)
+  if (type === 'cash') return true;
+  // Transfer / Cheque = paid เมื่อ matched กับ stmt เท่านั้น
+  return p.match_status === 'paid' && !!p.matched_stmt_uuid;
+}
+window._isPartialActuallyPaid = _isPartialActuallyPaid;
+
+// Total paid = Σ partials ที่ "นับว่าจ่ายจริง" (Cash always / Transfer+Cheque ต้อง matched)
+//   ⭐ partials อยู่ที่ระดับ SP-TEMP (มี sb_no field) — ไม่ใช่ระดับบิล
 function spTempPaidTotal(t) {
   let total = 0;
-  (t.bills || []).forEach(b => {
-    (b.partials || []).forEach(p => total += Number(p.amount) || 0);
+  (t.partials || []).forEach(p => {
+    if (_isPartialActuallyPaid(p)) total += Number(p.amount) || 0;
   });
-  (t.unassigned_partials || []).forEach(p => total += Number(p.amount) || 0);
   return total;
 }
+
+// Pending total = Σ Transfer/Cheque ที่ยังไม่ matched (รอตัดบัญชี)
+function spTempPendingTotal(t) {
+  let total = 0;
+  (t.partials || []).forEach(p => {
+    if (!_isPartialActuallyPaid(p)) total += Number(p.amount) || 0;
+  });
+  return total;
+}
+window.spTempPendingTotal = spTempPendingTotal;
 
 // Total bills = Σ (SR/OR amounts) − Σ (SC/JR amounts) — distinct by bill_no
 function spTempBillsTotal(t) {
@@ -8822,16 +8852,148 @@ function spTempSBBills(t, sb_no) {
   return total;
 }
 
-// SB paid = Σ all partials of bills in this SB
+// SB paid = Σ partials.sb_no === target และ "นับว่าจ่ายจริง"
 function spTempSBPaid(t, sb_no) {
   const target = String(sb_no || '').trim();
   let total = 0;
-  (t.bills || []).forEach(b => {
-    if (String(b.sb_no || '').trim() !== target) return;
-    (b.partials || []).forEach(p => total += Number(p.amount) || 0);
+  (t.partials || []).forEach(p => {
+    if (String(p.sb_no || '').trim() !== target) return;
+    if (_isPartialActuallyPaid(p)) total += Number(p.amount) || 0;
   });
   return total;
 }
+
+// SB pending = Σ partials.sb_no === target ที่ยังไม่ matched (Transfer/Cheque)
+function spTempSBPending(t, sb_no) {
+  const target = String(sb_no || '').trim();
+  let total = 0;
+  (t.partials || []).forEach(p => {
+    if (String(p.sb_no || '').trim() !== target) return;
+    if (!_isPartialActuallyPaid(p)) total += Number(p.amount) || 0;
+  });
+  return total;
+}
+window.spTempSBPending = spTempSBPending;
+
+// ⭐ FIFO bill allocation ภายใน SB — ใช้แสดง progress ต่อบิล
+//   Returns { bill_no: { paidAllocated, pendingAllocated, sign } }
+function spTempBillAllocation(t, sb_no) {
+  const target = String(sb_no || '').trim();
+  const bills = (t.bills||[]).filter(b => String(b.sb_no||'').trim() === target);
+  // Sort by bill_no (alphabetical — stable)
+  bills.sort((a,b) => String(a.bill_no||'').localeCompare(String(b.bill_no||'')));
+  
+  let paidPool = spTempSBPaid(t, target);
+  let pendingPool = spTempSBPending(t, target);
+  
+  const result = {};
+  bills.forEach(b => {
+    const amt = Math.abs(Number(b.bill_amount)||0);
+    const isCredit = (b.bill_type === 'SC' || b.bill_type === 'JR');
+    if (isCredit) {
+      // Credit note — adds to pool (reverses payment)
+      paidPool += amt;
+      result[b.bill_no] = { paidAllocated: amt, pendingAllocated: 0, sign: -1 };
+    } else {
+      const paidConsumed = Math.min(paidPool, amt);
+      paidPool -= paidConsumed;
+      const remAfterPaid = amt - paidConsumed;
+      const pendingConsumed = Math.min(pendingPool, remAfterPaid);
+      pendingPool -= pendingConsumed;
+      result[b.bill_no] = { paidAllocated: paidConsumed, pendingAllocated: pendingConsumed, sign: 1 };
+    }
+  });
+  return result;
+}
+window.spTempBillAllocation = spTempBillAllocation;
+
+// ⭐ หา SB ถัดไปที่ยังมี remaining > 0 (สำหรับ carryover)
+function spTempNextSbWithRoom(t, currentSb) {
+  const sbsAll = [...new Set((t.bills||[]).map(b => String(b.sb_no||'').trim()).filter(Boolean))].sort();
+  for (const sb of sbsAll) {
+    if (sb === currentSb) continue;
+    const rem = spTempSBRemaining(t, sb);
+    if (rem > 0.01) return sb;
+  }
+  return null;
+}
+window.spTempNextSbWithRoom = spTempNextSbWithRoom;
+
+// ⭐ Add partial to SB — ถ้าจ่ายเกิน auto-carryover ไป SB ถัดไป
+//   Returns: { rolled: bool, extra: number, nextSb: string|null, carryover: partial|null }
+function spTempAddPartialWithCarryover(t, partial, options) {
+  options = options || {};
+  const maxDepth = options.maxDepth || 5; // กัน infinite loop
+  
+  if (!t.partials) t.partials = [];
+  
+  const sb = String(partial.sb_no || '').trim();
+  
+  // Unassigned (no SB) — just add, no carryover
+  if (!sb) {
+    t.partials.push(partial);
+    return { rolled: false, extra: 0, nextSb: null, carryover: null };
+  }
+  
+  const sbBills = spTempSBBills(t, sb);
+  // No bills in SB → just add (can't determine overpay yet)
+  if (sbBills <= 0) {
+    t.partials.push(partial);
+    return { rolled: false, extra: 0, nextSb: null, carryover: null };
+  }
+  
+  const sbPaidBefore = spTempSBPaid(t, sb) + spTempSBPending(t, sb); // count both
+  const newAmt = Number(partial.amount) || 0;
+  const totalAfter = sbPaidBefore + newAmt;
+  
+  if (totalAfter <= sbBills + 0.01) {
+    // No overpay
+    t.partials.push(partial);
+    return { rolled: false, extra: 0, nextSb: null, carryover: null };
+  }
+  
+  // Overpay — split
+  const fitsInSb = Math.max(0, sbBills - sbPaidBefore);
+  const extra = newAmt - fitsInSb;
+  
+  if (fitsInSb > 0.01) {
+    partial.amount = fitsInSb;
+    t.partials.push(partial);
+  }
+  
+  // Find next SB with room
+  const nextSb = spTempNextSbWithRoom(t, sb);
+  
+  // Build carryover partial
+  const carryover = {
+    partial_uuid: _genPartialUuid(),
+    sb_no: nextSb || '', // empty = unassigned
+    type: partial.type,
+    amount: extra,
+    pay_date: partial.pay_date,
+    confirmation: partial.confirmation,
+    remarks1: `🔄 ยกมาจาก ${sb}` + (partial.remarks1 ? ` · ${partial.remarks1}` : ''),
+    remarks2: partial.remarks2 || '',
+    bank: partial.bank || '',
+    due_date: partial.due_date || '',
+    match_status: partial.match_status || 'unpaid',
+    matched_stmt_uuid: partial.matched_stmt_uuid || '',
+    rolled_from_sb: sb,
+    rolled_from_partial_uuid: partial.partial_uuid,
+  };
+  
+  // Recursively check next SB (cap depth)
+  if (nextSb && maxDepth > 0) {
+    spTempAddPartialWithCarryover(t, carryover, { maxDepth: maxDepth - 1 });
+  } else {
+    // Push to unassigned
+    t.partials.push(carryover);
+  }
+  
+  return { rolled: true, extra: extra, nextSb: nextSb, carryover: carryover };
+}
+window.spTempAddPartialWithCarryover = spTempAddPartialWithCarryover;
+window.spTempSBPending = spTempSBPending;
 
 function spTempSBRemaining(t, sb_no) {
   return Math.max(0, spTempSBBills(t, sb_no) - spTempSBPaid(t, sb_no));
@@ -8896,15 +9058,15 @@ function spTempFlatten(t) {
   };
   
   const bills = t.bills || [];
-  const unassigned = t.unassigned_partials || [];
+  const partials = t.partials || [];
   
-  // Empty SP-TEMP → 1 placeholder
-  if (bills.length === 0 && unassigned.length === 0) {
+  // Empty SP-TEMP → 1 placeholder row
+  if (bills.length === 0 && partials.length === 0) {
     rows.push(Object.assign({}, masterFields, emptyBill, emptyPartial));
     return rows;
   }
   
-  // Each bill — emit at least 1 row
+  // 1 row per bill (metadata only — no partial)
   bills.forEach(b => {
     const billFields = {
       sb_no: b.sb_no || '',
@@ -8913,31 +9075,17 @@ function spTempFlatten(t) {
       bill_amount: b.bill_amount === '' || b.bill_amount === null || b.bill_amount === undefined 
         ? '' : Number(b.bill_amount) || 0
     };
-    const partials = b.partials || [];
-    if (partials.length === 0) {
-      rows.push(Object.assign({}, masterFields, billFields, emptyPartial));
-    } else {
-      partials.forEach(p => {
-        rows.push(Object.assign({}, masterFields, billFields, {
-          partial_uuid: p.partial_uuid || '',
-          type: p.type || '',
-          amount: Number(p.amount) || 0,
-          pay_date: p.pay_date || '',
-          confirmation: p.confirmation || '',
-          remarks1: p.remarks1 || '',
-          remarks2: p.remarks2 || '',
-          bank: p.bank || '',
-          due_date: p.due_date || '',
-          match_status: p.match_status || 'unpaid',
-          matched_stmt_uuid: p.matched_stmt_uuid || ''
-        }));
-      });
-    }
+    rows.push(Object.assign({}, masterFields, billFields, emptyPartial));
   });
   
-  // Unassigned partials (no bill association)
-  unassigned.forEach(p => {
-    rows.push(Object.assign({}, masterFields, emptyBill, {
+  // 1 row per partial (sb_no in partial; bill_no='' since partial belongs to SB not bill)
+  partials.forEach(p => {
+    rows.push(Object.assign({}, masterFields, {
+      sb_no: p.sb_no || '',
+      bill_no: '',  // SB-level partial — no bill ownership
+      bill_type: '',
+      bill_amount: ''
+    }, {
       partial_uuid: p.partial_uuid || '',
       type: p.type || '',
       amount: Number(p.amount) || 0,
@@ -8973,7 +9121,7 @@ function spTempGroupFlat(flatRows) {
         linked_sp: String(row.linked_sp || '').trim(),
         notes: row.notes || '',
         bills: [],
-        unassigned_partials: [],
+        partials: [],
         created_at: row.created_at || '',
         updated_at: row.updated_at || '',
         created_by: row.created_by || '',
@@ -8984,28 +9132,31 @@ function spTempGroupFlat(flatRows) {
     const sbNo = String(row.sb_no || '').trim();
     const billNo = String(row.bill_no || '').trim();
     const partialUuid = String(row.partial_uuid || '').trim();
-    const hasBill = sbNo || billNo;
-    const hasPartial = !!partialUuid;
     
-    if (hasBill) {
-      // Find or create bill
-      let bill = t.bills.find(b => 
+    // Bill metadata row (bill_no filled)
+    if (billNo) {
+      const exists = t.bills.find(b => 
         String(b.sb_no||'').trim() === sbNo && String(b.bill_no||'').trim() === billNo
       );
-      if (!bill) {
-        bill = {
+      if (!exists) {
+        t.bills.push({
           sb_no: sbNo,
           bill_no: billNo,
           bill_type: row.bill_type || '',
           bill_amount: row.bill_amount === '' || row.bill_amount === null || row.bill_amount === undefined 
             ? 0 : Number(row.bill_amount) || 0,
-          partials: []
-        };
-        t.bills.push(bill);
+        });
       }
-      if (hasPartial) {
-        bill.partials.push({
+    }
+    
+    // Partial row (partial_uuid filled) — ALWAYS treated as SB-level, regardless of bill_no
+    //   Old data: bill_no may be filled (legacy). Migrate to SB-level by dropping bill_no.
+    if (partialUuid) {
+      const existsP = t.partials.find(p => p.partial_uuid === partialUuid);
+      if (!existsP) {
+        t.partials.push({
           partial_uuid: partialUuid,
+          sb_no: sbNo,
           type: row.type || '',
           amount: Number(row.amount) || 0,
           pay_date: row.pay_date || '',
@@ -9018,23 +9169,7 @@ function spTempGroupFlat(flatRows) {
           matched_stmt_uuid: String(row.matched_stmt_uuid || '').trim()
         });
       }
-    } else if (hasPartial) {
-      // Unassigned partial (no bill linkage)
-      t.unassigned_partials.push({
-        partial_uuid: partialUuid,
-        type: row.type || '',
-        amount: Number(row.amount) || 0,
-        pay_date: row.pay_date || '',
-        confirmation: row.confirmation || '',
-        remarks1: row.remarks1 || '',
-        remarks2: row.remarks2 || '',
-        bank: row.bank || '',
-        due_date: row.due_date || '',
-        match_status: row.match_status || 'unpaid',
-        matched_stmt_uuid: String(row.matched_stmt_uuid || '').trim()
-      });
     }
-    // else: pure placeholder row (just master record)
   });
   return Object.values(map);
 }
@@ -9064,20 +9199,72 @@ window.spTempGroupFlat = spTempGroupFlat;
 
 function renderSpTempBillsTabHtml(t) {
   const sbGroups = spTempGroupBillsBySB(t);
-  const hasUnassigned = (t.unassigned_partials || []).length > 0;
+  // SBs ที่มี partial แต่ไม่มีบิล (เช่น carryover จากที่อื่น)
+  const sbsFromBills = new Set(sbGroups.map(g => g.sb_no === '(ไม่มีใบวางบิล)' ? '' : g.sb_no));
+  const sbsFromPartials = [...new Set((t.partials||[]).map(p => String(p.sb_no||'').trim()).filter(Boolean))];
+  const orphanSbs = sbsFromPartials.filter(sb => !sbsFromBills.has(sb));
   
-  if (sbGroups.length === 0 && !hasUnassigned) {
-    return '<div class="text-xs text-muted" style="padding:10px 0;text-align:center">ยังไม่มีบิล — กด "+ บิล" ด้านล่าง</div>';
+  // Unassigned = partials with sb_no=''
+  const unassignedPartials = (t.partials||[]).filter(p => !String(p.sb_no||'').trim());
+  
+  if (sbGroups.length === 0 && orphanSbs.length === 0 && unassignedPartials.length === 0) {
+    return '<div class="text-xs text-muted" style="padding:10px 0;text-align:center">ยังไม่มีบิล — กด "+ เพิ่มบิล/SB" ด้านล่าง</div>';
   }
   
-  const sbCards = sbGroups.map(g => {
+  // Augment groups with orphan SBs (have partials but no bills)
+  const allGroups = [...sbGroups];
+  orphanSbs.forEach(sb => allGroups.push({sb_no: sb, bills: []}));
+  
+  function partialRowHtml(p, isOrphan) {
+    const matched = !!p.matched_stmt_uuid;
+    const actuallyPaid = _isPartialActuallyPaid(p);
+    const amtColor = actuallyPaid ? 'var(--success)' : 'var(--warn)';
+    const amtTitle = actuallyPaid ? 'จ่ายแล้ว' : 'รอ match กับ stmt (ยังไม่นับเป็นจ่าย)';
+    const remarksText = p.remarks1 || p.confirmation || '';
+    const isCarryover = !!p.rolled_from_sb || /^🔄\s*ยกมาจาก/.test(remarksText);
+    
+    return `
+      <div class="sptv2-partial-row" data-partial="${p.partial_uuid||''}" data-no="${t.no}" 
+           style="display:grid;grid-template-columns:80px 70px 100px 1fr 90px 100px;gap:6px;align-items:center;padding:5px 8px;font-size:.72rem;cursor:pointer;border-radius:4px;background:${isOrphan?'rgba(245,158,11,.05)':'var(--bg)'}${isCarryover?';border-left:2px solid var(--info)':''}${actuallyPaid?'':';opacity:0.9'}"
+           onmouseover="this.style.background='var(--surface2)'" onmouseout="this.style.background='${isOrphan?'rgba(245,158,11,.05)':'var(--bg)'}'" title="${amtTitle}">
+        <span style="font-family:var(--mono);font-weight:600;color:${amtColor}">${actuallyPaid?'':'⏳ '}฿${fmtNum(p.amount)}</span>
+        <span style="font-family:var(--mono);font-size:.7rem">${p.type||'-'}</span>
+        <span style="color:var(--text2);font-size:.68rem">${fmtDate(p.pay_date)} ${p.bank||''}</span>
+        <span style="color:var(--text3);font-size:.68rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${remarksText}">${isCarryover?'🔄 ':''}${remarksText||'-'}</span>
+        <span style="text-align:center">
+          ${matched 
+            ? '<span class="badge badge-success" style="font-size:.6rem">✓ matched</span>' 
+            : (String(p.type||'').toLowerCase()==='cash' 
+                ? '<span class="badge badge-success" style="font-size:.6rem">✓ Cash</span>' 
+                : '<span class="badge" style="background:rgba(245,158,11,.15);color:var(--warn);font-size:.6rem">⏳ pending</span>')}
+        </span>
+        <span style="display:flex;gap:3px;justify-content:flex-end">
+          <button class="sptv2-edit-partial" data-partial="${p.partial_uuid||''}" data-no="${t.no}" 
+                  style="background:none;border:0.5px solid var(--border);padding:1px 6px;border-radius:3px;cursor:pointer;font-size:.65rem;color:var(--text2)" title="แก้ไข">✎</button>
+          ${matched 
+            ? `<button class="sptv2-unlink-partial" data-partial="${p.partial_uuid||''}" data-no="${t.no}" 
+                      style="background:none;border:0.5px solid var(--warn);padding:1px 6px;border-radius:3px;cursor:pointer;font-size:.65rem;color:var(--warn)" title="unlink">↺</button>`
+            : (String(p.type||'').toLowerCase()==='cash' 
+                ? '' 
+                : `<button class="sptv2-match-partial" data-partial="${p.partial_uuid||''}" data-no="${t.no}" 
+                      style="background:var(--info-bg,rgba(59,130,246,.1));border:0.5px solid var(--info);padding:1px 6px;border-radius:3px;cursor:pointer;font-size:.65rem;color:var(--info)" title="match">🔗</button>`)}
+          <button class="sptv2-del-partial" data-partial="${p.partial_uuid||''}" data-no="${t.no}" 
+                  style="background:none;border:none;padding:1px 4px;cursor:pointer;font-size:.7rem;color:var(--danger)" title="ลบ">✕</button>
+        </span>
+      </div>
+    `;
+  }
+  
+  const sbCards = allGroups.map(g => {
     const sbNo = g.sb_no === '(ไม่มีใบวางบิล)' ? '' : g.sb_no;
     const tot = spTempSBBills(t, sbNo);
     const pd = spTempSBPaid(t, sbNo);
+    const pending = spTempSBPending(t, sbNo);
     const rm = Math.max(0, tot - pd);
     const pct = tot > 0 ? Math.round(pd / tot * 100) : 0;
     const status = spTempSBStatus(t, sbNo);
-    const partialCount = g.bills.reduce((s, b) => s + (b.partials||[]).length, 0);
+    const sbPartials = (t.partials||[]).filter(p => String(p.sb_no||'').trim() === sbNo);
+    const allocation = spTempBillAllocation(t, sbNo);
     
     const statusBadge = status === 'paid' 
       ? '<span class="badge badge-success" style="font-size:.65rem">จ่ายเต็ม</span>'
@@ -9085,49 +9272,18 @@ function renderSpTempBillsTabHtml(t) {
         ? '<span class="badge badge-warn" style="font-size:.65rem">จ่ายบางส่วน</span>'
         : '<span class="badge" style="background:var(--surface2);color:var(--text2);font-size:.65rem">รอชำระ</span>';
     
-    // Bills under this SB (each may have multiple partials)
+    // Bills (metadata only — show with FIFO allocation %)
     const billsHtml = g.bills.map(bill => {
       const billKey = `${sbNo}|${bill.bill_no||''}`;
       const isNeg = (bill.bill_type === 'JR' || bill.bill_type === 'SC');
       const typeColors = { OR: '#3b82f6', SR: '#22c55e', JR: '#ef4444', SC: '#ef4444' };
       const billAmt = Math.abs(Number(bill.bill_amount) || 0);
-      const billPaid = (bill.partials||[]).reduce((s,p) => s + (Number(p.amount)||0), 0);
-      const billPct = billAmt > 0 ? Math.round(billPaid / billAmt * 100) : 0;
-      const billLabel = (bill.partials||[]).length === 0 ? 'ยังไม่จ่าย' :
-                        billPct >= 100 ? `paid 100% (${(bill.partials||[]).length} partials)` :
-                        `${billPct}% paid`;
-      
-      const partialsHtml = (bill.partials || []).map(p => {
-        const matched = !!p.matched_stmt_uuid;
-        return `
-          <div class="sptv2-partial-row" data-bill="${billKey}" data-partial="${p.partial_uuid||''}" data-no="${t.no}" 
-               style="display:grid;grid-template-columns:75px 75px 100px 1fr 80px 95px;gap:6px;align-items:center;padding:4px 6px;font-size:.7rem;cursor:pointer;border-radius:3px"
-               onmouseover="this.style.background='var(--surface2)'" onmouseout="this.style.background=''">
-            <span style="font-family:var(--mono);font-weight:600;color:var(--success)">฿${fmtNum(p.amount)}</span>
-            <span style="font-family:var(--mono);font-size:.7rem">${p.type||'-'}</span>
-            <span style="color:var(--text2);font-size:.68rem">${fmtDate(p.pay_date)} ${p.bank||''}</span>
-            <span style="color:var(--text3);font-size:.68rem">conf: ${p.confirmation||'-'}</span>
-            <span style="text-align:center">
-              ${matched 
-                ? '<span class="badge badge-success" style="font-size:.6rem">✓ matched</span>' 
-                : '<span class="badge" style="background:var(--surface2);color:var(--text2);font-size:.6rem">unpaid</span>'}
-            </span>
-            <span style="display:flex;gap:3px;justify-content:flex-end">
-              <button class="sptv2-edit-partial" data-bill="${billKey}" data-partial="${p.partial_uuid||''}" data-no="${t.no}" 
-                      style="background:none;border:0.5px solid var(--border);padding:1px 6px;border-radius:3px;cursor:pointer;font-size:.65rem;color:var(--text2)" title="แก้ไข">✎</button>
-              ${matched 
-                ? `<button class="sptv2-unlink-partial" data-bill="${billKey}" data-partial="${p.partial_uuid||''}" data-no="${t.no}" 
-                          style="background:none;border:0.5px solid var(--warn);padding:1px 6px;border-radius:3px;cursor:pointer;font-size:.65rem;color:var(--warn)" title="unlink">↺</button>`
-                : `<button class="sptv2-match-partial" data-bill="${billKey}" data-partial="${p.partial_uuid||''}" data-no="${t.no}" 
-                          style="background:var(--info-bg,rgba(59,130,246,.1));border:0.5px solid var(--info);padding:1px 6px;border-radius:3px;cursor:pointer;font-size:.65rem;color:var(--info)" title="match">🔗</button>`}
-              <button class="sptv2-del-partial" data-bill="${billKey}" data-partial="${p.partial_uuid||''}" data-no="${t.no}" 
-                      style="background:none;border:none;padding:1px 4px;cursor:pointer;font-size:.7rem;color:var(--danger)" title="ลบ">✕</button>
-            </span>
-          </div>
-        `;
-      }).join('');
-      
-      const noPartial = (bill.partials||[]).length === 0;
+      const alloc = allocation[bill.bill_no] || { paidAllocated: 0, pendingAllocated: 0 };
+      const allocPct = billAmt > 0 ? Math.round(alloc.paidAllocated / billAmt * 100) : 0;
+      const billLabel = isNeg ? 'ใบลดหนี้' :
+                        allocPct >= 100 ? `จ่ายเต็ม` :
+                        alloc.paidAllocated > 0 || alloc.pendingAllocated > 0 ? `${allocPct}% paid${alloc.pendingAllocated>0?` · ${fmtNum(alloc.pendingAllocated)} pending`:''}` :
+                        'ยังไม่จ่าย';
       
       return `
         <div class="sptv2-bill" data-bill="${billKey}" data-no="${t.no}" style="background:var(--bg);border-radius:5px;padding:6px 9px;margin-top:5px;border:0.5px solid var(--border)">
@@ -9138,35 +9294,39 @@ function renderSpTempBillsTabHtml(t) {
             <span style="margin-left:auto;font-family:var(--mono);font-size:.78rem;font-weight:500;color:${isNeg?'var(--danger)':'var(--text)'}">${isNeg?'−':''}฿${fmtNum(billAmt)}</span>
             <button class="sptv2-del-bill" data-bill="${billKey}" data-no="${t.no}" style="background:none;border:none;padding:0 4px;cursor:pointer;font-size:.75rem;color:var(--danger)" title="ลบบิล">✕</button>
           </div>
-          ${noPartial ? `
-            <div style="padding:5px 8px;background:var(--surface2);border-radius:3px;font-size:.7rem;color:var(--text2);font-style:italic;margin-top:5px;text-align:center">⏳ ยังไม่มีการชำระ</div>
-          ` : `
-            <div style="margin:6px 0 0 12px;padding-left:8px;border-left:1.5px solid var(--border)">
-              ${partialsHtml}
-            </div>
-          `}
         </div>
       `;
     }).join('');
+    
+    // SB partials list
+    const partialsListHtml = sbPartials.length === 0 
+      ? '<div style="padding:6px 8px;background:var(--surface2);border-radius:4px;font-size:.7rem;color:var(--text2);font-style:italic;margin-top:6px;text-align:center">⏳ ยังไม่มีการชำระใน SB นี้</div>'
+      : `<div style="display:flex;flex-direction:column;gap:3px;margin-top:6px">${sbPartials.map(p => partialRowHtml(p, false)).join('')}</div>`;
     
     return `
       <div style="background:var(--surface2);border-radius:6px;padding:10px 12px;margin-bottom:10px">
         <div style="display:flex;align-items:center;gap:10px;font-size:.78rem">
           <span style="font-family:var(--mono);font-weight:600">${sbNo || '<span style="color:var(--text3);font-style:italic;font-weight:400">ไม่มี SB</span>'}</span>
-          <span style="color:var(--text2);font-size:.7rem">${g.bills.length} บิล · ${partialCount} partials</span>
+          <span style="color:var(--text2);font-size:.7rem">${g.bills.length} บิล · ${sbPartials.length} partials</span>
           <span style="margin-left:auto">${statusBadge}</span>
         </div>
         
         <!-- ⭐ SB-level metric cards -->
-        <div style="display:grid;grid-template-columns:repeat(3,1fr) 1.4fr;gap:6px;margin-top:8px">
+        <div style="display:grid;grid-template-columns:repeat(${pending>0?4:3},1fr) 1.4fr;gap:6px;margin-top:8px">
           <div style="background:var(--bg);border-radius:5px;padding:5px 8px;border:0.5px solid var(--border)">
             <div style="font-size:.65rem;color:var(--text2)">Bills</div>
             <div style="font-family:var(--mono);font-weight:500;font-size:.85rem;color:var(--warn)">฿${fmtNum(tot)}</div>
           </div>
           <div style="background:var(--bg);border-radius:5px;padding:5px 8px;border:0.5px solid var(--border)">
-            <div style="font-size:.65rem;color:var(--text2)">จ่าย</div>
+            <div style="font-size:.65rem;color:var(--text2)">จ่ายแล้ว</div>
             <div style="font-family:var(--mono);font-weight:500;font-size:.85rem;color:var(--success)">฿${fmtNum(pd)}</div>
           </div>
+          ${pending > 0 ? `
+            <div style="background:var(--bg);border-radius:5px;padding:5px 8px;border:0.5px solid var(--warn)" title="Transfer/Cheque ที่ยังไม่ match กับ stmt">
+              <div style="font-size:.65rem;color:var(--warn)">⏳ Pending</div>
+              <div style="font-family:var(--mono);font-weight:500;font-size:.85rem;color:var(--warn)">฿${fmtNum(pending)}</div>
+            </div>
+          ` : ''}
           <div style="background:var(--bg);border-radius:5px;padding:5px 8px;border:0.5px solid var(--border)">
             <div style="font-size:.65rem;color:var(--text2)">เหลือ</div>
             <div style="font-family:var(--mono);font-weight:500;font-size:.85rem;color:${rm>0?'var(--danger)':'var(--success)'}">฿${fmtNum(rm)}</div>
@@ -9182,47 +9342,26 @@ function renderSpTempBillsTabHtml(t) {
           </div>
         </div>
         
+        <!-- Bills list -->
+        ${billsHtml || '<div style="padding:6px 8px;background:rgba(245,158,11,.05);border-radius:4px;font-size:.7rem;color:var(--warn);font-style:italic;margin-top:6px;text-align:center">⚠️ ไม่มีบิลใน SB นี้ — เพิ่มบิลเพื่อ assign carryover</div>'}
+        
+        <!-- SB partials -->
+        ${partialsListHtml}
+        
         <div style="display:flex;justify-content:flex-end;gap:6px;margin-top:6px">
           <button class="btn btn-primary btn-sm sptv2-add-pay-sb" data-no="${t.no}" data-sb="${sbNo}" style="padding:3px 10px;font-size:.7rem">+ ชำระ</button>
         </div>
-        
-        ${billsHtml}
       </div>
     `;
   }).join('');
   
-  // Unassigned partials (no bill linkage)
+  // Unassigned partials (sb_no='')
   let unassignedHtml = '';
-  if (hasUnassigned) {
-    const unassignedRows = (t.unassigned_partials || []).map(p => {
-      const matched = !!p.matched_stmt_uuid;
-      return `
-        <div class="sptv2-partial-row" data-no="${t.no}" data-partial="${p.partial_uuid||''}" data-bill="" 
-             style="display:grid;grid-template-columns:80px 80px 110px 1fr 90px 100px;gap:6px;align-items:center;padding:5px 8px;font-size:.72rem;cursor:pointer;border-radius:3px;background:var(--bg)">
-          <span style="font-family:var(--mono);font-weight:600;color:var(--success)">฿${fmtNum(p.amount)}</span>
-          <span>${p.type||'-'}</span>
-          <span style="color:var(--text2);font-size:.68rem">${fmtDate(p.pay_date)} ${p.bank||''}</span>
-          <span style="color:var(--text3);font-size:.68rem">${p.remarks1||p.confirmation||'-'}</span>
-          <span style="text-align:center">${matched ? '<span class="badge badge-success" style="font-size:.6rem">✓ matched</span>' : '<span class="badge" style="background:var(--surface2);color:var(--text2);font-size:.6rem">unpaid</span>'}</span>
-          <span style="display:flex;gap:3px;justify-content:flex-end">
-            <button class="sptv2-edit-partial" data-no="${t.no}" data-partial="${p.partial_uuid||''}" data-bill="" 
-                    style="background:none;border:0.5px solid var(--border);padding:1px 6px;border-radius:3px;cursor:pointer;font-size:.65rem">✎</button>
-            ${matched 
-              ? `<button class="sptv2-unlink-partial" data-no="${t.no}" data-partial="${p.partial_uuid||''}" data-bill="" 
-                        style="background:none;border:0.5px solid var(--warn);padding:1px 6px;border-radius:3px;cursor:pointer;font-size:.65rem;color:var(--warn)">↺</button>`
-              : `<button class="sptv2-match-partial" data-no="${t.no}" data-partial="${p.partial_uuid||''}" data-bill="" 
-                        style="background:var(--info-bg,rgba(59,130,246,.1));border:0.5px solid var(--info);padding:1px 6px;border-radius:3px;cursor:pointer;font-size:.65rem;color:var(--info)">🔗</button>`}
-            <button class="sptv2-del-partial" data-no="${t.no}" data-partial="${p.partial_uuid||''}" data-bill="" 
-                    style="background:none;border:none;cursor:pointer;font-size:.7rem;color:var(--danger)">✕</button>
-          </span>
-        </div>
-      `;
-    }).join('');
-    
+  if (unassignedPartials.length > 0) {
     unassignedHtml = `
       <div style="background:rgba(245,158,11,.05);border:0.5px dashed var(--warn);border-radius:6px;padding:8px 10px;margin-bottom:10px">
-        <div style="font-size:.7rem;color:var(--warn);font-weight:500;margin-bottom:5px">⚠️ Partials ที่ยังไม่ระบุบิล (${(t.unassigned_partials||[]).length}) — แตะเพื่อ assign</div>
-        ${unassignedRows}
+        <div style="font-size:.7rem;color:var(--warn);font-weight:500;margin-bottom:5px">⚠️ Partials ที่ยังไม่ระบุ SB (${unassignedPartials.length}) — แตะเพื่อ assign</div>
+        <div style="display:flex;flex-direction:column;gap:3px">${unassignedPartials.map(p => partialRowHtml(p, true)).join('')}</div>
       </div>
     `;
   }
@@ -9231,29 +9370,19 @@ function renderSpTempBillsTabHtml(t) {
 }
 
 function renderSpTempPartialsTabHtml(t) {
-  // Flat list of all partials across all bills + unassigned
-  const allPartials = [];
-  (t.bills || []).forEach(b => {
-    (b.partials || []).forEach(p => {
-      allPartials.push({ ...p, _sb_no: b.sb_no, _bill_no: b.bill_no, _bill_type: b.bill_type });
-    });
-  });
-  (t.unassigned_partials || []).forEach(p => {
-    allPartials.push({ ...p, _sb_no: '', _bill_no: '', _bill_type: '', _unassigned: true });
-  });
+  // Flat list of all partials (deprecated tab — use bills tab instead)
+  const allPartials = (t.partials||[]).slice().sort((a,b) => String(a.pay_date||'').localeCompare(String(b.pay_date||'')));
   
   if (allPartials.length === 0) {
     return '<div class="text-xs text-muted" style="padding:10px 0;text-align:center">ยังไม่มีรายการชำระ — กด "+ ชำระ" ใน tab บิล</div>';
   }
-  
-  allPartials.sort((a, b) => String(a.pay_date || '').localeCompare(String(b.pay_date || '')));
   
   return `
     <table style="width:100%;font-size:.78rem">
       <thead>
         <tr style="color:var(--text2);border-bottom:1px solid var(--border)">
           <th style="text-align:left;padding:4px;font-weight:500">วันที่จ่าย</th>
-          <th style="text-align:left;padding:4px;font-weight:500">SB / บิล</th>
+          <th style="text-align:left;padding:4px;font-weight:500">SB</th>
           <th style="text-align:right;padding:4px;font-weight:500">จำนวน</th>
           <th style="text-align:left;padding:4px;font-weight:500">วิธี</th>
           <th style="text-align:left;padding:4px;font-weight:500">ธนาคาร</th>
@@ -9265,11 +9394,11 @@ function renderSpTempPartialsTabHtml(t) {
       <tbody>
         ${allPartials.map(p => {
           const matched = !!p.matched_stmt_uuid;
-          const billKey = `${p._sb_no}|${p._bill_no}`;
+          const sbNo = String(p.sb_no||'').trim();
           return `
-          <tr class="sptv2-partial-row" data-no="${t.no}" data-bill="${billKey}" data-partial="${p.partial_uuid||''}" style="cursor:pointer">
+          <tr class="sptv2-partial-row" data-no="${t.no}" data-partial="${p.partial_uuid||''}" style="cursor:pointer">
             <td style="padding:4px">${fmtDate(p.pay_date)}</td>
-            <td style="padding:4px;font-family:var(--mono);font-size:.7rem">${p._unassigned ? '<span style="color:var(--warn)">unassigned</span>' : `${p._sb_no}<br><span style="color:var(--text3)">${p._bill_no}</span>`}</td>
+            <td style="padding:4px;font-family:var(--mono);font-size:.7rem">${sbNo || '<span style="color:var(--warn)">unassigned</span>'}</td>
             <td style="padding:4px;text-align:right;font-weight:600;color:var(--success)">฿${fmtNum(p.amount)}</td>
             <td style="padding:4px">${p.type||'-'}</td>
             <td style="padding:4px">${p.bank||'-'}</td>
@@ -9277,10 +9406,10 @@ function renderSpTempPartialsTabHtml(t) {
             <td style="padding:4px;text-align:center">
               ${matched 
                 ? '<span class="badge badge-success" style="font-size:.65rem">✓ matched</span>'
-                : `<button class="btn btn-primary btn-sm sptv2-match-partial" data-no="${t.no}" data-bill="${billKey}" data-partial="${p.partial_uuid||''}" style="padding:2px 8px;font-size:.7rem">🔗 Match</button>`}
+                : `<button class="btn btn-primary btn-sm sptv2-match-partial" data-no="${t.no}" data-partial="${p.partial_uuid||''}" style="padding:2px 8px;font-size:.7rem">🔗 Match</button>`}
             </td>
             <td style="padding:4px;text-align:right">
-              <button class="sptv2-del-partial" data-no="${t.no}" data-bill="${billKey}" data-partial="${p.partial_uuid||''}" style="background:none;border:none;color:var(--danger);cursor:pointer;font-size:.85rem">✕</button>
+              <button class="sptv2-del-partial" data-no="${t.no}" data-partial="${p.partial_uuid||''}" style="background:none;border:none;color:var(--danger);cursor:pointer;font-size:.85rem">✕</button>
             </td>
           </tr>`;
         }).join('')}
@@ -9315,7 +9444,7 @@ function wireSpTempV2Events(container, renderFn) {
     });
   });
   
-  // Delete bill (✕ at bill row)
+  // Delete bill (✕ at bill row) — bills เป็น metadata เท่านั้น (ไม่มี partials ใน)
   container.querySelectorAll('.sptv2-del-bill').forEach(btn => {
     btn.addEventListener('click', e => {
       e.stopPropagation();
@@ -9326,9 +9455,12 @@ function wireSpTempV2Events(container, renderFn) {
       const [sbNo, billNo] = billKey.split('|');
       const bill = (t.bills||[]).find(b => (b.sb_no||'') === sbNo && (b.bill_no||'') === billNo);
       if (!bill) return;
-      const partialCount = (bill.partials||[]).length;
-      const msg = partialCount > 0 
-        ? `ลบบิล ${billNo}? (มี ${partialCount} partials จะถูกลบด้วย)`
+      // Check if SB has partials — warn if removing only bill in SB while partials exist
+      const sbPartials = (t.partials||[]).filter(p => String(p.sb_no||'') === sbNo);
+      const sbBills = (t.bills||[]).filter(b => (b.sb_no||'') === sbNo);
+      const willOrphan = sbBills.length === 1 && sbPartials.length > 0;
+      const msg = willOrphan 
+        ? `ลบบิล ${billNo}? (เป็นบิลสุดท้ายใน ${sbNo} — partials ${sbPartials.length} อันจะกลายเป็น "ไม่มีบิลรองรับ")`
         : `ลบบิล ${billNo}?`;
       if (!confirm(msg)) return;
       t.bills = t.bills.filter(b => !((b.sb_no||'') === sbNo && (b.bill_no||'') === billNo));
@@ -9344,10 +9476,9 @@ function wireSpTempV2Events(container, renderFn) {
     btn.addEventListener('click', e => {
       e.stopPropagation();
       const no = btn.dataset.no;
-      const billKey = btn.dataset.bill;
       const partialUuid = btn.dataset.partial;
       if (typeof openSpTempPartialMatchModal === 'function') {
-        openSpTempPartialMatchModal(no, billKey, partialUuid, renderFn);
+        openSpTempPartialMatchModal(no, partialUuid, renderFn);
       }
     });
   });
@@ -9357,9 +9488,8 @@ function wireSpTempV2Events(container, renderFn) {
     btn.addEventListener('click', e => {
       e.stopPropagation();
       const no = btn.dataset.no;
-      const billKey = btn.dataset.bill;
       const partialUuid = btn.dataset.partial;
-      const partial = _findPartialByKey(no, billKey, partialUuid);
+      const partial = _findPartialByUuid(no, partialUuid);
       if (!partial) return;
       if (!confirm('Unlink ออกจาก stmt?')) return;
       // Cleanup stmt-side
@@ -9390,10 +9520,9 @@ function wireSpTempV2Events(container, renderFn) {
     const el = e.currentTarget;
     e.stopPropagation();
     const no = el.dataset.no;
-    const billKey = el.dataset.bill;
     const partialUuid = el.dataset.partial;
     if (typeof openSpTempPartialEditModal === 'function') {
-      openSpTempPartialEditModal(no, billKey, partialUuid, renderFn);
+      openSpTempPartialEditModal(no, partialUuid, renderFn);
     }
   }
   container.querySelectorAll('.sptv2-edit-partial').forEach(el => el.addEventListener('click', editHandler));
@@ -9404,12 +9533,11 @@ function wireSpTempV2Events(container, renderFn) {
     btn.addEventListener('click', e => {
       e.stopPropagation();
       const no = btn.dataset.no;
-      const billKey = btn.dataset.bill;
       const partialUuid = btn.dataset.partial;
       if (!confirm('ลบ partial นี้?')) return;
       const t = spTempList.find(x => x.no === no);
       if (!t) return;
-      const partial = _findPartialByKey(no, billKey, partialUuid);
+      const partial = _findPartialByUuid(no, partialUuid);
       // Cleanup stmt-side
       if (partial?.matched_stmt_uuid && typeof getAllStatements === 'function') {
         const stmt = getAllStatements().find(s => s.stmt_uuid === partial.matched_stmt_uuid);
@@ -9421,14 +9549,8 @@ function wireSpTempV2Events(container, renderFn) {
           if (window.syncManager) syncManager.markDirty('stmts');
         }
       }
-      // Remove from nested structure
-      if (billKey) {
-        const [sbNo, billNo] = billKey.split('|');
-        const bill = (t.bills||[]).find(b => (b.sb_no||'') === sbNo && (b.bill_no||'') === billNo);
-        if (bill) bill.partials = (bill.partials||[]).filter(p => (p.partial_uuid||'') !== partialUuid);
-      } else {
-        t.unassigned_partials = (t.unassigned_partials||[]).filter(p => (p.partial_uuid||'') !== partialUuid);
-      }
+      // Remove from t.partials
+      t.partials = (t.partials||[]).filter(p => (p.partial_uuid||'') !== partialUuid);
       t.updated_at = new Date().toISOString();
       recomputeSpTempStatus(t);
       markDirtySpTemps();
@@ -9437,20 +9559,15 @@ function wireSpTempV2Events(container, renderFn) {
   });
 }
 
-// Helper: find partial by composite key
-function _findPartialByKey(no, billKey, partialUuid) {
+// Helper: find partial by uuid (single flat array now)
+function _findPartialByUuid(no, partialUuid) {
   const t = spTempList.find(x => x.no === no);
   if (!t) return null;
-  if (billKey) {
-    const [sbNo, billNo] = billKey.split('|');
-    const bill = (t.bills||[]).find(b => (b.sb_no||'') === sbNo && (b.bill_no||'') === billNo);
-    if (bill) return (bill.partials||[]).find(p => (p.partial_uuid||'') === partialUuid);
-  } else {
-    return (t.unassigned_partials||[]).find(p => (p.partial_uuid||'') === partialUuid);
-  }
-  return null;
+  return (t.partials||[]).find(p => (p.partial_uuid||'') === partialUuid);
 }
-window._findPartialByKey = _findPartialByKey;
+window._findPartialByUuid = _findPartialByUuid;
+// Backward compat alias
+window._findPartialByKey = function(no, _billKey, partialUuid) { return _findPartialByUuid(no, partialUuid); };
 
 window.renderSpTempBillsTabHtml = renderSpTempBillsTabHtml;
 window.renderSpTempPartialsTabHtml = renderSpTempPartialsTabHtml;
@@ -9476,7 +9593,10 @@ function openSpTempBillModal(spTempNo, billKey, onChange) {
     existing = t.bills.find(b => (b.sb_no||'') === sbNo && (b.bill_no||'') === billNo);
     isEdit = !!existing;
   }
-  const b = existing || { sb_no: '', bill_no: '', bill_type: 'SR', bill_amount: 0, partials: [] };
+  const b = existing || { sb_no: '', bill_no: '', bill_type: 'SR', bill_amount: 0 };
+  
+  // Count partials in this SB (for warning)
+  const sbPartialCount = isEdit ? (t.partials||[]).filter(p => String(p.sb_no||'') === (b.sb_no||'')).length : 0;
   
   const existingSbs = [...new Set((t.bills || []).map(x => x.sb_no).filter(Boolean))];
   
@@ -9514,9 +9634,9 @@ function openSpTempBillModal(spTempNo, billKey, onChange) {
         <div style="grid-column:1/-1;font-size:.7rem;color:var(--text2);background:var(--surface2);padding:6px 10px;border-radius:4px">
           ⓘ JR/SC จะถูก ลบ ออกจาก SR/OR ตอน calc remaining_sb
         </div>
-        ${isEdit && (b.partials||[]).length > 0 ? `
+        ${isEdit && sbPartialCount > 0 ? `
           <div style="grid-column:1/-1;font-size:.7rem;color:var(--warn);padding:6px 10px;border-radius:4px;background:rgba(245,158,11,.05)">
-            ⚠️ บิลนี้มี ${(b.partials||[]).length} partials — แก้บิล/ลบ จะกระทบ partials ที่ผูกอยู่
+            ⚠️ SB <b>${b.sb_no||'(ไม่มี SB)'}</b> มี ${sbPartialCount} partials — เปลี่ยนยอดบิลจะกระทบ allocation
           </div>
         ` : ''}
       </div>
@@ -9538,8 +9658,9 @@ function openSpTempBillModal(spTempNo, billKey, onChange) {
   
   if (isEdit) {
     document.getElementById('sptb-del').addEventListener('click', () => {
-      const ct = (b.partials||[]).length;
-      const msg = ct > 0 ? `ลบบิล ${b.bill_no}? (มี ${ct} partials จะถูกลบด้วย)` : `ลบบิล ${b.bill_no}?`;
+      const sbBills = (t.bills||[]).filter(x => (x.sb_no||'') === b.sb_no);
+      const willOrphan = sbBills.length === 1 && sbPartialCount > 0;
+      const msg = willOrphan ? `ลบบิล ${b.bill_no}? (เป็นบิลสุดท้ายใน SB — partials ${sbPartialCount} อันจะกลายเป็น "ไม่มีบิลรองรับ")` : `ลบบิล ${b.bill_no}?`;
       if (!confirm(msg)) return;
       t.bills = t.bills.filter(x => !((x.sb_no||'') === b.sb_no && (x.bill_no||'') === b.bill_no));
       t.updated_at = new Date().toISOString();
@@ -9561,20 +9682,17 @@ function openSpTempBillModal(spTempNo, billKey, onChange) {
     if (amount <= 0) { toast('ยอดต้อง > 0', 'warn'); return; }
     
     if (isEdit) {
-      // Update bill metadata (keep partials intact)
       existing.sb_no = sbNo;
       existing.bill_type = billType;
       existing.bill_amount = amount;
     } else {
-      // Check duplicate (sb_no + bill_no)
       const dup = t.bills.find(x => (x.sb_no||'') === sbNo && (x.bill_no||'') === billNo);
       if (dup) { toast('บิลนี้มีอยู่แล้วใน SB เดียวกัน', 'error'); return; }
       t.bills.push({
         sb_no: sbNo,
         bill_no: billNo,
         bill_type: billType,
-        bill_amount: amount,
-        partials: []
+        bill_amount: amount
       });
     }
     
@@ -9842,7 +9960,7 @@ function openSpTempEditModal(no, onChange) {
       </div>
       
       <div style="padding:8px 10px;background:var(--bg2);border-radius:6px;font-size:.78rem;color:var(--text2)">
-        📋 Bills: ${(t.bills||[]).length} ใบ · Partials: ${(t.bills||[]).reduce((s,b)=>s+(b.partials||[]).length,0)+(t.unassigned_partials||[]).length} ครั้ง
+        📋 Bills: ${(t.bills||[]).length} ใบ · Partials: ${(t.partials||[]).length} ครั้ง
       </div>
       
       <div class="flex gap-2 mt-2">
@@ -9875,56 +9993,37 @@ function openSpTempEditModal(no, onChange) {
 }
 
 // ⭐ Modal: Edit single partial
-function openSpTempPartialEditModal(no, billKey, partialUuid, onChange) {
+function openSpTempPartialEditModal(no, partialUuid, onChange) {
+  // Backward compat: เก่าเรียก (no, billKey, partialUuid, onChange) → shift args
+  if (typeof onChange === 'undefined' && typeof partialUuid === 'string' && arguments.length >= 4) {
+    onChange = arguments[3];
+    partialUuid = arguments[2];
+  }
   const t = spTempList.find(x => x.no === no);
   if (!t) { toast('ไม่พบ SP-TEMP', 'warn'); return; }
   
-  // Find partial by composite key
-  let pr = null, currentBill = null, isUnassigned = false;
-  if (billKey) {
-    const [sbNo, billNo] = billKey.split('|');
-    currentBill = (t.bills||[]).find(b => (b.sb_no||'') === sbNo && (b.bill_no||'') === billNo);
-    if (currentBill) pr = (currentBill.partials||[]).find(p => (p.partial_uuid||'') === partialUuid);
-  }
-  if (!pr) {
-    pr = (t.unassigned_partials||[]).find(p => (p.partial_uuid||'') === partialUuid);
-    isUnassigned = true;
-  }
+  const pr = (t.partials||[]).find(p => (p.partial_uuid||'') === partialUuid);
   if (!pr) { toast('ไม่พบ partial', 'warn'); return; }
   
   const isMatched = !!pr.matched_stmt_uuid;
   const matchedStmt = isMatched && typeof getAllStatements === 'function'
     ? getAllStatements().find(s => s.stmt_uuid === pr.matched_stmt_uuid) : null;
   
-  // SBs + bills for dropdowns (re-assign possibility)
   const sbGroups = spTempGroupBillsBySB(t);
-  const currentSb = currentBill ? currentBill.sb_no : '';
-  const currentBillNo = currentBill ? currentBill.bill_no : '';
-  
-  function billOptionsHtml(sbNo) {
-    return (t.bills||[]).filter(b => !sbNo || (b.sb_no||'') === sbNo)
-      .map(b => `<option value="${b.bill_no}">${b.bill_no} (${b.bill_type}) · ฿${fmtNum(Math.abs(b.bill_amount))}</option>`).join('');
-  }
+  const currentSb = String(pr.sb_no || '').trim();
+  const isCarryover = !!pr.rolled_from_sb;
   
   openModal(`✎ แก้ไข Partial · ${no}`, `
     <div class="flex-col gap-3" style="min-width:480px;max-width:560px">
       <div style="padding:8px 10px;background:var(--bg2);border-radius:5px;font-size:.78rem;color:var(--text2)">
-        ${isUnassigned ? '<span style="color:var(--warn);font-weight:500">⚠️ Partial นี้ยังไม่ assign บิล</span>' : `🧾 ${currentBill.bill_no} (${currentBill.bill_type}) · ${currentSb||'<i>ไม่มี SB</i>'}`}
+        ${currentSb ? `📑 SB <b>${currentSb}</b>` : '<span style="color:var(--warn);font-weight:500">⚠️ Partial นี้ยังไม่ระบุ SB</span>'}
+        ${isCarryover ? `<br><span style="color:var(--info);font-size:.7rem">🔄 ยอดยกมาจาก ${pr.rolled_from_sb}</span>` : ''}
       </div>
       
-      <div class="flex gap-2">
-        <div class="input-group flex-1">
-          <label>SB</label>
-          <input class="input" id="epr-sb-no" list="epr-sb-list" value="${currentSb}" placeholder="SB00126-001">
-          <datalist id="epr-sb-list">${sbGroups.filter(g=>g.sb_no!=='(ไม่มีใบวางบิล)').map(g => `<option value="${g.sb_no}">${g.bills.length} บิล</option>`).join('')}</datalist>
-        </div>
-        <div class="input-group flex-1">
-          <label>เลขบิล</label>
-          <select class="input" id="epr-bill-no">
-            <option value="">— เลือก —</option>
-            ${billOptionsHtml(currentSb)}
-          </select>
-        </div>
+      <div class="input-group">
+        <label>SB (ใบวางบิลที่ partial นี้สังกัด)</label>
+        <input class="input" id="epr-sb-no" list="epr-sb-list" value="${currentSb}" placeholder="SB00126-001">
+        <datalist id="epr-sb-list">${sbGroups.filter(g=>g.sb_no!=='(ไม่มีใบวางบิล)').map(g => `<option value="${g.sb_no}">${g.bills.length} บิล · เหลือ ${fmtNum(spTempSBRemaining(t,g.sb_no))}</option>`).join('')}</datalist>
       </div>
       
       <div class="flex gap-2">
@@ -9967,7 +10066,7 @@ function openSpTempPartialEditModal(no, billKey, partialUuid, onChange) {
       
       <div class="flex gap-2">
         <div class="input-group flex-1">
-          <label>หมายเหตุ 1 (เหตุผล)</label>
+          <label>หมายเหตุ 1</label>
           <input class="input" id="epr-rem1" value="${pr.remarks1||''}">
         </div>
         <div class="input-group flex-1">
@@ -9986,7 +10085,7 @@ function openSpTempPartialEditModal(no, billKey, partialUuid, onChange) {
             <div class="text-xs" style="color:var(--text2);margin-top:4px">
               ${fmtDate(matchedStmt.date)} · ${matchedStmt.bank} · ฿${fmtNum(Math.abs(Number(matchedStmt.amount)||0))}
             </div>
-          ` : `<div class="text-xs text-muted" style="margin-top:4px">stmt_uuid: ${pr.matched_stmt_uuid}</div>`}
+          ` : ''}
         </div>
       ` : `
         <div style="padding:8px 10px;background:var(--bg2);border-radius:5px;border-left:3px solid var(--warn)">
@@ -10005,18 +10104,7 @@ function openSpTempPartialEditModal(no, billKey, partialUuid, onChange) {
     </div>
   `);
   
-  // Wire SB → bill dropdown refresh
   const sbInput = document.getElementById('epr-sb-no');
-  const billSelect = document.getElementById('epr-bill-no');
-  function refreshEditBillDropdown() {
-    const sbNo = sbInput.value.trim();
-    billSelect.innerHTML = '<option value="">— เลือก —</option>' + billOptionsHtml(sbNo);
-    if (currentBillNo) billSelect.value = currentBillNo;
-  }
-  sbInput.addEventListener('input', refreshEditBillDropdown);
-  if (currentBillNo) billSelect.value = currentBillNo;
-  
-  // Cheque toggle
   const $eprType = document.getElementById('epr-type');
   const $eprChqExtra = document.getElementById('epr-cheque-extra');
   $eprType.addEventListener('change', () => {
@@ -10026,7 +10114,7 @@ function openSpTempPartialEditModal(no, billKey, partialUuid, onChange) {
   // Match
   document.getElementById('epr-match')?.addEventListener('click', () => {
     if (typeof openSpTempPartialMatchModal === 'function') {
-      openSpTempPartialMatchModal(no, billKey, partialUuid, onChange);
+      openSpTempPartialMatchModal(no, partialUuid, onChange);
     }
   });
   
@@ -10052,17 +10140,14 @@ function openSpTempPartialEditModal(no, billKey, partialUuid, onChange) {
     if (onChange) onChange();
   });
   
-  // Save
+  // Save (no carryover on edit — user expected to cap manually if needed)
   document.getElementById('epr-save').addEventListener('click', () => {
     const amt = Number(document.getElementById('epr-amount').value) || 0;
     if (amt <= 0) { toast('กรอกจำนวน', 'error'); return; }
     
     const newSbNo = sbInput.value.trim();
-    const newBillNo = billSelect.value.trim();
     
-    // Check if bill changed → need to move partial
-    const billChanged = newSbNo !== currentSb || newBillNo !== currentBillNo;
-    
+    pr.sb_no = newSbNo;
     pr.amount = amt;
     pr.pay_date = document.getElementById('epr-pay-date').value;
     pr.type = $eprType.value;
@@ -10071,29 +10156,6 @@ function openSpTempPartialEditModal(no, billKey, partialUuid, onChange) {
     pr.remarks1 = document.getElementById('epr-rem1').value.trim();
     pr.remarks2 = document.getElementById('epr-rem2').value.trim();
     pr.due_date = pr.type === 'Cheque' ? document.getElementById('epr-due-date').value : '';
-    
-    if (billChanged) {
-      // Remove from current location
-      if (currentBill) {
-        currentBill.partials = (currentBill.partials||[]).filter(p => (p.partial_uuid||'') !== partialUuid);
-      } else if (isUnassigned) {
-        t.unassigned_partials = (t.unassigned_partials||[]).filter(p => (p.partial_uuid||'') !== partialUuid);
-      }
-      // Add to new location
-      if (newBillNo) {
-        let targetBill = (t.bills||[]).find(b => (b.sb_no||'') === newSbNo && (b.bill_no||'') === newBillNo);
-        if (!targetBill) {
-          toast('ไม่พบบิลที่เลือก', 'error');
-          return;
-        }
-        if (!Array.isArray(targetBill.partials)) targetBill.partials = [];
-        targetBill.partials.push(pr);
-      } else {
-        // Move to unassigned
-        if (!Array.isArray(t.unassigned_partials)) t.unassigned_partials = [];
-        t.unassigned_partials.push(pr);
-      }
-    }
     
     t.updated_at = new Date().toISOString();
     recomputeSpTempStatus(t);
@@ -10116,11 +10178,7 @@ function openSpTempPartialEditModal(no, billKey, partialUuid, onChange) {
         if (window.syncManager) syncManager.markDirty('stmts');
       }
     }
-    if (currentBill) {
-      currentBill.partials = (currentBill.partials||[]).filter(p => (p.partial_uuid||'') !== partialUuid);
-    } else if (isUnassigned) {
-      t.unassigned_partials = (t.unassigned_partials||[]).filter(p => (p.partial_uuid||'') !== partialUuid);
-    }
+    t.partials = (t.partials||[]).filter(p => (p.partial_uuid||'') !== partialUuid);
     t.updated_at = new Date().toISOString();
     recomputeSpTempStatus(t);
     markDirtySpTemps();
@@ -10131,10 +10189,15 @@ function openSpTempPartialEditModal(no, billKey, partialUuid, onChange) {
 }
 
 // ⭐ Modal: Match partial with statement (picker)
-function openSpTempPartialMatchModal(no, billKey, partialUuid, onChange) {
+function openSpTempPartialMatchModal(no, partialUuid, onChange) {
+  // Backward compat: เก่าเรียก (no, billKey, partialUuid, onChange)
+  if (typeof onChange === 'undefined' && arguments.length >= 4) {
+    onChange = arguments[3];
+    partialUuid = arguments[2];
+  }
   const t = spTempList.find(x => x.no === no);
   if (!t) return;
-  const pr = _findPartialByKey(no, billKey, partialUuid);
+  const pr = _findPartialByUuid(no, partialUuid);
   if (!pr) { toast('ไม่พบ partial', 'warn'); return; }
   
   const prAmt = Math.abs(Number(pr.amount)||0);
@@ -10217,11 +10280,12 @@ function openSpTempPartialMatchModal(no, billKey, partialUuid, onChange) {
         pr.match_status = 'paid';
         if (!pr.bank && stmt.bank) pr.bank = stmt.bank;
         
-        // Stmt side
+        // Stmt side — composite key: SP-TEMP-XXXX|sb_no|partial_uuid
+        const sbNo = String(pr.sb_no || '').trim();
         stmt.match_status = 'paid';
         stmt.match_station = 'SP-TEMP';
-        stmt.match_bill = `${no}|${billKey||''}|${partialUuid}`;
-        stmt.matched_bills = [`${no}|${billKey||''}|${partialUuid}`];
+        stmt.match_bill = `${no}|${sbNo}|${partialUuid}`;
+        stmt.matched_bills = [`${no}|${sbNo}|${partialUuid}`];
         stmt.match_method = 'manual_sp_temp';
         stmt.matched_at = new Date().toISOString();
         
@@ -10241,12 +10305,12 @@ function openSpTempPartialMatchModal(no, billKey, partialUuid, onChange) {
     });
   }
   
-  const billLabel = billKey ? billKey.split('|').filter(Boolean).join(' / ') : 'unassigned';
+  const sbLabel = String(pr.sb_no || '').trim() || 'unassigned';
   openModal(`🔍 หา Statement สำหรับ Partial`, `
     <div style="min-width:560px;max-width:700px">
       <div style="padding:10px;background:var(--bg2);border-radius:6px;font-size:.83rem;margin-bottom:10px">
         <div class="flex justify-between">
-          <div><b>${no}</b> · ${t.customer || t.cust_name || '-'} · <span style="color:var(--text2)">${billLabel}</span></div>
+          <div><b>${no}</b> · ${t.customer || t.cust_name || '-'} · <span style="color:var(--text2)">SB ${sbLabel}</span></div>
           <div><b style="color:var(--success)">฿${fmtNum(prAmt)}</b> · ${fmtDate(pr.pay_date)} · ${pr.bank||'ไม่ระบุ bank'}</div>
         </div>
       </div>
@@ -10334,7 +10398,7 @@ function openSpTempModal() {
       linked_sp: '',
       notes: notes,
       bills: [],
-      unassigned_partials: [],
+      partials: [],
       created_at: now,
       updated_at: now,
       created_by: (typeof getCurrentUserName === 'function' ? getCurrentUserName() : 'Admin'),
@@ -10358,63 +10422,34 @@ function spTempCheckRollover(t, partial) {
   return { split: false, partialThis: partial, partialNext: null, overflow: 0 };
 }
 
-// Modal: Add partial to existing SP-TEMP
-function openPartialModal(tempNo, sbNoDefault, billNoDefault) {
+// Modal: Add partial to existing SP-TEMP — SB-level (not bill-level)
+function openPartialModal(tempNo, sbNoDefault, _ignored) {
   const t = spTempList.find(x => x.no === tempNo);
   if (!t) return;
-  const p = spTempProgress(t);
   
   const defaultSb = String(sbNoDefault || '').trim();
-  const defaultBill = String(billNoDefault || '').trim();
-  
-  // Get bills in this SP-TEMP, optionally filtered by SB
-  function getBillsInScope(sbNo) {
-    if (!sbNo) return (t.bills || []);
-    return (t.bills || []).filter(b => (b.sb_no||'') === sbNo);
-  }
-  
-  function billOptionsHtml(sbNo) {
-    const bills = getBillsInScope(sbNo);
-    return bills.map(b => {
-      const billPaid = (b.partials||[]).reduce((s,p) => s + (Number(p.amount)||0), 0);
-      const billRem = Math.max(0, Math.abs(Number(b.bill_amount)||0) - billPaid);
-      return `<option value="${b.bill_no}" data-amount="${b.bill_amount}" data-rem="${billRem}">
-        ${b.bill_no} (${b.bill_type}) · ฿${fmtNum(Math.abs(b.bill_amount))} · เหลือ ฿${fmtNum(billRem)}
-      </option>`;
-    }).join('');
-  }
-  
-  // SB list
   const sbGroups = spTempGroupBillsBySB(t);
+  const sbInitialRem = defaultSb ? spTempSBRemaining(t, defaultSb) : 0;
   
-  openModal(`+ ชำระ ใน ${tempNo}${defaultSb?` · ${defaultSb}`:''}`, `
+  openModal(`+ ชำระ ใน ${tempNo}${defaultSb?` · SB ${defaultSb}`:''}`, `
     <div class="flex-col gap-3" style="min-width:440px">
       <div style="padding:10px;background:var(--bg2);border-radius:6px;font-size:.82rem">
         ลูกค้า: <b>${t.customer||t.cust_name||'-'}</b><br>
         Bills: ${fmtNum(spTempBillsTotal(t))} · จ่าย: ${fmtNum(spTempPaidTotal(t))} · เหลือ: <b style="color:var(--warn)">${fmtNum(spTempTotalRemaining(t))}</b>
       </div>
       
-      <div class="flex gap-2">
-        <div class="input-group flex-1">
-          <label>ใบวางบิล (SB)</label>
-          <input class="input" id="prt-sb-no" list="prt-sb-list" value="${defaultSb}" placeholder="SB00126-001" autocomplete="off">
-          <datalist id="prt-sb-list">
-            ${sbGroups.filter(g=>g.sb_no!=='(ไม่มีใบวางบิล)').map(g => `<option value="${g.sb_no}">${g.bills.length} บิล · เหลือ ${fmtNum(spTempSBRemaining(t,g.sb_no))}</option>`).join('')}
-          </datalist>
-        </div>
-        <div class="input-group flex-1">
-          <label>เลขบิล *</label>
-          <select class="input" id="prt-bill-no" autocomplete="off">
-            <option value="">— เลือกบิล —</option>
-            ${billOptionsHtml(defaultSb)}
-          </select>
-        </div>
+      <div class="input-group">
+        <label>ใบวางบิล (SB) <span style="color:var(--text2);font-size:.7rem">— partial จะตัดจาก SB นี้ ถ้าเกินจะยกไป SB ถัดไป</span></label>
+        <input class="input" id="prt-sb-no" list="prt-sb-list" value="${defaultSb}" placeholder="SB00126-001 หรือเว้นว่าง = unassigned" autocomplete="off">
+        <datalist id="prt-sb-list">
+          ${sbGroups.filter(g=>g.sb_no!=='(ไม่มีใบวางบิล)').map(g => `<option value="${g.sb_no}">${g.bills.length} บิล · เหลือ ${fmtNum(spTempSBRemaining(t,g.sb_no))}</option>`).join('')}
+        </datalist>
       </div>
       
       <div class="flex gap-2">
         <div class="input-group flex-1">
           <label>จำนวน *</label>
-          <input type="number" class="input" id="prt-amount" placeholder="0" step="0.01" autofocus>
+          <input type="number" class="input" id="prt-amount" placeholder="0" step="0.01" autofocus value="${sbInitialRem>0?sbInitialRem:''}">
         </div>
         <div class="input-group flex-1">
           <label>วันที่จ่าย</label>
@@ -10451,7 +10486,7 @@ function openPartialModal(tempNo, sbNoDefault, billNoDefault) {
       
       <div class="flex gap-2">
         <div class="input-group flex-1">
-          <label>หมายเหตุ 1 (เหตุผล)</label>
+          <label>หมายเหตุ 1</label>
           <input class="input" id="prt-rem1">
         </div>
         <div class="input-group flex-1">
@@ -10460,6 +10495,8 @@ function openPartialModal(tempNo, sbNoDefault, billNoDefault) {
         </div>
       </div>
       
+      <div id="prt-overpay-warn" style="display:none;padding:8px 10px;border-radius:5px;background:rgba(59,130,246,.05);border-left:3px solid var(--info);font-size:.78rem;color:var(--info)"></div>
+      
       <div class="flex gap-2 mt-2">
         <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ยกเลิก</button>
         <button class="btn btn-primary btn-sm flex-1" id="prt-confirm">+ เพิ่ม partial</button>
@@ -10467,28 +10504,40 @@ function openPartialModal(tempNo, sbNoDefault, billNoDefault) {
     </div>
   `);
   
-  // Wire SB → bill dropdown
   const sbInput = document.getElementById('prt-sb-no');
-  const billSelect = document.getElementById('prt-bill-no');
-  function refreshBillDropdown() {
-    const sbNo = sbInput.value.trim();
-    billSelect.innerHTML = '<option value="">— เลือกบิล —</option>' + billOptionsHtml(sbNo);
-    if (defaultBill) billSelect.value = defaultBill;
-  }
-  sbInput.addEventListener('input', refreshBillDropdown);
-  sbInput.addEventListener('change', refreshBillDropdown);
-  if (defaultBill) {
-    billSelect.value = defaultBill;
-  }
+  const amtInput = document.getElementById('prt-amount');
+  const overpayWarn = document.getElementById('prt-overpay-warn');
   
-  // Bill → pre-fill amount with remaining
-  billSelect.addEventListener('change', () => {
-    const opt = billSelect.options[billSelect.selectedIndex];
-    if (opt && opt.dataset.rem) {
-      const amtInput = document.getElementById('prt-amount');
-      if (!amtInput.value) amtInput.value = opt.dataset.rem;
+  // Live overpay preview
+  function updateOverpayPreview() {
+    const sb = sbInput.value.trim();
+    const amt = Number(amtInput.value) || 0;
+    if (!sb || amt <= 0) { overpayWarn.style.display = 'none'; return; }
+    const sbBills = spTempSBBills(t, sb);
+    if (sbBills <= 0) { overpayWarn.style.display = 'none'; return; }
+    const sbCurrent = spTempSBPaid(t, sb) + spTempSBPending(t, sb);
+    const total = sbCurrent + amt;
+    if (total > sbBills + 0.01) {
+      const extra = total - sbBills;
+      const nextSb = spTempNextSbWithRoom(t, sb);
+      overpayWarn.style.display = 'block';
+      overpayWarn.innerHTML = `🔄 จ่ายเกิน SB <b>${sb}</b> ฿${fmtNum(extra)} → ${nextSb ? `ยกไป <b>${nextSb}</b>` : 'ไป unassigned (ไม่มี SB ถัดไป)'}`;
+    } else {
+      overpayWarn.style.display = 'none';
     }
+  }
+  sbInput.addEventListener('input', updateOverpayPreview);
+  amtInput.addEventListener('input', updateOverpayPreview);
+  // when SB changes, update default amount to SB remaining
+  sbInput.addEventListener('change', () => {
+    const sb = sbInput.value.trim();
+    if (sb && !amtInput.value) {
+      const rem = spTempSBRemaining(t, sb);
+      if (rem > 0) amtInput.value = rem;
+    }
+    updateOverpayPreview();
   });
+  setTimeout(updateOverpayPreview, 100);
   
   // Cheque extra
   const $prtType = document.getElementById('prt-type');
@@ -10501,19 +10550,13 @@ function openPartialModal(tempNo, sbNoDefault, billNoDefault) {
   
   document.getElementById('prt-confirm').addEventListener('click', () => {
     const sbNo = sbInput.value.trim();
-    const billNo = billSelect.value.trim();
-    const amt = Number(document.getElementById('prt-amount').value) || 0;
+    const amt = Number(amtInput.value) || 0;
     
     if (amt <= 0) { toast('กรอกจำนวน', 'error'); return; }
-    if (!billNo) { toast('เลือกบิลที่จะตัด', 'error'); return; }
-    
-    // Find target bill
-    const bill = t.bills.find(b => (b.sb_no||'') === sbNo && (b.bill_no||'') === billNo);
-    if (!bill) { toast('ไม่พบบิล — ตรวจ SB และ เลขบิล', 'error'); return; }
-    if (!Array.isArray(bill.partials)) bill.partials = [];
     
     const partial = {
       partial_uuid: _genPartialUuid(),
+      sb_no: sbNo,
       type: $prtType.value,
       amount: amt,
       pay_date: document.getElementById('prt-pay-date').value,
@@ -10526,12 +10569,19 @@ function openPartialModal(tempNo, sbNoDefault, billNoDefault) {
       matched_stmt_uuid: ''
     };
     
-    bill.partials.push(partial);
+    // ⭐ Add with auto-carryover if overpay
+    const result = spTempAddPartialWithCarryover(t, partial);
+    
     t.updated_at = new Date().toISOString();
     recomputeSpTempStatus(t);
     markDirtySpTemps();
     closeModal();
-    toast(`เพิ่ม partial ฿${fmtNum(amt)} → ${billNo}`, 'success');
+    
+    if (result.rolled) {
+      toast(`✓ ฿${fmtNum(amt - result.extra)} → ${sbNo} · 🔄 ฿${fmtNum(result.extra)} ยกไป ${result.nextSb || 'unassigned'}`, 'success');
+    } else {
+      toast(`เพิ่ม partial ฿${fmtNum(amt)} → ${sbNo || 'unassigned'}`, 'success');
+    }
     
     if (typeof currentPage !== 'undefined') {
       if (currentPage === 'payments') navigateTo('payments');
@@ -10721,10 +10771,7 @@ function renderSpSectionsForDate(opts) {
   const temps = spTempList.filter(t => {
     if (t.status === 'graduated' || t.status === 'cancelled') return false;
     if (matchDate(t.date_created || t.date)) return true;
-    // Check if any partial fell on this date
-    const hasPartialOnDate = (t.bills||[]).some(b => 
-      (b.partials||[]).some(p => matchDate(p.pay_date))
-    ) || (t.unassigned_partials||[]).some(p => matchDate(p.pay_date));
+    const hasPartialOnDate = (t.partials||[]).some(p => matchDate(p.pay_date));
     return hasPartialOnDate;
   }).sort((a, b) => {
     const an = String(a.customer || a.cust_name || '').trim();
@@ -10763,11 +10810,12 @@ function renderSpSectionsForDate(opts) {
         <div style="max-height:500px;overflow-y:auto">
         ${temps.map(t => {
           const p = spTempProgress(t);
+          const pendingTotal = (typeof spTempPendingTotal === 'function') ? spTempPendingTotal(t) : 0;
           const isOpen = expandedTempSet.has(t.no);
           const pctBar = Math.min(100, p.pct);
           const barColor = p.pct >= 100 ? 'var(--success)' : p.pct > 0 ? 'var(--warn)' : 'var(--text3)';
           const customerStr = t.customer || t.cust_name || '-';
-          const partialCount = (t.bills||[]).reduce((s,b)=>s+(b.partials||[]).length,0)+(t.unassigned_partials||[]).length;
+          const partialCount = (t.partials||[]).length;
           const statusBadge = t.status === 'complete'
             ? '<span class="badge badge-success" style="font-size:.65rem">✓ พร้อม Graduate</span>'
             : p.paid > 0 ? '<span class="badge badge-warn" style="font-size:.65rem">⏳ กำลังรับ</span>'
@@ -10783,8 +10831,8 @@ function renderSpSectionsForDate(opts) {
                     <span class="text-xs" style="color:var(--text)">${customerStr}</span>
                     <span class="text-xs text-muted">${(t.bills||[]).length} บิล · ${partialCount} partials</span>
                   </div>
-                  <!-- 4 metrics -->
-                  <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:5px;margin-top:6px">
+                  <!-- 4 or 5 metrics -->
+                  <div style="display:grid;grid-template-columns:repeat(${pendingTotal>0?5:4},1fr);gap:5px;margin-top:6px">
                     <div style="background:var(--bg2);border-radius:4px;padding:4px 7px">
                       <div style="font-size:.62rem;color:var(--text2)">Expected</div>
                       <div style="font-family:var(--mono);font-weight:500;font-size:.78rem;color:var(--text2)">฿${fmtNum(p.expected)}</div>
@@ -10797,6 +10845,12 @@ function renderSpSectionsForDate(opts) {
                       <div style="font-size:.62rem;color:var(--text2)">จ่าย</div>
                       <div style="font-family:var(--mono);font-weight:500;font-size:.78rem;color:var(--success)">฿${fmtNum(p.paid)}</div>
                     </div>
+                    ${pendingTotal > 0 ? `
+                      <div style="background:rgba(245,158,11,.05);border-radius:4px;padding:4px 7px;border:0.5px solid var(--warn)" title="Transfer/Cheque ที่ยังไม่ match">
+                        <div style="font-size:.62rem;color:var(--warn)">⏳ Pending</div>
+                        <div style="font-family:var(--mono);font-weight:500;font-size:.78rem;color:var(--warn)">฿${fmtNum(pendingTotal)}</div>
+                      </div>
+                    ` : ''}
                     <div style="background:var(--bg2);border-radius:4px;padding:4px 7px">
                       <div style="font-size:.62rem;color:var(--text2)">เหลือ</div>
                       <div style="font-family:var(--mono);font-weight:500;font-size:.78rem;color:${p.remaining>0?'var(--danger)':'var(--success)'}">฿${fmtNum(p.remaining)}</div>
@@ -11089,11 +11143,12 @@ async function renderPayments(el) {
           <div style="max-height:600px;overflow-y:auto">
           ${openTemps.map(t => {
             const p = spTempProgress(t);
+            const pendingTotal = (typeof spTempPendingTotal === 'function') ? spTempPendingTotal(t) : 0;
             const isOpen = expandedTemp.has(t.no);
             const pctBar = Math.min(100, p.pct);
             const barColor = p.pct >= 100 ? 'var(--success)' : p.pct > 0 ? 'var(--warn)' : 'var(--text3)';
             const customerStr = t.customer || t.cust_name || '-';
-            const partialCount = (t.bills||[]).reduce((s,b) => s + (b.partials||[]).length, 0) + (t.unassigned_partials||[]).length;
+            const partialCount = (t.partials||[]).length;
             const statusBadge = t.status === 'complete' ? 
               '<span class="badge badge-success" style="font-size:.7rem">✓ ครบแล้ว พร้อม Graduate</span>' :
               p.paid > 0 ? '<span class="badge badge-warn" style="font-size:.7rem">⏳ กำลังรับ</span>' :
@@ -11111,8 +11166,8 @@ async function renderPayments(el) {
                       <span class="text-xs" style="color:var(--text)">${customerStr}</span>
                       <span class="text-xs text-muted">${(t.bills||[]).length} บิล · ${partialCount} partials</span>
                     </div>
-                    <!-- ⭐ SP-TEMP level 4 metrics -->
-                    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:8px">
+                    <!-- ⭐ SP-TEMP level metrics (4 cards or 5 if pending) -->
+                    <div style="display:grid;grid-template-columns:repeat(${pendingTotal>0?5:4},1fr);gap:6px;margin-top:8px">
                       <div style="background:var(--bg2);border-radius:5px;padding:5px 8px">
                         <div style="font-size:.65rem;color:var(--text2)">Expected (ตั้งไว้)</div>
                         <div style="font-family:var(--mono);font-weight:500;font-size:.85rem;color:var(--text2)">฿${fmtNum(p.expected)}</div>
@@ -11125,6 +11180,12 @@ async function renderPayments(el) {
                         <div style="font-size:.65rem;color:var(--text2)">จ่ายแล้ว</div>
                         <div style="font-family:var(--mono);font-weight:500;font-size:.85rem;color:var(--success)">฿${fmtNum(p.paid)}</div>
                       </div>
+                      ${pendingTotal > 0 ? `
+                        <div style="background:rgba(245,158,11,.05);border-radius:5px;padding:5px 8px;border:0.5px solid var(--warn)" title="Transfer/Cheque ที่ยังไม่ match">
+                          <div style="font-size:.65rem;color:var(--warn)">⏳ Pending</div>
+                          <div style="font-family:var(--mono);font-weight:500;font-size:.85rem;color:var(--warn)">฿${fmtNum(pendingTotal)}</div>
+                        </div>
+                      ` : ''}
                       <div style="background:var(--bg2);border-radius:5px;padding:5px 8px">
                         <div style="font-size:.65rem;color:var(--text2)">เหลือ</div>
                         <div style="font-family:var(--mono);font-weight:500;font-size:.85rem;color:${p.remaining>0?'var(--danger)':'var(--success)'}">฿${fmtNum(p.remaining)}</div>
@@ -17891,37 +17952,20 @@ async function renderMatching(el) {
           });
         
         // ── SP-TEMP partials as candidates (income only — ลูกค้าจ่ายเข้า) ──
-        // แสดง partial ที่ยังไม่ผูก stmt (stmt_ref ว่าง) เท่านั้น
         const spTempCandidates = [];
         (spTempList || []).forEach(t => {
           if (t.status === 'graduated' || t.status === 'cancelled') return;
-          // bills[].partials
-          (t.bills || []).forEach(b => {
-            (b.partials || []).forEach(pr => {
-              if (pr.matched_stmt_uuid) return;
-              const billKey = `${b.sb_no||''}|${b.bill_no||''}`;
-              spTempCandidates.push({
-                bill_no: `${t.no}|${billKey}|${pr.partial_uuid}`,
-                amount: Math.abs(Number(pr.amount) || 0),
-                date: pr.pay_date,
-                station: '⚡ SP-TEMP',
-                type: `จ่ายลด ${t.customer || t.cust_name || '-'}`,
-                remarks1: `${b.bill_no || ''} · ${pr.bank || ''}`,
-                _spTempPartial: { temp: t, partial: pr, bill: b, billKey: billKey },
-              });
-            });
-          });
-          // unassigned partials
-          (t.unassigned_partials || []).forEach(pr => {
+          (t.partials || []).forEach(pr => {
             if (pr.matched_stmt_uuid) return;
+            const sbNo = String(pr.sb_no || '').trim();
             spTempCandidates.push({
-              bill_no: `${t.no}||${pr.partial_uuid}`,
+              bill_no: `${t.no}|${sbNo}|${pr.partial_uuid}`,
               amount: Math.abs(Number(pr.amount) || 0),
               date: pr.pay_date,
-              station: '⚡ SP-TEMP (unassigned)',
+              station: sbNo ? '⚡ SP-TEMP' : '⚡ SP-TEMP (unassigned)',
               type: `จ่ายลด ${t.customer || t.cust_name || '-'}`,
-              remarks1: `${pr.bank || ''} · ยังไม่ระบุบิล`,
-              _spTempPartial: { temp: t, partial: pr, bill: null, billKey: '' },
+              remarks1: `${sbNo || 'no SB'} · ${pr.bank || ''}`,
+              _spTempPartial: { temp: t, partial: pr, sbNo: sbNo },
             });
           });
         });
@@ -18409,19 +18453,18 @@ async function renderMatching(el) {
         });
         
         billNumbersToUnmatch.forEach(bn => {
-          // ⚡ SP-TEMP partial pattern (new): SP-TEMP-XXXX|sb_no|bill_no|partial_uuid
-          //    Old fallback: SP-TEMP-XXXX#N (idx-based)
-          const newPattern = String(bn).match(/^(SP-TEMP-\d+)\|([^|]*)\|([^|]*)\|(.+)$/);
-          if (newPattern) {
-            const [, no, sbNo, billNo, partialUuid] = newPattern;
+          // ⚡ SP-TEMP partial — new format: SP-TEMP-XXXX|sb_no|partial_uuid (3-part, sb-level)
+          //    Legacy:                       SP-TEMP-XXXX|sb_no|bill_no|partial_uuid (4-part, bill-level)
+          //    Older fallback:               SP-TEMP-XXXX#N (idx-based)
+          const m4 = String(bn).match(/^(SP-TEMP-\d+)\|([^|]*)\|([^|]*)\|(.+)$/);
+          const m3 = !m4 ? String(bn).match(/^(SP-TEMP-\d+)\|([^|]*)\|(.+)$/) : null;
+          const m = m4 || m3;
+          if (m) {
+            const no = m[1];
+            const partialUuid = m4 ? m4[4] : m3[3];
             const t = spTempList.find(x => x.no === no);
             if (t) {
-              let pr = null;
-              if (sbNo || billNo) {
-                const bill = (t.bills||[]).find(b => (b.sb_no||'') === sbNo && (b.bill_no||'') === billNo);
-                if (bill) pr = (bill.partials||[]).find(p => (p.partial_uuid||'') === partialUuid);
-              }
-              if (!pr) pr = (t.unassigned_partials||[]).find(p => (p.partial_uuid||'') === partialUuid);
+              const pr = (t.partials||[]).find(p => (p.partial_uuid||'') === partialUuid);
               if (pr) {
                 pr.matched_stmt_uuid = '';
                 pr.match_status = 'unpaid';
