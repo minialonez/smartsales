@@ -19111,67 +19111,6 @@ function renderData(el) {
         <div id="rebuild-status" class="text-xs text-muted mt-2" style="display:none;font-family:monospace;max-height:250px;overflow-y:auto;padding:10px;background:var(--surface2);border-radius:6px;white-space:pre-wrap"></div>
       </div>
       
-      <!-- ⭐ Normalize date columns in cloud sheets -->
-      <div class="card mb-3" style="border:1.5px solid var(--purple);background:rgba(139,92,246,.04)">
-        <div class="flex justify-between items-center">
-          <div>
-            <div class="font-semi" style="color:var(--purple)">📅 Normalize วันที่ใน Cloud Sheets</div>
-            <div class="text-xs text-muted mt-1">แก้ format วันที่ใน sheet ทุก column ที่ปนกัน (<code>01/02/2026</code> + <code>2026-01-13</code>) → <b>YYYY-MM-DD</b> consistent ทุกแถว · ครอบคลุม meta + bills + 5 stmts banks</div>
-          </div>
-          <button class="btn btn-sm" id="btn-normalize-dates" style="background:var(--purple);color:#fff;border:none">📅 Normalize</button>
-        </div>
-        <div id="normalize-status" class="text-xs text-muted mt-2" style="display:none;font-family:monospace;max-height:250px;overflow-y:auto;padding:10px;background:var(--surface2);border-radius:6px;white-space:pre-wrap"></div>
-      </div>
-      
-      <!-- ⭐ Phase 1: Migrate Transfer Schema (drop nickname + add uuid + dc_pm + net) -->
-      <div class="card mb-3" style="border:1.5px solid var(--warn);background:rgba(245,166,35,.04)">
-        <div class="flex justify-between items-center">
-          <div>
-            <div class="font-semi" style="color:var(--warn)">🔄 Migrate Transfer Schema (Phase 1)</div>
-            <div class="text-xs text-muted mt-1">
-              ปรับ schema ของ <code>transfer_master_vat/novat</code> + <code>transfer_log_vat/novat</code> + <code>transfer_checks</code>:<br>
-              • ลบ <b>nickname</b> column<br>
-              • เพิ่ม <b>tm_uuid / tl_uuid</b> (PK)<br>
-              • เพิ่ม <b>deduct_dc_pm</b> + <b>net</b> column ใน log (เดิมไม่มี)<br>
-              • Recompute <code>deduct_total = ship + dc_pm + claim + other</code><br>
-              • Dedupe master ที่ <code>(name, account_no)</code> ซ้ำ<br>
-              • Backup ทุกชีทก่อน (ชื่อ <code>*_backup_yyyymmdd_hhmmss</code>)
-            </div>
-          </div>
-          <div class="flex gap-2">
-            <button class="btn btn-outline btn-sm" id="btn-migrate-tl-dryrun" style="color:var(--warn);border-color:var(--warn)">🧪 Dry-run</button>
-            <button class="btn btn-sm" id="btn-migrate-tl-apply" style="background:var(--warn);color:#1a1d27;border:none">⚡ Apply</button>
-            <button class="btn btn-outline btn-sm" id="btn-repair-tl-uuid" style="color:var(--info);border-color:var(--info)" title="ถ้า column uuid หาย/ว่าง — เติม uuid ใหม่ให้ rows ที่ขาด">🔧 Repair UUIDs</button>
-            <button class="btn btn-outline btn-sm" id="btn-drop-net-col" style="color:var(--danger);border-color:var(--danger)" title="ลบ column net (ซ้ำกับ amount) — รันครั้งเดียว">🗑 Drop net</button>
-          </div>
-        </div>
-        <div id="migrate-tl-status" class="text-xs text-muted mt-2" style="display:none;font-family:monospace;max-height:280px;overflow-y:auto;padding:10px;background:var(--surface2);border-radius:6px;white-space:pre-wrap"></div>
-      </div>
-      
-      <!-- ⭐ Auto-link bills to customers -->
-      <div class="card mb-3" style="border:1.5px solid var(--info);background:rgba(79,156,249,.04)">
-        <div class="flex justify-between items-center">
-          <div>
-            <div class="font-semi" style="color:var(--info)">🔗 Auto-link บิลลูกหนี้กับลูกค้า (Phase A)</div>
-            <div class="text-xs text-muted mt-1">เชื่อมบิล <b>SR/SC/OR/JR</b> เข้ากับ <code>cust_id</code> จากชื่อใน remarks1 · จำเป็นต้องทำก่อนใช้หน้า "ติดตามหนี้" แบบใหม่</div>
-          </div>
-          <button class="btn btn-primary btn-sm" onclick="openAutoLinkModal()">🔗 เริ่ม Auto-link</button>
-        </div>
-      </div>
-      
-      
-      <!-- Sheet Health Check -->
-      <div class="card mb-3" style="border:1.5px solid var(--info);background:rgba(79,156,249,.04)">
-        <div class="flex justify-between items-center">
-          <div>
-            <div class="font-semi" style="color:var(--info)">🔍 ตรวจสอบ Google Sheet</div>
-            <div class="text-xs text-muted mt-1">เช็คว่า Sheet มีแท็บครบตามที่ระบบต้องการหรือไม่ · ดู row counts · แสดงรายการ sheet ที่ขาด</div>
-          </div>
-          <button class="btn btn-info btn-sm" id="btn-check-sheets">🔍 ตรวจสอบ</button>
-        </div>
-        <div id="sheet-check-result" style="display:none;margin-top:10px;padding:12px;background:var(--surface2);border-radius:6px;font-family:monospace;font-size:.78rem;white-space:pre-wrap;max-height:400px;overflow-y:auto"></div>
-      </div>
-      
       <!-- Daily Import Section -->
       <div class="card mb-3" style="border:1.5px solid var(--primary);background:rgba(91,124,250,.04)">
         <div class="flex justify-between items-center mb-3">
@@ -19234,20 +19173,6 @@ function renderData(el) {
         </div>
       </div>
       
-      <!-- UUID Migration (v1.0) — One-time migrate to UUID-based sync -->
-      <div class="card" style="border-left:3px solid var(--info);margin-bottom:12px;background:rgba(79,156,249,.04)">
-        <div class="font-semi mb-2" style="color:var(--info)">🚀 Migrate to UUID Sync (ครั้งเดียวจบ)</div>
-        <p class="text-xs text-muted mb-3">
-          แก้ปัญหา sync บวมถาวรด้วย UUID-based upsert — backend จะ UPDATE ถ้า uuid มี, INSERT ถ้าไม่มี → <strong>ไม่มีทาง double อีก</strong><br>
-          <strong style="color:var(--warn)">⚠️ จะล้าง Sheet bills_YYYY / stmts_YYYY ทั้งหมดแล้ว push ใหม่</strong> — backup JSON ก่อนทำ
-        </p>
-        <div class="flex gap-2 flex-wrap items-center mb-2">
-          <button class="btn btn-info btn-sm" id="btn-uuid-migrate" style="background:var(--info);color:#fff">🚀 Migrate ข้อมูลเก่าสู่ UUID</button>
-          <button class="btn btn-outline btn-sm" id="btn-uuid-verify">🔍 Verify UUID Status</button>
-          <span id="uuid-result" class="text-xs text-dim"></span>
-        </div>
-        <div id="uuid-progress" style="display:none;margin-top:8px;padding:10px;background:var(--surface2);border-radius:6px;font-family:monospace;font-size:.78rem;white-space:pre-wrap;max-height:300px;overflow-y:auto"></div>
-      </div>
     `;
     
     // ── Sync from Cloud ──
