@@ -4329,7 +4329,7 @@ function parseSPReport(result, fileName) {
   const gradDelay = tempsToMerge.length > 0 ? 2000 : 600;
   setTimeout(() => spTempAutoGraduateDialog(realSPs), gradDelay);
   
-  if (currentPage === 'payments') navigateTo('payments');
+  if (currentPage === 'payments' && typeof window.renderPaymentsKeepScroll === 'function') window.renderPaymentsKeepScroll();
 }
 
 // ── Dialog เสนอ merge SP-TEMP กับ SP จริง ──
@@ -4379,7 +4379,7 @@ function showSpMergeDialog(candidates) {
     persistMainState();
     closeModal();
     toast(`รวม SP-TEMP ${merged} รายการเข้ากับ SP จริงสำเร็จ`, 'success');
-    if (currentPage === 'payments') navigateTo('payments');
+    if (currentPage === 'payments' && typeof window.renderPaymentsKeepScroll === 'function') window.renderPaymentsKeepScroll();
   });
 }
 
@@ -10410,7 +10410,7 @@ function openSpTempModal() {
     toast(`สร้าง ${tempNo} สำเร็จ`, 'success');
     
     if (typeof currentPage !== 'undefined') {
-      if (currentPage === 'payments') navigateTo('payments');
+      if (currentPage === 'payments' && typeof window.renderPaymentsKeepScroll === 'function') window.renderPaymentsKeepScroll();
       else if (currentPage === 'main' && typeof window.renderMainKeepScroll === 'function') window.renderMainKeepScroll();
     }
   });
@@ -10584,7 +10584,7 @@ function openPartialModal(tempNo, sbNoDefault, _ignored) {
     }
     
     if (typeof currentPage !== 'undefined') {
-      if (currentPage === 'payments') navigateTo('payments');
+      if (currentPage === 'payments' && typeof window.renderPaymentsKeepScroll === 'function') window.renderPaymentsKeepScroll();
       else if (currentPage === 'main' && typeof window.renderMainKeepScroll === 'function') window.renderMainKeepScroll();
     }
   });
@@ -10689,7 +10689,7 @@ function openGraduateTempModal(t) {
     spTempGraduate(t.no, realSpNo, realSpDate);
     closeModal();
     toast(`Graduate ${t.no} → ${realSpNo} สำเร็จ`, 'success');
-    if (typeof currentPage !== 'undefined' && currentPage === 'payments') navigateTo('payments');
+    if (typeof currentPage !== 'undefined' && currentPage === 'payments' && typeof window.renderPaymentsKeepScroll === 'function') window.renderPaymentsKeepScroll();
   });
 }
 
@@ -10746,7 +10746,7 @@ function spTempAutoGraduateDialog(newRealSPs) {
     });
     closeModal();
     toast(`Graduate ${graduated} SP-TEMP สำเร็จ`, 'success');
-    if (currentPage === 'payments') navigateTo('payments');
+    if (currentPage === 'payments' && typeof window.renderPaymentsKeepScroll === 'function') window.renderPaymentsKeepScroll();
   });
 }
 
@@ -11060,6 +11060,32 @@ async function renderPayments(el) {
   let searchText = '';
   let expandedSP = new Set(); // SP ที่เปิดแสดง child
   let expandedTemp = new Set(); // SP-TEMP ที่เปิดแสดง partials
+  
+  // ⭐ Keep-scroll re-render — preserves scroll + expanded states ตอนแก้ข้อมูล
+  function renderKeepScroll() {
+    const scrollY = window.scrollY;
+    const scrollX = window.scrollX;
+    const innerScrolls = [];
+    el.querySelectorAll('[style*="overflow-y:auto"], [style*="overflow:auto"]').forEach((node, idx) => {
+      if (node.scrollTop > 0) innerScrolls.push({idx, top: node.scrollTop});
+    });
+    const activeId = document.activeElement?.id;
+    
+    render();
+    
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      try {
+        window.scrollTo(scrollX, scrollY);
+        const newInner = el.querySelectorAll('[style*="overflow-y:auto"], [style*="overflow:auto"]');
+        innerScrolls.forEach(({idx, top}) => { if (newInner[idx]) newInner[idx].scrollTop = top; });
+        if (activeId) {
+          const t = document.getElementById(activeId);
+          if (t && typeof t.focus === 'function') t.focus();
+        }
+      } catch(_){}
+    }));
+  }
+  window.renderPaymentsKeepScroll = renderKeepScroll;
 
   function render() {
     let data = paymentList;
@@ -11345,7 +11371,7 @@ async function renderPayments(el) {
         e.stopPropagation();
         const tempNo = btn.dataset.no;
         if (typeof openSpTempEditModal === 'function') {
-          openSpTempEditModal(tempNo, () => render());
+          openSpTempEditModal(tempNo, () => renderKeepScroll());
         }
       });
     });
@@ -11363,7 +11389,7 @@ async function renderPayments(el) {
     
     // ⭐ V2: Wire SB toggle / + ชำระ / Match button / partial row → edit
     if (typeof wireSpTempV2Events === 'function') {
-      wireSpTempV2Events(el, render);
+      wireSpTempV2Events(el, renderKeepScroll);
     }
     
     // ⭐ + บิล button (เพิ่มบิลใหม่ใน SP-TEMP)
@@ -11371,7 +11397,7 @@ async function renderPayments(el) {
       btn.addEventListener('click', (e) => {
         e.stopPropagation();
         const no = btn.dataset.no;
-        openSpTempBillModal(no, null, () => render());
+        openSpTempBillModal(no, null, () => renderKeepScroll());
       });
     });
     
@@ -11384,7 +11410,7 @@ async function renderPayments(el) {
         trackSpTempDelete(tempNo);
         spTempList = spTempList.filter(x => x.no !== tempNo);
         markDirtySpTemps();
-        render();
+        renderKeepScroll();
       });
     });
     
