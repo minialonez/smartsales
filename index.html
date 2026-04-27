@@ -2743,6 +2743,56 @@ const syncManager = {
       });
       uploadedStatements = getAllStatements();
       
+      // ⭐ Self-heal stmts after pull: match_station+match_bill มี แต่ match_status ไม่ใช่ 'matched'
+      //    เกิดจาก partial sync race ตอน user A push → user B pull
+      {
+        let healedM = 0, healedU = 0;
+        uploadedStatements.forEach(s => {
+          const hasStation = !!(s.match_station && String(s.match_station).trim());
+          const hasBill = !!(s.match_bill && String(s.match_bill).trim());
+          const hasMatchedBills = Array.isArray(s.matched_bills) && s.matched_bills.length > 0;
+          const hasMatchData = (hasStation && hasBill) || hasMatchedBills;
+          
+          if (hasMatchData && s.match_status !== 'matched' && s.match_status !== 'paid') {
+            s.match_status = 'matched';
+            healedM++;
+          } else if (!hasMatchData && (s.match_status === 'matched' || s.match_status === 'paid')) {
+            s.match_status = 'unmatched';
+            healedU++;
+          }
+        });
+        if (healedM + healedU > 0) {
+          console.log(`[sync heal stmts] matched:+${healedM} unmatched:+${healedU}`);
+        }
+      }
+      
+      // ⭐ Self-heal bills after pull: bill มี matched_stmt_ref + ตรงกับ stmt matched → status = matched
+      //    + bill ที่ stmt บอกว่า matched แต่ตัวเองยัง pending → sync ให้
+      if (billList.length > 0 && uploadedStatements.length > 0) {
+        const stmtByBillNo = {};
+        uploadedStatements.forEach(s => {
+          if ((s.match_status !== 'matched' && s.match_status !== 'paid') || !s.match_bill) return;
+          const billNos = Array.isArray(s.matched_bills) && s.matched_bills.length 
+            ? s.matched_bills 
+            : String(s.match_bill).split(' + ').map(x => x.split(' (')[0].trim()).filter(Boolean);
+          billNos.forEach(bn => { stmtByBillNo[bn] = s; });
+        });
+        let healedBills = 0;
+        billList.forEach(b => {
+          if (!b.bill_no) return;
+          const stmt = stmtByBillNo[b.bill_no];
+          if (stmt && b.match_status !== 'matched' && b.match_status !== 'paid' && b.match_status !== 'void') {
+            b.match_status = 'matched';
+            if (!b.matched_stmt_ref) b.matched_stmt_ref = stmt.ref_no || '';
+            if (!b.confirmation && stmt.ref_no) b.confirmation = stmt.ref_no;
+            healedBills++;
+          }
+        });
+        if (healedBills > 0) {
+          console.log(`[sync heal bills] +${healedBills} bills marked matched (matched stmt found)`);
+        }
+      }
+      
       // Payments / Cashflow / Suppliers (รวม)
       try {
         const r = await api('getPayments');
