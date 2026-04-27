@@ -17794,6 +17794,13 @@ async function renderMatching(el) {
               ? String(stmt.match_bill).split(' + ').map(s => s.split(' (')[0].trim()).filter(Boolean)
               : []);
         
+        // ⭐ Find bills LINKED TO THIS STMT first (by matched_stmt_ref) — เพื่อ handle case ที่ bill_no ซ้ำ
+        //    (เช่น "SP-XXX" มีหลายบิล แต่ที่ match อยู่กับ stmt นี้คืออันที่ matched_stmt_ref ตรง)
+        const linkedBills = billList.filter(b => 
+          b.matched_stmt_ref === stmt.ref_no && 
+          (b.match_status === 'paid' || b.match_status === 'matched')
+        );
+        
         billNumbersToUnmatch.forEach(bn => {
           // ⚡ SP-TEMP partial pattern: SP-TEMP-XXXX#N → clear partial.stmt_ref
           const spTempMatch = String(bn).match(/^(SP-TEMP-\d+)#(\d+)$/);
@@ -17809,7 +17816,17 @@ async function renderMatching(el) {
             }
             return;
           }
-          const bill = billList.find(b => b.bill_no === bn);
+          // ⭐ Prefer linked bill (by matched_stmt_ref) over first bill_no match
+          //    เพราะถ้ามีบิลหลายตัว bill_no = "SP-XXX" → find() คืนแค่อันแรก (ผิด)
+          let bill = linkedBills.find(b => b.bill_no === bn);
+          if (!bill) {
+            // Fallback: bill_no match (อาจไม่มี matched_stmt_ref ตรง — เช่น เคยลบไปแล้ว)
+            bill = billList.find(b => b.bill_no === bn && (b.match_status === 'paid' || b.match_status === 'matched'));
+          }
+          if (!bill) {
+            // Last fallback: any bill with this bill_no
+            bill = billList.find(b => b.bill_no === bn);
+          }
           if (bill && !bill.paid_by_sp) {
             bill.match_status = 'pending';
             // ⭐ ตั้ง '' แทน delete — ไม่งั้น backend จะ preserve ค่าเก่าใน sheet
@@ -17818,6 +17835,18 @@ async function renderMatching(el) {
             bill.matched_stmt_ref = '';
             bill.matched_at = '';
           }
+        });
+        
+        // ⭐ Also unmatch any other linked bills that weren't in matched_bills array
+        //    (paranoid: handle case ที่ matched_bills array หายไป แต่ bills ยังมี matched_stmt_ref)
+        linkedBills.forEach(bill => {
+          if (bill.match_status === 'pending') return; // ทำไปแล้วข้างบน
+          if (bill.paid_by_sp) return; // SP จ่าย — ไม่แตะ
+          bill.match_status = 'pending';
+          bill.confirmation = '';
+          bill.pay_date = '';
+          bill.matched_stmt_ref = '';
+          bill.matched_at = '';
         });
         
         stmt.match_status = 'unpaid';
@@ -17834,14 +17863,25 @@ async function renderMatching(el) {
         try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(e) {}
         persistMainState();
         
-        // ⭐ Delta push: push bills ที่เพิ่ง unmatch + stmt
+        // ⭐ Delta push: push บิลทุกตัวที่แก้ไข (linked + matched_bills) + stmt
+        //    ใช้ Set เพื่อกัน push ซ้ำ (linked + matched_bills อาจ overlap)
+        const pushedUuids = new Set();
+        linkedBills.forEach(bill => {
+          if (bill.bill_uuid && !pushedUuids.has(bill.bill_uuid)) {
+            pushMatchDelta(bill, null);
+            pushedUuids.add(bill.bill_uuid);
+          }
+        });
         billNumbersToUnmatch.forEach(bn => {
-          const bill = billList.find(b => b.bill_no === bn);
-          if (bill) pushMatchDelta(bill, null);
+          const bill = billList.find(b => b.bill_no === bn && b.match_status === 'pending');
+          if (bill && bill.bill_uuid && !pushedUuids.has(bill.bill_uuid)) {
+            pushMatchDelta(bill, null);
+            pushedUuids.add(bill.bill_uuid);
+          }
         });
         pushMatchDelta(null, stmt);
         
-        toast('ยกเลิก match แล้ว', 'success');
+        toast('ยกเลิก match แล้ว — กด 💾 บันทึก เพื่อ push ขึ้น Sheet', 'success', 5000);
         render();
       });
     });
