@@ -10000,19 +10000,30 @@ async function renderPayments(el) {
                         </tr>
                       </thead>
                       <tbody>
-                        ${(t.partials||[]).map((pr, i) => `
-                          <tr>
-                            <td style="padding:4px;color:var(--text3)">${i+1}</td>
+                        ${(() => {
+                          // ⭐ Sort partials by date asc — keep originalIdx for data-idx
+                          const indexed = (t.partials||[]).map((pr, originalIdx) => ({ pr, originalIdx }));
+                          indexed.sort((a, b) => {
+                            const da = String(a.pr.date || '');
+                            const db = String(b.pr.date || '');
+                            if (da && !db) return -1;
+                            if (!da && db) return 1;
+                            return da.localeCompare(db);
+                          });
+                          return indexed.map(({ pr, originalIdx }, displayI) => `
+                          <tr class="pay-sp-partial-row" data-no="${t.no}" data-idx="${originalIdx}" style="cursor:pointer" title="คลิกเพื่อแก้ไข/match">
+                            <td style="padding:4px;color:var(--text3)">${displayI+1}</td>
                             <td style="padding:4px">${fmtDate(pr.date)}</td>
                             <td style="padding:4px;text-align:right;font-weight:600;color:var(--success)">฿${fmtNum(pr.amount)}</td>
                             <td style="padding:4px">${pr.method||'-'}</td>
                             <td style="padding:4px">${pr.bank||'-'}</td>
                             <td style="padding:4px;color:var(--text2)">${pr.notes||pr.stmt_ref||''}${pr._auto_split?' <span class="badge badge-info" style="font-size:.65rem">auto-split</span>':''}</td>
                             <td style="padding:4px;text-align:right">
-                              <button class="btn-del-partial" data-no="${t.no}" data-idx="${i}" style="background:none;border:none;color:var(--danger);cursor:pointer;font-size:.9rem" title="ลบ partial">✕</button>
+                              <button class="btn-del-partial" data-no="${t.no}" data-idx="${originalIdx}" style="background:none;border:none;color:var(--danger);cursor:pointer;font-size:.9rem" title="ลบ partial">✕</button>
                             </td>
                           </tr>
-                        `).join('')}
+                        `).join('');
+                        })()}
                       </tbody>
                     </table>
                   </div>
@@ -10177,6 +10188,18 @@ async function renderPayments(el) {
         recomputeSpTempStatus(t);
         markDirtySpTemps();
         render();
+      });
+    });
+    
+    // ⭐ Click partial row → edit modal (same as Main page)
+    el.querySelectorAll('.pay-sp-partial-row').forEach(row => {
+      row.addEventListener('click', (e) => {
+        if (e.target.closest('.btn-del-partial')) return;
+        const no = row.dataset.no;
+        const idx = Number(row.dataset.idx);
+        if (typeof openSpTempPartialEditModal === 'function') {
+          openSpTempPartialEditModal(no, idx, () => render());
+        }
       });
     });
     
