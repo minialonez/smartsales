@@ -2863,16 +2863,42 @@ const syncManager = {
           const byUuid = {};
           spTempList.forEach(t => { if (t.sp_temp_uuid) byUuid[t.sp_temp_uuid] = t; });
           
+          // ⭐ Dirty/timestamp guards — ป้องกัน cloud ทับ local ที่แก้ไขใหม่กว่า
+          const isDirty = this.dirty.has('sp_temps');
+          let kept = 0, replaced = 0, added = 0;
+          
           grouped.forEach(t => {
             if (!t.sp_temp_uuid) return;
-            if (!byUuid[t.sp_temp_uuid]) {
+            const localT = byUuid[t.sp_temp_uuid];
+            if (!localT) {
+              // ใหม่ใน cloud → เพิ่มเข้า local
               spTempList.push(t);
+              added++;
             } else {
-              // Cloud = source of truth — replace nested structure entirely
-              Object.assign(byUuid[t.sp_temp_uuid], t);
+              // ⭐ mode='force' → trust cloud, override
+              if (mode === 'force') {
+                Object.assign(localT, t);
+                replaced++;
+                return;
+              }
+              // ⭐ Dirty guard: ถ้า user มี local edits ที่ยังไม่ push → skip merge
+              if (isDirty) {
+                kept++;
+                return;
+              }
+              // ⭐ Timestamp guard: local.updated_at >= cloud.updated_at → keep local
+              const localTs = localT.updated_at ? new Date(localT.updated_at).getTime() : 0;
+              const cloudTs = t.updated_at ? new Date(t.updated_at).getTime() : 0;
+              if (localTs >= cloudTs && localTs > 0) {
+                kept++;
+                return;
+              }
+              // Cloud ใหม่กว่า → replace
+              Object.assign(localT, t);
+              replaced++;
             }
           });
-          console.log(`[sync sp_temps] flat rows: ${flatRows.length} → grouped: ${grouped.length} SP-TEMPs`);
+          console.log(`[sync sp_temps] flat:${flatRows.length} grouped:${grouped.length} added:${added} replaced:${replaced} kept-local:${kept} dirty:${isDirty} mode:${mode}`);
         }
       } catch(err) { console.warn('[sync] SpTemps', err?.message); }
       
@@ -11313,6 +11339,14 @@ async function renderPayments(el) {
     const totalChildBills = paymentList.reduce((s,p) => s + (p.bills?.length||0), 0);
     const pendingCount = paymentList.filter(p => p.match_status === 'pending').length;
     const matchedCount = paymentList.filter(p => p.match_status === 'paid').length;
+    
+    // ⭐ Include SP-TEMP totals in cards
+    const openTempsForStats = spTempList.filter(t => t.status !== 'graduated' && t.status !== 'cancelled');
+    const tempCount = openTempsForStats.length;
+    const tempBillsTotal = openTempsForStats.reduce((s,t) => s + spTempBillsTotal(t), 0);
+    const tempBillsCount = openTempsForStats.reduce((s,t) => s + (t.bills||[]).length, 0);
+    const tempPaid = openTempsForStats.reduce((s,t) => s + spTempPaidTotal(t), 0);
+    const tempPending = openTempsForStats.reduce((s,t) => s + spTempPendingTotal(t), 0);
 
     el.innerHTML = `
       <div class="flex justify-between items-center mb-3">
@@ -11330,10 +11364,10 @@ async function renderPayments(el) {
 
       <!-- Summary cards -->
       <div class="flex gap-3 flex-wrap mb-3 stagger">
-        ${statCard('SP ทั้งหมด', paymentList.length, '', 'var(--primary)', ICONS.file)}
-        ${statCard('ยอดรวม', '฿'+fmtNum(totalAmt), '', 'var(--success)', ICONS.dollar)}
-        ${statCard('บิลที่ตัด', totalChildBills, 'SS/OS/SR/OR/JR', 'var(--info)', ICONS.check)}
-        ${statCard('รอ Paid', pendingCount, matchedCount + ' paid', 'var(--warn)', ICONS.bar)}
+        ${statCard('SP ทั้งหมด', paymentList.length + tempCount, tempCount > 0 ? `${paymentList.length} จริง + ${tempCount} ชั่วคราว` : '', 'var(--primary)', ICONS.file)}
+        ${statCard('ยอดรวม', '฿'+fmtNum(totalAmt + tempBillsTotal), tempBillsTotal > 0 ? `จริง ฿${fmtNum(totalAmt)} · ชั่วคราว ฿${fmtNum(tempBillsTotal)}` : '', 'var(--success)', ICONS.dollar)}
+        ${statCard('บิลที่ตัด', totalChildBills + tempBillsCount, 'SS/OS/SR/OR/JR', 'var(--info)', ICONS.check)}
+        ${statCard('รอ Paid', pendingCount + (tempPending > 0 ? 1 : 0), tempPending > 0 ? `${matchedCount} paid · pending ฿${fmtNum(tempPending)}` : matchedCount + ' paid', 'var(--warn)', ICONS.bar)}
       </div>
 
       <!-- Filter pills -->
@@ -11660,10 +11694,38 @@ async function renderPayments(el) {
       if (confirm('ล้างข้อมูล SP ทั้งหมด?')) { paymentList = []; persistMainState(); render(); }
     });
     document.getElementById('btn-save-pay')?.addEventListener('click', async () => {
-      toast('กำลังบันทึก...', 'info');
-      const res = await api('savePayments', { payments: paymentList, created_by: currentUser?.display_name || 'Admin' });
-      if (res.success) toast(`บันทึกสำเร็จ ${paymentList.length} SP`, 'success');
-      else toast(res.error || 'บันทึกไม่สำเร็จ', 'error');
+      if (!window.syncManager) { toast('Sync ไม่พร้อม', 'error'); return; }
+      
+      // ⭐ Mark dirty types ที่เกี่ยวกับ Payments page
+      if (paymentList.length > 0) syncManager.markDirty('payments');
+      if (spTempList.length > 0) syncManager.markDirty('sp_temps');
+      
+      const dirtyTypes = Array.from(syncManager.dirty);
+      if (dirtyTypes.length === 0) {
+        toast('ไม่มีอะไรต้องบันทึก', 'info');
+        return;
+      }
+      
+      toast(`กำลังบันทึก ${dirtyTypes.join(', ')}...`, 'info');
+      try {
+        const result = await syncManager._flushPush();
+        const stats = result || {};
+        const pushed = stats.ok || 0;
+        const errors = (stats.errors && stats.errors.length) || 0;
+        const skipped = stats.skipped || 0;
+        console.log('[btn-save-pay] result:', JSON.stringify(stats));
+        
+        if (errors > 0) {
+          toast(`⚠ บันทึก ${pushed}/${dirtyTypes.length} ประเภท · error ${errors} (ดู console)`, 'warn', 6000);
+        } else if (pushed === 0 && skipped > 0) {
+          toast(`ℹ ไม่มี การเปลี่ยนแปลง — skipped ${skipped} (ข้อมูลตรงกับ cloud)`, 'info', 4000);
+        } else {
+          toast(`✅ บันทึกสำเร็จ — push ${pushed} ประเภท · SP ${paymentList.length} · SP-TEMP ${spTempList.length}${skipped>0?` (skip ${skipped})`:''}`, 'success', 4000);
+        }
+      } catch (err) {
+        console.error('[btn-save-pay] error:', err);
+        toast('บันทึกล้มเหลว: ' + (err?.message||err), 'error', 6000);
+      }
     });
     el.querySelectorAll('.pill[data-fs]').forEach(btn => {
       btn.addEventListener('click', () => { filterStatus = btn.dataset.fs; render(); });
