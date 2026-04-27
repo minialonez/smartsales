@@ -16448,7 +16448,10 @@ async function renderMatching(el) {
                   <td>${isMatched
                     ? `<span class="badge badge-success">✓ ${isManual?'Manual':'Auto'}${s.match_method === 'manual_diff' ? ' · diff' : ''}</span> <button class="btn btn-ghost btn-sm btn-unmatch" data-stmt-idx="${i}" title="ยกเลิก match">${ICONS.edit}</button>`
                     : `<span class="badge badge-danger">✗ ไม่พบ</span> <button class="btn btn-primary btn-sm btn-manual-match" data-stmt-idx="${i}">${ICONS.search} Match เอง</button>`
-                  }</td>
+                  }
+                    <button class="btn btn-ghost btn-sm btn-stmt-edit-date" data-stmt-idx="${i}" title="แก้ไขวันที่ (date format ผิด)" style="color:var(--info);padding:2px 6px;margin-left:2px">📅</button>
+                    <button class="btn btn-ghost btn-sm btn-stmt-delete" data-stmt-idx="${i}" title="ลบรายการนี้ (statement ซ้ำ/ผิด)" style="color:var(--danger);padding:2px 6px">🗑</button>
+                  </td>
                 </tr>
               `}).join('') : '<tr><td colspan="9" style="text-align:center;padding:30px;color:var(--text3)">ไม่มีข้อมูล Statement — กรองวันที่หรือเลือกธนาคาร</td></tr>'}
             </tbody>
@@ -17220,6 +17223,146 @@ async function renderMatching(el) {
         pushMatchDelta(null, stmt);
         
         toast('ยกเลิก match แล้ว', 'success');
+        render();
+      });
+    });
+    
+    // ⭐ Edit stmt date — แก้กรณี date format swap (MM/DD vs DD/MM)
+    el.querySelectorAll('.btn-stmt-edit-date').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const stmtIdx = Number(btn.dataset.stmtIdx);
+        const stmt = data[stmtIdx];
+        if (!stmt) return;
+        const cur = toISODate(stmt.date) || stmt.date || '';
+        const dateOnly = cur.substring(0, 10);
+        // คำนวณ swap (DD/MM ↔ MM/DD) เพื่อ suggest
+        let swapped = '';
+        const m = cur.match(/^(\d{4})-(\d{2})-(\d{2})/);
+        if (m && Number(m[2]) <= 12 && Number(m[3]) <= 12 && m[2] !== m[3]) {
+          swapped = `${m[1]}-${m[3]}-${m[2]}`;
+        }
+        
+        const html = `
+          <div class="flex-col gap-3">
+            <p class="text-sm">แก้วันที่ของ statement นี้:</p>
+            <div class="text-xs text-muted" style="font-family:var(--mono);background:var(--surface2);padding:8px;border-radius:6px">
+              ${stmt.bank} · ${fmtStmtTime(stmt.time)} · ฿${fmtNum(stmt.amount)}<br>
+              Ref: ${stmt.ref_no || '-'}<br>
+              ${stmt.description || ''}
+            </div>
+            <div class="input-group">
+              <label>วันที่ปัจจุบัน</label>
+              <input type="text" class="input" value="${dateOnly}" disabled>
+            </div>
+            ${swapped ? `<div class="input-group">
+              <label style="color:var(--info)">💡 ลองสลับ DD/MM ↔ MM/DD</label>
+              <button class="btn btn-outline btn-sm" id="sed-suggest" type="button" style="text-align:left">${swapped} (สลับเดือน-วัน)</button>
+            </div>` : ''}
+            <div class="input-group">
+              <label>วันที่ใหม่</label>
+              <input type="date" class="input" id="sed-new" value="${dateOnly}">
+            </div>
+            <div class="text-xs text-muted">⚠ ถ้า stmt เคย match กับบิล → match ยังคงอยู่ (เพียงเปลี่ยนวันที่)</div>
+            <div class="flex gap-2 justify-end">
+              <button class="btn btn-ghost" id="sed-cancel">ยกเลิก</button>
+              <button class="btn btn-primary" id="sed-save">💾 บันทึก</button>
+            </div>
+          </div>
+        `;
+        openModal('📅 แก้วันที่ Statement', html);
+        if (swapped) {
+          document.getElementById('sed-suggest')?.addEventListener('click', () => {
+            document.getElementById('sed-new').value = swapped;
+          });
+        }
+        document.getElementById('sed-cancel')?.addEventListener('click', closeModal);
+        document.getElementById('sed-save')?.addEventListener('click', () => {
+          const newDate = document.getElementById('sed-new').value;
+          if (!newDate) { toast('ใส่วันที่', 'warn'); return; }
+          // Find original in statementsByBank by stmt_uuid (if any) else by ref+bank+amount+time
+          const origArr = statementsByBank[stmt.bank] || [];
+          let target = stmt.stmt_uuid ? origArr.find(x => x.stmt_uuid === stmt.stmt_uuid) : null;
+          if (!target) {
+            target = origArr.find(x => 
+              x.ref_no === stmt.ref_no && 
+              Number(x.amount) === Number(stmt.amount) && 
+              x.time === stmt.time
+            );
+          }
+          if (!target) { toast('ไม่พบ statement ใน statementsByBank', 'error'); return; }
+          target.date = newDate;
+          if (target.trans_date) target.trans_date = newDate;
+          if (typeof markDirtyStmt === 'function' && target.stmt_uuid) markDirtyStmt(target.stmt_uuid);
+          uploadedStatements = getAllStatements();
+          persistMainState();
+          closeModal();
+          toast(`✓ แก้วันที่เป็น ${fmtDate(newDate)}`, 'success');
+          render();
+        });
+      });
+    });
+    
+    // ⭐ Delete stmt row — ลบ statement ซ้ำ/ผิด
+    el.querySelectorAll('.btn-stmt-delete').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const stmtIdx = Number(btn.dataset.stmtIdx);
+        const stmt = data[stmtIdx];
+        if (!stmt) return;
+        
+        const isMatched = stmt.match_status === 'matched';
+        const matchInfo = isMatched && stmt.match_bill ? `\n\n⚠️ Stmt นี้ matched กับบิล "${stmt.match_bill}"\nลบแล้ว → บิลจะกลายเป็น pending` : '';
+        
+        if (!confirm(
+          `ลบ statement นี้?\n\n` +
+          `${stmt.bank} · ${fmtDate(stmt.date)} · ${fmtStmtTime(stmt.time)}\n` +
+          `Ref: ${stmt.ref_no || '-'}\n` +
+          `จำนวน: ฿${fmtNum(stmt.amount)}${matchInfo}\n\n` +
+          `ลบแล้วกู้คืนไม่ได้ (ยกเว้นจะ Re-import จากไฟล์ KTB)`
+        )) return;
+        
+        // Unmatch bills first (ถ้ามี matched_bills)
+        if (isMatched) {
+          const billsToUnmatch = Array.isArray(stmt.matched_bills) && stmt.matched_bills.length 
+            ? stmt.matched_bills 
+            : (stmt.match_bill ? String(stmt.match_bill).split(' + ').map(s => s.split(' (')[0].trim()).filter(Boolean) : []);
+          billsToUnmatch.forEach(bn => {
+            const bill = billList.find(b => b.bill_no === bn);
+            if (bill && bill.matched_stmt_ref === stmt.ref_no) {
+              bill.match_status = 'pending';
+              delete bill.matched_stmt_ref;
+              delete bill.confirmation;
+              if (typeof markDirtyBill === 'function' && bill.bill_uuid) markDirtyBill(bill.bill_uuid);
+            }
+          });
+        }
+        
+        // Find + remove from statementsByBank by stmt_uuid (or ref+amount+time fallback)
+        const origArr = statementsByBank[stmt.bank] || [];
+        let removeIdx = -1;
+        if (stmt.stmt_uuid) {
+          removeIdx = origArr.findIndex(x => x.stmt_uuid === stmt.stmt_uuid);
+        }
+        if (removeIdx < 0) {
+          removeIdx = origArr.findIndex(x => 
+            x.ref_no === stmt.ref_no && 
+            Number(x.amount) === Number(stmt.amount) && 
+            x.time === stmt.time && 
+            x.date === stmt.date
+          );
+        }
+        if (removeIdx < 0) { toast('ไม่พบใน statementsByBank', 'error'); return; }
+        
+        const removed = origArr[removeIdx];
+        // Track for sync deletion
+        if (removed.stmt_uuid && typeof syncManager !== 'undefined' && syncManager.markDeleted) {
+          syncManager.markDeleted('stmts', removed.stmt_uuid);
+        }
+        origArr.splice(removeIdx, 1);
+        uploadedStatements = getAllStatements();
+        persistMainState();
+        toast(`✓ ลบ statement แล้ว${isMatched?' + unmatch บิลที่เคย match':''}`, 'success', 4000);
         render();
       });
     });
