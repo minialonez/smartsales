@@ -6049,8 +6049,8 @@ async function renderMain(el) {
       <div class="flex gap-2 mb-3 flex-wrap items-center">
         <span class="text-xs text-dim">สถานะ:</span>
         <button class="pill ${filterMatch==='ALL'?'active':''}" data-fm="ALL">ทั้งหมด</button>
-        <button class="pill ${filterMatch==='unmatched'?'active':''}" data-fm="unmatched" style="--pill-color:var(--danger)">✗ ยังไม่ match (${unmatchedCount})</button>
-        <button class="pill ${filterMatch==='matched'?'active':''}" data-fm="matched" style="--pill-color:var(--success)">✓ matched</button>
+        <button class="pill ${filterMatch==='unmatched'?'active':''}" data-fm="unmatched" style="--pill-color:var(--danger)">✗ unpaid (${unmatchedCount})</button>
+        <button class="pill ${filterMatch==='matched'?'active':''}" data-fm="matched" style="--pill-color:var(--success)">✓ paid</button>
         <button class="pill ${filterMatch==='pending'?'active':''}" data-fm="pending" style="--pill-color:var(--warn)">⏳ pending</button>
         <span style="margin-left:auto"></span>
         <span class="text-xs text-dim">เรียง:</span>
@@ -6133,7 +6133,7 @@ async function renderMain(el) {
                     statusBadge = `<br><span class="badge badge-danger" style="margin-top:2px">❌ ยอด=0</span>`;
                   } else if (isPaid) {
                     rowStyle = 'background:rgba(45,212,160,.08)';
-                    statusBadge = `<br><span class="badge badge-success" style="margin-top:2px" title="จ่ายแล้วโดย ${b.paid_by_sp||''}">✓ ${b.paid_by_sp?'จ่ายแล้ว':'Matched'}</span>`;
+                    statusBadge = `<br><span class="badge badge-success" style="margin-top:2px" title="จ่ายแล้วโดย ${b.paid_by_sp||''}">✓ ${b.paid_by_sp?'จ่ายแล้ว':'Paid'}</span>`;
                   } else if (isBounced) {
                     rowStyle = 'background:rgba(239,87,87,.12);border-left:3px solid var(--danger)';
                     statusBadge = `<br><span class="badge badge-danger" style="margin-top:2px">🚫 เช็คเด้ง</span>`;
@@ -10079,7 +10079,7 @@ function renderSpSectionsForDate(opts) {
             <tbody>${pays.map(p => {
               const isOpen = expandedSpSet.has(p.sp_no);
               const statusCls = p.match_status === 'paid' ? 'badge-success' : 'badge-warn';
-              const statusLabel = p.match_status === 'paid' ? '✓ Matched' : '⏳ รอ';
+              const statusLabel = p.match_status === 'paid' ? '✓ Paid' : '⏳ รอ';
               const isTemp = /^SP-TEMP-/.test(p.sp_no);
               return `
                 <tr class="main-sp-row" data-sp="${p.sp_no}" style="cursor:pointer;${isOpen ? 'background:var(--surface2)' : ''}${isTemp ? ';border-left:3px solid var(--warn)' : ''}">
@@ -10348,14 +10348,14 @@ async function renderPayments(el) {
         ${statCard('SP ทั้งหมด', paymentList.length, '', 'var(--primary)', ICONS.file)}
         ${statCard('ยอดรวม', '฿'+fmtNum(totalAmt), '', 'var(--success)', ICONS.dollar)}
         ${statCard('บิลที่ตัด', totalChildBills, 'SS/OS/SR/OR/JR', 'var(--info)', ICONS.check)}
-        ${statCard('รอ Match', pendingCount, matchedCount + ' matched', 'var(--warn)', ICONS.bar)}
+        ${statCard('รอ Paid', pendingCount, matchedCount + ' paid', 'var(--warn)', ICONS.bar)}
       </div>
 
       <!-- Filter pills -->
       <div class="flex gap-2 mb-3 items-center">
         <button class="pill ${filterStatus==='ALL'?'active':''}" data-fs="ALL">ทั้งหมด (${paymentList.length})</button>
-        <button class="pill ${filterStatus==='pending'?'active':''}" data-fs="pending">รอ Match (${pendingCount})</button>
-        <button class="pill ${filterStatus==='matched'?'active':''}" data-fs="matched">Matched (${matchedCount})</button>
+        <button class="pill ${filterStatus==='pending'?'active':''}" data-fs="pending">รอ Paid (${pendingCount})</button>
+        <button class="pill ${filterStatus==='matched'?'active':''}" data-fs="matched">Paid (${matchedCount})</button>
         <span style="margin-left:auto"></span>
         ${sortToggleBtn('payment')}
       </div>
@@ -10539,7 +10539,7 @@ async function renderPayments(el) {
                 visibleData.map((p, idx) => {
                   const isOpen = expandedSP.has(p.sp_no);
                   const statusCls = p.match_status === 'paid' ? 'badge-success' : 'badge-warn';
-                  const statusLabel = p.match_status === 'paid' ? '✓ Matched' : '⏳ รอ Match';
+                  const statusLabel = p.match_status === 'paid' ? '✓ Paid' : '⏳ รอ Paid';
                   const isTemp = /^SP-TEMP-/.test(p.sp_no);
                   return `
                     <tr class="sp-row" data-sp="${p.sp_no}" style="cursor:pointer;${isOpen?'background:var(--surface2)':''}${isTemp?';border-left:3px solid var(--warn)':''}">
@@ -11041,7 +11041,7 @@ async function renderCashflow(el) {
                     <td>${c.bank ? `<span class="badge" style="background:${(bankColors[c.bank]||'#555')}22;color:${bankColors[c.bank]||'#aaa'}">${c.bank}</span>` : '-'}</td>
                     <td class="text-xs" style="font-family:var(--mono)">${c.reference||'-'}</td>
                     <td class="text-xs" style="max-width:160px">${c.note||'-'}</td>
-                    <td style="text-align:center">${isMatched?'<span class="badge badge-success">✓ Matched</span>':'<span class="badge badge-warn">⏳ รอ Match</span>'}</td>
+                    <td style="text-align:center">${isMatched?'<span class="badge badge-success">✓ Paid</span>':'<span class="badge badge-warn">⏳ รอ Paid</span>'}</td>
                     <td style="text-align:center">
                       <button class="btn btn-ghost btn-sm btn-cf-edit" data-idx="${realIdx}" title="แก้ไข">${ICONS.edit}</button>
                       <button class="btn btn-ghost btn-sm btn-cf-delete" data-idx="${realIdx}" title="ลบ" style="color:var(--danger)">🗑️</button>
@@ -11058,7 +11058,7 @@ async function renderCashflow(el) {
             ${visibleData.length} / ${data.length} (กรองจาก ${cashflowList.length})
             ${truncationFooter(data.length)}
           </span>
-          <span class="text-sm"><span style="color:var(--success)">Matched ${matchedCount}</span> · <span style="color:var(--warn)">รอ Match ${cashflowList.length-matchedCount}</span></span>
+          <span class="text-sm"><span style="color:var(--success)">Paid ${matchedCount}</span> · <span style="color:var(--warn)">รอ Paid ${cashflowList.length-matchedCount}</span></span>
         </div>
       </div>
     `;
@@ -12825,7 +12825,7 @@ async function renderPPReport(el) {
         rebuildMerged();
         persistMainState();
         closeModal();
-        toast(`สร้าง ${created} รายการใน "จ่ายเจ้าหนี้" สำเร็จ — รอ Match กับ Statement`, 'success');
+        toast(`สร้าง ${created} รายการใน "จ่ายเจ้าหนี้" สำเร็จ — รอ Paid กับ Statement`, 'success');
         render();
       });
     });
@@ -14144,7 +14144,7 @@ async function renderTransferLog(el) {
                   let spBadge;
                   if (c.linked_sp) {
                     const color = c.sp_match_status === 'paid' ? 'var(--success)' : 'var(--info)';
-                    const label = c.sp_match_status === 'paid' ? '✓ Matched' : '🔗 Linked';
+                    const label = c.sp_match_status === 'paid' ? '✓ Paid' : '🔗 Linked';
                     spBadge = `<span class="badge" style="background:${color}22;color:${color};font-size:.7rem">${label}</span>`;
                   } else if (c.pp_no) {
                     spBadge = `<span class="badge" style="background:rgba(244,180,26,.15);color:var(--warn);font-size:.7rem">⚠️ ไม่มี SP</span>`;
@@ -15253,7 +15253,7 @@ async function renderDashboard(el) {
         <div class="flex gap-3 flex-wrap">
           ${unmatchedBillsTransfer.length > 0 ? `
             <div style="padding:12px;background:rgba(245,166,35,.08);border-radius:8px;min-width:200px;flex:1;cursor:pointer" onclick="openPendingBillsModal('transfer')" title="คลิกเพื่อดูรายการ">
-              <div class="text-xs text-dim">บิลโอน/บัตรรอ Match</div>
+              <div class="text-xs text-dim">บิลโอน/บัตรรอ Paid</div>
               <div style="font-size:1.4rem;font-weight:700;color:var(--warn)">${unmatchedBillsTransfer.length}</div>
               <div class="text-xs text-muted">฿${fmtNum(unmatchedBillsTransfer.reduce((s,b)=>s+Number(b.amount||0),0))}</div>
             </div>
@@ -15735,7 +15735,7 @@ window.openPendingBillsModal = function(kind) {
       b.station !== 'Invoice Credit' && b.station !== 'Order Credit' &&
       !b.matched_stmt_ref
     );
-    title = '💳 บิลโอน/บัตรรอ Match';
+    title = '💳 บิลโอน/บัตรรอ Paid';
     subtitle = 'บิลที่ลูกค้าโอนเงิน/รูดบัตร แต่ยังไม่ได้ match กับ statement';
   }
   
@@ -17002,8 +17002,8 @@ async function renderMatching(el) {
       <div class="flex gap-2 mb-3 items-center">
         <span class="text-xs text-dim">สถานะ:</span>
         <button class="pill ${matchFilter==='ALL'?'active':''}" data-mf="ALL">ทั้งหมด (${allStmts.length})</button>
-        <button class="pill ${matchFilter==='unmatched'?'active':''}" data-mf="unmatched" style="--pill-color:var(--danger)">✗ ยังไม่ Match (${totalUnmatched})</button>
-        <button class="pill ${matchFilter==='matched'?'active':''}" data-mf="matched" style="--pill-color:var(--success)">✓ Matched (${totalMatched})</button>
+        <button class="pill ${matchFilter==='unmatched'?'active':''}" data-mf="unmatched" style="--pill-color:var(--danger)">✗ unpaid (${totalUnmatched})</button>
+        <button class="pill ${matchFilter==='matched'?'active':''}" data-mf="matched" style="--pill-color:var(--success)">✓ paid (${totalMatched})</button>
         <span style="margin-left:12px;padding-left:12px;border-left:1px solid var(--border)" class="text-xs text-dim">ทิศทาง:</span>
         <button class="pill ${dirFilter==='ALL'?'active':''}" data-dir="ALL">ทั้งหมด</button>
         <button class="pill ${dirFilter==='in'?'active':''}" data-dir="in" style="--pill-color:var(--success)" title="฿${fmtNum(sumIn)}">💰 เข้า (${countIn})</button>
@@ -20705,7 +20705,7 @@ async function renderAlerts(el) {
         <button class="pill ${filterCat==='all'?'active':''}" data-cat="all">ทั้งหมด (${categories.all})</button>
         ${categories.rule_violation > 0 ? `<button class="pill ${filterCat==='rule_violation'?'active':''}" data-cat="rule_violation" style="--pill-color:var(--danger)">🚨 Rule Violation (${categories.rule_violation})</button>` : ''}
         ${categories.supplier_pending > 0 ? `<button class="pill ${filterCat==='supplier_pending'?'active':''}" data-cat="supplier_pending" style="--pill-color:var(--danger)">🏭 Supplier รอโอน (${categories.supplier_pending})</button>` : ''}
-        ${categories.supplier_unmatched > 0 ? `<button class="pill ${filterCat==='supplier_unmatched'?'active':''}" data-cat="supplier_unmatched" style="--pill-color:var(--warn)">💰 PP รอ Match (${categories.supplier_unmatched})</button>` : ''}
+        ${categories.supplier_unmatched > 0 ? `<button class="pill ${filterCat==='supplier_unmatched'?'active':''}" data-cat="supplier_unmatched" style="--pill-color:var(--warn)">💰 PP รอ Paid (${categories.supplier_unmatched})</button>` : ''}
         ${categories.debt > 0 ? `<button class="pill ${filterCat==='debt'?'active':''}" data-cat="debt" style="--pill-color:var(--warn)">📋 หนี้ค้าง (${categories.debt})</button>` : ''}
         ${categories.cheque > 0 ? `<button class="pill ${filterCat==='cheque'?'active':''}" data-cat="cheque" style="--pill-color:var(--danger)">🟡 เช็ค (${categories.cheque})</button>` : ''}
         ${categories.sp_temp > 0 ? `<button class="pill ${filterCat==='sp_temp'?'active':''}" data-cat="sp_temp" style="--pill-color:var(--info)">🔷 SP ชั่วคราว (${categories.sp_temp})</button>` : ''}
