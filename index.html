@@ -1547,6 +1547,30 @@ window.buildCompactMetaRows = function(filterDates) {
   // filterDates: Set<string> of dateISO ('yyyy-mm-dd') — if provided, only build rows for these dates
   //              If undefined/null/empty Set → build all (full push fallback)
   const useFilter = filterDates && typeof filterDates.has === 'function' && filterDates.size > 0;
+  
+  // ⭐ Ghost-rows guard: ห้าม push date ที่ > today (อนาคต) เพื่อกัน junk data จาก version เก่า
+  //   เคยพบ ghost rows ในเดือน 5-12 (cashIn=5155 ทุกวัน — default ที่ seed จาก version เก่า)
+  //   user มีข้อมูลจริงแค่ ม.ค. - วันนี้ → ลบ keys อนาคตจาก local + ไม่ push ขึ้น cloud
+  const todayISOStr = (function() {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+  })();
+  // Allow up to 3 days in future (for slight clock drift / pre-entry)
+  const maxAllowedDate = (function() {
+    const d = new Date();
+    d.setDate(d.getDate() + 3);
+    return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+  })();
+  
+  const isValidBusinessDate = (dateISO) => {
+    if (!dateISO || typeof dateISO !== 'string') return false;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateISO)) return false;
+    if (dateISO > maxAllowedDate) return false;  // future-date guard
+    // Lower bound: 2020 (sanity check, prevents Date(0)=1970 leak)
+    if (dateISO < '2020-01-01') return false;
+    return true;
+  };
+  
   const LABEL_TO_KEY = {
     'นำเงินเข้า': 'cashIn', 'ยอดขาย': 'sales', 'นำเงินออก': 'cashOut',
     'ยอดคืนสินค้า': 'returns', 'Cash Drawer': 'cashDrawer',
@@ -1555,12 +1579,15 @@ window.buildCompactMetaRows = function(filterDates) {
   const nowStr = (typeof nowDisplay === 'function') ? nowDisplay() : new Date().toLocaleString('th-TH');
   const user = (window.currentUser && window.currentUser.display_name) || 'Admin';
   const rows = [];
+  let skippedFuture = 0;
   
   // ⭐ ไม่ filter Sunday — user อนุญาตให้กรอกข้อมูลวันอาทิตย์ได้
   
   if (mainSummary && mainSummary.__byDate) {
     Object.keys(mainSummary.__byDate).forEach(function(dateISO) {
       if (useFilter && !filterDates.has(dateISO)) return;
+      // ⭐ Future-date guard
+      if (!isValidBusinessDate(dateISO)) { skippedFuture++; return; }
       const dayLabels = mainSummary.__byDate[dateISO] || {};
       const flat = {};
       Object.keys(dayLabels).forEach(function(label) {
@@ -1588,6 +1615,8 @@ window.buildCompactMetaRows = function(filterDates) {
   if (cashCount && cashCount.__byDate) {
     Object.keys(cashCount.__byDate).forEach(function(dateISO) {
       if (useFilter && !filterDates.has(dateISO)) return;
+      // ⭐ Future-date guard
+      if (!isValidBusinessDate(dateISO)) { skippedFuture++; return; }
       const dayCash = cashCount.__byDate[dateISO] || {};
       const filtered = {};
       Object.keys(dayCash).forEach(function(k) {
@@ -1616,6 +1645,10 @@ window.buildCompactMetaRows = function(filterDates) {
         updated_by: user,
       });
     });
+  }
+  
+  if (skippedFuture > 0) {
+    console.warn(`[buildCompactMetaRows] skipped ${skippedFuture} future/invalid dates (won't push to cloud)`);
   }
   return rows;
 };
@@ -3599,6 +3632,43 @@ async function restoreMainState() {
       uploadedStatements = getAllStatements();
     }
   } catch (e) { console.warn('Could not restore state:', e); }
+  
+  // ⭐ Purge ghost dates in __byDate — ลบ dates อนาคต/ผิด format ที่อาจค้างจาก version เก่า
+  //   (เคยพบ ghost rows ในเดือน 5-12 ที่ cashIn=5155 ทุกวัน — default จาก version เก่า)
+  {
+    const todayPlus3 = (function() {
+      const d = new Date();
+      d.setDate(d.getDate() + 3); // เผื่อ pre-entry 3 วัน
+      return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+    })();
+    const isValidISO = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
+    const isInWindow = (s) => isValidISO(s) && s >= '2020-01-01' && s <= todayPlus3;
+    
+    let purgedSummary = 0, purgedCash = 0;
+    if (mainSummary && mainSummary.__byDate) {
+      Object.keys(mainSummary.__byDate).forEach(d => {
+        if (!isInWindow(d)) {
+          delete mainSummary.__byDate[d];
+          purgedSummary++;
+        }
+      });
+    }
+    if (cashCount && cashCount.__byDate) {
+      Object.keys(cashCount.__byDate).forEach(d => {
+        if (!isInWindow(d)) {
+          delete cashCount.__byDate[d];
+          purgedCash++;
+        }
+      });
+    }
+    if (purgedSummary + purgedCash > 0) {
+      console.warn(`[purge ghost] removed future/invalid dates: summary=${purgedSummary}, cashCount=${purgedCash}`);
+      // Persist purge — กัน sync push ghost dates กลับขึ้น cloud
+      try { 
+        if (typeof persistMainState === 'function') persistMainState(); 
+      } catch(e) {}
+    }
+  }
   
   // ── Bank field = USER MANUAL ENTRY ──
   // ไม่แตะข้อมูล user อัตโนมัติ (เคย clear สำหรับ SP/SC/JS/JR แต่ทำให้ข้อมูลหาย)
@@ -14376,6 +14446,17 @@ async function loadMetaFromBackend() {
     var now = new Date();
     var years = [String(now.getFullYear()), String(now.getFullYear() - 1)];
     
+    // ⭐ Future-date guard: ไม่ import ghost rows จาก cloud (date > today + 3)
+    var _maxAllowedDate = (function() {
+      var d = new Date();
+      d.setDate(d.getDate() + 3);
+      return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+    })();
+    var _isValidBusinessDate = function(s) {
+      return typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s) && s >= '2020-01-01' && s <= _maxAllowedDate;
+    };
+    var _skipped = 0;
+    
     for (var y of years) {
       var res = await api('getMetaWithUuid', { year: y });
       if (!res || !res.success || !Array.isArray(res.data?.rows)) continue;
@@ -14387,6 +14468,7 @@ async function loadMetaFromBackend() {
       if (parsed.summary && parsed.summary.__byDate) {
         if (!mainSummary.__byDate) mainSummary.__byDate = {};
         Object.keys(parsed.summary.__byDate).forEach(function(dateISO) {
+          if (!_isValidBusinessDate(dateISO)) { _skipped++; return; }
           if (!mainSummary.__byDate[dateISO]) {
             mainSummary.__byDate[dateISO] = parsed.summary.__byDate[dateISO];
           }
@@ -14397,6 +14479,7 @@ async function loadMetaFromBackend() {
       if (parsed.cashCount && parsed.cashCount.__byDate) {
         if (!cashCount.__byDate) cashCount.__byDate = {};
         Object.keys(parsed.cashCount.__byDate).forEach(function(dateISO) {
+          if (!_isValidBusinessDate(dateISO)) { _skipped++; return; }
           if (!cashCount.__byDate[dateISO]) {
             cashCount.__byDate[dateISO] = parsed.cashCount.__byDate[dateISO];
           } else {
@@ -14417,6 +14500,8 @@ async function loadMetaFromBackend() {
         });
       }
     }
+    
+    if (_skipped > 0) console.warn('[loadMetaFromBackend] skipped ' + _skipped + ' future/invalid dates from cloud');
     
     persistMainState();
     // Re-render ถ้าอยู่หน้า Main
@@ -18753,6 +18838,14 @@ function renderData(el) {
         // 6) Meta (summary + cashCount) — ⭐ ใช้ new schema เท่านั้น (meta_uuid + data_json)
         try {
           statusEl.textContent = 'กำลังดึง Daily Summary...';
+          // ⭐ Future-date guard: don't import ghost rows from cloud
+          const _maxAllowedDate = (function() {
+            const d = new Date();
+            d.setDate(d.getDate() + 3);
+            return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+          })();
+          const _isValidBusinessDate = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s) && s >= '2020-01-01' && s <= _maxAllowedDate;
+          let _skipFutureMeta = 0;
           for (const y of years) {
             const r = await api('getMetaWithUuid', { year: y });
             if (r?.success && Array.isArray(r.data?.rows) && r.data.rows.length > 0 && typeof window.parseCompactMetaRows === 'function') {
@@ -18760,17 +18853,20 @@ function renderData(el) {
               if (parsed.summary?.__byDate) {
                 if (!mainSummary.__byDate) mainSummary.__byDate = {};
                 Object.entries(parsed.summary.__byDate).forEach(([d, v]) => {
+                  if (!_isValidBusinessDate(d)) { _skipFutureMeta++; return; }
                   if (!mainSummary.__byDate[d]) { mainSummary.__byDate[d] = v; stats.meta++; }
                 });
               }
               if (parsed.cashCount?.__byDate) {
                 if (!cashCount.__byDate) cashCount.__byDate = {};
                 Object.entries(parsed.cashCount.__byDate).forEach(([d, v]) => {
+                  if (!_isValidBusinessDate(d)) { _skipFutureMeta++; return; }
                   if (!cashCount.__byDate[d]) cashCount.__byDate[d] = v;
                 });
               }
             }
           }
+          if (_skipFutureMeta > 0) console.warn(`[sync] skipped ${_skipFutureMeta} future/invalid meta dates from cloud`);
         } catch(err) { stats.errors.push(`Meta: ${err.message}`); }
         
         // Persist + refresh
