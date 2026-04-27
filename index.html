@@ -8993,6 +8993,49 @@ function spTempAddPartialWithCarryover(t, partial, options) {
   return { rolled: true, extra: extra, nextSb: nextSb, carryover: carryover };
 }
 window.spTempAddPartialWithCarryover = spTempAddPartialWithCarryover;
+
+// ⭐ หา partials ที่อยู่ใน carryover chain เดียวกัน
+//    Used for: match กับ stmt เดียว (เช่น โอน 70k → split เป็น 2 partials → match 1 stmt 70k)
+function spTempFindPartialChain(t, partial) {
+  if (!partial) return [];
+  const chain = new Map();
+  const partials = t.partials || [];
+  
+  // BFS แบบ undirected — เริ่มจาก partial ใด ๆ ก็ตาม → BFS ทั้ง parent และ children
+  const queue = [partial];
+  while (queue.length) {
+    const cur = queue.shift();
+    if (!cur || chain.has(cur.partial_uuid)) continue;
+    chain.set(cur.partial_uuid, cur);
+    // Parent (rolled_from_partial_uuid)
+    if (cur.rolled_from_partial_uuid) {
+      const parent = partials.find(x => x.partial_uuid === cur.rolled_from_partial_uuid);
+      if (parent && !chain.has(parent.partial_uuid)) queue.push(parent);
+    }
+    // Children (anyone whose rolled_from_partial_uuid === cur.partial_uuid)
+    partials.forEach(x => {
+      if (x.rolled_from_partial_uuid === cur.partial_uuid && !chain.has(x.partial_uuid)) {
+        queue.push(x);
+      }
+    });
+  }
+  
+  // Fallback: ถ้า rolled_from_partial_uuid ถูก strip จาก backend round-trip
+  //   ลอง match ด้วย signature: pay_date + type + bank + confirmation
+  if (chain.size === 1 && /🔄\s*ยกมาจาก/.test(partial.remarks1||'')) {
+    const sig = (p) => `${p.pay_date||''}|${p.type||''}|${p.bank||''}|${p.confirmation||''}`;
+    const targetSig = sig(partial);
+    if (partial.confirmation || partial.bank) {
+      partials.forEach(x => {
+        if (chain.has(x.partial_uuid)) return;
+        if (sig(x) === targetSig) chain.set(x.partial_uuid, x);
+      });
+    }
+  }
+  
+  return Array.from(chain.values());
+}
+window.spTempFindPartialChain = spTempFindPartialChain;
 window.spTempSBPending = spTempSBPending;
 
 function spTempSBRemaining(t, sb_no) {
@@ -9491,23 +9534,51 @@ function wireSpTempV2Events(container, renderFn) {
       const partialUuid = btn.dataset.partial;
       const partial = _findPartialByUuid(no, partialUuid);
       if (!partial) return;
-      if (!confirm('Unlink ออกจาก stmt?')) return;
-      // Cleanup stmt-side
-      if (partial.matched_stmt_uuid && typeof getAllStatements === 'function') {
-        const stmt = getAllStatements().find(s => s.stmt_uuid === partial.matched_stmt_uuid);
-        if (stmt) {
+      
+      // หา stmt + ตรวจว่ามี partial อื่นในกลุ่มมั้ย
+      const stmt = (partial.matched_stmt_uuid && typeof getAllStatements === 'function')
+        ? getAllStatements().find(s => s.stmt_uuid === partial.matched_stmt_uuid) : null;
+      const t = spTempList.find(x => x.no === no);
+      const linkedKeys = stmt && Array.isArray(stmt.matched_bills) ? stmt.matched_bills : [];
+      const sharedPartials = (t?.partials||[]).filter(p => p.matched_stmt_uuid === partial.matched_stmt_uuid);
+      const isMulti = sharedPartials.length > 1;
+      
+      let unlinkAll = false;
+      if (isMulti) {
+        const ans = confirm(`Stmt นี้ผูกอยู่กับ ${sharedPartials.length} partials\n\n[OK] = unlink ทั้งหมด (${sharedPartials.length} partials)\n[Cancel] = unlink เฉพาะ partial นี้ (เก็บอันอื่นไว้)`);
+        unlinkAll = ans;
+      } else {
+        if (!confirm('Unlink ออกจาก stmt?')) return;
+        unlinkAll = true;
+      }
+      
+      const partialsToUnlink = unlinkAll ? sharedPartials : [partial];
+      const removedKeys = partialsToUnlink.map(p => `${no}|${p.sb_no||''}|${p.partial_uuid}`);
+      
+      partialsToUnlink.forEach(p => {
+        p.matched_stmt_uuid = '';
+        p.match_status = 'unpaid';
+      });
+      
+      // Update stmt-side
+      if (stmt) {
+        const remainingKeys = linkedKeys.filter(k => !removedKeys.includes(k));
+        if (remainingKeys.length === 0) {
+          // No partials left → fully unlink stmt
           stmt.match_status = 'unpaid';
           stmt.match_station = '';
           stmt.match_bill = '';
           stmt.matched_bills = [];
-          if (window.syncManager) syncManager.markDirty('stmts');
+        } else {
+          stmt.matched_bills = remainingKeys;
+          stmt.match_bill = remainingKeys[0];
         }
+        if (window.syncManager) syncManager.markDirty('stmts');
       }
-      partial.matched_stmt_uuid = '';
-      partial.match_status = 'unpaid';
-      const t = spTempList.find(x => x.no === no);
+      
       if (t) {
         t.updated_at = new Date().toISOString();
+        recomputeSpTempStatus(t);
         markDirtySpTemps();
       }
       renderFn && renderFn();
@@ -10204,142 +10275,265 @@ function openSpTempPartialMatchModal(no, partialUuid, onChange) {
   const pr = _findPartialByUuid(no, partialUuid);
   if (!pr) { toast('ไม่พบ partial', 'warn'); return; }
   
-  const prAmt = Math.abs(Number(pr.amount)||0);
-  const prDateISO = toISODate(pr.pay_date);
-  const prBank = String(pr.bank||'').toUpperCase();
+  // ⭐ Auto-detect chain — partials ที่เกิดจากการโอนเดียวกัน (carryover)
+  const chain = spTempFindPartialChain(t, pr);
+  const chainUuids = new Set(chain.map(p => p.partial_uuid));
+  // Initial selection: all chain members (default match-as-chain)
+  const selected = new Set(chainUuids);
   
   const allStmts = (typeof getAllStatements === 'function') ? getAllStatements() : [];
-  const candidates = allStmts.filter(s => {
-    if (s.match_status === 'paid') return false;
-    const sAmt = Math.abs(Number(s.amount)||0);
-    if (Math.abs(sAmt - prAmt) > 0.01) return false;
-    if (Number(s.amount) < 0) return false; // partial = income → stmt must be +
-    if (prDateISO) {
-      const sDateISO = toISODate(s.date);
-      if (sDateISO) {
-        const diff = Math.abs((new Date(prDateISO) - new Date(sDateISO)) / 86400000);
-        if (diff > 3) return false;
-      }
-    }
-    return true;
-  });
+  let filterMode = 'matching'; // 'matching' | 'all'
   
-  candidates.forEach(s => {
-    let score = 0;
-    if (prBank && String(s.bank||'').toUpperCase() === prBank) score += 200;
-    else if (prBank && String(s.bank||'').toUpperCase().includes(prBank)) score += 100;
-    if (toISODate(s.date) === prDateISO) score += 50;
-    s._matchScore = score;
-  });
-  candidates.sort((a, b) => (b._matchScore||0) - (a._matchScore||0));
+  function calcSelectedTotal() {
+    let total = 0;
+    selected.forEach(u => {
+      const p = (t.partials||[]).find(x => x.partial_uuid === u);
+      if (p) total += Math.abs(Number(p.amount)||0);
+    });
+    return total;
+  }
   
-  let showAll = false;
+  function selectedDateRange() {
+    const dates = [];
+    selected.forEach(u => {
+      const p = (t.partials||[]).find(x => x.partial_uuid === u);
+      if (p?.pay_date) dates.push(toISODate(p.pay_date));
+    });
+    return dates.filter(Boolean);
+  }
   
-  function renderList() {
-    const list = showAll 
-      ? allStmts.filter(s => s.match_status !== 'paid' && Number(s.amount) > 0)
-                .sort((a,b) => Math.abs(Math.abs(Number(a.amount)||0) - prAmt) - Math.abs(Math.abs(Number(b.amount)||0) - prAmt))
-                .slice(0, 50)
-      : candidates;
+  function selectedBanks() {
+    const banks = new Set();
+    selected.forEach(u => {
+      const p = (t.partials||[]).find(x => x.partial_uuid === u);
+      if (p?.bank) banks.add(String(p.bank).toUpperCase());
+    });
+    return banks;
+  }
+  
+  function getCandidateStmts() {
+    const target = calcSelectedTotal();
+    if (target <= 0) return [];
+    const dates = selectedDateRange();
+    const banks = selectedBanks();
     
-    const listHtml = list.length === 0 ? `
-      <div style="padding:20px;text-align:center;color:var(--text2)">
-        ไม่เจอ statement ที่ตรงยอด ${fmtNum(prAmt)} ± 3 วัน<br>
-        <button class="btn btn-outline btn-xs mt-2" id="epr-show-all">ดู statement ทั้งหมดที่ยังไม่ match</button>
-      </div>
-    ` : list.map(s => {
+    let list = allStmts.filter(s => {
+      if (s.match_status === 'paid') return false;
+      if (Number(s.amount) <= 0) return false; // income only
       const sAmt = Math.abs(Number(s.amount)||0);
-      const diff = sAmt - prAmt;
-      const diffClass = Math.abs(diff) < 0.01 ? 'success' : 'warn';
+      if (filterMode === 'matching') {
+        if (Math.abs(sAmt - target) > 0.01) return false;
+        if (dates.length) {
+          const sDate = toISODate(s.date);
+          if (sDate) {
+            const minDiff = Math.min(...dates.map(d => Math.abs((new Date(sDate) - new Date(d)) / 86400000)));
+            if (minDiff > 7) return false;
+          }
+        }
+      }
+      return true;
+    });
+    
+    list.forEach(s => {
+      let score = 0;
+      if (Math.abs(Math.abs(Number(s.amount)||0) - target) < 0.01) score += 500;
+      if (banks.size && banks.has(String(s.bank||'').toUpperCase())) score += 200;
+      if (dates.length && dates.includes(toISODate(s.date))) score += 50;
+      s._matchScore = score;
+    });
+    list.sort((a,b) => (b._matchScore||0) - (a._matchScore||0));
+    return list.slice(0, 50);
+  }
+  
+  // Get all unmatched partials in this SP-TEMP (sorted: chain-related first, then by date)
+  const allUnmatchedPartials = (t.partials||[]).filter(p => !p.matched_stmt_uuid).sort((a,b) => {
+    const aChain = chainUuids.has(a.partial_uuid) ? 0 : 1;
+    const bChain = chainUuids.has(b.partial_uuid) ? 0 : 1;
+    if (aChain !== bChain) return aChain - bChain;
+    return String(a.pay_date||'').localeCompare(String(b.pay_date||''));
+  });
+  
+  function renderPartialsList() {
+    const container = document.getElementById('mm-partials-list');
+    if (!container) return;
+    container.innerHTML = allUnmatchedPartials.map(p => {
+      const isChain = chainUuids.has(p.partial_uuid);
+      const isClicked = p.partial_uuid === partialUuid;
+      const checked = selected.has(p.partial_uuid);
+      const isCarryover = !!p.rolled_from_sb || /^🔄\s*ยกมาจาก/.test(p.remarks1||'');
       return `
-        <div class="epr-stmt-row" data-uuid="${s.stmt_uuid||''}" style="padding:10px;border-bottom:1px solid var(--border);cursor:pointer;display:flex;gap:10px;align-items:center" onmouseenter="this.style.background='var(--bg2)'" onmouseleave="this.style.background=''">
+        <label class="mm-partial-row" style="display:flex;align-items:center;gap:8px;padding:6px 8px;border-bottom:0.5px solid var(--border);cursor:pointer;${isChain?'background:rgba(59,130,246,.04)':''}">
+          <input type="checkbox" class="mm-pcheck" data-uuid="${p.partial_uuid}" ${checked?'checked':''}>
+          <span style="font-family:var(--mono);font-weight:600;color:var(--success);min-width:90px">฿${fmtNum(p.amount)}</span>
+          <span style="font-size:.7rem;min-width:65px">${p.type||'-'}</span>
+          <span style="color:var(--text2);font-size:.7rem;min-width:90px">${fmtDate(p.pay_date)}</span>
+          <span style="font-size:.7rem;min-width:60px">${p.bank||'-'}</span>
+          <span style="flex:1;color:var(--text3);font-size:.68rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+            SB ${p.sb_no||'(none)'} ${isCarryover?'· 🔄':''} ${isClicked?'· 👆':''}
+          </span>
+        </label>
+      `;
+    }).join('');
+    container.querySelectorAll('.mm-pcheck').forEach(cb => {
+      cb.addEventListener('change', e => {
+        const u = cb.dataset.uuid;
+        if (cb.checked) selected.add(u); else selected.delete(u);
+        updateSummary();
+        renderStmtsList();
+      });
+    });
+  }
+  
+  function updateSummary() {
+    const total = calcSelectedTotal();
+    const cnt = selected.size;
+    const sumEl = document.getElementById('mm-sum');
+    if (sumEl) sumEl.innerHTML = `เลือก <b>${cnt} partial</b> · รวม <b style="color:var(--success);font-size:1.1em">฿${fmtNum(total)}</b>`;
+  }
+  
+  function renderStmtsList() {
+    const list = getCandidateStmts();
+    const container = document.getElementById('mm-stmts-list');
+    if (!container) return;
+    
+    if (selected.size === 0) {
+      container.innerHTML = '<div style="padding:20px;text-align:center;color:var(--text2)">เลือก partial ก่อน</div>';
+      return;
+    }
+    
+    if (list.length === 0) {
+      container.innerHTML = `
+        <div style="padding:20px;text-align:center;color:var(--text2)">
+          ${filterMode === 'matching' ? `ไม่เจอ statement ที่ยอดตรง ฿${fmtNum(calcSelectedTotal())} ± 7 วัน` : 'ไม่มี statement ที่ยังไม่ match'}
+        </div>
+      `;
+      return;
+    }
+    
+    const target = calcSelectedTotal();
+    container.innerHTML = list.map(s => {
+      const sAmt = Math.abs(Number(s.amount)||0);
+      const diff = sAmt - target;
+      const exact = Math.abs(diff) < 0.01;
+      const dates = selectedDateRange();
+      const sameDate = dates.length && dates.includes(toISODate(s.date));
+      return `
+        <div class="mm-stmt-row" data-uuid="${s.stmt_uuid||''}" style="padding:10px;border-bottom:1px solid var(--border);cursor:pointer;display:flex;gap:10px;align-items:center" onmouseenter="this.style.background='var(--bg2)'" onmouseleave="this.style.background=''">
           <div style="flex:1;font-size:.82rem">
             <div class="flex gap-2 items-center" style="flex-wrap:wrap">
               <span class="badge badge-info" style="font-size:.65rem">${s.bank||'-'}</span>
               <span style="color:var(--text)">${fmtDate(s.date)} ${s.time||''}</span>
-              ${toISODate(s.date) === prDateISO ? '<span class="badge badge-success" style="font-size:.6rem">วันเดียวกัน</span>' : ''}
+              ${sameDate ? '<span class="badge badge-success" style="font-size:.6rem">วันเดียวกัน</span>' : ''}
+              ${exact ? '<span class="badge badge-success" style="font-size:.6rem">ยอดตรง</span>' : ''}
             </div>
-            <div class="text-xs" style="font-family:monospace;margin-top:2px;color:var(--text2)">${(s.ref_no||'').substring(0,50)}</div>
-            ${s.description ? `<div class="text-xs text-muted">${String(s.description).substring(0,60)}</div>` : ''}
+            <div class="text-xs" style="font-family:monospace;margin-top:2px;color:var(--text2)">${(s.ref_no||'').substring(0,60)}</div>
+            ${s.description ? `<div class="text-xs text-muted" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${String(s.description).substring(0,80)}</div>` : ''}
           </div>
           <div style="text-align:right;white-space:nowrap">
-            <div style="font-weight:700;color:var(--success);font-size:.9rem">฿${fmtNum(sAmt)}</div>
-            ${Math.abs(diff) > 0.01 ? `<div class="text-xs" style="color:var(--${diffClass})">${diff > 0 ? '+' : ''}${fmtNum(diff)}</div>` : '<div class="text-xs" style="color:var(--success)">ตรง</div>'}
+            <div style="font-weight:700;color:var(--success);font-size:.95rem">฿${fmtNum(sAmt)}</div>
+            ${exact ? '<div class="text-xs" style="color:var(--success)">✓ ตรง</div>' : `<div class="text-xs" style="color:var(--warn)">${diff>0?'+':''}${fmtNum(diff)}</div>`}
           </div>
         </div>
       `;
     }).join('');
     
-    const container = document.getElementById('epr-stmt-list');
-    if (container) container.innerHTML = listHtml;
-    
-    document.querySelectorAll('.epr-stmt-row').forEach(row => {
+    container.querySelectorAll('.mm-stmt-row').forEach(row => {
       row.addEventListener('click', () => {
+        if (selected.size === 0) return;
         const stmtUuid = row.dataset.uuid;
         const stmt = allStmts.find(s => s.stmt_uuid === stmtUuid);
         if (!stmt) return;
-        
-        // Apply match — use matched_stmt_uuid (NOT stmt_ref)
-        pr.matched_stmt_uuid = stmt.stmt_uuid;
-        pr.match_status = 'paid';
-        if (!pr.bank && stmt.bank) pr.bank = stmt.bank;
-        
-        // Stmt side — composite key: SP-TEMP-XXXX|sb_no|partial_uuid
-        const sbNo = String(pr.sb_no || '').trim();
-        stmt.match_status = 'paid';
-        stmt.match_station = 'SP-TEMP';
-        stmt.match_bill = `${no}|${sbNo}|${partialUuid}`;
-        stmt.matched_bills = [`${no}|${sbNo}|${partialUuid}`];
-        stmt.match_method = 'manual_sp_temp';
-        stmt.matched_at = new Date().toISOString();
-        
-        t.updated_at = new Date().toISOString();
-        recomputeSpTempStatus(t);
-        markDirtySpTemps();
-        if (window.syncManager) syncManager.markDirty('stmts');
-        closeModal();
-        toast(`✓ ผูกกับ ${stmt.bank} ${fmtDate(stmt.date)}`, 'success');
-        if (onChange) onChange();
+        doMatch(stmt);
       });
-    });
-    
-    document.getElementById('epr-show-all')?.addEventListener('click', () => {
-      showAll = true;
-      renderList();
     });
   }
   
+  function doMatch(stmt) {
+    const target = calcSelectedTotal();
+    const stmtAmt = Math.abs(Number(stmt.amount)||0);
+    const exact = Math.abs(stmtAmt - target) < 0.01;
+    
+    if (!exact) {
+      if (!confirm(`ยอดต่างกัน:\n• Statement: ฿${fmtNum(stmtAmt)}\n• Partials รวม: ฿${fmtNum(target)}\n• ต่าง: ฿${fmtNum(stmtAmt - target)}\n\nยืนยัน match?`)) return;
+    }
+    
+    // Apply match to all selected partials
+    const matchedKeys = [];
+    selected.forEach(u => {
+      const p = (t.partials||[]).find(x => x.partial_uuid === u);
+      if (!p) return;
+      p.matched_stmt_uuid = stmt.stmt_uuid;
+      p.match_status = 'paid';
+      if (!p.bank && stmt.bank) p.bank = stmt.bank;
+      matchedKeys.push(`${no}|${p.sb_no||''}|${u}`);
+    });
+    
+    // Stmt side — array of all matched partial keys
+    stmt.match_status = 'paid';
+    stmt.match_station = 'SP-TEMP';
+    stmt.match_bill = matchedKeys[0] || '';
+    stmt.matched_bills = matchedKeys;
+    stmt.match_method = matchedKeys.length > 1 ? 'manual_sp_temp_chain' : 'manual_sp_temp';
+    stmt.matched_at = new Date().toISOString();
+    
+    t.updated_at = new Date().toISOString();
+    recomputeSpTempStatus(t);
+    markDirtySpTemps();
+    if (window.syncManager) syncManager.markDirty('stmts');
+    closeModal();
+    toast(`✓ ผูก ${matchedKeys.length} partial → ${stmt.bank} ${fmtDate(stmt.date)} ฿${fmtNum(stmtAmt)}`, 'success');
+    if (onChange) onChange();
+  }
+  
   const sbLabel = String(pr.sb_no || '').trim() || 'unassigned';
-  openModal(`🔍 หา Statement สำหรับ Partial`, `
-    <div style="min-width:560px;max-width:700px">
+  const isMultiChain = chain.length > 1;
+  
+  openModal(`🔍 Match Partial → Statement`, `
+    <div style="min-width:680px;max-width:820px">
       <div style="padding:10px;background:var(--bg2);border-radius:6px;font-size:.83rem;margin-bottom:10px">
-        <div class="flex justify-between">
-          <div><b>${no}</b> · ${t.customer || t.cust_name || '-'} · <span style="color:var(--text2)">SB ${sbLabel}</span></div>
-          <div><b style="color:var(--success)">฿${fmtNum(prAmt)}</b> · ${fmtDate(pr.pay_date)} · ${pr.bank||'ไม่ระบุ bank'}</div>
+        <div><b>${no}</b> · ${t.customer || t.cust_name || '-'}</div>
+        ${isMultiChain ? `
+          <div style="margin-top:6px;padding:6px 8px;background:rgba(59,130,246,.08);border-left:3px solid var(--info);border-radius:3px;font-size:.78rem">
+            🔄 <b>Carryover chain</b> ${chain.length} partials — เลือกได้หลายตัวเพื่อ match กับ stmt เดียว
+          </div>
+        ` : ''}
+      </div>
+      
+      <!-- Partials section -->
+      <div style="margin-bottom:10px">
+        <div class="flex justify-between items-center mb-1">
+          <div style="font-size:.75rem;font-weight:500">Partials ที่จะ match (${allUnmatchedPartials.length} ที่ยังว่าง)</div>
+          <div id="mm-sum" style="font-size:.78rem;color:var(--text2)"></div>
         </div>
+        <div id="mm-partials-list" style="max-height:200px;overflow-y:auto;border:1px solid var(--border);border-radius:5px"></div>
       </div>
-      <div class="flex justify-between items-center mb-2">
-        <div class="text-xs text-dim">
-          Statements ที่ยอดตรง ${fmtNum(prAmt)} ± 3 วัน
+      
+      <!-- Statements section -->
+      <div>
+        <div class="flex justify-between items-center mb-1">
+          <div style="font-size:.75rem;font-weight:500">Statements ที่ตรงยอด</div>
+          <button class="btn btn-ghost btn-xs" id="mm-toggle-filter" style="font-size:.7rem">ดูทั้งหมด</button>
         </div>
-        <button class="btn btn-ghost btn-xs" id="epr-show-all-top" style="font-size:.7rem">ดูทั้งหมดที่ยอดตรง</button>
+        <div id="mm-stmts-list" style="max-height:280px;overflow-y:auto;border:1px solid var(--border);border-radius:5px"></div>
       </div>
-      <div id="epr-stmt-list" style="max-height:400px;overflow-y:auto;border:1px solid var(--border);border-radius:6px">
-        <div style="padding:20px;text-align:center;color:var(--text2)">กำลังโหลด...</div>
-      </div>
+      
       <div class="flex gap-2 mt-3">
         <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ยกเลิก</button>
       </div>
     </div>
   `);
   
-  document.getElementById('epr-show-all-top')?.addEventListener('click', () => {
-    showAll = !showAll;
-    document.getElementById('epr-show-all-top').textContent = showAll ? '← ดูเฉพาะที่ใกล้เคียง' : 'ดูทั้งหมดที่ยอดตรง';
-    renderList();
+  document.getElementById('mm-toggle-filter')?.addEventListener('click', () => {
+    filterMode = filterMode === 'matching' ? 'all' : 'matching';
+    document.getElementById('mm-toggle-filter').textContent = filterMode === 'matching' ? 'ดูทั้งหมด' : '← เฉพาะที่ยอดตรง';
+    renderStmtsList();
   });
   
-  setTimeout(renderList, 50);
+  setTimeout(() => {
+    renderPartialsList();
+    updateSummary();
+    renderStmtsList();
+  }, 30);
 }
 
 // Modal: Create new SP-TEMP
