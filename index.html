@@ -1555,10 +1555,10 @@ window.buildCompactMetaRows = function(filterDates) {
     const d = new Date();
     return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
   })();
-  // Allow up to 3 days in future (for slight clock drift / pre-entry)
+  // Allow up to 1 year in future (รองรับ pre-entry/planning + clock drift)
   const maxAllowedDate = (function() {
     const d = new Date();
-    d.setDate(d.getDate() + 3);
+    d.setDate(d.getDate() + 365);
     return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
   })();
   
@@ -2545,7 +2545,9 @@ const syncManager = {
       const hasStmts = getAllStatements().length > 0;
       const hasMeta = Object.keys(mainSummary?.__byDate || {}).length > 0;
       const hasLocalData = hasEnoughBills && hasStmts && hasMeta;
-      const lastPullRecent = Date.now() - this.lastPullAt < 30 * 60 * 1000; // 30 min
+      // ⭐ 2 min — multi-device sync: ถ้า user เปิดหลายเครื่อง → pull ข้อมูลใหม่บ่อยพอ
+      //    เดิม 30 min → เครื่องอื่นแก้แล้วจะไม่ pull ทันที → "ไม่มีอะไรเปลี่ยนแปลง"
+      const lastPullRecent = Date.now() - this.lastPullAt < 2 * 60 * 1000;
       if (hasLocalData && lastPullRecent) {
         return { skipped: 'has_local_and_recent' };
       }
@@ -3740,14 +3742,15 @@ async function restoreMainState() {
   
   // ⭐ Purge ghost dates in __byDate — ลบ dates อนาคต/ผิด format ที่อาจค้างจาก version เก่า
   //   (เคยพบ ghost rows ในเดือน 5-12 ที่ cashIn=5155 ทุกวัน — default จาก version เก่า)
+  //   ⭐ Window: today + 365 days (รองรับ pre-entry/planning ทั้งปี)
   {
-    const todayPlus3 = (function() {
+    const todayPlus365 = (function() {
       const d = new Date();
-      d.setDate(d.getDate() + 3); // เผื่อ pre-entry 3 วัน
+      d.setDate(d.getDate() + 365); // รองรับ pre-entry/planning 1 ปี
       return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
     })();
     const isValidISO = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
-    const isInWindow = (s) => isValidISO(s) && s >= '2020-01-01' && s <= todayPlus3;
+    const isInWindow = (s) => isValidISO(s) && s >= '2020-01-01' && s <= todayPlus365;
     
     let purgedSummary = 0, purgedCash = 0;
     if (mainSummary && mainSummary.__byDate) {
@@ -14943,10 +14946,10 @@ async function loadMetaFromBackend() {
     var now = new Date();
     var years = [String(now.getFullYear()), String(now.getFullYear() - 1)];
     
-    // ⭐ Future-date guard: ไม่ import ghost rows จาก cloud (date > today + 3)
+    // ⭐ Future-date guard: ไม่ import ghost rows จาก cloud — window 1 ปี (รองรับ planning)
     var _maxAllowedDate = (function() {
       var d = new Date();
-      d.setDate(d.getDate() + 3);
+      d.setDate(d.getDate() + 365);
       return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
     })();
     var _isValidBusinessDate = function(s) {
@@ -19410,10 +19413,10 @@ function renderData(el) {
         // 6) Meta (summary + cashCount) — ⭐ ใช้ new schema เท่านั้น (meta_uuid + data_json)
         try {
           statusEl.textContent = 'กำลังดึง Daily Summary...';
-          // ⭐ Future-date guard: don't import ghost rows from cloud
+          // ⭐ Future-date guard: don't import ghost rows from cloud — window 1 ปี (รองรับ planning)
           const _maxAllowedDate = (function() {
             const d = new Date();
-            d.setDate(d.getDate() + 3);
+            d.setDate(d.getDate() + 365);
             return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
           })();
           const _isValidBusinessDate = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s) && s >= '2020-01-01' && s <= _maxAllowedDate;
