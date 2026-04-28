@@ -20498,6 +20498,27 @@ function renderData(el) {
         </p>
       </div>
       
+      <!-- Match Integrity Repair Section -->
+      <div class="card mb-3" style="border:1.5px solid var(--info);background:rgba(91,124,250,.04)">
+        <div class="flex justify-between items-center mb-3">
+          <div>
+            <div class="font-semi" style="color:var(--info)">🔗 ตรวจสอบความตรงกัน Match (Bill ↔ Statement)</div>
+            <div class="text-xs text-muted mt-1">
+              ใช้เมื่อ <strong>ข้อมูลใน Sheet ไม่ตรงกัน</strong> เช่น bill says "paid" แต่ stmt says "unpaid"<br>
+              เกิดจาก match/unmatch ครั้งเก่าที่ push ไม่ครบ → ฝั่งหนึ่งเก่า ฝั่งหนึ่งใหม่
+            </div>
+          </div>
+          <div class="flex gap-2">
+            <button class="btn btn-outline btn-sm" id="btn-scan-match-integrity" style="border-color:var(--info);color:var(--info)">🔍 ตรวจสอบ</button>
+          </div>
+        </div>
+        <p class="text-xs text-dim" style="padding:10px;background:rgba(91,124,250,.08);border-radius:6px;border-left:3px solid var(--info)">
+          ✅ <strong>Scan-only</strong> — รายงานก่อน ไม่แก้อัตโนมัติ — ผู้ใช้เลือกได้ว่าจะ repair แบบไหน<br>
+          🔧 ตัวเลือก repair: <strong>Unlink ทั้งคู่</strong> (กลับเป็น unpaid) หรือ <strong>Sync ทั้งคู่ไป paid</strong> (ถือว่า match แล้ว)<br>
+          ☁️ หลัง repair ต้องกด "บันทึก" เพื่อ push ขึ้น cloud
+        </p>
+      </div>
+      
       <!-- Meta Reset Section -->
       <div class="card mb-3" style="border:1.5px solid var(--purple);background:rgba(165,134,255,.04)">
         <div class="flex justify-between items-center mb-3">
@@ -21541,6 +21562,264 @@ function renderData(el) {
         btn.disabled = false;
         btn.textContent = origText;
       }
+    });
+    
+    // ── Scan Match Integrity (Bill ↔ Stmt desync) ──
+    document.getElementById('btn-scan-match-integrity')?.addEventListener('click', () => {
+      const allStmts = getAllStatements();
+      const stmtByUuid = new Map();
+      const stmtByRef = new Map();
+      allStmts.forEach(s => {
+        if (s.stmt_uuid) stmtByUuid.set(s.stmt_uuid, s);
+        if (s.ref_no) {
+          const k = String(s.ref_no);
+          if (!stmtByRef.has(k)) stmtByRef.set(k, []);
+          stmtByRef.get(k).push(s);
+        }
+      });
+      
+      const issues = {
+        billPaidStmtUnpaid: [],  // bill paid, linked stmt unpaid (user's case)
+        billUnpaidStmtPaid: [],  // stmt paid, linked bill unpaid
+        billPaidStmtMissing: [], // bill paid but stmt not found
+        stmtPaidNoBills: [],     // stmt paid but no matched bills found (excludes manual_reason)
+      };
+      
+      // Pass 1: bills paid → check stmt
+      billList.forEach(b => {
+        if (b.match_status !== 'paid') return;
+        if (b.paid_by_sp) return; // paid via SP, no stmt link expected
+        
+        let stmt = b.matched_stmt_uuid ? stmtByUuid.get(b.matched_stmt_uuid) : null;
+        if (!stmt && b.matched_stmt_ref) {
+          const cands = stmtByRef.get(String(b.matched_stmt_ref)) || [];
+          stmt = cands[0]; // first match (may be wrong if ref duplicated)
+        }
+        
+        if (!stmt) {
+          issues.billPaidStmtMissing.push({ bill: b });
+          return;
+        }
+        
+        if (stmt.match_status !== 'paid') {
+          issues.billPaidStmtUnpaid.push({ bill: b, stmt: stmt });
+        }
+      });
+      
+      // Pass 2: stmts paid → check bills
+      allStmts.forEach(s => {
+        if (s.match_status !== 'paid') return;
+        if (s.match_method === 'manual_reason') return; // reason-only
+        
+        const billNos = (Array.isArray(s.matched_bills) && s.matched_bills.length)
+          ? s.matched_bills
+          : (s.match_bill 
+              ? String(s.match_bill).split(' + ').map(x => x.split(' (')[0].trim()).filter(Boolean)
+              : []);
+        
+        if (billNos.length === 0 && s.match_station !== 'SP-TEMP') {
+          issues.stmtPaidNoBills.push({ stmt: s });
+          return;
+        }
+        
+        // SP-TEMP partial matching — skip (different system)
+        if (s.match_station === 'SP-TEMP') return;
+        
+        const linkedBills = billList.filter(b => 
+          (b.matched_stmt_uuid && b.matched_stmt_uuid === s.stmt_uuid) ||
+          billNos.includes(String(b.bill_no || '').trim())
+        );
+        
+        linkedBills.forEach(b => {
+          if (b.match_status !== 'paid') {
+            // Check if not already in billPaidStmtUnpaid (avoid double-report)
+            const dup = issues.billPaidStmtUnpaid.find(x => x.bill.bill_uuid === b.bill_uuid);
+            if (!dup) {
+              issues.billUnpaidStmtPaid.push({ bill: b, stmt: s });
+            }
+          }
+        });
+      });
+      
+      const total = issues.billPaidStmtUnpaid.length + issues.billUnpaidStmtPaid.length 
+                  + issues.billPaidStmtMissing.length + issues.stmtPaidNoBills.length;
+      
+      if (total === 0) {
+        toast('✓ Match integrity OK — bill ↔ stmt ตรงกันหมด', 'success', 4000);
+        return;
+      }
+      
+      // Build report HTML
+      const renderRow = (label, list, fields) => {
+        if (list.length === 0) return '';
+        const items = list.slice(0, 20).map(x => {
+          const b = x.bill, s = x.stmt;
+          const billStr = b ? `${b.bill_no||'(ไม่มีเลข)'} ฿${fmtNum(b.amount)} <span style="color:${b.match_status==='paid'?'var(--success)':'var(--danger)'}">[${b.match_status}]</span>` : '-';
+          const stmtStr = s ? `${s.bank} ${fmtDate(s.date)} ฿${fmtNum(s.amount)} <span style="color:${s.match_status==='paid'?'var(--success)':'var(--danger)'}">[${s.match_status}]</span>` : '-';
+          return `<tr><td style="padding:3px 8px;font-family:var(--mono);font-size:.78rem">${billStr}</td><td style="padding:3px 8px;font-family:var(--mono);font-size:.78rem">${stmtStr}</td></tr>`;
+        }).join('');
+        const more = list.length > 20 ? `<tr><td colspan="2" style="padding:3px 8px;color:var(--text3);text-align:center">… อีก ${list.length-20} รายการ</td></tr>` : '';
+        return `<details ${list.length<=10?'open':''} style="margin-bottom:10px"><summary style="cursor:pointer;font-weight:600;padding:6px 0">${label} (${list.length})</summary>
+          <table style="width:100%;border-collapse:collapse;font-size:.85rem">
+            <thead><tr style="background:var(--surface2)"><th style="padding:5px 8px;text-align:left">Bill</th><th style="padding:5px 8px;text-align:left">Statement</th></tr></thead>
+            <tbody>${items}${more}</tbody>
+          </table>
+        </details>`;
+      };
+      
+      openModal(`🔗 Match Integrity Report — พบ ${total} รายการไม่ตรงกัน`, `
+        <div style="min-width:680px;max-width:900px">
+          <div style="padding:10px 12px;background:rgba(245,166,35,.08);border-left:3px solid var(--warn);border-radius:5px;margin-bottom:14px;font-size:.85rem">
+            ⚠️ ข้อมูลด้านล่างคือ state <strong>local ปัจจุบัน</strong> (ไม่ใช่ cloud) — ถ้าเพิ่ง pull/rebuild มา ก็คือ state cloud แล้ว
+          </div>
+          
+          ${renderRow('🟡 Bill paid แต่ Stmt unpaid (push ไม่ครบ → ฝั่ง stmt ค้าง)', issues.billPaidStmtUnpaid)}
+          ${renderRow('🟡 Stmt paid แต่ Bill unpaid (push ไม่ครบ → ฝั่ง bill ค้าง)', issues.billUnpaidStmtPaid)}
+          ${renderRow('🔴 Bill paid แต่หา Stmt ไม่เจอ (stmt ถูกลบ?)', issues.billPaidStmtMissing)}
+          ${renderRow('🔴 Stmt paid แต่ไม่มี Bill ผูก (matched_bills ว่าง)', issues.stmtPaidNoBills)}
+          
+          <div style="padding:12px;background:rgba(91,124,250,.08);border-radius:6px;margin:16px 0 12px;font-size:.85rem">
+            <strong>วิธีซ่อม:</strong><br>
+            <strong>A.</strong> <span style="color:var(--danger)">Unlink ทั้งคู่</span> — ตั้งให้ทั้ง bill+stmt = unpaid → user ต้อง match ใหม่<br>
+            <strong>B.</strong> <span style="color:var(--success)">Sync ไป paid</span> — เชื่อ side ที่ paid แล้ว → set อีกฝั่งเป็น paid ด้วย (ใช้ถ้า match จริงแล้ว แต่ push ไม่ครบ)
+          </div>
+          
+          <div class="flex gap-2 mt-3">
+            <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ยกเลิก</button>
+            <button class="btn btn-sm flex-1" id="repair-unlink" style="background:var(--danger);color:#fff;border:none;font-weight:600">🔓 Unlink ทั้งคู่</button>
+            <button class="btn btn-sm flex-1" id="repair-sync-paid" style="background:var(--success);color:#1a1d27;border:none;font-weight:600">✓ Sync ไป paid</button>
+          </div>
+        </div>
+      `);
+      
+      const dirtyBills = new Set();
+      const dirtyStmts = new Set();
+      
+      const doRepair = (mode) => {
+        let billsTouched = 0, stmtsTouched = 0;
+        
+        // billPaidStmtUnpaid: bill says paid, stmt says unpaid
+        issues.billPaidStmtUnpaid.forEach(({ bill, stmt }) => {
+          if (mode === 'unlink') {
+            // Unlink both
+            bill.match_status = 'pending';
+            bill.confirmation = '';
+            bill.pay_date = '';
+            bill.matched_stmt_ref = '';
+            bill.matched_stmt_uuid = '';
+            bill.matched_at = '';
+            stmt.match_status = 'unpaid';
+            stmt.match_bill = '';
+            stmt.matched_bills = [];
+            stmt.match_station = '';
+            stmt.match_method = '';
+            stmt.matched_at = '';
+            stmt.match_reason = '';
+            stmt.overpay_amount = '';
+          } else {
+            // Sync to paid — make stmt paid
+            stmt.match_status = 'paid';
+            if (!stmt.match_bill && bill.bill_no) stmt.match_bill = bill.bill_no;
+            if (!Array.isArray(stmt.matched_bills) || stmt.matched_bills.length === 0) {
+              stmt.matched_bills = bill.bill_no ? [bill.bill_no] : [];
+            }
+            if (!stmt.match_station && bill.station) stmt.match_station = bill.station;
+            if (!stmt.matched_at) stmt.matched_at = new Date().toISOString();
+            if (!stmt.match_method) stmt.match_method = 'repair_sync';
+          }
+          dirtyBills.add(bill.bill_uuid);
+          dirtyStmts.add(stmt.stmt_uuid);
+          billsTouched++;
+          stmtsTouched++;
+        });
+        
+        // billUnpaidStmtPaid: stmt paid, bill unpaid
+        issues.billUnpaidStmtPaid.forEach(({ bill, stmt }) => {
+          if (mode === 'unlink') {
+            bill.match_status = 'pending';
+            bill.confirmation = '';
+            bill.pay_date = '';
+            bill.matched_stmt_ref = '';
+            bill.matched_stmt_uuid = '';
+            stmt.match_status = 'unpaid';
+            stmt.match_bill = '';
+            stmt.matched_bills = [];
+            stmt.match_station = '';
+            stmt.match_method = '';
+            stmt.matched_at = '';
+            stmt.match_reason = '';
+            stmt.overpay_amount = '';
+          } else {
+            // Sync to paid — make bill paid
+            bill.match_status = 'paid';
+            if (!bill.matched_stmt_uuid && stmt.stmt_uuid) bill.matched_stmt_uuid = stmt.stmt_uuid;
+            if (!bill.matched_stmt_ref && stmt.ref_no) bill.matched_stmt_ref = String(stmt.ref_no);
+            if (!bill.pay_date && stmt.date) bill.pay_date = toISODate(stmt.date) || stmt.date;
+            if (!bill.matched_at) bill.matched_at = new Date().toISOString();
+          }
+          dirtyBills.add(bill.bill_uuid);
+          dirtyStmts.add(stmt.stmt_uuid);
+          billsTouched++;
+          stmtsTouched++;
+        });
+        
+        // billPaidStmtMissing: bill paid but stmt deleted → only fix bill
+        issues.billPaidStmtMissing.forEach(({ bill }) => {
+          if (mode === 'unlink') {
+            bill.match_status = 'pending';
+            bill.confirmation = '';
+            bill.pay_date = '';
+            bill.matched_stmt_ref = '';
+            bill.matched_stmt_uuid = '';
+            bill.matched_at = '';
+            dirtyBills.add(bill.bill_uuid);
+            billsTouched++;
+          }
+          // mode='sync_paid': nothing to sync to (stmt missing)
+        });
+        
+        // stmtPaidNoBills: stmt paid but no bills → only fix stmt
+        issues.stmtPaidNoBills.forEach(({ stmt }) => {
+          if (mode === 'unlink') {
+            stmt.match_status = 'unpaid';
+            stmt.match_bill = '';
+            stmt.matched_bills = [];
+            stmt.match_station = '';
+            stmt.match_method = '';
+            stmt.matched_at = '';
+            stmt.match_reason = '';
+            stmt.overpay_amount = '';
+            dirtyStmts.add(stmt.stmt_uuid);
+            stmtsTouched++;
+          }
+          // mode='sync_paid': nothing to sync to (no bills)
+        });
+        
+        // Mark dirty
+        dirtyBills.forEach(uuid => {
+          if (uuid) syncManager?.markDirty?.('bills', uuid);
+        });
+        dirtyStmts.forEach(uuid => {
+          if (uuid) syncManager?.markDirty?.('stmts', uuid);
+        });
+        
+        try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(_) {}
+        if (typeof persistMainState === 'function') persistMainState();
+        if (typeof invalidateBillsCache === 'function') invalidateBillsCache();
+        
+        closeModal();
+        toast(`✓ Repair สำเร็จ — แก้ไข bills ${billsTouched} ตัว · stmts ${stmtsTouched} ตัว · กด "บันทึก" เพื่อ push ขึ้น cloud`, 'success', 6000);
+      };
+      
+      document.getElementById('repair-unlink')?.addEventListener('click', () => {
+        if (!confirm(`🔓 ยืนยัน Unlink ทั้งคู่ทุกรายการ (${total} รายการ)?\n\nทั้ง bill และ stmt จะกลับเป็น unpaid → ต้อง match ใหม่\n\nหลังจากนั้นกด "บันทึก" เพื่อ push ขึ้น cloud`)) return;
+        doRepair('unlink');
+      });
+      
+      document.getElementById('repair-sync-paid')?.addEventListener('click', () => {
+        if (!confirm(`✓ ยืนยัน Sync ไป paid ทั้งคู่ทุกรายการ?\n\nสำหรับ ${issues.billPaidStmtUnpaid.length + issues.billUnpaidStmtPaid.length} รายการที่ "ฝั่งหนึ่ง paid อีกฝั่ง unpaid" — จะตั้งให้ทั้งสองฝั่ง = paid\n\nสำหรับ ${issues.billPaidStmtMissing.length + issues.stmtPaidNoBills.length} รายการที่ขาด counterpart — ไม่ทำอะไร (ใช้ Unlink แทน)\n\nหลังจากนั้นกด "บันทึก" เพื่อ push ขึ้น cloud`)) return;
+        doRepair('sync_paid');
+      });
     });
     
     // ── Clear Meta ทั้งหมด (Local + Cloud) ──
