@@ -516,8 +516,40 @@ function todayISO() {
 function todayKey() { return todayISO().replace(/-/g, ''); }
 
 // แปลงทุก input → dd/mm/yyyy (ค.ศ.) ไม่มี timezone shift
+// ⭐ Memoization cache for hot pure date functions (called 10000s of times during render)
+const _toISODateCache = new Map();
+const _fmtDateCache = new Map();
+const TOISODATE_CACHE_LIMIT = 5000; // hard cap to prevent memory bloat
+
+// ⭐ Debounced stmts persist — ลด JSON.stringify(8000+ rows) ทุก match/unmatch
+let _stmtsPersistTimer = null;
+function persistStmtsDebounced() {
+  if (_stmtsPersistTimer) clearTimeout(_stmtsPersistTimer);
+  _stmtsPersistTimer = setTimeout(() => {
+    _stmtsPersistTimer = null;
+    try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(_) {}
+  }, 500);
+}
+function flushStmtsPersist() {
+  if (_stmtsPersistTimer) {
+    clearTimeout(_stmtsPersistTimer);
+    _stmtsPersistTimer = null;
+    try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(_) {}
+  }
+}
+// Flush on tab close
+window.addEventListener('beforeunload', flushStmtsPersist);
+
 function fmtDate(d) {
   if (!d && d !== 0) return '';
+  // ⭐ Memoize for primitives (Date objects skipped — mutable)
+  const isPrimitive = typeof d === 'string' || typeof d === 'number';
+  if (isPrimitive) {
+    const cached = _fmtDateCache.get(d);
+    if (cached !== undefined) return cached;
+  }
+
+  const result = (() => {
 
   // 1) Date object → ใช้ local getters ตรงๆ (ไม่ผ่าน ISO)
   if (d instanceof Date && !isNaN(d)) {
@@ -561,6 +593,13 @@ function fmtDate(d) {
   }
 
   return str.split(' ')[0];
+  })(); // end IIFE
+  
+  if (isPrimitive) {
+    if (_fmtDateCache.size >= TOISODATE_CACHE_LIMIT) _fmtDateCache.clear();
+    _fmtDateCache.set(d, result);
+  }
+  return result;
 }
 function fmtNum(n) { return new Intl.NumberFormat('th-TH',{minimumFractionDigits:2,maximumFractionDigits:2}).format(n); }
 // Sum diff formatter: แสดง 2 ทศนิยมเสมอ (เช่น +1.00, -18.50, +0.50)
@@ -14586,7 +14625,7 @@ function parseTransferSheet(sheet, isVat) {
   if (!sheet || sheet.length < 3) return records;
   
   // Header row = row index 2 (row 3 in Excel)
-  // Columns (1-indexed within parsed array, but we use 0-indexed):
+  // ⭐ Schema V2 (17 cols, with DC/PM separated):
   //   0: ลำดับที่
   //   1: วันที่จ่าย
   //   2: ประเภท (ต้นทุน/ค่าใช้จ่าย)
@@ -14597,14 +14636,17 @@ function parseTransferSheet(sheet, isVat) {
   //   7: เลขที่ใบวางบิล
   //   8: เลขที่ใบเสร็จ
   //   9: ยอดตามใบแจ้งยอด
-  //   10-12: หัก (ค่าขนส่ง/เคลม/อื่นๆ or โปรโมชั่น)
-  //   13: หักรวม
-  //   14: ยอดจ่าย
-  //   15: โอนจาก
+  //   10: หักค่าขนส่ง
+  //   11: หัก DC/PM       ← ใหม่
+  //   12: หักเคลม
+  //   13: หักอื่นๆ
+  //   14: หักรวม
+  //   15: ยอดจ่าย (net)
+  //   16: โอนจาก
   
   for (let i = 0; i < sheet.length; i++) {
     const r = sheet[i] || [];
-    const c0 = r[0]; // ลำดับ column 2 in Excel (B)
+    const c0 = r[0]; // ลำดับ
     const c1 = r[1]; // วันที่จ่าย
     
     // Skip header rows (look for valid number in col 0)
@@ -14612,14 +14654,14 @@ function parseTransferSheet(sheet, isVat) {
     if (typeof c0 !== 'number' && !/^\d+$/.test(String(c0).trim())) continue;
     if (!c1) continue; // no date → skip
     
-    const amount = Number(r[13]) || Number(r[9]) || 0; // ยอดจ่าย or fallback ยอดแจ้ง
-    if (amount <= 0) continue;
+    const netAmount = Number(r[15]) || Number(r[14]) || Number(r[9]) || 0;
+    if (netAmount <= 0) continue;
     
     records.push({
-      id: (isVat ? 'TV-' : 'TN-') + Date.now() + '-' + i,
+      tl_uuid: '', // assigned on push
       seq: Number(c0) || 0,
-      transfer_date: fmtDate(c1) || '',
-      category: String(r[2] || '').trim(), // ต้นทุน / ค่าใช้จ่าย
+      transfer_date: toISODate(c1) || fmtDate(c1) || '',
+      category: String(r[2] || '').trim(),
       nickname: String(r[3] || '').trim(),
       supplier_name: String(r[4] || '').trim(),
       supplier_bank: String(r[5] || '').trim(),
@@ -14628,15 +14670,19 @@ function parseTransferSheet(sheet, isVat) {
       receipt_no: String(r[8] || '').trim(),
       amount_billed: Number(r[9]) || 0,
       deduct_shipping: Number(r[10]) || 0,
-      deduct_claim: Number(r[11]) || 0,
-      deduct_other: Number(r[12]) || 0,
-      deduct_total: Number(r[13]) || 0,
-      amount: Number(r[14]) || amount, // ยอดจ่ายจริง
-      from_bank: String(r[15] || '').trim(), // K PLUS SME JKN / BBL / SCB / BBL NW
+      deduct_dc_pm: Number(r[11]) || 0,
+      deduct_claim: Number(r[12]) || 0,
+      deduct_other: Number(r[13]) || 0,
+      deduct_total: Number(r[14]) || 0,
+      net_amount: netAmount,
+      from_bank: String(r[16] || '').trim(),
       vat: isVat ? 'VAT' : 'NOVAT',
-      pp_no: '', // รอ match จาก ตรวจ YYYY-MM
-      match_status: 'pending', // pending / matched (กับ PP) / stmt_matched (กับ Statement)
+      pp_no: '',
+      match_status: 'unpaid',
       stmt_ref: '',
+      matched_stmt_uuid: '',
+      matched_at: '',
+      matched_by: '',
     });
   }
   
@@ -15196,6 +15242,7 @@ async function renderTransferLog(el) {
   function render() {
     if (tab === 'suppliers') return renderSuppliersTab();
     if (tab === 'checks') return renderChecksTab();
+    if (tab === 'stmts') return renderStmtsTab();
     renderTransfersTab();
   }
   
@@ -15258,17 +15305,13 @@ async function renderTransferLog(el) {
           <p class="text-sm text-dim" style="margin-top:2px">รวม VAT + NOVAT · เชื่อมกับ PP Report + Supplier Payments + Statement</p>
         </div>
         <div class="flex gap-2 flex-wrap">
-          <button class="btn btn-success btn-sm" id="btn-tl-pull-cloud" title="ดึง Transfer Log + Master จาก Cloud Sheets">🔄 ดึงจาก Cloud</button>
+          <button class="btn btn-success btn-sm" id="btn-tl-refresh" title="Refresh Transfer Log + Master + Statements จาก Cloud">🔄 Refresh</button>
+          <span class="text-xs text-dim" id="tl-refresh-badge" style="align-self:center;color:var(--text3);min-width:120px"></span>
           <button class="btn btn-primary btn-sm" id="btn-tl-add-vat">➕ เพิ่ม VAT</button>
           <button class="btn btn-primary btn-sm" id="btn-tl-add-novat" style="background:#8e44ad">➕ เพิ่ม NOVAT</button>
           <span style="border-left:1px solid var(--border);height:24px;align-self:center"></span>
           <button class="btn btn-outline btn-sm" id="btn-tl-import">${ICONS.download} Import JKN</button>
-          <label class="btn btn-outline btn-sm" style="cursor:pointer" title="Import JSON ที่ convert ไว้แล้ว">
-            📂 Import JSON
-            <input type="file" id="btn-tl-import-json" accept=".json" style="display:none">
-          </label>
           <button class="btn btn-success btn-sm" id="btn-tl-save">${ICONS.check} บันทึกเข้า Sheet</button>
-          <button class="btn btn-outline btn-sm" id="btn-tl-sync">🔗 Sync → Supplier Payments</button>
           <button class="btn btn-ghost btn-sm" id="btn-tl-clear" style="color:var(--danger)">🗑️ ล้าง</button>
         </div>
       </div>
@@ -15278,6 +15321,7 @@ async function renderTransferLog(el) {
         <button class="pill ${tab==='transfers'?'active':''}" data-tab="transfers">💸 รายการโอน (${vatCount + novatCount})</button>
         <button class="pill ${tab==='suppliers'?'active':''}" data-tab="suppliers">📋 Master Supplier (${transferLog.vatSuppliers.length + transferLog.novatSuppliers.length})</button>
         <button class="pill ${tab==='checks'?'active':''}" data-tab="checks">✅ ตรวจรายเดือน (${Object.keys(transferLog.monthlyChecks).length} เดือน)</button>
+        <button class="pill ${tab==='stmts'?'active':''}" data-tab="stmts">💳 Statements (${(getAllStatements()||[]).length})</button>
       </div>
       
       <!-- Summary -->
@@ -15305,8 +15349,14 @@ async function renderTransferLog(el) {
       </div>
       <div class="flex gap-2 mb-3 flex-wrap items-center">
         <span class="text-xs text-dim">ช่วงวัน:</span>
+        <button class="btn btn-ghost btn-sm" id="tl-date-prev" title="เลื่อนช่วงวันถอยหลัง" style="padding:4px 8px">◀</button>
         <input type="date" class="input" id="tl-from" value="${dateFrom}" style="width:140px;font-size:.8rem">
+        <span class="text-xs text-dim">→</span>
         <input type="date" class="input" id="tl-to" value="${dateTo}" style="width:140px;font-size:.8rem">
+        <button class="btn btn-ghost btn-sm" id="tl-date-next" title="เลื่อนช่วงวันไปข้างหน้า" style="padding:4px 8px">▶</button>
+        <button class="btn btn-outline btn-sm" id="tl-date-today" title="วันนี้" style="font-size:.78rem;padding:4px 8px">วันนี้</button>
+        <button class="btn btn-outline btn-sm" id="tl-date-month" title="เดือนนี้" style="font-size:.78rem;padding:4px 8px">เดือนนี้</button>
+        <button class="btn btn-ghost btn-sm" id="tl-date-clear" title="ล้างช่วงวัน" style="font-size:.78rem;padding:4px 8px;color:var(--text3)">✕</button>
         <span style="margin-left:auto"></span>
         ${sortToggleBtn('transferlog')}
       </div>
@@ -15384,6 +15434,66 @@ async function renderTransferLog(el) {
     document.getElementById('tl-cat')?.addEventListener('change', e => { filterCategory = e.target.value; render(); });
     document.getElementById('tl-from')?.addEventListener('change', e => { dateFrom = e.target.value; render(); });
     document.getElementById('tl-to')?.addEventListener('change', e => { dateTo = e.target.value; render(); });
+    
+    // ── Date nav buttons ──
+    const _shiftDays = (iso, days) => {
+      if (!iso) return iso;
+      const d = new Date(iso); d.setDate(d.getDate() + days);
+      return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+    };
+    document.getElementById('tl-date-prev')?.addEventListener('click', () => {
+      if (!dateFrom && !dateTo) {
+        // No range → set to yesterday
+        const y = _shiftDays(todayISO(), -1);
+        dateFrom = y; dateTo = y;
+      } else if (dateFrom && dateTo) {
+        // Shift range backward by length+1 days
+        const fromMs = new Date(dateFrom).getTime();
+        const toMs = new Date(dateTo).getTime();
+        const days = Math.max(1, Math.round((toMs - fromMs) / 86400000) + 1);
+        dateFrom = _shiftDays(dateFrom, -days);
+        dateTo = _shiftDays(dateTo, -days);
+      } else if (dateFrom) {
+        dateFrom = _shiftDays(dateFrom, -1);
+      } else {
+        dateTo = _shiftDays(dateTo, -1);
+      }
+      render();
+    });
+    document.getElementById('tl-date-next')?.addEventListener('click', () => {
+      if (!dateFrom && !dateTo) {
+        const t = todayISO();
+        dateFrom = t; dateTo = t;
+      } else if (dateFrom && dateTo) {
+        const fromMs = new Date(dateFrom).getTime();
+        const toMs = new Date(dateTo).getTime();
+        const days = Math.max(1, Math.round((toMs - fromMs) / 86400000) + 1);
+        dateFrom = _shiftDays(dateFrom, days);
+        dateTo = _shiftDays(dateTo, days);
+      } else if (dateFrom) {
+        dateFrom = _shiftDays(dateFrom, 1);
+      } else {
+        dateTo = _shiftDays(dateTo, 1);
+      }
+      render();
+    });
+    document.getElementById('tl-date-today')?.addEventListener('click', () => {
+      const t = todayISO();
+      dateFrom = t; dateTo = t;
+      render();
+    });
+    document.getElementById('tl-date-month')?.addEventListener('click', () => {
+      const t = new Date();
+      const y = t.getFullYear(), m = t.getMonth();
+      const first = `${y}-${String(m+1).padStart(2,'0')}-01`;
+      const lastDay = new Date(y, m+1, 0).getDate();
+      const last = `${y}-${String(m+1).padStart(2,'0')}-${String(lastDay).padStart(2,'0')}`;
+      dateFrom = first; dateTo = last;
+      render();
+    });
+    document.getElementById('tl-date-clear')?.addEventListener('click', () => {
+      dateFrom = ''; dateTo = ''; render();
+    });
     el.querySelectorAll('.sort-toggle').forEach(btn => {
       btn.addEventListener('click', () => {
         toggleSortOrder(btn.dataset.pageKey);
@@ -15394,18 +15504,46 @@ async function renderTransferLog(el) {
       btn.addEventListener('click', () => { filterVat = btn.dataset.fv; render(); });
     });
     
-    // ── Phase 2: Pull from Cloud ──
-    document.getElementById('btn-tl-pull-cloud')?.addEventListener('click', async () => {
-      const btn = document.getElementById('btn-tl-pull-cloud');
+    // ── Refresh: Pull TL + Statements (with dirty guard, like Main page) ──
+    document.getElementById('btn-tl-refresh')?.addEventListener('click', async () => {
+      const btn = document.getElementById('btn-tl-refresh');
+      
+      // Dirty guard
+      const dirtyTypes = window.syncManager?.dirty ? [...window.syncManager.dirty] : [];
+      if (dirtyTypes.length > 0) {
+        if (!confirm(`⚠️ มีการแก้ไขที่ยังไม่ได้บันทึก (${dirtyTypes.join(', ')})\n\nการ Refresh จะดึงข้อมูลจาก cloud — การแก้ไข local อาจถูก overwrite\n\nกด "บันทึก" ก่อน หรือดำเนินการต่อ?`)) return;
+      }
+      
       btn.disabled = true;
       const orig = btn.textContent;
-      btn.textContent = '⏳ ดึง...';
+      btn.textContent = '⏳ Refresh...';
       try {
+        // 1) Pull TL data (vat + novat + masters + checks)
         const r = await pullTransferFromCloud();
-        toast(`ดึงสำเร็จ: TL ${r.vatTL+r.novatTL} · Master ${r.vatMaster+r.novatMaster}`, 'success', 4000);
+        
+        // 2) Pull stmts (shared pool with Main page) — uses common pull
+        let stmtCount = 0;
+        if (typeof pullFromCloud === 'function') {
+          try {
+            const r2 = await pullFromCloud(2, 'force', { types: ['stmts'] });
+            stmtCount = r2?.stats?.stmts || 0;
+          } catch(e) {
+            console.warn('[TL refresh] stmt pull failed:', e);
+          }
+        }
+        
+        const tlTotal = (r.vatTL||0) + (r.novatTL||0);
+        const masterTotal = (r.vatMaster||0) + (r.novatMaster||0);
+        toast(`✓ Refresh สำเร็จ — TL ${tlTotal} · Master ${masterTotal} · Stmts ${stmtCount}`, 'success', 4000);
+        
+        // Update badge
+        window._tlRefreshAt = Date.now();
+        const badge = document.getElementById('tl-refresh-badge');
+        if (badge) badge.textContent = '↻ Refresh เมื่อสักครู่';
+        
         render();
       } catch (e) {
-        toast('ดึงล้มเหลว: ' + e.message, 'error', 6000);
+        toast('Refresh ล้มเหลว: ' + e.message, 'error', 6000);
       } finally {
         btn.disabled = false;
         btn.textContent = orig;
@@ -15434,6 +15572,532 @@ async function renderTransferLog(el) {
         }
       });
     });
+  }
+  
+  // ──────────────────────────────────────────────────
+  // Statements Tab — match TL ↔ stmt (separate flow from Main)
+  // Match key: from_bank + |net_amount|=|stmt.amount| + transfer_date(±1d)
+  // Stmt fields used (shared pool):
+  //   match_status='paid', match_station='TL-VAT'/'TL-NOVAT',
+  //   match_bill=invoice_no, matched_bills=[tl_uuid], match_method='auto_tl'/'manual_tl'
+  // TL fields used:
+  //   match_status='paid', matched_stmt_uuid, matched_at, matched_by
+  // ──────────────────────────────────────────────────
+  function renderStmtsTab() {
+    const bankColors = { KTB:'#00a4e4', KBANK:'#138f2d', 'BBL NW':'#ff7b00', BBL:'#1e3a7b', TTB:'#ff0066' };
+    const allStmts = getAllStatements() || [];
+    
+    // Pre-compute TL pool for match detection
+    const tlAll = [...transferLog.vatTransfers, ...transferLog.novatTransfers];
+    const tlByUuid = new Map();
+    tlAll.forEach(t => { if (t.tl_uuid) tlByUuid.set(t.tl_uuid, t); });
+    
+    // Filter: by date range + bank + status
+    let data = allStmts.slice();
+    if (dateFrom || dateTo) {
+      data = data.filter(s => {
+        const d = toISODate(s.date);
+        if (!d) return true;
+        if (dateFrom && d < dateFrom) return false;
+        if (dateTo && d > dateTo) return false;
+        return true;
+      });
+    }
+    if (filterBank !== 'ALL') data = data.filter(s => s.bank === filterBank);
+    if (searchText) {
+      const q = searchText.toLowerCase();
+      data = data.filter(s => 
+        (s.ref_no && String(s.ref_no).toLowerCase().includes(q)) ||
+        (s.description && String(s.description).toLowerCase().includes(q)) ||
+        (s.match_bill && String(s.match_bill).toLowerCase().includes(q))
+      );
+    }
+    
+    // Sort: newest first
+    const _order = getSortOrder('transferlog');
+    data.sort((a, b) => {
+      const da = toISODate(a.date) || '';
+      const db = toISODate(b.date) || '';
+      return _order === 'asc' ? da.localeCompare(db) : db.localeCompare(da);
+    });
+    
+    const _t = truncateForRender(data);
+    const visible = _t.visible;
+    
+    const matchedTL = data.filter(s => s.match_station === 'TL-VAT' || s.match_station === 'TL-NOVAT').length;
+    const unpaidOut = data.filter(s => s.match_status !== 'paid' && Number(s.amount) < 0).length;
+    
+    el.innerHTML = `
+      <div class="flex justify-between items-center mb-3">
+        <div>
+          <h2 style="display:inline-flex;align-items:center;gap:8px">${ICONS.pulse} Transfer Log</h2>
+          <p class="text-sm text-dim" style="margin-top:2px">💳 Statement Matching — Match TL กับ Bank Statement</p>
+        </div>
+        <div class="flex gap-2 flex-wrap">
+          <button class="btn btn-success btn-sm" id="btn-tl-refresh" title="Refresh TL + Statements จาก Cloud">🔄 Refresh</button>
+          <span class="text-xs text-dim" id="tl-refresh-badge" style="align-self:center;color:var(--text3);min-width:120px"></span>
+          <button class="btn btn-primary btn-sm" id="tl-stmts-auto" style="background:var(--info)">⚡ Auto Match</button>
+        </div>
+      </div>
+      
+      <!-- Tabs (same as transfers) -->
+      <div class="flex gap-2 mb-3">
+        <button class="pill ${tab==='transfers'?'active':''}" data-tab="transfers">💸 รายการโอน</button>
+        <button class="pill ${tab==='suppliers'?'active':''}" data-tab="suppliers">📋 Master Supplier</button>
+        <button class="pill ${tab==='checks'?'active':''}" data-tab="checks">✅ ตรวจรายเดือน</button>
+        <button class="pill ${tab==='stmts'?'active':''}" data-tab="stmts">💳 Statements (${allStmts.length})</button>
+      </div>
+      
+      <!-- Summary cards -->
+      <div class="flex gap-3 flex-wrap mb-3">
+        ${statCard('💳 Total Stmts', String(data.length), '', 'var(--info)', ICONS.dollar)}
+        ${statCard('✓ Match TL', String(matchedTL), matchedTL?(matchedTL*100/(data.length||1)).toFixed(0)+'%':'0%', 'var(--success)', ICONS.check)}
+        ${statCard('🔴 ยังไม่ match (เงินออก)', String(unpaidOut), '', 'var(--danger)', ICONS.alert)}
+      </div>
+      
+      <!-- Filters -->
+      <div class="flex gap-2 mb-3 flex-wrap items-center">
+        <input class="input" id="tl-stmts-search" placeholder="ค้นหา ref / รายละเอียด / invoice" value="${searchText}" style="width:280px">
+        <button class="pill ${filterBank==='ALL'?'active':''}" data-fb="ALL">ทั้งหมด</button>
+        ${['KTB','KBANK','BBL','BBL NW','TTB'].map(bk =>
+          `<button class="pill ${filterBank===bk?'active':''}" data-fb="${bk}">${bk}</button>`
+        ).join('')}
+      </div>
+      <div class="flex gap-2 mb-3 flex-wrap items-center">
+        <span class="text-xs text-dim">ช่วงวัน:</span>
+        <button class="btn btn-ghost btn-sm" id="tl-date-prev" style="padding:4px 8px">◀</button>
+        <input type="date" class="input" id="tl-from" value="${dateFrom}" style="width:140px;font-size:.8rem">
+        <span class="text-xs text-dim">→</span>
+        <input type="date" class="input" id="tl-to" value="${dateTo}" style="width:140px;font-size:.8rem">
+        <button class="btn btn-ghost btn-sm" id="tl-date-next" style="padding:4px 8px">▶</button>
+        <button class="btn btn-outline btn-sm" id="tl-date-today" style="font-size:.78rem;padding:4px 8px">วันนี้</button>
+        <button class="btn btn-outline btn-sm" id="tl-date-month" style="font-size:.78rem;padding:4px 8px">เดือนนี้</button>
+        <button class="btn btn-ghost btn-sm" id="tl-date-clear" style="font-size:.78rem;padding:4px 8px;color:var(--text3)">✕</button>
+      </div>
+      
+      <!-- Table -->
+      <div class="card-flat">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>ธนาคาร</th>
+              <th>วันที่</th>
+              <th>Ref</th>
+              <th style="text-align:right">จำนวนเงิน</th>
+              <th>รายละเอียด</th>
+              <th>TL Match</th>
+              <th>สถานะ</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${visible.length ? visible.map((s,i) => {
+              const isMatchedTL = s.match_station === 'TL-VAT' || s.match_station === 'TL-NOVAT';
+              const isMatchedBill = s.match_status === 'paid' && !isMatchedTL;
+              const isReason = s.match_method === 'manual_reason';
+              const linkedTl = isMatchedTL && Array.isArray(s.matched_bills) && s.matched_bills[0]
+                ? tlByUuid.get(s.matched_bills[0])
+                : null;
+              const rowStyle = isMatchedTL 
+                ? 'background:rgba(91,124,250,.07)'
+                : (isMatchedBill ? 'background:rgba(45,212,160,.06)' : (Number(s.amount) < 0 ? 'background:rgba(239,87,87,.05);border-left:3px solid var(--danger)' : ''));
+              return `
+                <tr style="${rowStyle}" data-stmt-uuid="${s.stmt_uuid||''}">
+                  <td><span class="badge" style="background:${(bankColors[s.bank]||'#555')}22;color:${bankColors[s.bank]||'#aaa'}">${s.bank||'-'}</span></td>
+                  <td style="white-space:nowrap">${fmtDate(s.date)}</td>
+                  <td class="text-xs" style="font-family:var(--mono)">${String(s.ref_no||'').substring(0,30)}</td>
+                  <td style="text-align:right;font-weight:600;color:${Number(s.amount)>=0?'var(--success)':'var(--danger)'}">${Number(s.amount)>=0?'+':''}${fmtNum(s.amount)}</td>
+                  <td class="truncate" style="max-width:200px;color:var(--text2)">${String(s.description||'').substring(0,80)}</td>
+                  <td>
+                    ${isMatchedTL ? 
+                      `<span class="badge" style="background:rgba(91,124,250,.2);color:var(--info)">${s.match_station}</span> ${linkedTl ? `<span class="text-xs" title="${linkedTl.supplier_name||''}">${linkedTl.invoice_no||linkedTl.tl_uuid?.substring(0,8)||''}</span>` : ''}` :
+                      (isMatchedBill ? `<span class="badge badge-success" style="font-size:.7rem">Bill: ${s.match_bill||'-'}</span>` :
+                      (isReason ? `<span class="badge" style="background:rgba(165,134,255,.2);color:var(--purple);font-size:.7rem">📝 reason</span>` : '-'))}
+                  </td>
+                  <td>${isMatchedTL ? 
+                    `<button class="btn btn-ghost btn-sm btn-tl-stmt-unmatch" data-stmt-uuid="${s.stmt_uuid||''}" title="ยกเลิก">↩</button>` :
+                    (isMatchedBill ? `<span class="text-xs text-dim" title="Match กับบิลที่หน้า Main แล้ว">🔒 ผูก Bill</span>` :
+                    (isReason ? `<span class="text-xs text-dim">🔒 มีเหตุผล</span>` :
+                    `<button class="btn btn-primary btn-sm btn-tl-stmt-manual" data-stmt-uuid="${s.stmt_uuid||''}">${ICONS.search} Match TL</button>`))}
+                  </td>
+                </tr>
+              `;
+            }).join('') : `<tr><td colspan="7" style="text-align:center;padding:30px;color:var(--text3)">ไม่มีข้อมูล Statement</td></tr>`}
+          </tbody>
+        </table>
+        <div class="text-xs text-dim" style="padding:10px">
+          แสดง ${visible.length} / ${data.length} รายการ ${truncationFooter(data.length)}
+        </div>
+      </div>
+    `;
+    
+    // ── Wire common nav (tabs, refresh, dates) ──
+    el.querySelectorAll('[data-tab]').forEach(btn => {
+      btn.addEventListener('click', () => { tab = btn.dataset.tab; render(); });
+    });
+    el.querySelectorAll('[data-fb]').forEach(btn => {
+      btn.addEventListener('click', () => { filterBank = btn.dataset.fb; render(); });
+    });
+    document.getElementById('tl-stmts-search')?.addEventListener('input', e => { searchText = e.target.value; render(); });
+    document.getElementById('tl-from')?.addEventListener('change', e => { dateFrom = e.target.value; render(); });
+    document.getElementById('tl-to')?.addEventListener('change', e => { dateTo = e.target.value; render(); });
+    
+    const _shiftDays = (iso, days) => {
+      if (!iso) return iso;
+      const d = new Date(iso); d.setDate(d.getDate() + days);
+      return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+    };
+    document.getElementById('tl-date-prev')?.addEventListener('click', () => {
+      if (!dateFrom && !dateTo) { const y = _shiftDays(todayISO(), -1); dateFrom=y; dateTo=y; }
+      else if (dateFrom && dateTo) {
+        const days = Math.max(1, Math.round((new Date(dateTo)-new Date(dateFrom))/86400000) + 1);
+        dateFrom = _shiftDays(dateFrom,-days); dateTo = _shiftDays(dateTo,-days);
+      } else if (dateFrom) dateFrom = _shiftDays(dateFrom,-1);
+      else dateTo = _shiftDays(dateTo,-1);
+      render();
+    });
+    document.getElementById('tl-date-next')?.addEventListener('click', () => {
+      if (!dateFrom && !dateTo) { const t = todayISO(); dateFrom=t; dateTo=t; }
+      else if (dateFrom && dateTo) {
+        const days = Math.max(1, Math.round((new Date(dateTo)-new Date(dateFrom))/86400000) + 1);
+        dateFrom = _shiftDays(dateFrom,days); dateTo = _shiftDays(dateTo,days);
+      } else if (dateFrom) dateFrom = _shiftDays(dateFrom,1);
+      else dateTo = _shiftDays(dateTo,1);
+      render();
+    });
+    document.getElementById('tl-date-today')?.addEventListener('click', () => {
+      const t = todayISO(); dateFrom=t; dateTo=t; render();
+    });
+    document.getElementById('tl-date-month')?.addEventListener('click', () => {
+      const t = new Date(); const y=t.getFullYear(), m=t.getMonth();
+      dateFrom = `${y}-${String(m+1).padStart(2,'0')}-01`;
+      const lastDay = new Date(y, m+1, 0).getDate();
+      dateTo = `${y}-${String(m+1).padStart(2,'0')}-${String(lastDay).padStart(2,'0')}`;
+      render();
+    });
+    document.getElementById('tl-date-clear')?.addEventListener('click', () => {
+      dateFrom=''; dateTo=''; render();
+    });
+    
+    // ── Refresh button (TL-specific) ──
+    document.getElementById('btn-tl-refresh')?.addEventListener('click', async () => {
+      const btn = document.getElementById('btn-tl-refresh');
+      const dirtyTypes = window.syncManager?.dirty ? [...window.syncManager.dirty] : [];
+      if (dirtyTypes.length > 0) {
+        if (!confirm(`⚠️ มีการแก้ไขที่ยังไม่ได้บันทึก (${dirtyTypes.join(', ')})\n\nกด "บันทึก" ก่อน หรือดำเนินการต่อ?`)) return;
+      }
+      btn.disabled = true;
+      const orig = btn.textContent;
+      btn.textContent = '⏳ Refresh...';
+      try {
+        const r = await pullTransferFromCloud();
+        let stmtCount = 0;
+        if (typeof pullFromCloud === 'function') {
+          try {
+            const r2 = await pullFromCloud(2, 'force', { types: ['stmts'] });
+            stmtCount = r2?.stats?.stmts || 0;
+          } catch(e) {}
+        }
+        const tlTotal = (r.vatTL||0) + (r.novatTL||0);
+        toast(`✓ Refresh สำเร็จ — TL ${tlTotal} · Master ${(r.vatMaster||0)+(r.novatMaster||0)} · Stmts ${stmtCount}`, 'success', 4000);
+        render();
+      } catch (e) {
+        toast('Refresh ล้มเหลว: ' + e.message, 'error', 6000);
+      } finally {
+        btn.disabled = false; btn.textContent = orig;
+      }
+    });
+    
+    // ── Auto Match TL ↔ Stmt ──
+    document.getElementById('tl-stmts-auto')?.addEventListener('click', () => {
+      autoMatchTLStatements();
+    });
+    
+    // ── Manual Match button on row ──
+    el.querySelectorAll('.btn-tl-stmt-manual').forEach(btn => {
+      btn.addEventListener('click', e => {
+        e.stopPropagation();
+        const stmtUuid = btn.dataset.stmtUuid;
+        const stmt = allStmts.find(s => s.stmt_uuid === stmtUuid);
+        if (!stmt) { toast('ไม่พบ statement', 'error'); return; }
+        openTlManualMatchModal(stmt);
+      });
+    });
+    
+    // ── Unmatch ──
+    el.querySelectorAll('.btn-tl-stmt-unmatch').forEach(btn => {
+      btn.addEventListener('click', e => {
+        e.stopPropagation();
+        const stmtUuid = btn.dataset.stmtUuid;
+        if (!confirm('ยกเลิก match TL ↔ Statement นี้?')) return;
+        unmatchTLStatement(stmtUuid);
+      });
+    });
+  }
+  
+  // ── Auto Match TL ↔ Stmt ──
+  function autoMatchTLStatements() {
+    const tlAll = [...transferLog.vatTransfers, ...transferLog.novatTransfers];
+    const stmts = getAllStatements() || [];
+    
+    // Bank name normalize: TL.from_bank อาจเป็น "K PLUS SME JKN" / "BBL" / "SCB" / "BBL NW"
+    //   stmt.bank = "KTB" / "KBANK" / "BBL" / "BBL NW" / "TTB"
+    const normalizeBank = (s) => {
+      const lc = String(s||'').toLowerCase();
+      if (lc.includes('bbl nw') || lc.includes('bbl-nw') || lc.includes('bblnw')) return 'BBL NW';
+      if (lc.includes('bbl') || lc.includes('กรุงเทพ')) return 'BBL';
+      if (lc.includes('kbank') || lc.includes('k plus') || lc.includes('กสิกร')) return 'KBANK';
+      if (lc.includes('ktb') || lc.includes('กรุงไทย')) return 'KTB';
+      if (lc.includes('ttb')) return 'TTB';
+      if (lc.includes('scb')) return 'SCB';
+      return String(s||'').toUpperCase();
+    };
+    
+    let matched = 0, skipped = 0;
+    const dirtyStmts = new Set();
+    
+    // Index stmts by composite key: bank|date|abs(amount)
+    //   pre-filter: amount<0 (เงินออก) + unmatched
+    const stmtIdx = new Map();
+    stmts.forEach(s => {
+      if (s.match_status === 'paid') return;
+      if (Number(s.amount) >= 0) return;
+      const bk = normalizeBank(s.bank);
+      const dt = toISODate(s.date);
+      const k2 = Math.round(Math.abs(Number(s.amount))*100);
+      const key = `${bk}|${dt}|${k2}`;
+      if (!stmtIdx.has(key)) stmtIdx.set(key, []);
+      stmtIdx.get(key).push(s);
+    });
+    
+    // Loop TL — find unique stmt match
+    tlAll.forEach(t => {
+      if (t.match_status === 'paid') return;
+      if (!t.tl_uuid) return; // need uuid
+      const tlBk = normalizeBank(t.from_bank);
+      const tlDate = toISODate(t.transfer_date);
+      const k2 = Math.round(Math.abs(Number(t.net_amount)||0)*100);
+      if (!k2) return;
+      
+      // Try ±1 day
+      const candidates = [];
+      [-1, 0, 1].forEach(d => {
+        const dt = d === 0 ? tlDate : (() => {
+          const dd = new Date(tlDate); dd.setDate(dd.getDate()+d);
+          return dd.getFullYear()+'-'+String(dd.getMonth()+1).padStart(2,'0')+'-'+String(dd.getDate()).padStart(2,'0');
+        })();
+        const arr = stmtIdx.get(`${tlBk}|${dt}|${k2}`) || [];
+        candidates.push(...arr);
+      });
+      
+      // Unique match required (ambiguous → skip)
+      const fresh = candidates.filter(s => s.match_status !== 'paid');
+      if (fresh.length !== 1) { skipped++; return; }
+      const stmt = fresh[0];
+      
+      // Apply match
+      const station = t.vat === 'VAT' ? 'TL-VAT' : 'TL-NOVAT';
+      stmt.match_status = 'paid';
+      stmt.match_station = station;
+      stmt.match_bill = t.invoice_no || t.tl_uuid;
+      stmt.matched_bills = [t.tl_uuid];
+      stmt.match_method = 'auto_tl';
+      stmt.matched_at = new Date().toISOString();
+      if (typeof currentUser !== 'undefined' && currentUser?.username) stmt.matched_by = currentUser.username;
+      
+      t.match_status = 'paid';
+      t.matched_stmt_uuid = stmt.stmt_uuid;
+      t.matched_at = stmt.matched_at;
+      t.matched_by = stmt.matched_by || '';
+      t.stmt_ref = stmt.ref_no || '';
+      
+      dirtyStmts.add(stmt.stmt_uuid);
+      matched++;
+    });
+    
+    // Mark dirty + persist + push TL
+    dirtyStmts.forEach(uuid => {
+      if (window.syncManager?.markDirty) window.syncManager.markDirty('stmts', uuid);
+    });
+    try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(_) {}
+    persistMainState();
+    
+    if (matched === 0) {
+      toast(`Auto Match: ไม่เจอคู่ที่ตรงเงื่อนไข (skip ${skipped})`, 'info', 4000);
+      return;
+    }
+    
+    // Push TL records ที่เพิ่ง match (fire-and-forget)
+    (async () => {
+      try {
+        const updatedTL = tlAll.filter(t => dirtyStmts.has(t.matched_stmt_uuid));
+        const vatRecs = updatedTL.filter(t => t.vat === 'VAT');
+        const novatRecs = updatedTL.filter(t => t.vat === 'NOVAT');
+        if (vatRecs.length) await api('v2_upsertTransferLog', { sheet: 'vat', records: vatRecs });
+        if (novatRecs.length) await api('v2_upsertTransferLog', { sheet: 'novat', records: novatRecs });
+      } catch(e) { console.warn('[TL push delta]', e); }
+    })();
+    
+    toast(`✓ Auto Match สำเร็จ ${matched} คู่ · skip ${skipped} (ไม่ unique หรือไม่ตรง) — กด "บันทึก" เพื่อ push stmts`, 'success', 6000);
+    render();
+  }
+  
+  // ── Manual Match modal: pick TL row to link with stmt ──
+  function openTlManualMatchModal(stmt) {
+    const tlAll = [...transferLog.vatTransfers, ...transferLog.novatTransfers];
+    const candidates = tlAll.filter(t => t.match_status !== 'paid' && t.tl_uuid);
+    
+    // Sort: closest to stmt date first, then by amount diff
+    const stmtDate = toISODate(stmt.date);
+    const stmtAmtAbs = Math.abs(Number(stmt.amount)||0);
+    candidates.sort((a,b) => {
+      const dDa = Math.abs(new Date(toISODate(a.transfer_date)) - new Date(stmtDate)) / 86400000;
+      const dDb = Math.abs(new Date(toISODate(b.transfer_date)) - new Date(stmtDate)) / 86400000;
+      const dAa = Math.abs((Number(a.net_amount)||0) - stmtAmtAbs);
+      const dAb = Math.abs((Number(b.net_amount)||0) - stmtAmtAbs);
+      return (dDa + dAa/10000) - (dDb + dAb/10000);
+    });
+    
+    let selectedUuid = null;
+    let searchTl = '';
+    
+    const renderCandidates = () => {
+      const q = searchTl.toLowerCase();
+      const filtered = q ? candidates.filter(t =>
+        (t.invoice_no||'').toLowerCase().includes(q) ||
+        (t.supplier_name||'').toLowerCase().includes(q) ||
+        (t.nickname||'').toLowerCase().includes(q)
+      ) : candidates;
+      const list = filtered.slice(0, 50);
+      const container = document.getElementById('tl-mm-list');
+      if (!container) return;
+      container.innerHTML = list.length ? list.map(t => {
+        const dDiff = Math.round(Math.abs(new Date(toISODate(t.transfer_date)) - new Date(stmtDate)) / 86400000);
+        const aDiff = Math.abs((Number(t.net_amount)||0) - stmtAmtAbs);
+        const isExact = dDiff <= 1 && aDiff < 0.01;
+        return `
+          <div class="tl-mm-row" data-uuid="${t.tl_uuid}" style="padding:8px 10px;border-bottom:1px solid var(--border);cursor:pointer;display:grid;grid-template-columns:80px 110px 1fr 130px 100px;gap:8px;align-items:center;font-size:.85rem;${selectedUuid===t.tl_uuid?'background:rgba(91,124,250,.15)':''}${isExact?';border-left:3px solid var(--success)':''}">
+            <span class="badge" style="background:${t.vat==='VAT'?'rgba(79,156,249,.2)':'rgba(142,68,173,.2)'};color:${t.vat==='VAT'?'#4f9cf9':'#8e44ad'};font-size:.7rem">${t.vat}</span>
+            <span style="font-family:var(--mono);font-size:.78rem">${fmtDate(t.transfer_date)}${dDiff?` <span class="text-xs" style="color:var(--warn)">±${dDiff}d</span>`:''}</span>
+            <span title="${t.supplier_name||''}">${t.invoice_no||'-'} · <span class="text-xs text-dim">${(t.supplier_name||t.nickname||'').substring(0,30)}</span></span>
+            <span style="text-align:right;font-weight:600;color:var(--text)">฿${fmtNum(t.net_amount)}${aDiff>0.01?`<br><span class="text-xs" style="color:var(--warn)">Δ฿${fmtNum(aDiff)}</span>`:''}</span>
+            <span class="text-xs text-dim">${t.from_bank||'-'}</span>
+          </div>
+        `;
+      }).join('') : `<div style="padding:30px;text-align:center;color:var(--text3)">ไม่พบ TL ที่ unmatch</div>`;
+      
+      container.querySelectorAll('.tl-mm-row').forEach(row => {
+        row.addEventListener('click', () => {
+          selectedUuid = row.dataset.uuid;
+          renderCandidates();
+        });
+      });
+    };
+    
+    openModal('🔗 Match TL ↔ Statement', `
+      <div style="min-width:760px">
+        <div style="padding:10px;background:var(--bg2);border-radius:5px;margin-bottom:12px;font-size:.85rem">
+          <strong>Statement:</strong> ${stmt.bank} · ${fmtDate(stmt.date)} · 
+          <span style="color:${Number(stmt.amount)>=0?'var(--success)':'var(--danger)'};font-weight:600">฿${fmtNum(stmt.amount)}</span><br>
+          <span class="text-xs text-dim">${String(stmt.description||'').substring(0,120)}</span>
+        </div>
+        
+        <input class="input mb-2" id="tl-mm-search" placeholder="ค้นหา invoice / supplier / nickname" style="width:100%">
+        
+        <div style="max-height:380px;overflow-y:auto;border:1px solid var(--border);border-radius:6px" id="tl-mm-list"></div>
+        
+        <div style="padding:8px 0;font-size:.8rem;color:var(--text-dim)">
+          🟢 = ตรงเป๊ะ (วันเดียวกัน + ยอดเท่ากัน) — เรียงตามใกล้ที่สุด
+        </div>
+        
+        <div class="flex gap-2 mt-3">
+          <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ยกเลิก</button>
+          <button class="btn btn-primary btn-sm flex-1" id="tl-mm-confirm">${ICONS.check} Match</button>
+        </div>
+      </div>
+    `);
+    
+    document.getElementById('tl-mm-search')?.addEventListener('input', e => {
+      searchTl = e.target.value;
+      renderCandidates();
+    });
+    renderCandidates();
+    
+    document.getElementById('tl-mm-confirm')?.addEventListener('click', async () => {
+      if (!selectedUuid) { toast('เลือก TL ก่อน', 'warn'); return; }
+      const tl = tlAll.find(t => t.tl_uuid === selectedUuid);
+      if (!tl) { toast('TL not found', 'error'); return; }
+      
+      const station = tl.vat === 'VAT' ? 'TL-VAT' : 'TL-NOVAT';
+      stmt.match_status = 'paid';
+      stmt.match_station = station;
+      stmt.match_bill = tl.invoice_no || tl.tl_uuid;
+      stmt.matched_bills = [tl.tl_uuid];
+      stmt.match_method = 'manual_tl';
+      stmt.matched_at = new Date().toISOString();
+      if (typeof currentUser !== 'undefined' && currentUser?.username) stmt.matched_by = currentUser.username;
+      
+      tl.match_status = 'paid';
+      tl.matched_stmt_uuid = stmt.stmt_uuid;
+      tl.matched_at = stmt.matched_at;
+      tl.matched_by = stmt.matched_by || '';
+      tl.stmt_ref = stmt.ref_no || '';
+      
+      if (window.syncManager?.markDirty) window.syncManager.markDirty('stmts', stmt.stmt_uuid);
+      try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(_) {}
+      persistMainState();
+      
+      // Push TL row
+      try {
+        await api('v2_upsertTransferLog', { sheet: tl.vat==='VAT'?'vat':'novat', records: [tl] });
+      } catch(e) { console.warn('[TL push]', e); }
+      
+      closeModal();
+      toast(`✓ Match สำเร็จ — ${stmt.bank} ${fmtDate(stmt.date)} ↔ ${tl.invoice_no||'TL'} · กด "บันทึก" เพื่อ push stmts`, 'success', 5000);
+      render();
+    });
+  }
+  
+  // ── Unmatch TL ↔ Stmt ──
+  async function unmatchTLStatement(stmtUuid) {
+    const stmt = (getAllStatements()||[]).find(s => s.stmt_uuid === stmtUuid);
+    if (!stmt) { toast('ไม่พบ statement', 'error'); return; }
+    
+    const tlUuid = (Array.isArray(stmt.matched_bills) && stmt.matched_bills[0]) || '';
+    const tlAll = [...transferLog.vatTransfers, ...transferLog.novatTransfers];
+    const tl = tlUuid ? tlAll.find(t => t.tl_uuid === tlUuid) : null;
+    
+    // Clear stmt side
+    stmt.match_status = 'unpaid';
+    stmt.match_station = '';
+    stmt.match_bill = '';
+    stmt.matched_bills = [];
+    stmt.match_method = '';
+    stmt.matched_at = '';
+    stmt.matched_by = '';
+    stmt.match_reason = '';
+    stmt.overpay_amount = '';
+    
+    // Clear TL side
+    if (tl) {
+      tl.match_status = 'unpaid';
+      tl.matched_stmt_uuid = '';
+      tl.matched_at = '';
+      tl.matched_by = '';
+      tl.stmt_ref = '';
+    }
+    
+    if (window.syncManager?.markDirty) window.syncManager.markDirty('stmts', stmt.stmt_uuid);
+    try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(_) {}
+    persistMainState();
+    
+    if (tl) {
+      try {
+        await api('v2_upsertTransferLog', { sheet: tl.vat==='VAT'?'vat':'novat', records: [tl] });
+      } catch(e) { console.warn('[TL unmatch push]', e); }
+    }
+    
+    toast('✓ Unmatch สำเร็จ — กด "บันทึก" เพื่อ push stmts', 'success', 4000);
+    render();
   }
   
   function renderSuppliersTab() {
@@ -15466,6 +16130,7 @@ async function renderTransferLog(el) {
         <button class="pill ${tab==='transfers'?'active':''}" data-tab="transfers">💸 รายการโอน</button>
         <button class="pill ${tab==='suppliers'?'active':''}" data-tab="suppliers">📋 Master Supplier</button>
         <button class="pill ${tab==='checks'?'active':''}" data-tab="checks">✅ ตรวจรายเดือน</button>
+        <button class="pill ${tab==='stmts'?'active':''}" data-tab="stmts">💳 Statements</button>
       </div>
       
       <div class="flex gap-2 mb-3 items-center">
@@ -15611,6 +16276,7 @@ async function renderTransferLog(el) {
         <button class="pill ${tab==='transfers'?'active':''}" data-tab="transfers">💸 รายการโอน</button>
         <button class="pill ${tab==='suppliers'?'active':''}" data-tab="suppliers">📋 Master Supplier</button>
         <button class="pill ${tab==='checks'?'active':''}" data-tab="checks">✅ ตรวจรายเดือน</button>
+        <button class="pill ${tab==='stmts'?'active':''}" data-tab="stmts">💳 Statements</button>
       </div>
       
       ${months.length === 0 ? '<div class="card text-center" style="padding:40px;color:var(--text3)">ยังไม่มีข้อมูลตรวจ — Import ไฟล์ JKN ก่อน</div>' : `
@@ -15794,70 +16460,12 @@ async function renderTransferLog(el) {
     });
     document.getElementById('btn-tl-import')?.addEventListener('click', () => openImportModal());
     
-    // Import JSON (converted offline)
-    document.getElementById('btn-tl-import-json')?.addEventListener('change', async e => {
-      const f = e.target.files[0];
-      if (!f) return;
-      try {
-        const text = await f.text();
-        const data = JSON.parse(text);
-        
-        // Validate structure
-        if (!Array.isArray(data.vatTransfers) || !Array.isArray(data.novatTransfers)) {
-          toast('ไฟล์ JSON ไม่ถูก format (ต้องมี vatTransfers, novatTransfers, ...)', 'error');
-          return;
-        }
-        
-        if (!confirm(`จะ Import:
-• VAT Transfers: ${data.vatTransfers?.length||0}
-• NoVAT Transfers: ${data.novatTransfers?.length||0}
-• Supplier VAT: ${data.vatSuppliers?.length||0}
-• Supplier NoVAT: ${data.novatSuppliers?.length||0}
-• ตรวจ: ${Object.keys(data.monthlyChecks||{}).length} เดือน
-
-*ข้อมูลเดิมจะถูกแทนที่*`)) return;
-        
-        transferLog.vatTransfers = data.vatTransfers || [];
-        transferLog.novatTransfers = data.novatTransfers || [];
-        transferLog.vatSuppliers = data.vatSuppliers || [];
-        transferLog.novatSuppliers = data.novatSuppliers || [];
-        transferLog.monthlyChecks = data.monthlyChecks || {};
-        
-        // Auto-link transfers กับ PP จาก monthlyChecks (invoice_no + amount)
-        const checksByKey = {};
-        Object.values(transferLog.monthlyChecks).forEach(arr => {
-          arr.forEach(c => {
-            if (c.pp_no && c.invoice_no) {
-              checksByKey[`${c.invoice_no}|${Math.round(Number(c.amount_paid))}`] = c.pp_no;
-            }
-          });
-        });
-        [...transferLog.vatTransfers, ...transferLog.novatTransfers].forEach(t => {
-          const key = `${t.invoice_no}|${Math.round(Number(t.amount))}`;
-          if (checksByKey[key]) {
-            t.pp_no = checksByKey[key];
-            t.match_status = 'paid';
-          }
-        });
-        
-        persistMainState();
-        const total = (data.vatTransfers?.length||0) + (data.novatTransfers?.length||0);
-        toast(`✓ Import JSON สำเร็จ — ${total} รายการ`, 'success');
-        render();
-      } catch (err) {
-        console.error(err);
-        toast('Import ไม่สำเร็จ: ' + err.message, 'error');
-      }
-      e.target.value = '';
-    });
-    
     document.getElementById('btn-tl-save')?.addEventListener('click', async () => {
       toast('กำลังบันทึก...', 'info');
       const res = await api('saveTransferLog', { data: transferLog });
       if (res.success) toast(`บันทึกสำเร็จ — ${res.data?.total||0} รายการ`, 'success');
       else toast(res.error || 'บันทึกไม่สำเร็จ', 'error');
     });
-    document.getElementById('btn-tl-sync')?.addEventListener('click', () => syncToSupplierPayments());
     document.getElementById('btn-tl-clear')?.addEventListener('click', () => {
       if (!confirm('ล้างข้อมูล Transfer Log ทั้งหมด?')) return;
       transferLog = { vatTransfers:[], novatTransfers:[], vatSuppliers:[], novatSuppliers:[], monthlyChecks:{} };
@@ -15899,19 +16507,41 @@ async function renderTransferLog(el) {
         
         // Parse each sheet
         let vatCount = 0, novatCount = 0, vatSupCount = 0, novatSupCount = 0, checkMonths = 0;
+        let vatSkipped = 0, novatSkipped = 0;
+        
+        // ⭐ Merge helper: skip if invoice_no|transfer_date|net_amount duplicate
+        //    Preserves user matches (matched_stmt_uuid, pp_no, match_status)
+        const _tlKey = r => `${r.invoice_no||''}|${r.transfer_date||''}|${Math.round(Number(r.net_amount)||0)}`;
+        const mergeTransfers = (existing, incoming) => {
+          const seen = new Set(existing.map(_tlKey));
+          let added = 0, skipped = 0;
+          incoming.forEach(r => {
+            const k = _tlKey(r);
+            if (seen.has(k)) { skipped++; return; }
+            seen.add(k);
+            existing.push(r);
+            added++;
+          });
+          return { added, skipped };
+        };
         
         const vatSheet = result.sheets['Vat'];
         if (vatSheet) {
-          transferLog.vatTransfers = parseTransferSheet(vatSheet, true);
-          vatCount = transferLog.vatTransfers.length;
+          const fresh = parseTransferSheet(vatSheet, true);
+          const m = mergeTransfers(transferLog.vatTransfers, fresh);
+          vatCount = m.added;
+          vatSkipped = m.skipped;
         }
         
         const novatSheet = result.sheets['NoVat'];
         if (novatSheet) {
-          transferLog.novatTransfers = parseTransferSheet(novatSheet, false);
-          novatCount = transferLog.novatTransfers.length;
+          const fresh = parseTransferSheet(novatSheet, false);
+          const m = mergeTransfers(transferLog.novatTransfers, fresh);
+          novatCount = m.added;
+          novatSkipped = m.skipped;
         }
         
+        // Master suppliers — replace ทับได้ (data ไม่มี user match)
         const dropVatSheet = result.sheets['DropdownVat'];
         if (dropVatSheet) {
           transferLog.vatSuppliers = parseDropdownSheet(dropVatSheet, true);
@@ -15957,7 +16587,9 @@ async function renderTransferLog(el) {
         
         persistMainState();
         closeModal();
-        toast(`Import สำเร็จ — VAT ${vatCount} · NOVAT ${novatCount} · Supplier ${vatSupCount+novatSupCount} · ตรวจ ${checkMonths} เดือน`, 'success');
+        const skippedTotal = vatSkipped + novatSkipped;
+        const skippedMsg = skippedTotal > 0 ? ` · ข้าม ${skippedTotal} รายการซ้ำ` : '';
+        toast(`Import สำเร็จ — เพิ่ม VAT ${vatCount} · NOVAT ${novatCount}${skippedMsg} · Supplier ${vatSupCount+novatSupCount} · ตรวจ ${checkMonths} เดือน`, 'success', 5000);
         render();
       } catch (err) {
         toast('อ่านไฟล์ไม่สำเร็จ: ' + err.message, 'error');
@@ -16055,7 +16687,14 @@ async function renderTransferLog(el) {
 
 function toISODate(d) {
   if (!d && d !== 0) return '';
+  // Cache for primitives only (Date objects are mutable, skip)
+  const isPrimitive = typeof d === 'string' || typeof d === 'number';
+  if (isPrimitive) {
+    const cached = _toISODateCache.get(d);
+    if (cached !== undefined) return cached;
+  }
 
+  const result = (() => {
   // Date object
   if (d instanceof Date && !isNaN(d)) {
     let y = d.getFullYear();
@@ -16094,6 +16733,17 @@ function toISODate(d) {
     return `${y}-${String(m[2]).padStart(2,'0')}-${String(m[1]).padStart(2,'0')}`;
   }
   return '';
+  })(); // end IIFE
+  
+  // Cache primitives only
+  if (isPrimitive) {
+    if (_toISODateCache.size >= TOISODATE_CACHE_LIMIT) {
+      // Reset to prevent memory bloat (FIFO would be slower)
+      _toISODateCache.clear();
+    }
+    _toISODateCache.set(d, result);
+  }
+  return result;
 }
 
 function handleSalesUpload(result, fileName) {
@@ -21617,8 +22267,9 @@ function renderData(el) {
           return;
         }
         
-        // SP-TEMP partial matching — skip (different system)
+        // SP-TEMP / TL-VAT / TL-NOVAT — skip (different systems, not bill matching)
         if (s.match_station === 'SP-TEMP') return;
+        if (s.match_station === 'TL-VAT' || s.match_station === 'TL-NOVAT') return;
         
         const linkedBills = billList.filter(b => 
           (b.matched_stmt_uuid && b.matched_stmt_uuid === s.stmt_uuid) ||
