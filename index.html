@@ -1680,6 +1680,10 @@ window.parseCompactMetaRows = function(rows) {
   const summary = { __byDate: {} };
   const cash = { __byDate: {} };
   const lockedDates = {};
+  // ⭐ Track ว่า cloud มี locks row ของปีไหนบ้าง (ใช้เป็น source of truth สำหรับ replace)
+  //    ถ้ามี locks row → cloud คือ snapshot สมบูรณ์ → local ต้อง replace ตาม
+  //    ถ้าไม่มี locks row → คง local ไว้ (อาจจะยังไม่ pull ปีนั้น)
+  const yearsWithLocksRow = {};
   let skippedJunk = 0;
   
   rows.forEach(function(r) {
@@ -1763,6 +1767,9 @@ window.parseCompactMetaRows = function(rows) {
       if (Object.keys(cleaned).length > 0) cash.__byDate[dateISO] = cleaned;
     } else if (r.meta_type === 'locks') {
       // data = { 'yyyy-mm-dd': true, ... } — keys เป็น locked dates
+      // ⭐ Mark year นี้ว่ามี locks snapshot (cloud authoritative for this year)
+      const yearOfRow = String(dateISO).substring(0, 4);
+      if (yearOfRow) yearsWithLocksRow[yearOfRow] = true;
       Object.keys(data).forEach(function(d) {
         if (data[d] === true) lockedDates[d] = true;
       });
@@ -1770,7 +1777,7 @@ window.parseCompactMetaRows = function(rows) {
   });
   
   if (skippedJunk > 0) console.warn(`[parseMeta] Skipped ${skippedJunk} junk rows`);
-  return { summary: summary, cashCount: cash, lockedDates: lockedDates };
+  return { summary: summary, cashCount: cash, lockedDates: lockedDates, yearsWithLocksRow: yearsWithLocksRow };
 };
 
 // ═══════════════════════════════════════════════════════════════════
@@ -3032,16 +3039,32 @@ const syncManager = {
                     mergeFields(cashCount.__byDate[d], v);
                   });
                 }
-                // ⭐ Merge lockedDates from cloud (UNION — cloud lock + local lock = locked)
-                //    Reason: lock เป็น authoritative state — ถ้า admin lock ที่ device อื่น
-                //    device นี้ต้องเห็น lock ทันทีหลัง refresh (ไม่งั้น แก้แล้ว push ทับได้)
-                //    แต่ unlock ต้อง explicit (user กดเอง) — ดังนั้นไม่ลบ local locks ออก
-                if (parsed.lockedDates && Object.keys(parsed.lockedDates).length > 0) {
+                // ⭐ REPLACE lockedDates per year (cloud = source of truth)
+                //    เดิม: UNION → unlock จากอีกเครื่องไม่ sync (local lock เก่ายังอยู่)
+                //    ใหม่: ปีไหนที่ cloud มี locks row → ลบ local locks ของปีนั้นทิ้ง → ใส่ cloud locks
+                //    ปีไหน cloud ไม่มี locks row → ไม่แตะ local (อาจยังไม่ pull ปีนั้น)
+                //    Dirty guard: ถ้า user มี local meta edit ที่ยังไม่ push → skip merge (กันทับ)
+                const isDirty = this.dirty.has('meta');
+                if (parsed.yearsWithLocksRow && Object.keys(parsed.yearsWithLocksRow).length > 0 && !isDirty) {
                   if (!mainSummary.__lockedDates) mainSummary.__lockedDates = {};
-                  Object.keys(parsed.lockedDates).forEach(d => {
-                    mainSummary.__lockedDates[d] = true;
+                  // ลบ local locks ของปีที่ cloud มี row
+                  Object.keys(parsed.yearsWithLocksRow).forEach(yr => {
+                    Object.keys(mainSummary.__lockedDates).forEach(d => {
+                      if (String(d).substring(0, 4) === yr) {
+                        delete mainSummary.__lockedDates[d];
+                      }
+                    });
                   });
-                  console.log(`[sync] Lock dates merged: ${Object.keys(mainSummary.__lockedDates).length} total`);
+                  // ใส่ cloud locks (เฉพาะที่อยู่ในปีที่มี row)
+                  Object.keys(parsed.lockedDates || {}).forEach(d => {
+                    const yr = String(d).substring(0, 4);
+                    if (parsed.yearsWithLocksRow[yr]) {
+                      mainSummary.__lockedDates[d] = true;
+                    }
+                  });
+                  console.log(`[sync] Lock dates REPLACED for years [${Object.keys(parsed.yearsWithLocksRow).join(',')}] → ${Object.keys(mainSummary.__lockedDates).length} total`);
+                } else if (isDirty) {
+                  console.log(`[sync] Lock merge SKIPPED (local meta dirty)`);
                 }
                 handled = true;
                 console.log(`[sync] Meta ${y}: ${r.data.rows.length} rows via getMetaWithUuid (new schema)`);
@@ -11799,8 +11822,8 @@ async function renderPayments(el) {
         // Clear dirty (user accepted overwrite)
         if (hasDirty) syncManager.dirty.clear();
         
-        // ⭐ Targeted pull: SP-TEMP + Payments เท่านั้น (ไม่ดึง bills/stmts หนัก)
-        const before = { sp: paymentList.length, temp: spTempList.length };
+        // ⭐ Targeted pull: SP-TEMP + Payments + Meta(locks) เท่านั้น (ไม่ดึง bills/stmts หนัก)
+        const before = { sp: paymentList.length, temp: spTempList.length, locks: Object.keys(mainSummary.__lockedDates||{}).length };
         
         // Pull SP-TEMPs (force mode → override local)
         try {
@@ -11826,14 +11849,42 @@ async function renderPayments(el) {
           }
         } catch(e) { console.warn('[refresh-pay] payments:', e); }
         
+        // ⭐ Pull Meta (locks) — ปีปัจจุบัน + ปีก่อน
+        //    เหตุผล: lock อยู่ใน meta sheet → ถ้า user unlock ที่อีกเครื่อง ต้อง sync ตาม
+        try {
+          const yr = new Date().getFullYear();
+          for (const y of [String(yr), String(yr-1)]) {
+            const r = await api('getMetaWithUuid', { year: y });
+            if (r?.success && Array.isArray(r.data?.rows) && typeof window.parseCompactMetaRows === 'function') {
+              const parsed = window.parseCompactMetaRows(r.data.rows);
+              // REPLACE locks per year (cloud=truth)
+              if (parsed.yearsWithLocksRow && Object.keys(parsed.yearsWithLocksRow).length > 0) {
+                if (!mainSummary.__lockedDates) mainSummary.__lockedDates = {};
+                Object.keys(parsed.yearsWithLocksRow).forEach(yr2 => {
+                  Object.keys(mainSummary.__lockedDates).forEach(d => {
+                    if (String(d).substring(0, 4) === yr2) delete mainSummary.__lockedDates[d];
+                  });
+                });
+                Object.keys(parsed.lockedDates || {}).forEach(d => {
+                  const yr2 = String(d).substring(0, 4);
+                  if (parsed.yearsWithLocksRow[yr2]) mainSummary.__lockedDates[d] = true;
+                });
+              }
+            }
+          }
+          persistMainState();
+        } catch(e) { console.warn('[refresh-pay] meta:', e); }
+        
         // Reset fp cache → next push จะส่งจริง (ไม่ skip)
         if (syncManager._fpCache) {
           delete syncManager._fpCache.sp_temps;
           delete syncManager._fpCache.payments;
+          delete syncManager._fpCache.meta;
         }
         
-        const after = { sp: paymentList.length, temp: spTempList.length };
-        toast(`✅ Refresh สำเร็จ — SP ${after.sp} (${after.sp-before.sp>=0?'+':''}${after.sp-before.sp}) · SP-TEMP ${after.temp} (${after.temp-before.temp>=0?'+':''}${after.temp-before.temp})`, 'success', 3500);
+        const after = { sp: paymentList.length, temp: spTempList.length, locks: Object.keys(mainSummary.__lockedDates||{}).length };
+        const dSp = after.sp-before.sp, dTemp = after.temp-before.temp, dLocks = after.locks-before.locks;
+        toast(`✅ Refresh สำเร็จ — SP ${after.sp} (${dSp>=0?'+':''}${dSp}) · SP-TEMP ${after.temp} (${dTemp>=0?'+':''}${dTemp}) · Locks ${after.locks} (${dLocks>=0?'+':''}${dLocks})`, 'success', 4000);
         render();
       } catch (e) {
         console.error('[refresh-pay] error:', e);
@@ -16069,11 +16120,23 @@ async function loadMetaFromBackend() {
         });
       }
       
-      // ── Merge lockedDates (UNION) ──
-      if (parsed.lockedDates && Object.keys(parsed.lockedDates).length > 0) {
+      // ── Replace lockedDates per year (cloud = source of truth) ──
+      // เก่า: UNION → unlock จากเครื่องอื่นไม่ sync
+      // ใหม่: ปีไหน cloud มี locks row → ลบ local locks ของปีนั้น → ใส่ cloud locks
+      if (parsed.yearsWithLocksRow && Object.keys(parsed.yearsWithLocksRow).length > 0) {
         if (!mainSummary.__lockedDates) mainSummary.__lockedDates = {};
-        Object.keys(parsed.lockedDates).forEach(function(d) {
-          mainSummary.__lockedDates[d] = true;
+        Object.keys(parsed.yearsWithLocksRow).forEach(function(yr) {
+          Object.keys(mainSummary.__lockedDates).forEach(function(d) {
+            if (String(d).substring(0, 4) === yr) {
+              delete mainSummary.__lockedDates[d];
+            }
+          });
+        });
+        Object.keys(parsed.lockedDates || {}).forEach(function(d) {
+          var yr = String(d).substring(0, 4);
+          if (parsed.yearsWithLocksRow[yr]) {
+            mainSummary.__lockedDates[d] = true;
+          }
         });
       }
     }
@@ -18160,7 +18223,7 @@ async function renderMatching(el) {
                 return `
                 <tr class="${_classes}" style="${rowStyle}" data-stmt-idx="${i}">
                   <td><span class="badge" style="background:${(bankColors[s.bank]||'#555')}22;color:${bankColors[s.bank]||'#aaa'}">${s.bank}</span>${_isDirty?'<span class="dirty-badge" title="ยังไม่ได้บันทึก"></span>':''}${_isLocked?' <span title="วันนี้ถูก lock — แก้ไขไม่ได้ แต่ matching ทำได้" style="color:var(--danger);font-size:.85rem">🔒</span>':''}</td>
-                  <td>${fmtDate(s.date)}</td>
+                  <td style="white-space:nowrap">${fmtDate(s.date)} <button class="btn-edit-stmt-date" data-stmt-idx="${i}" title="แก้ไขวันที่ statement" style="background:none;border:none;cursor:pointer;color:var(--text3);font-size:.78rem;padding:1px 4px">✎</button></td>
                   <td>${fmtStmtTime(s.time)}</td>
                   <td class="text-xs" style="font-family:var(--mono)">${s.ref_no}</td>
                   <td style="text-align:right;font-weight:600;color:${Number(s.amount)>=0?'var(--success)':'var(--danger)'}">${Number(s.amount)>=0?'+':''}${fmtNum(s.amount)}</td>
@@ -18373,6 +18436,127 @@ async function renderMatching(el) {
       }
     });
 
+    // ── Edit Statement Date ──
+    el.querySelectorAll('.btn-edit-stmt-date').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const stmtIdx = Number(btn.dataset.stmtIdx);
+        const stmt = data[stmtIdx];
+        if (!stmt) return;
+        
+        const stmtUuid = stmt.stmt_uuid || '';
+        if (!stmtUuid) {
+          toast('ไม่พบ stmt_uuid — refresh หน้านี้ก่อน', 'error');
+          return;
+        }
+        
+        const currentDate = toISODate(stmt.date) || '';
+        // Modal HTML
+        const html = `
+          <div class="modal-head">
+            <strong>✎ แก้ไขวันที่ Statement</strong>
+            <button class="btn-close" id="esd-close">×</button>
+          </div>
+          <div class="modal-body">
+            <div class="text-xs text-muted mb-2">
+              <strong>Bank:</strong> ${stmt.bank} · 
+              <strong>Ref:</strong> <span style="font-family:var(--mono)">${(stmt.ref_no||'').substring(0,40)}</span> · 
+              <strong>ยอด:</strong> ฿${fmtNum(stmt.amount)}
+            </div>
+            <label>วันที่เดิม</label>
+            <input type="text" value="${fmtDate(currentDate)}" disabled style="background:var(--surface2);color:var(--text2)">
+            <label class="mt-2">วันที่ใหม่</label>
+            <input type="date" id="esd-new-date" value="${currentDate}" max="${(()=>{
+              const d=new Date(); d.setDate(d.getDate()+30);
+              return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+            })()}">
+            <div class="text-xs text-muted mt-2" style="line-height:1.5">
+              ${stmt.match_status === 'paid' && stmt.match_bill ? '⚠️ Statement นี้ matched กับบิล <strong>'+stmt.match_bill+'</strong> — pay_date ของบิลจะอัปเดตตาม' : ''}
+              ${(()=>{
+                const _isLocked = (typeof isDateLocked === 'function') && isDateLocked(currentDate);
+                return _isLocked ? '<br>🔒 วันเดิมถูก lock — แก้ไขได้ แต่ขอ confirm' : '';
+              })()}
+            </div>
+          </div>
+          <div class="modal-foot" style="justify-content:flex-end;gap:8px">
+            <button class="btn btn-outline btn-sm" id="esd-cancel">ยกเลิก</button>
+            <button class="btn btn-primary btn-sm" id="esd-save">บันทึก</button>
+          </div>
+        `;
+        
+        // Render in modal-overlay
+        const overlay = document.getElementById('modal-overlay');
+        const content = document.getElementById('modal-content');
+        if (!overlay || !content) {
+          // Fallback to prompt
+          const newD = prompt('วันที่ใหม่ (yyyy-mm-dd):', currentDate);
+          if (!newD || newD === currentDate) return;
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(newD)) { toast('format ผิด — ต้องเป็น yyyy-mm-dd', 'error'); return; }
+          applyDateChange(stmt, currentDate, newD);
+          render();
+          return;
+        }
+        content.innerHTML = html;
+        overlay.classList.add('show');
+        
+        const close = () => { overlay.classList.remove('show'); content.innerHTML = ''; };
+        document.getElementById('esd-close')?.addEventListener('click', close);
+        document.getElementById('esd-cancel')?.addEventListener('click', close);
+        document.getElementById('esd-save')?.addEventListener('click', () => {
+          const newD = document.getElementById('esd-new-date')?.value;
+          if (!newD) { toast('กรุณาเลือกวันที่', 'warn'); return; }
+          if (newD === currentDate) { close(); return; }
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(newD)) { toast('format วันที่ผิด', 'error'); return; }
+          
+          // Lock guard
+          if (typeof isDateLocked === 'function') {
+            if (isDateLocked(currentDate)) {
+              if (!confirm(`🔒 วันเดิม (${fmtDate(currentDate)}) ถูก lock\n\nยืนยันแก้ไข?`)) return;
+            }
+            if (isDateLocked(newD)) {
+              if (!confirm(`🔒 วันใหม่ (${fmtDate(newD)}) ถูก lock\n\nยืนยันย้ายไปวันนั้น?`)) return;
+            }
+          }
+          
+          applyDateChange(stmt, currentDate, newD);
+          close();
+          toast(`✓ แก้ไขวันที่: ${fmtDate(currentDate)} → ${fmtDate(newD)}`, 'success', 3000);
+          render();
+        });
+        
+        function applyDateChange(s, oldDate, newDate) {
+          // Find original in uploadedStatements (data is filtered view)
+          const orig = uploadedStatements.find(x => x.stmt_uuid === s.stmt_uuid) || s;
+          orig.date = newDate;
+          if (s !== orig) s.date = newDate;
+          
+          // ⭐ ถ้า matched กับบิล → update bill.pay_date ด้วย (เคยตั้งจาก stmt.date เดิม)
+          if (orig.match_status === 'paid') {
+            const matchedBills = Array.isArray(orig.matched_bills) && orig.matched_bills.length 
+              ? orig.matched_bills 
+              : (orig.match_bill ? [orig.match_bill] : []);
+            matchedBills.forEach(billNo => {
+              const bills = (typeof getAllBills === 'function') ? getAllBills() : (window.bills2026 || []);
+              bills.forEach(b => {
+                if (String(b.bill_no||'').trim() === String(billNo).trim()) {
+                  b.pay_date = newDate;
+                  if (window.syncManager?.markDirty) {
+                    window.syncManager.markDirty('bills', b.bill_uuid);
+                  }
+                }
+              });
+            });
+          }
+          
+          // markDirty stmt
+          if (window.syncManager?.markDirty) {
+            window.syncManager.markDirty('stmts', orig.stmt_uuid);
+          }
+          if (typeof persistMainState === 'function') persistMainState();
+        }
+      });
+    });
+    
     // ── Manual Match: เลือก Statement → เลือก Bill → ผูก ──
     el.querySelectorAll('.btn-manual-match').forEach(btn => {
       btn.addEventListener('click', (e) => {
