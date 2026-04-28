@@ -19887,13 +19887,35 @@ function renderData(el) {
             </div>
           </div>
           <div class="flex gap-2">
+            <button class="btn btn-outline btn-sm" id="btn-compact-stmts" title="ลบ ghost empty rows ออกจากทุก stmts sheet">🔧 ซ่อม Sheet</button>
             <button class="btn btn-sm" id="btn-clear-stmts-all" style="background:var(--warn);color:#1a1d27;border:none;font-weight:700">🗑 ล้าง Statements ทั้งหมด</button>
           </div>
         </div>
         <p class="text-xs text-dim" style="padding:10px;background:rgba(239,87,87,.08);border-radius:6px;border-left:3px solid var(--danger)">
-          ⚠️ <strong>ล้างทั้ง Local + Sheet</strong> — Sheet stmts_YYYY (legacy) + stmts_&lt;BANK&gt;_YYYY (KTB/KBANK/BBL/BBL_NW/TTB) <strong>ทุกปี</strong> จะถูก clear (เก็บ header)<br>
+          ⚠️ <strong>ล้างทั้ง Local + Sheet</strong> — Sheet stmts_YYYY (legacy) + stmts_&lt;BANK&gt;_YYYY (KTB/KBANK/BBL/BBL_NW/TTB) <strong>ทุกปี</strong> จะถูก delete (เก็บ header)<br>
           ✅ ไม่แตะ: Bills, Daily, Cashflow, SP/PP, Match Log<br>
+          💡 <strong>"ซ่อม Sheet"</strong> = ลบเฉพาะ rows ว่าง (ghost) ที่ทำให้ append เพี้ยน — ไม่แตะข้อมูลจริง<br>
           💡 หลังล้าง — ไปหน้า <strong>Matching</strong> → upload bank statement files ใหม่
+        </p>
+      </div>
+      
+      <!-- Meta Reset Section -->
+      <div class="card mb-3" style="border:1.5px solid var(--purple);background:rgba(165,134,255,.04)">
+        <div class="flex justify-between items-center mb-3">
+          <div>
+            <div class="font-semi" style="color:var(--purple)">🧾 จัดการ Meta (Daily Summary / Cash Count / Locks)</div>
+            <div class="text-xs text-muted mt-1">
+              ใช้เมื่อ <strong>ลบ rows ใน Sheet เองแล้ว data กลับมาเอง</strong> (เพราะ local-first sync UPSERT push เก่ากลับ)
+            </div>
+          </div>
+          <div class="flex gap-2">
+            <button class="btn btn-sm" id="btn-clear-meta-all" style="background:var(--purple);color:#fff;border:none;font-weight:700">🗑 ล้าง Meta ทั้งหมด</button>
+          </div>
+        </div>
+        <p class="text-xs text-dim" style="padding:10px;background:rgba(239,87,87,.08);border-radius:6px;border-left:3px solid var(--danger)">
+          ⚠️ <strong>ล้างทั้ง Local + Sheet</strong> — meta_YYYY ทุกปี (cash_count + summary + locks) จะถูก delete<br>
+          ⚠️ จะลบ: <strong>mainSummary, cashCount, locks (วัน lock ทั้งหมด)</strong> ใน local ด้วย<br>
+          ✅ ไม่แตะ: Bills, Statements, SP/PP, Cashflow, Suppliers
         </p>
       </div>
       
@@ -20870,6 +20892,137 @@ function renderData(el) {
         render();
       } catch(e) {
         console.error('[clear-stmts] error:', e);
+        toast('เกิดข้อผิดพลาด: ' + e.message, 'error', 6000);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = origText;
+      }
+    });
+    
+    // ── Compact Stmts Sheets (ลบ ghost empty rows) ──
+    document.getElementById('btn-compact-stmts')?.addEventListener('click', async () => {
+      const msg = `🔧 ซ่อม Statement Sheets?\n\n` +
+                  `จะลบ "ghost empty rows" — rows ที่ uuid ว่าง (เกิดจาก clear ที่ไม่ smart ในอดีต)\n\n` +
+                  `ผลกระทบ:\n` +
+                  `  • Sheet stmts_<BANK>_YYYY ทุกปี — ลบเฉพาะ rows ที่ stmt_uuid ว่าง\n` +
+                  `  • ข้อมูลจริง (rows ที่มี uuid) — ไม่แตะ\n` +
+                  `  • Local — ไม่แตะ\n\n` +
+                  `ใช้เมื่อ: append ใหม่ตกท้าย sheet เพี้ยน หรือ getLastRow() คืนค่าเกินจริง\n\n` +
+                  `ดำเนินการ?`;
+      if (!confirm(msg)) return;
+      
+      const btn = document.getElementById('btn-compact-stmts');
+      const origText = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = '⏳ กำลังซ่อม...';
+      
+      try {
+        toast('🔧 กำลังซ่อม Sheet...', 'info');
+        const res = await api('v2_compactSheets', { target: 'stmts' });
+        if (!res.success) throw new Error('Backend error: ' + (res.error || 'unknown'));
+        const info = res.data || {};
+        console.log('[compact-stmts]', info);
+        
+        const lines = (info.report || [])
+          .filter(r => r.removed > 0 || r.kept_data_rows > 0)
+          .map(r => `  • ${r.sheet}: ลบ ${r.removed} ghost · เหลือ ${r.kept_data_rows} data`)
+          .join('\n');
+        
+        toast(`✓ ซ่อม Sheet สำเร็จ — ลบ ${info.total_rows_removed || 0} ghost rows`, 'success', 5000);
+        alert(
+          `🔧 ซ่อม Sheet เรียบร้อย\n\n` +
+          `Total ghost rows ลบ: ${info.total_rows_removed || 0}\n` +
+          `Sheets ตรวจ: ${info.sheets_processed || 0}\n\n` +
+          (lines || '(ไม่มี ghost rows — sheet ปกติ)')
+        );
+      } catch(e) {
+        console.error('[compact-stmts] error:', e);
+        toast('เกิดข้อผิดพลาด: ' + e.message, 'error', 6000);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = origText;
+      }
+    });
+    
+    // ── Clear Meta ทั้งหมด (Local + Cloud) ──
+    document.getElementById('btn-clear-meta-all')?.addEventListener('click', async () => {
+      const summaryDays = Object.keys(mainSummary || {}).length;
+      const cashDays = Object.keys(cashCount || {}).length;
+      const lockDays = Object.keys(lockedDates || {}).length;
+      
+      const msg1 = `🗑 ล้าง Meta ทั้งหมด?\n\n` +
+                   `จะลบ:\n` +
+                   `  • Local mainSummary: ${summaryDays} วัน\n` +
+                   `  • Local cashCount: ${cashDays} วัน\n` +
+                   `  • Local lockedDates: ${lockDays} วัน\n` +
+                   `  • Cloud meta_YYYY: cash_count + summary + locks ทุกปี\n\n` +
+                   `ไม่แตะ: Bills, Statements, SP/PP, Cashflow, Suppliers\n\n` +
+                   `แน่ใจไหม? (ไม่สามารถย้อนกลับได้)`;
+      if (!confirm(msg1)) return;
+      
+      const msg2 = `🚨 ยืนยันอีกครั้ง\n\nBackup JSON ก่อนแล้วใช่ไหม?`;
+      if (!confirm(msg2)) return;
+      
+      const btn = document.getElementById('btn-clear-meta-all');
+      const origText = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = '⏳ กำลังล้าง...';
+      
+      try {
+        // 1. Pause sync
+        const wasPulling = window.syncManager?._inPull;
+        if (window.syncManager) window.syncManager._inPull = true;
+        
+        // 2. Clear Cloud first
+        toast('☁️ กำลังล้าง Sheet meta...', 'info');
+        const res = await api('v2_clearAllMeta', {});
+        if (!res.success) throw new Error('Backend error: ' + (res.error || 'unknown'));
+        const cloudInfo = res.data || {};
+        console.log('[clear-meta] cloud cleared:', cloudInfo);
+        
+        // 3. Clear Local memory
+        mainSummary = {};
+        cashCount = {};
+        if (typeof lockedDates !== 'undefined') {
+          if (window.lockedDates) {
+            Object.keys(window.lockedDates).forEach(k => delete window.lockedDates[k]);
+          }
+        }
+        try { safeStorage.del('sf_lockedDates'); } catch(_) {}
+        
+        // 4. Persist local
+        try {
+          safeStorage.set('sf_mainSummary', JSON.stringify(mainSummary));
+          safeStorage.set('sf_cashCount', JSON.stringify(cashCount));
+        } catch(e) { console.warn('[clear-meta] local persist:', e); }
+        
+        // 5. Mark meta clean — ไม่ให้ syncManager push เก่ากลับ
+        if (window.syncManager?.markClean) {
+          window.syncManager.markClean('meta');
+          // Clear any per-date dirty uuids
+          if (window.syncManager.dirtyUuids?.meta) {
+            window.syncManager.dirtyUuids.meta.clear?.();
+          }
+        }
+        
+        // 6. Resume sync
+        if (window.syncManager) window.syncManager._inPull = wasPulling || false;
+        
+        // 7. Toast + render
+        const sheetsInfo = (cloudInfo.cleared || []).map(c => `  • ${c.sheet}: ${c.rows_cleared}`).join('\n');
+        toast(`✓ ล้าง Meta สำเร็จ`, 'success', 5000);
+        
+        alert(
+          `🗑 ล้าง Meta เรียบร้อย\n\n` +
+          `Local: summary ${summaryDays} + cash ${cashDays} + locks ${lockDays} → 0\n` +
+          `Cloud: ${cloudInfo.sheets_count || 0} sheets, ${cloudInfo.total_rows_cleared || 0} rows\n` +
+          (sheetsInfo ? sheetsInfo + '\n' : '') +
+          `\nกรอกข้อมูลใหม่ได้เลย — sync จะ push ขึ้น cloud อัตโนมัติ`
+        );
+        
+        render();
+      } catch(e) {
+        console.error('[clear-meta] error:', e);
         toast('เกิดข้อผิดพลาด: ' + e.message, 'error', 6000);
       } finally {
         btn.disabled = false;
