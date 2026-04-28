@@ -739,9 +739,9 @@ function applyFlatpickrAll() {
 // Auto-apply flatpickr เมื่อมี date input ใหม่เพิ่มใน DOM (modal, re-render)
 if (typeof window !== 'undefined') {
   const _fpObserver = new MutationObserver(() => {
-    // debounce: รอ 50ms หลังเปลี่ยนแปลง
+    // debounce: รอ 200ms หลังเปลี่ยนแปลง — เผื่อ DOM ใหญ่ (bills 9000+ rows)
     clearTimeout(window._fpTimer);
-    window._fpTimer = setTimeout(applyFlatpickrAll, 50);
+    window._fpTimer = setTimeout(applyFlatpickrAll, 200);
   });
   // เริ่มสังเกตหลัง DOM พร้อม
   if (document.body) {
@@ -2892,7 +2892,11 @@ const syncManager = {
           const hasStation = !!(s.match_station && String(s.match_station).trim());
           const hasBill = !!(s.match_bill && String(s.match_bill).trim());
           const hasMatchedBills = Array.isArray(s.matched_bills) && s.matched_bills.length > 0;
-          const hasMatchData = (hasStation && hasBill) || hasMatchedBills;
+          // ⭐ manual_reason / SP-TEMP เป็น valid paid โดยไม่ต้องมี bill link
+          const isReasonOnly = s.match_method === 'manual_reason';
+          const isSpTemp = s.match_station === 'SP-TEMP';
+          const hasReason = !!(s.match_reason && String(s.match_reason).trim());
+          const hasMatchData = (hasStation && hasBill) || hasMatchedBills || isReasonOnly || isSpTemp || hasReason;
           
           if (hasMatchData && s.match_status !== 'paid') {
             s.match_status = 'paid';
@@ -4017,7 +4021,11 @@ async function restoreMainState() {
       const hasStation = !!(s.match_station && String(s.match_station).trim());
       const hasBill = !!(s.match_bill && String(s.match_bill).trim());
       const hasMatchedBills = Array.isArray(s.matched_bills) && s.matched_bills.length > 0;
-      const hasMatchData = (hasStation && hasBill) || hasMatchedBills;
+      // ⭐ manual_reason / SP-TEMP / มี match_reason = valid paid (no bill link by design)
+      const isReasonOnly = s.match_method === 'manual_reason';
+      const isSpTemp = s.match_station === 'SP-TEMP';
+      const hasReason = !!(s.match_reason && String(s.match_reason).trim());
+      const hasMatchData = (hasStation && hasBill) || hasMatchedBills || isReasonOnly || isSpTemp || hasReason;
       
       if (hasMatchData && s.match_status !== 'paid') {
         s.match_status = 'paid';
@@ -6542,6 +6550,10 @@ async function renderMain(el) {
       expandedSpSet: expandedSpMain,
       onChange: () => { renderKeepScroll(); },
     });
+    
+    // ⭐ Force flatpickr — MutationObserver debounce อาจไม่ทันบน big DOM (9000+ rows)
+    //    ทำให้ <input type="date"> แสดง mm/dd/yyyy ตาม browser locale แทน dd/mm/yyyy
+    try { if (typeof applyFlatpickrAll === 'function') setTimeout(applyFlatpickrAll, 0); } catch(_) {}
   }
   
   // ── renderKeepScroll: re-render หน้าโดย preserve scroll position ──
@@ -6598,6 +6610,8 @@ async function renderMain(el) {
             }
           }
         } catch(_) {}
+        // ⭐ Force apply flatpickr — MutationObserver debounce อาจไม่ทันบน big DOM (9000+ rows)
+        try { if (typeof applyFlatpickrAll === 'function') applyFlatpickrAll(); } catch(_) {}
       });
     });
   }
