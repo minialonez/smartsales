@@ -6017,7 +6017,7 @@ async function renderMain(el) {
           <button class="btn btn-primary btn-sm" id="btn-gen-smart">${ICONS.download} Smart (SS/OS/OR/SR)</button>
           <button class="btn btn-info btn-sm" id="btn-import-pos" style="background:var(--info);color:#fff">${ICONS.download} Front POS</button>
           <button class="btn ${showChange?'btn-primary':'btn-outline'} btn-sm" id="btn-toggle-change">🪙 นับธนบัตร</button>
-          <button class="btn btn-ghost btn-sm" id="btn-unmatch-day" style="color:var(--warn);border:1px solid var(--warn)" title="Unmatch บิลทั้งหมดในวันนี้">↩ Unmatch วันนี้</button>
+          <button class="btn btn-sm" id="btn-unmatch-day" style="background:var(--warn);color:#1a1d27;border:none;font-weight:700" title="Unmatch บิลทั้งหมดในวันนี้ — ปลด link statement ทุกตัวที่ match กับวันนี้">↩ Unmatch วันนี้</button>
           <button class="btn btn-sm" id="btn-lock-day" ${isDateLocked(selectedDate)?'disabled':''} style="${isDateLocked(selectedDate)?'background:rgba(239,87,87,.08);border:1px solid rgba(239,87,87,.3);color:rgba(239,87,87,.4);cursor:not-allowed':'background:var(--danger);color:#fff;border:1px solid var(--danger);font-weight:700'}" title="Lock วันนี้ — ป้องกันการแก้ไข">🔒 Lock</button>
           <button class="btn btn-sm" id="btn-unlock-day" ${!isDateLocked(selectedDate)?'disabled':''} style="${!isDateLocked(selectedDate)?'background:rgba(45,212,160,.08);border:1px solid rgba(45,212,160,.3);color:rgba(45,212,160,.4);cursor:not-allowed':'background:var(--success);color:#fff;border:1px solid var(--success);font-weight:700;box-shadow:0 0 0 2px rgba(45,212,160,.2)'}" title="ปลด Lock วันนี้">🔓 Unlock</button>
           <button class="btn btn-outline btn-sm" id="btn-bulk-lock" title="Lock/Unlock หลายวันพร้อมกัน" style="border:1px dashed var(--text2);color:var(--text2)">📅 Bulk</button>
@@ -19876,6 +19876,27 @@ function renderData(el) {
         </p>
       </div>
       
+      <!-- Statements Reset Section -->
+      <div class="card mb-3" style="border:1.5px solid var(--warn);background:rgba(245,166,35,.04)">
+        <div class="flex justify-between items-center mb-3">
+          <div>
+            <div class="font-semi" style="color:var(--warn)">🏦 จัดการ Statements (Bank)</div>
+            <div class="text-xs text-muted mt-1">
+              จำนวนปัจจุบัน: <strong id="stmts-count-display">${(typeof getAllStatements==='function'?getAllStatements().length:0).toLocaleString()}</strong> รายการ
+              · ใช้ <strong>"ล้าง Statements ทั้งหมด"</strong> เมื่อข้อมูล <strong>ซ้ำ/บวม/พัง</strong> หรืออยาก <strong>เริ่มใหม่</strong>
+            </div>
+          </div>
+          <div class="flex gap-2">
+            <button class="btn btn-sm" id="btn-clear-stmts-all" style="background:var(--warn);color:#1a1d27;border:none;font-weight:700">🗑 ล้าง Statements ทั้งหมด</button>
+          </div>
+        </div>
+        <p class="text-xs text-dim" style="padding:10px;background:rgba(239,87,87,.08);border-radius:6px;border-left:3px solid var(--danger)">
+          ⚠️ <strong>ล้างทั้ง Local + Sheet</strong> — Sheet stmts_YYYY (legacy) + stmts_&lt;BANK&gt;_YYYY (KTB/KBANK/BBL/BBL_NW/TTB) <strong>ทุกปี</strong> จะถูก clear (เก็บ header)<br>
+          ✅ ไม่แตะ: Bills, Daily, Cashflow, SP/PP, Match Log<br>
+          💡 หลังล้าง — ไปหน้า <strong>Matching</strong> → upload bank statement files ใหม่
+        </p>
+      </div>
+      
       <!-- Backup Section -->
       <div class="card mb-3">
         <div class="flex justify-between items-center mb-3">
@@ -20756,6 +20777,104 @@ function renderData(el) {
           render();
         };
       } catch(e) { console.error(e); toast('เกิดข้อผิดพลาด: ' + e.message, 'error'); }
+    });
+    
+    // ── Clear Statements ทั้งหมด (Local + Cloud) ──
+    document.getElementById('btn-clear-stmts-all')?.addEventListener('click', async () => {
+      const stmtsTotal = getAllStatements().length;
+      const matchedCount = billList.filter(b => b.matched_stmt_uuid || b.matched_stmt_ref).length;
+      
+      const msg1 = `🗑 ล้าง Statements ทั้งหมด?\n\n` +
+                   `จะลบ:\n` +
+                   `  • Local: statementsByBank ทุก bank (${stmtsTotal} รายการ)\n` +
+                   `  • Cloud: stmts_YYYY + stmts_<BANK>_YYYY ทุกปี (เก็บ header)\n\n` +
+                   `⚠️ Bills ที่เคย match (${matchedCount}) จะกลายเป็น "ยังไม่ paid"\n` +
+                   `   เพราะ statement ที่ match อยู่จะถูกลบ\n\n` +
+                   `ไม่แตะ: Bills, Daily, Cashflow, SP/PP, Match Log\n\n` +
+                   `แน่ใจไหม? (ไม่สามารถย้อนกลับได้)`;
+      if (!confirm(msg1)) return;
+      
+      const msg2 = `🚨 ยืนยันอีกครั้ง\n\n` +
+                   `กำลังจะล้าง ${stmtsTotal} statements + ${matchedCount} match links\n\n` +
+                   `Backup JSON ก่อนแล้วใช่ไหม?`;
+      if (!confirm(msg2)) return;
+      
+      const btn = document.getElementById('btn-clear-stmts-all');
+      const origText = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = '⏳ กำลังล้าง...';
+      
+      try {
+        // 1. Pause sync — กัน push race ระหว่าง clear
+        const wasPulling = window.syncManager?._inPull;
+        if (window.syncManager) window.syncManager._inPull = true;
+        
+        // 2. Clear Cloud first (ถ้า cloud ล้มเหลว — local ยังอยู่)
+        toast('☁️ กำลังล้าง Sheet...', 'info');
+        const res = await api('v2_clearAllStatements', {});
+        if (!res.success) {
+          throw new Error('Backend error: ' + (res.error || 'unknown'));
+        }
+        const cloudInfo = res.data || {};
+        console.log('[clear-stmts] cloud cleared:', cloudInfo);
+        
+        // 3. Clear Local memory
+        clearStatementsByBank('ALL');
+        uploadedStatements = [];
+        
+        // 4. Unmatch bills ที่ link กับ stmts ที่หาย (เพราะ stmts ถูกลบ)
+        let unmatchedBills = 0;
+        billList.forEach(b => {
+          if (b.matched_stmt_uuid || b.matched_stmt_ref) {
+            b.match_status = 'unpaid';
+            delete b.matched_stmt_uuid;
+            delete b.matched_stmt_ref;
+            delete b.match_bank;
+            delete b.match_date;
+            delete b.paid_at;
+            unmatchedBills++;
+          }
+        });
+        
+        // 5. Persist local — write IDB
+        try {
+          safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank));
+          safeStorage.set('sf_billList', JSON.stringify(billList));
+        } catch(e) { console.warn('[clear-stmts] local persist:', e); }
+        
+        // 6. Mark stmts clean — ไม่ให้ syncManager push เก่ากลับ
+        if (window.syncManager?.markClean) {
+          window.syncManager.markClean('stmts');
+        }
+        // Bills changed → mark dirty เพื่อ push unmatch state ขึ้น cloud
+        if (unmatchedBills > 0 && window.syncManager?.markDirty) {
+          window.syncManager.markDirty('bills');
+        }
+        
+        // 7. Resume sync
+        if (window.syncManager) window.syncManager._inPull = wasPulling || false;
+        
+        // 8. Toast + render
+        const sheetsInfo = (cloudInfo.cleared || []).map(c => `  • ${c.sheet}: ${c.rows_cleared}`).join('\n');
+        toast(`✓ ล้าง Statements สำเร็จ`, 'success', 5000);
+        
+        alert(
+          `🗑 ล้าง Statements เรียบร้อย\n\n` +
+          `Local: ${stmtsTotal} → 0\n` +
+          `Cloud: ${cloudInfo.sheets_count || 0} sheets, ${cloudInfo.total_rows_cleared || 0} rows\n` +
+          (sheetsInfo ? sheetsInfo + '\n' : '') +
+          `Bills unmatched: ${unmatchedBills}\n\n` +
+          `ไปหน้า Matching → upload bank statement files ใหม่ได้เลย`
+        );
+        
+        render();
+      } catch(e) {
+        console.error('[clear-stmts] error:', e);
+        toast('เกิดข้อผิดพลาด: ' + e.message, 'error', 6000);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = origText;
+      }
     });
     
     // ── Import Daily xlsm (หลายไฟล์) ──
