@@ -5794,19 +5794,38 @@ async function renderMain(el) {
     
     const sumStations = (fn) => stationsFor(station).reduce((s, st) => s + fn(st), 0);
     
+    // ⭐ cashIn must be computed BEFORE drawerRaw — bills-based drawer needs it
+    //    (cash bills เก็บแค่ cash sales — ต้อง + cashIn float ถึงจะเป็น drawer raw)
+    const cashIn = sumStations(st => _getSummaryValue('cashIn', st));
+    
     // Drawer RAW (รวม cashIn)
+    // Priority: counted banknote > bills+cashIn > __byDate stored value
+    //   เปลี่ยนจาก __byDate → bills เพราะ:
+    //     - __byDate มาจาก POS import — อาจเก่า/ไม่ตรงกับ bills ปัจจุบัน
+    //     - Bills เป็น current state ที่ user จัดการอยู่ — แม่นกว่า
+    //     - Case 14/02/26: import drawer 75,590 (หลังจ่าย JS -760 แล้ว)
+    //       แต่ JS ยัง unmatched → formula หา balance ไม่เจอ ขาด 760
+    //       Bills-based: cash sales 71,195 + cashIn 5,155 = 76,350 (drawer ก่อนหัก JS)
+    //       → match แล้วได้ 0, unmatched ได้ -4,665 ตามคาด
     let drawerRaw = 0;
     if (station === 'Invoice') {
       const countedCash = calcCashDrawer('Invoice');
-      drawerRaw = countedCash > 0 
-        ? countedCash 
-        : (summaryOrZero('Cash Drawer', 'Invoice') || ['Invoice','Order','Payment'].reduce((s,st)=>s+calcCashFromBills(st), 0));
+      if (countedCash > 0) {
+        drawerRaw = countedCash;
+      } else {
+        const billsCash = ['Invoice','Order','Payment'].reduce((s, st) => s + calcCashFromBills(st), 0);
+        if (billsCash > 0) {
+          // Bills sum = cash sales เท่านั้น (ไม่รวม float) → + cashIn ให้เป็น drawer raw
+          drawerRaw = billsCash + cashIn;
+        } else {
+          drawerRaw = summaryOrZero('Cash Drawer', 'Invoice');
+        }
+      }
     } else {
       drawerRaw = summaryOrBills('Cash Drawer', 'Cash', station);
     }
     
-    // cashIn, cashOut, returns, sales
-    const cashIn = sumStations(st => _getSummaryValue('cashIn', st));
+    // cashOut, returns, sales (cashIn already computed above)
     const cashOut = sumStations(st => _getSummaryValue('cashOut', st));
     const returns = sumStations(st => _getSummaryValue('returns', st));
     // sales: ใช้ calcSales() ตรงๆ (รู้วิธีเลือก summary/bills ตาม station แล้ว)
