@@ -2806,6 +2806,10 @@ const syncManager = {
         if (s.time != null && typeof fmtStmtTime === 'function') {
           s.time = fmtStmtTime(s.time);
         }
+        // ⭐ Coerce ref_no/description to String — Excel/CSV import บางครั้งทำให้เป็น Number
+        //    (เช่น ref_no=3991079207 จาก TTB cheque) → .substring() พัง
+        if (s.ref_no != null && typeof s.ref_no !== 'string') s.ref_no = String(s.ref_no);
+        if (s.description != null && typeof s.description !== 'string') s.description = String(s.description);
         return s;
       };
       
@@ -10936,7 +10940,7 @@ function openSpTempPartialMatchModal(no, partialUuid, onChange) {
               ${sameDate ? '<span class="badge badge-success" style="font-size:.6rem">วันเดียวกัน</span>' : ''}
               ${exact ? '<span class="badge badge-success" style="font-size:.6rem">ยอดตรง</span>' : ''}
             </div>
-            <div class="text-xs" style="font-family:monospace;margin-top:2px;color:var(--text2)">${(s.ref_no||'').substring(0,60)}</div>
+            <div class="text-xs" style="font-family:monospace;margin-top:2px;color:var(--text2)">${String(s.ref_no||'').substring(0,60)}</div>
             ${s.description ? `<div class="text-xs text-muted" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${String(s.description).substring(0,80)}</div>` : ''}
           </div>
           <div style="text-align:right;white-space:nowrap">
@@ -18909,7 +18913,7 @@ async function renderMatching(el) {
         <div class="flex-col gap-3" style="min-width:380px">
           <div class="text-xs" style="padding:8px 10px;background:var(--bg2);border-radius:5px;color:var(--text2)">
             <strong>Bank:</strong> ${stmt.bank} · 
-            <strong>Ref:</strong> <span style="font-family:var(--mono)">${(stmt.ref_no||'').substring(0,40)}</span> · 
+            <strong>Ref:</strong> <span style="font-family:var(--mono)">${String(stmt.ref_no||'').substring(0,40)}</span> · 
             <strong>ยอด:</strong> <span style="color:${Number(stmt.amount)>=0?'var(--success)':'var(--danger)'};font-weight:600">฿${fmtNum(stmt.amount)}</span>
           </div>
           <div class="input-group">
@@ -18991,7 +18995,7 @@ async function renderMatching(el) {
         `🗑 ลบ Statement นี้?\n\n` +
         `Bank: ${stmt.bank}\n` +
         `วันที่: ${fmtDate(stmtDate)}\n` +
-        `Ref: ${(stmt.ref_no||'').substring(0,50)}\n` +
+        `Ref: ${String(stmt.ref_no||'').substring(0,50)}\n` +
         `ยอด: ฿${fmtNum(stmt.amount)}` + warnMatched +
         `\n\nลบแล้วกู้คืนไม่ได้`
       )) return;
@@ -19095,7 +19099,7 @@ async function renderMatching(el) {
             <strong>Bank:</strong> ${stmt.bank} · 
             <strong>วันที่:</strong> ${fmtDate(stmtDateISO)} · 
             <strong>ยอด:</strong> <span style="color:${Number(stmt.amount)>=0?'var(--success)':'var(--danger)'};font-weight:600">฿${fmtNum(stmt.amount)}</span><br>
-            <span style="color:var(--text3);font-size:.78rem">${(stmt.description||'').substring(0,80)}</span>
+            <span style="color:var(--text3);font-size:.78rem">${String(stmt.description||'').substring(0,80)}</span>
           </div>
           
           <div class="input-group">
