@@ -18575,7 +18575,7 @@ async function renderMatching(el) {
                 return `
                 <tr class="${_classes}" style="${rowStyle}" data-stmt-idx="${i}">
                   <td><span class="badge" style="background:${(bankColors[s.bank]||'#555')}22;color:${bankColors[s.bank]||'#aaa'}">${s.bank}</span>${_isDirty?'<span class="dirty-badge" title="ยังไม่ได้บันทึก"></span>':''}${_isLocked?' <span title="วันนี้ถูก lock — แก้ไขไม่ได้ แต่ matching ทำได้" style="color:var(--danger);font-size:.85rem">🔒</span>':''}</td>
-                  <td style="white-space:nowrap">${fmtDate(s.date)} <button class="btn-edit-stmt-date" data-stmt-idx="${i}" title="แก้ไขวันที่ statement" style="background:none;border:none;cursor:pointer;color:var(--text3);font-size:.78rem;padding:1px 4px">✎</button></td>
+                  <td style="white-space:nowrap">${fmtDate(s.date)} <button class="btn-edit-stmt-date" data-stmt-idx="${i}" title="แก้ไขวันที่ statement" style="background:none;border:none;cursor:pointer;color:var(--text3);font-size:.78rem;padding:1px 4px">✎</button> <button class="btn-delete-stmt" data-stmt-idx="${i}" title="ลบ statement นี้" style="background:none;border:none;cursor:pointer;color:var(--text3);font-size:.78rem;padding:1px 4px">🗑</button></td>
                   <td>${fmtStmtTime(s.time)}</td>
                   <td class="text-xs" style="font-family:var(--mono)">${s.ref_no}</td>
                   <td style="text-align:right;font-weight:600;color:${Number(s.amount)>=0?'var(--success)':'var(--danger)'}">${Number(s.amount)>=0?'+':''}${fmtNum(s.amount)}</td>
@@ -18840,95 +18840,68 @@ async function renderMatching(el) {
         }
         
         const currentDate = toISODate(stmt.date) || '';
-        // Modal HTML
-        const html = `
-          <div class="modal-head">
-            <strong>✎ แก้ไขวันที่ Statement</strong>
-            <button class="btn-close" id="esd-close">×</button>
-          </div>
-          <div class="modal-body">
-            <div class="text-xs text-muted mb-2">
+        const maxDate = (() => {
+          const d = new Date(); d.setDate(d.getDate() + 30);
+          return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+        })();
+        const _isLocked = (typeof isDateLocked === 'function') && isDateLocked(currentDate);
+        const matchedNote = (stmt.match_status === 'paid' && stmt.match_bill) 
+          ? `<div style="padding:8px;background:rgba(245,166,35,.08);border-radius:4px;border-left:3px solid var(--warn);margin-top:8px;font-size:.82rem">⚠️ Statement matched กับบิล <strong>${stmt.match_bill}</strong> — pay_date ของบิลจะอัปเดตตามวันใหม่</div>`
+          : '';
+        const lockNote = _isLocked 
+          ? `<div style="padding:8px;background:rgba(239,87,87,.08);border-radius:4px;border-left:3px solid var(--danger);margin-top:8px;font-size:.82rem">🔒 วันเดิมถูก lock — แก้ไขได้ แต่ขอ confirm</div>`
+          : '';
+        
+        openModal('✎ แก้ไขวันที่ Statement', `
+          <div class="flex-col gap-3" style="min-width:380px">
+            <div class="text-xs" style="padding:8px 10px;background:var(--bg2);border-radius:5px;color:var(--text2)">
               <strong>Bank:</strong> ${stmt.bank} · 
               <strong>Ref:</strong> <span style="font-family:var(--mono)">${(stmt.ref_no||'').substring(0,40)}</span> · 
-              <strong>ยอด:</strong> ฿${fmtNum(stmt.amount)}
+              <strong>ยอด:</strong> <span style="color:${Number(stmt.amount)>=0?'var(--success)':'var(--danger)'};font-weight:600">฿${fmtNum(stmt.amount)}</span>
             </div>
-            <label>วันที่เดิม</label>
-            <input type="text" value="${fmtDate(currentDate)}" disabled style="background:var(--surface2);color:var(--text2)">
-            <label class="mt-2">วันที่ใหม่</label>
-            <input type="date" id="esd-new-date" value="${currentDate}" max="${(()=>{
-              const d=new Date(); d.setDate(d.getDate()+30);
-              return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
-            })()}">
-            <div class="text-xs text-muted mt-2" style="line-height:1.5">
-              ${stmt.match_status === 'paid' && stmt.match_bill ? '⚠️ Statement นี้ matched กับบิล <strong>'+stmt.match_bill+'</strong> — pay_date ของบิลจะอัปเดตตาม' : ''}
-              ${(()=>{
-                const _isLocked = (typeof isDateLocked === 'function') && isDateLocked(currentDate);
-                return _isLocked ? '<br>🔒 วันเดิมถูก lock — แก้ไขได้ แต่ขอ confirm' : '';
-              })()}
+            <div class="input-group">
+              <label>วันที่เดิม</label>
+              <input type="text" value="${fmtDate(currentDate)}" disabled style="background:var(--surface2);color:var(--text2)">
+            </div>
+            <div class="input-group">
+              <label>วันที่ใหม่</label>
+              <input type="date" id="esd-new-date" class="input" value="${currentDate}" max="${maxDate}">
+            </div>
+            ${matchedNote}
+            ${lockNote}
+            <div class="flex gap-2 mt-2">
+              <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ยกเลิก</button>
+              <button class="btn btn-primary btn-sm flex-1" id="esd-save">บันทึก</button>
             </div>
           </div>
-          <div class="modal-foot" style="justify-content:flex-end;gap:8px">
-            <button class="btn btn-outline btn-sm" id="esd-cancel">ยกเลิก</button>
-            <button class="btn btn-primary btn-sm" id="esd-save">บันทึก</button>
-          </div>
-        `;
+        `);
         
-        // Render in modal-overlay
-        const overlay = document.getElementById('modal-overlay');
-        const content = document.getElementById('modal-content');
-        if (!overlay || !content) {
-          // Fallback to prompt
-          const newD = prompt('วันที่ใหม่ (yyyy-mm-dd):', currentDate);
-          if (!newD || newD === currentDate) return;
-          if (!/^\d{4}-\d{2}-\d{2}$/.test(newD)) { toast('format ผิด — ต้องเป็น yyyy-mm-dd', 'error'); return; }
-          applyDateChange(stmt, currentDate, newD);
-          render();
-          return;
-        }
-        content.innerHTML = html;
-        overlay.classList.add('show');
-        
-        const close = () => { overlay.classList.remove('show'); content.innerHTML = ''; };
-        document.getElementById('esd-close')?.addEventListener('click', close);
-        document.getElementById('esd-cancel')?.addEventListener('click', close);
         document.getElementById('esd-save')?.addEventListener('click', () => {
           const newD = document.getElementById('esd-new-date')?.value;
           if (!newD) { toast('กรุณาเลือกวันที่', 'warn'); return; }
-          if (newD === currentDate) { close(); return; }
+          if (newD === currentDate) { closeModal(); return; }
           if (!/^\d{4}-\d{2}-\d{2}$/.test(newD)) { toast('format วันที่ผิด', 'error'); return; }
           
           // Lock guard
           if (typeof isDateLocked === 'function') {
-            if (isDateLocked(currentDate)) {
-              if (!confirm(`🔒 วันเดิม (${fmtDate(currentDate)}) ถูก lock\n\nยืนยันแก้ไข?`)) return;
-            }
-            if (isDateLocked(newD)) {
-              if (!confirm(`🔒 วันใหม่ (${fmtDate(newD)}) ถูก lock\n\nยืนยันย้ายไปวันนั้น?`)) return;
-            }
+            if (isDateLocked(currentDate) && !confirm(`🔒 วันเดิม (${fmtDate(currentDate)}) ถูก lock\n\nยืนยันแก้ไข?`)) return;
+            if (isDateLocked(newD) && !confirm(`🔒 วันใหม่ (${fmtDate(newD)}) ถูก lock\n\nยืนยันย้ายไปวันนั้น?`)) return;
           }
           
-          applyDateChange(stmt, currentDate, newD);
-          close();
-          toast(`✓ แก้ไขวันที่: ${fmtDate(currentDate)} → ${fmtDate(newD)}`, 'success', 3000);
-          render();
-        });
-        
-        function applyDateChange(s, oldDate, newDate) {
           // Find original in uploadedStatements (data is filtered view)
-          const orig = uploadedStatements.find(x => x.stmt_uuid === s.stmt_uuid) || s;
-          orig.date = newDate;
-          if (s !== orig) s.date = newDate;
+          const orig = uploadedStatements.find(x => x.stmt_uuid === stmt.stmt_uuid) || stmt;
+          orig.date = newD;
+          if (stmt !== orig) stmt.date = newD;
           
-          // ⭐ ถ้า matched กับบิล → update bill.pay_date ด้วย (เคยตั้งจาก stmt.date เดิม)
+          // ⭐ ถ้า matched กับบิล → update bill.pay_date ด้วย
           if (orig.match_status === 'paid') {
             const matchedBills = Array.isArray(orig.matched_bills) && orig.matched_bills.length 
               ? orig.matched_bills 
               : (orig.match_bill ? [orig.match_bill] : []);
             matchedBills.forEach(billNo => {
-              const bills = (typeof getAllBills === 'function') ? getAllBills() : (window.bills2026 || []);
-              bills.forEach(b => {
+              billList.forEach(b => {
                 if (String(b.bill_no||'').trim() === String(billNo).trim()) {
-                  b.pay_date = newDate;
+                  b.pay_date = newD;
                   if (window.syncManager?.markDirty) {
                     window.syncManager.markDirty('bills', b.bill_uuid);
                   }
@@ -18937,12 +18910,132 @@ async function renderMatching(el) {
             });
           }
           
-          // markDirty stmt
           if (window.syncManager?.markDirty) {
             window.syncManager.markDirty('stmts', orig.stmt_uuid);
           }
           if (typeof persistMainState === 'function') persistMainState();
+          
+          closeModal();
+          toast(`✓ แก้ไขวันที่: ${fmtDate(currentDate)} → ${fmtDate(newD)}`, 'success', 3000);
+          render();
+        });
+      });
+    });
+    
+    // ── Delete Statement ──
+    el.querySelectorAll('.btn-delete-stmt').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const stmtIdx = Number(btn.dataset.stmtIdx);
+        const stmt = data[stmtIdx];
+        if (!stmt) return;
+        
+        const stmtUuid = stmt.stmt_uuid || '';
+        if (!stmtUuid) {
+          toast('ไม่พบ stmt_uuid — refresh หน้านี้ก่อน', 'error');
+          return;
         }
+        
+        const stmtDate = toISODate(stmt.date) || '';
+        
+        // Lock guard
+        if (typeof isDateLocked === 'function' && isDateLocked(stmtDate)) {
+          toast(`🔒 วัน ${fmtDate(stmtDate)} ถูก lock — ปลด lock ก่อน`, 'warn', 4000);
+          return;
+        }
+        
+        const isMatched = stmt.match_status === 'paid';
+        const matchedBillsArr = Array.isArray(stmt.matched_bills) && stmt.matched_bills.length
+          ? stmt.matched_bills
+          : (stmt.match_bill ? [stmt.match_bill] : []);
+        
+        const warnMatched = isMatched && matchedBillsArr.length > 0
+          ? `\n\n⚠️ Statement นี้ matched กับบิล: ${matchedBillsArr.join(', ')}\n` +
+            `   → จะ unmatch บิลด้วย (match_status → unpaid, ล้าง confirmation/pay_date)`
+          : '';
+        
+        if (!confirm(
+          `🗑 ลบ Statement นี้?\n\n` +
+          `Bank: ${stmt.bank}\n` +
+          `วันที่: ${fmtDate(stmtDate)}\n` +
+          `Ref: ${(stmt.ref_no||'').substring(0,50)}\n` +
+          `ยอด: ฿${fmtNum(stmt.amount)}` +
+          warnMatched +
+          `\n\nลบแล้วกู้คืนไม่ได้ (เว้นแต่ Refresh จาก cloud)`
+        )) return;
+        
+        // ── Unmatch linked bills first (if matched) ──
+        let unmatchedBillCount = 0;
+        if (isMatched) {
+          billList.forEach(b => {
+            const linked = (b.matched_stmt_uuid === stmtUuid) ||
+                           (matchedBillsArr.includes(String(b.bill_no||'').trim()));
+            if (!linked) return;
+            b.match_status = 'unpaid';
+            b.confirmation = '';
+            b.pay_date = '';
+            b.matched_stmt_ref = '';
+            b.matched_stmt_uuid = '';
+            b.matched_at = '';
+            unmatchedBillCount++;
+            if (window.syncManager?.markDirty) {
+              window.syncManager.markDirty('bills', b.bill_uuid);
+            }
+          });
+          
+          // Clear SP-TEMP partial links
+          spTempList.forEach(t => {
+            let touched = false;
+            (t.partials || []).forEach(pr => {
+              if (pr.matched_stmt_uuid === stmtUuid) {
+                pr.matched_stmt_uuid = '';
+                pr.match_status = 'unpaid';
+                touched = true;
+              }
+            });
+            if (touched) {
+              t.updated_at = new Date().toISOString();
+              if (typeof recomputeSpTempStatus === 'function') recomputeSpTempStatus(t);
+              if (typeof markDirtySpTemps === 'function') markDirtySpTemps();
+            }
+          });
+        }
+        
+        // ── Remove stmt from local — search across all banks (bank field may have spaces vs underscores) ──
+        let removedFromBank = null;
+        Object.keys(statementsByBank).forEach(bk => {
+          const arr = statementsByBank[bk];
+          if (!Array.isArray(arr)) return;
+          const idx = arr.findIndex(x => x.stmt_uuid === stmtUuid);
+          if (idx >= 0) {
+            arr.splice(idx, 1);
+            removedFromBank = bk;
+          }
+        });
+        
+        if (!removedFromBank) {
+          toast('ไม่พบ statement ใน local — อาจถูกลบไปแล้ว', 'warn');
+          return;
+        }
+        
+        // ── Track deletion → push to cloud on next save ──
+        if (window.syncManager?.markDeleted) {
+          window.syncManager.markDeleted('stmts', stmtUuid);
+        } else if (window.syncManager?.deletedStmtUuids) {
+          window.syncManager.deletedStmtUuids.add(stmtUuid);
+          try { localStorage.setItem('sf_deleted_stmt_uuids', JSON.stringify([...window.syncManager.deletedStmtUuids])); } catch(_){}
+          if (window.syncManager.dirty) window.syncManager.dirty.add('stmts');
+        }
+        
+        uploadedStatements = getAllStatements();
+        try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(_) {}
+        if (typeof persistMainState === 'function') persistMainState();
+        
+        const msg = unmatchedBillCount > 0
+          ? `🗑 ลบ statement สำเร็จ — unmatch บิล ${unmatchedBillCount} ตัวด้วย`
+          : `🗑 ลบ statement สำเร็จ`;
+        toast(msg, 'success', 4000);
+        render();
       });
     });
     
