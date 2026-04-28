@@ -1058,19 +1058,68 @@ function handleStmtUpload(result, fileName, opts = {}) {
   // helper: แปลง date โดยตรวจจับ พ.ศ. พิเศษ
   let buddhistCount = 0;
   function convertDate(val) {
-    if (!val) return '';
-    // ถ้าเป็น Date object แล้วปี > 2400 = พ.ศ.
-    if (val instanceof Date && val.getFullYear() > 2400) {
-      buddhistCount++;
-      const converted = new Date(val.getFullYear() - 543, val.getMonth(), val.getDate());
-      return fmtDate(converted);
+    // ⭐ Storage format = ISO yyyy-mm-dd (ค.ศ. เสมอ)
+    //   - Buddhist year (>2400) → -543
+    //   - Date obj / Excel serial / dd/mm/yyyy / yyyy-mm-dd / dd-mm-yyyy → ISO
+    //   - หา + count buddhist เพื่อ warn user
+    if (!val && val !== 0) return '';
+    
+    // Date object
+    if (val instanceof Date && !isNaN(val)) {
+      let y = val.getFullYear();
+      if (y > 2400) { y -= 543; buddhistCount++; }
+      return `${y}-${String(val.getMonth()+1).padStart(2,'0')}-${String(val.getDate()).padStart(2,'0')}`;
     }
-    const result = fmtDate(val);
-    // ตรวจซ้ำในผลลัพธ์
-    if (/\/25\d\d$/.test(result)) {
-      buddhistCount++;
+    
+    // Excel serial number
+    if (typeof val === 'number' && val > 10000 && val < 80000) {
+      const excelEpoch = new Date(1899, 11, 30);
+      const dt = new Date(excelEpoch.getTime() + val * 86400000);
+      return `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`;
     }
-    return result;
+    
+    let s = String(val).trim();
+    if (!s || s === 'null' || s === 'undefined') return '';
+    // ตัด time ออก (เก็บแค่ส่วนวันที่)
+    s = s.split(/[\sT]/)[0];
+    
+    // yyyy-mm-dd
+    let m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+    if (m) {
+      let y = Number(m[1]); if (y > 2400) { y -= 543; buddhistCount++; }
+      return `${y}-${String(m[2]).padStart(2,'0')}-${String(m[3]).padStart(2,'0')}`;
+    }
+    
+    // yyyy/mm/dd
+    m = s.match(/^(\d{4})\/(\d{1,2})\/(\d{1,2})$/);
+    if (m) {
+      let y = Number(m[1]); if (y > 2400) { y -= 543; buddhistCount++; }
+      return `${y}-${String(m[2]).padStart(2,'0')}-${String(m[3]).padStart(2,'0')}`;
+    }
+    
+    // dd/mm/yyyy หรือ dd-mm-yyyy
+    m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
+    if (m) {
+      let y = Number(m[3]); if (y > 2400) { y -= 543; buddhistCount++; }
+      return `${y}-${String(m[2]).padStart(2,'0')}-${String(m[1]).padStart(2,'0')}`;
+    }
+    
+    // dd/mm/yy (2-digit year — assume 20xx)
+    m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2})$/);
+    if (m) {
+      let y = 2000 + Number(m[3]);
+      return `${y}-${String(m[2]).padStart(2,'0')}-${String(m[1]).padStart(2,'0')}`;
+    }
+    
+    // Fallback: parse as Date
+    const dt = new Date(s);
+    if (!isNaN(dt)) {
+      let y = dt.getFullYear();
+      if (y > 2400) { y -= 543; buddhistCount++; }
+      return `${y}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`;
+    }
+    
+    return '';
   }
 
   // ── Thai date parser: "17 เม.ย. 2569 17:13" → { date: "2026-04-17", time: "17:13" } ──
