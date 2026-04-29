@@ -1782,14 +1782,21 @@ window.parseCompactMetaRows = function(rows) {
     //    Format: "2026-01-01|locks"   → dateISO = "2026-01-01" (year anchor — actual dates อยู่ใน data_json)
     //    เหตุผล: Google Sheets อาจ auto-parse "02/03/2026" เป็น Date (mm/dd/yyyy = US format)
     //            แล้ว return เป็น "2026-02-03" → date column สลับวันกับเดือนสำหรับวัน ≤ 12
-    //    Bug: 02/03/2026 (2 มี.ค.) ใน Sheets → กลายเป็น 3 ก.พ. → ทำให้ฟิลด์ date เพี้ยน
     let dateISO = '';
-    // ⭐ FIX (26/4/26): Trust col date FIRST, then uuid
-    //   เดิม: trust uuid → ถ้า uuid swap day↔month จะ self-perpetuate (read swap → __byDate[wrong] → save swap back)
-    //   ใหม่: pull col_date (Date object) → ปลอดภัยกว่า → uuid ใช้แค่ fallback
     
-    // Try col_date first — Apps Script Date / ISO string / dd/mm/yyyy Thai
-    if (r.date) {
+    // ⭐ FIX (28/4/26): Trust meta_uuid FIRST, col_date FALLBACK
+    //   เดิม: trust col_date → ถ้า cell เก่ายังเป็น datetime ที่ swap day↔month
+    //          → return dd/MM/yyyy → frontend parse → swap dateISO → save back as ghost row
+    //   ใหม่: uuid ถูกสร้างจาก frontend ตั้งแต่แรก → trust uuid เป็น primary
+    //         col_date ใช้แค่ legacy rows ที่ยังไม่มี uuid
+    
+    // Primary: uuid prefix (most reliable)
+    const uuidStr = String(r.meta_uuid || '');
+    const uuidMatch = uuidStr.match(/^(\d{4}-\d{2}-\d{2})\|/);
+    if (uuidMatch) dateISO = uuidMatch[1];
+    
+    // Fallback: col_date (only if uuid is empty/legacy)
+    if (!dateISO && r.date) {
       // Date object → ISO directly
       if (r.date instanceof Date && !isNaN(r.date.getTime())) {
         const y = r.date.getFullYear();
@@ -1809,13 +1816,30 @@ window.parseCompactMetaRows = function(rows) {
       }
     }
     
-    // Fallback: uuid prefix (for legacy rows without date col)
-    if (!dateISO) {
-      const uuidStr = String(r.meta_uuid || '');
-      const uuidMatch = uuidStr.match(/^(\d{4}-\d{2}-\d{2})\|/);
-      if (uuidMatch) dateISO = uuidMatch[1];
-    }
     if (!dateISO) { skippedJunk++; return; }
+    
+    // ⭐ Ghost row detection: uuid date vs col_date mismatch (day↔month swap pattern)
+    //    Bug history: Apps Script เคย coerce string ISO เป็น Date → swap → push back as ghost
+    //    Logic: trust uuid (frontend-generated, not parsed by Apps Script)
+    //    Just log warning for awareness — don't skip (uuid is correct, data is real)
+    if (r.meta_type !== 'locks' && r.date && uuidMatch) {
+      let colISO = '';
+      if (r.date instanceof Date && !isNaN(r.date.getTime())) {
+        colISO = r.date.getFullYear() + '-' + 
+                 String(r.date.getMonth()+1).padStart(2,'0') + '-' + 
+                 String(r.date.getDate()).padStart(2,'0');
+      } else if (/^\d{4}-\d{2}-\d{2}/.test(String(r.date))) {
+        colISO = String(r.date).substring(0, 10);
+      }
+      if (colISO && colISO !== dateISO) {
+        const uuidParts = dateISO.split('-');
+        const colParts = colISO.split('-');
+        if (uuidParts[0] === colParts[0] && 
+            uuidParts[1] === colParts[2] && uuidParts[2] === colParts[1]) {
+          console.warn('[parseMeta] day-month swap detected — uuid=' + dateISO + ' col=' + colISO + ' → using uuid');
+        }
+      }
+    }
     
     // ⭐ Skip วันอาทิตย์ — ร้านปิด ไม่ควรมีข้อมูล (auto-cleanup)
     //    EXCEPTION: locks rows ใช้ date เป็น year anchor (yyyy-01-01) ไม่ใช่วันจริง — ไม่ skip
@@ -21177,6 +21201,7 @@ function renderData(el) {
             </div>
           </div>
           <div class="flex gap-2">
+            <button class="btn btn-outline btn-sm" id="btn-fix-meta-uuids" style="border-color:var(--info);color:var(--info)" title="ซ่อม day↔month swap ใน meta (uuid_swap, col_swap, ghost rows)">🔧 ซ่อม Meta Swap</button>
             <button class="btn btn-sm" id="btn-clear-meta-all" style="background:var(--purple);color:#fff;border:none;font-weight:700">🗑 ล้าง Meta ทั้งหมด</button>
           </div>
         </div>
@@ -22471,6 +22496,94 @@ function renderData(el) {
       });
     });
     
+    // ── ซ่อม Meta UUID Swap (day↔month swap from Apps Script coercion) ──
+    document.getElementById('btn-fix-meta-uuids')?.addEventListener('click', async () => {
+      const btn = document.getElementById('btn-fix-meta-uuids');
+      const yearInput = prompt('ระบุปีที่ต้องการซ่อม (เช่น 2026):', String(new Date().getFullYear()));
+      if (!yearInput || !/^\d{4}$/.test(yearInput.trim())) {
+        toast('ปีไม่ถูกต้อง', 'warn');
+        return;
+      }
+      const year = yearInput.trim();
+      
+      const monthsInput = prompt(
+        'ระบุเดือนที่มีข้อมูลจริง (คั่นด้วย comma เช่น 1,2,3,4,5):\n\n' +
+        'เดือนอื่นๆ จะถือว่าเป็น ghost — ระบบจะ swap day↔month กลับให้',
+        '1,2,3,4,5'
+      );
+      if (!monthsInput) return;
+      const validMonths = monthsInput.split(',').map(s => Number(s.trim())).filter(n => n >= 1 && n <= 12);
+      if (validMonths.length === 0) { toast('เดือนไม่ถูกต้อง', 'warn'); return; }
+      
+      btn.disabled = true;
+      const orig = btn.textContent;
+      btn.textContent = '⏳ ตรวจ (dry run)...';
+      
+      try {
+        // Step 1: Dry run
+        const dry = await api('v2_fixMetaUuids', { 
+          year: year, 
+          validMonths: validMonths, 
+          dryRun: true,
+          backup: false
+        });
+        if (!dry.success) throw new Error(dry.error || 'dry run failed');
+        const stats = dry.data?.stats || {};
+        const dups = dry.data?.duplicates || {};
+        
+        const summary = `📊 ผลการตรวจ meta_${year}:\n\n` +
+          `Total rows: ${dry.data?.originalRowCount}\n` +
+          `✓ Matched (ปกติ): ${stats.matched}\n` +
+          `🔄 col_swap (uuid ถูก, col ผิด): ${stats.col_swap}\n` +
+          `🔄 uuid_swap (col ถูก, uuid ผิด): ${stats.uuid_swap}\n` +
+          `⚠️ both_valid_mismatch (สับสน — เลือก uuid): ${stats.both_valid_mismatch}\n` +
+          `❌ unresolvable: ${stats.unresolvable}\n` +
+          `❌ junk_uuid: ${stats.junk_uuid}\n\n` +
+          `📦 Duplicates: ${dups.groups} groups, จะลบ ${dups.rowsRemoved} rows\n` +
+          `🎯 Final rows after fix: ${dry.data?.finalRowCount}\n\n` +
+          `กด OK เพื่อ APPLY การแก้ไข (จะ backup ก่อน)\nหรือ Cancel เพื่อยกเลิก`;
+        
+        if (!confirm(summary)) {
+          toast('ยกเลิกการแก้ไข', 'info');
+          return;
+        }
+        
+        // Step 2: Apply
+        btn.textContent = '⏳ ซ่อม + backup...';
+        const apply = await api('v2_fixMetaUuids', {
+          year: year, validMonths: validMonths, 
+          dryRun: false, backup: true,
+          user: currentUser?.username || 'admin'
+        });
+        if (!apply.success) throw new Error(apply.error || 'apply failed');
+        
+        const r = apply.data || {};
+        toast(`✓ ซ่อมเสร็จ — ${r.written} rows · backup: ${r.backup}`, 'success', 6000);
+        
+        if (confirm(
+          `✅ ซ่อม meta_${year} สำเร็จ\n\n` +
+          `Before: ${r.originalRowCount} rows\n` +
+          `After: ${r.written} rows\n` +
+          `Backup: ${r.backup}\n\n` +
+          `ต้องการ Rebuild local จาก cloud ทันทีหรือไม่?`
+        )) {
+          // Trigger refresh meta
+          if (typeof loadMetaFromBackend === 'function') {
+            await loadMetaFromBackend({ force: true });
+          }
+          toast('✓ Rebuild meta local จาก cloud สำเร็จ', 'success', 4000);
+          // Reload page to reflect
+          setTimeout(() => location.reload(), 1500);
+        }
+      } catch(e) {
+        console.error('[fix-meta-uuids]', e);
+        toast('ซ่อมล้มเหลว: ' + e.message, 'error', 6000);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = orig;
+      }
+    });
+    
     // ── Clear Meta ทั้งหมด (Local + Cloud) ──
     document.getElementById('btn-clear-meta-all')?.addEventListener('click', async () => {
       const summaryDays = Object.keys(mainSummary || {}).length;
@@ -23236,17 +23349,28 @@ function renderData(el) {
           return;
         }
         
-        // date: dd/mm/yyyy → dateISO yyyy-mm-dd
-        let dateISO = r.date;
-        if (/^\d{1,2}\/\d{1,2}\/\d{4}/.test(String(r.date))) {
-          const parts = String(r.date).split('/');
-          let y = Number(parts[2]); if (y > 2400) y -= 543;
-          dateISO = y + '-' + String(parts[1]).padStart(2,'0') + '-' + String(parts[0]).padStart(2,'0');
+        // ⭐ FIX (28/4/26): Trust meta_uuid FIRST, col_date FALLBACK
+        //    เดิม: trust col_date → ถ้า cell เก่ายังเป็น datetime ที่ swap day↔month
+        //          → return dd/MM/yyyy → frontend parse → swap → ghost row
+        //    ใหม่: uuid (yyyy-mm-dd|type) เป็น primary key — ปลอดภัยกว่า
+        let dateISO = '';
+        const uuidStr = String(r.meta_uuid || '');
+        const uuidMatch = uuidStr.match(/^(\d{4}-\d{2}-\d{2})\|/);
+        if (uuidMatch) dateISO = uuidMatch[1];
+        
+        // Fallback: col_date for legacy rows without uuid
+        if (!dateISO) {
+          dateISO = r.date;
+          if (/^\d{1,2}\/\d{1,2}\/\d{4}/.test(String(r.date))) {
+            const parts = String(r.date).split('/');
+            let y = Number(parts[2]); if (y > 2400) y -= 543;
+            dateISO = y + '-' + String(parts[1]).padStart(2,'0') + '-' + String(parts[0]).padStart(2,'0');
+          }
+          if (/^\d{4}-\d{2}-\d{2}/.test(String(dateISO))) {
+            dateISO = String(dateISO).substring(0, 10);
+          }
         }
-        // Also handle ISO with time: "2026-02-01 00:00:00" → "2026-02-01"
-        if (/^\d{4}-\d{2}-\d{2}/.test(String(dateISO))) {
-          dateISO = String(dateISO).substring(0, 10);
-        }
+        if (!dateISO) { skippedJunk++; return; }
         
         let data;
         try {
