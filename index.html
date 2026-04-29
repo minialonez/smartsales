@@ -4165,7 +4165,8 @@ async function restoreMainState() {
       if (b.match_status !== 'paid' && b.match_status !== 'void') {
         b.match_status = 'paid';
         b.confirmation = stmt.bank || '';
-        b.pay_date = b.date;
+        // ⭐ pay_date = วันที่ stmt (วันที่จริงที่เงิน clear / เช็คเข้า) ไม่ใช่วันออกบิล
+        b.pay_date = toISODate(stmt.date) || b.date;
         b.matched_stmt_ref = stmt.ref_no || '';
         b.matched_stmt_uuid = stmt.stmt_uuid || '';
         statusSynced++;
@@ -20284,7 +20285,9 @@ async function renderMatching(el) {
               } else {
                 match.match_status = 'paid';
                 match.confirmation = stmt.bank || '';
-                match.pay_date = match.date;
+                // ⭐ pay_date = วันที่จริงที่เงินเข้า/เช็คเข้า (จาก stmt) ไม่ใช่วันออกบิล
+                //    สำหรับเช็ค: bill.date = วันที่เขียนเช็ค, stmt.date = วันที่เช็คเข้า
+                match.pay_date = toISODate(stmt.date) || match.date;
                 match.matched_stmt_ref = stmt.ref_no || '';
                 match.matched_stmt_uuid = stmt.stmt_uuid || '';
                 match.matched_at = new Date().toISOString();
