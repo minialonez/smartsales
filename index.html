@@ -1758,7 +1758,16 @@ window.buildCompactMetaRows = function(filterDates) {
   return rows;
 };
 
-window.parseCompactMetaRows = function(rows) {
+window.parseCompactMetaRows = function(rows, opts) {
+  opts = opts || {};
+  // ⭐ optional filter: ส่ง Set ของ valid dates (yyyy-mm-dd) → skip rows ที่ date ไม่อยู่ใน set
+  //    ใช้ตอน rebuild: ส่ง dates จาก bills (valid = วันที่มีบิลจริง)
+  //    → ghost meta rows (จาก swap bug) จะถูกกรองออก
+  const validDates = opts.validDates instanceof Set ? opts.validDates : null;
+  // ⭐ optional filter: ส่ง Set ของ valid months (e.g., 1-12) → skip rows month ไม่อยู่ใน set
+  const validMonths = opts.validMonths instanceof Set ? opts.validMonths : null;
+  let skippedGhost = 0;
+  
   const KEY_TO_LABEL = {
     'cashIn': 'นำเงินเข้า', 'sales': 'ยอดขาย', 'cashOut': 'นำเงินออก',
     'returns': 'ยอดคืนสินค้า', 'cashDrawer': 'Cash Drawer',
@@ -1817,6 +1826,20 @@ window.parseCompactMetaRows = function(rows) {
     }
     
     if (!dateISO) { skippedJunk++; return; }
+    
+    // ⭐ Ghost filter: ถ้ามี validDates/validMonths → skip rows ที่ไม่ตรง
+    //    ใช้ตอน rebuild: ส่ง dates จาก bills → ghost meta rows ถูกกรองออก
+    //    locks rows มี date เป็น year anchor (yyyy-01-01) — skip filter check
+    if (r.meta_type !== 'locks') {
+      if (validDates && !validDates.has(dateISO)) {
+        skippedGhost++;
+        return;
+      }
+      if (validMonths) {
+        const mNum = Number(dateISO.substring(5, 7));
+        if (!validMonths.has(mNum)) { skippedGhost++; return; }
+      }
+    }
     
     // ⭐ Ghost row detection: uuid date vs col_date mismatch (day↔month swap pattern)
     //    Bug history: Apps Script เคย coerce string ISO เป็น Date → swap → push back as ghost
@@ -1889,7 +1912,8 @@ window.parseCompactMetaRows = function(rows) {
   });
   
   if (skippedJunk > 0) console.warn(`[parseMeta] Skipped ${skippedJunk} junk rows`);
-  return { summary: summary, cashCount: cash, lockedDates: lockedDates, yearsWithLocksRow: yearsWithLocksRow };
+  if (skippedGhost > 0) console.warn(`[parseMeta] Skipped ${skippedGhost} ghost rows (filtered by validDates/validMonths)`);
+  return { summary: summary, cashCount: cash, lockedDates: lockedDates, yearsWithLocksRow: yearsWithLocksRow, skippedJunk: skippedJunk, skippedGhost: skippedGhost };
 };
 
 // ═══════════════════════════════════════════════════════════════════
@@ -3153,7 +3177,27 @@ const syncManager = {
             if (r?.success && Array.isArray(r.data?.rows) && r.data.rows.length > 0) {
               // Parse via parseCompactMetaRows (decodes data_json per row)
               if (typeof window.parseCompactMetaRows === 'function') {
-                const parsed = window.parseCompactMetaRows(r.data.rows);
+                // ⭐ Build validDates from current billList + cashflow + payments (filter ghost)
+                const _validDates = new Set();
+                billList.forEach(b => {
+                  const d = (typeof toISODate === 'function') ? toISODate(b.date) : '';
+                  if (d && /^\d{4}-\d{2}-\d{2}$/.test(d)) _validDates.add(d);
+                });
+                if (typeof cashflowList !== 'undefined' && Array.isArray(cashflowList)) {
+                  cashflowList.forEach(c => {
+                    const d = (typeof toISODate === 'function') ? toISODate(c.date) : '';
+                    if (d && /^\d{4}-\d{2}-\d{2}$/.test(d)) _validDates.add(d);
+                  });
+                }
+                if (typeof paymentList !== 'undefined' && Array.isArray(paymentList)) {
+                  paymentList.forEach(p => {
+                    const d = (typeof toISODate === 'function') ? toISODate(p.date) : '';
+                    if (d && /^\d{4}-\d{2}-\d{2}$/.test(d)) _validDates.add(d);
+                  });
+                }
+                // Pass validDates only if we have data — otherwise allow all (initial load case)
+                const _opts = _validDates.size > 0 ? { validDates: _validDates } : {};
+                const parsed = window.parseCompactMetaRows(r.data.rows, _opts);
                 // Merge summary
                 if (parsed.summary?.__byDate) {
                   if (!mainSummary.__byDate) mainSummary.__byDate = {};
@@ -17101,12 +17145,34 @@ async function loadMetaFromBackend(opts) {
     };
     var _skipped = 0;
     
+    // ⭐ Build validDates from current data sources (filter ghost meta rows)
+    var _validDatesMeta = new Set();
+    if (typeof billList !== 'undefined' && Array.isArray(billList)) {
+      billList.forEach(function(b) {
+        var d = (typeof toISODate === 'function') ? toISODate(b.date) : '';
+        if (d && /^\d{4}-\d{2}-\d{2}$/.test(d)) _validDatesMeta.add(d);
+      });
+    }
+    if (typeof cashflowList !== 'undefined' && Array.isArray(cashflowList)) {
+      cashflowList.forEach(function(c) {
+        var d = (typeof toISODate === 'function') ? toISODate(c.date) : '';
+        if (d && /^\d{4}-\d{2}-\d{2}$/.test(d)) _validDatesMeta.add(d);
+      });
+    }
+    if (typeof paymentList !== 'undefined' && Array.isArray(paymentList)) {
+      paymentList.forEach(function(p) {
+        var d = (typeof toISODate === 'function') ? toISODate(p.date) : '';
+        if (d && /^\d{4}-\d{2}-\d{2}$/.test(d)) _validDatesMeta.add(d);
+      });
+    }
+    var _metaParseOpts = _validDatesMeta.size > 0 ? { validDates: _validDatesMeta } : {};
+    
     for (var y of years) {
       var res = await api('getMetaWithUuid', { year: y });
       if (!res || !res.success || !Array.isArray(res.data?.rows)) continue;
       if (typeof window.parseCompactMetaRows !== 'function') continue;
       
-      var parsed = window.parseCompactMetaRows(res.data.rows);
+      var parsed = window.parseCompactMetaRows(res.data.rows, _metaParseOpts);
       
       // ⭐ FORCE MODE: ทับ local ด้วย cloud (Refresh button)
       //    REPLACE per year — ลบ local entries ของปีนี้ → ใส่ cloud values
@@ -21480,8 +21546,30 @@ function renderData(el) {
         
         // ⭐ Pull Meta (mainSummary + cashCount) — user input รายวัน: นำเงินเข้า/ขาย/ออก/คืนสินค้า
         // ใช้ new schema (getMetaWithUuid + parseCompactMetaRows) เท่านั้น — ไม่มี fallback
+        // ⭐ Ghost filter: ใช้ dates จาก bills ที่ pull มาแล้ว เป็น valid set
+        //    → meta ghost rows (จาก swap bug) ที่ date ไม่ตรง bills → ถูกกรองออก
         const tempSummary = { __byDate: {} };
         const tempCashCount = { __byDate: {} };
+        const validDates = new Set();
+        tempBills.forEach(b => {
+          const d = (typeof toISODate === 'function') ? toISODate(b.date) : (b.date || '').substring(0, 10);
+          if (d && /^\d{4}-\d{2}-\d{2}$/.test(d)) validDates.add(d);
+        });
+        // Also include dates from cashflow + payments + spTemps (might not have bills)
+        tempCashflow.forEach(c => {
+          const d = (typeof toISODate === 'function') ? toISODate(c.date) : (c.date || '').substring(0, 10);
+          if (d && /^\d{4}-\d{2}-\d{2}$/.test(d)) validDates.add(d);
+        });
+        tempPayments.forEach(p => {
+          const d = (typeof toISODate === 'function') ? toISODate(p.date) : (p.date || '').substring(0, 10);
+          if (d && /^\d{4}-\d{2}-\d{2}$/.test(d)) validDates.add(d);
+        });
+        if (validDates.size === 0) {
+          tsLog(`   ⚠️ ไม่มี valid dates จาก bills/cashflow/payments — meta filter SKIPPED`);
+        } else {
+          tsLog(`   📅 Meta filter: ${validDates.size} valid dates จาก bills/cashflow/payments`);
+        }
+        
         for (const y of years) {
           try {
             let handled = false;
@@ -21490,7 +21578,9 @@ function renderData(el) {
               const r = await api('getMetaWithUuid', { year: y });
               if (r?.success && Array.isArray(r.data?.rows) && r.data.rows.length > 0) {
                 if (typeof window.parseCompactMetaRows === 'function') {
-                  const parsed = window.parseCompactMetaRows(r.data.rows);
+                  // ⭐ Pass validDates filter — skip ghost rows that don't match real bill dates
+                  const parseOpts = validDates.size > 0 ? { validDates: validDates } : {};
+                  const parsed = window.parseCompactMetaRows(r.data.rows, parseOpts);
                   if (parsed.summary?.__byDate) {
                     Object.entries(parsed.summary.__byDate).forEach(([d, v]) => {
                       tempSummary.__byDate[d] = v;
@@ -21502,7 +21592,8 @@ function renderData(el) {
                     });
                   }
                   handled = true;
-                  tsLog(`   ✓ Meta ${y}: ${r.data.rows.length} rows via getMetaWithUuid (new schema)`);
+                  const ghostNote = parsed.skippedGhost > 0 ? ` (กรอง ghost ${parsed.skippedGhost} rows)` : '';
+                  tsLog(`   ✓ Meta ${y}: ${r.data.rows.length} rows${ghostNote}`);
                 }
               }
             } catch(err) {
@@ -22537,6 +22628,8 @@ function renderData(el) {
           `🔄 col_swap (uuid ถูก, col ผิด): ${stats.col_swap}\n` +
           `🔄 uuid_swap (col ถูก, uuid ผิด): ${stats.uuid_swap}\n` +
           `⚠️ both_valid_mismatch (สับสน — เลือก uuid): ${stats.both_valid_mismatch}\n` +
+          `🔁 ghost_swap_back (ghost รวมกับของจริง): ${stats.ghost_swap_back || 0}\n` +
+          `🗑️ ghost_deleted (ghost ลบทิ้ง): ${stats.ghost_deleted || 0}\n` +
           `❌ unresolvable: ${stats.unresolvable}\n` +
           `❌ junk_uuid: ${stats.junk_uuid}\n\n` +
           `📦 Duplicates: ${dups.groups} groups, จะลบ ${dups.rowsRemoved} rows\n` +
