@@ -2703,7 +2703,11 @@ const syncManager = {
   //   mode='auto': pull เฉพาะเมื่อ local ว่าง (หรือ lastPull เก่ามาก)
   //   mode='force': pull เสมอ
   async pullFromCloud(yearsCount = 2, mode = 'auto', opts = {}) {
-    if (!this.enabled) return { skipped: 'disabled' };
+    // ⭐ Manual mode (enabled=false) — block AUTO pulls only
+    //    User กดปุ่ม Refresh = mode='force' → ผ่านได้
+    //    Auto pull (showApp init) = mode='auto' → block
+    //    เดิม: skip ทุก mode → Refresh button ใน manual mode ไม่ทำงาน → bills ใหม่ไม่ pull
+    if (!this.enabled && mode !== 'force') return { skipped: 'disabled' };
     
     // ⭐ Pull-guard: ถ้า user มี edits ยังไม่ได้ save → ห้าม auto-pull (กันทับงาน)
     //    mode='force' (Refresh button) ผ่านได้ — user confirm เองแล้ว
