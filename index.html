@@ -4249,6 +4249,12 @@ async function restoreMainState() {
         if (!b.pay_date) b.pay_date = b.date;
         confSynced++;
       }
+      // ⭐ Backfill matched_stmt_uuid ถ้าหายแต่ ref ตรงกับ stmt → backfill จาก stmt
+      //    เกิดเพราะ schema เก่าไม่มี column matched_stmt_uuid ใน sheet → pull ได้แต่ ref
+      if (b.match_status === 'paid' && !b.matched_stmt_uuid && stmt.stmt_uuid) {
+        b.matched_stmt_uuid = stmt.stmt_uuid;
+        statusSynced++;
+      }
     });
     
     if (confSynced > 0 || statusSynced > 0) {
