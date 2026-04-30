@@ -8224,6 +8224,12 @@ async function renderMain(el) {
       btn.innerHTML = monthScope ? `⏳ ${monthScope}...` : '⏳ ทั้งปี...';
       try {
         const t0 = Date.now();
+        // ⭐ Snapshot before refresh — สำหรับเปรียบเทียบ
+        const beforeCounts = {};
+        ['KTB','KBANK','BBL NW','BBL','TTB'].forEach(b => {
+          beforeCounts[b] = (statementsByBank[b] || []).length;
+        });
+        
         // ⭐ User confirmed "ทับการแก้ไขปัจจุบัน" → clear dirty ก่อน pull
         //    (ถ้า clear หลัง pull → pullFromCloud ยังเห็น dirty → skip merge cloud → ข้อมูลใหม่ไม่มา)
         if (hasDirty) {
@@ -8240,6 +8246,20 @@ async function renderMain(el) {
         // ⭐ pullFromCloud ไม่ดึง meta (mainSummary/cashCount/locks) — ต้อง load แยก
         //    force: true → ทับ local meta ทุกตัว (cloud = source of truth)
         await loadMetaFromBackend({ force: true });
+        
+        // ⭐ Diagnostic — เปรียบเทียบ before/after per bank
+        //    ถ้า bank ไหนได้ data ไม่ครบ → console.log จะบอก root cause
+        console.log(`[refresh] scope=${monthScope || 'all'}`);
+        ['KTB','KBANK','BBL NW','BBL','TTB'].forEach(b => {
+          const after = (statementsByBank[b] || []).length;
+          const before = beforeCounts[b];
+          const diff = after - before;
+          const sign = diff >= 0 ? '+' : '';
+          console.log(`  ${b}: ${before} → ${after} (${sign}${diff})`);
+        });
+        const totalLocal = Object.values(statementsByBank).reduce((s, arr) => s + (arr?.length || 0), 0);
+        console.log(`  Total stmts: ${totalLocal}`);
+        
         const elapsed = Math.round((Date.now() - t0) / 100) / 10;
         toast(`✅ ดึง${monthScope?'เดือน '+monthScope:'ทั้งปี'}สำเร็จ (${elapsed}s)`, 'success', 3000);
         render();
