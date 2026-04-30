@@ -4211,6 +4211,7 @@ async function restoreMainState() {
       }
     });
     
+    const _touchedBills = new Set();
     billList.forEach(b => {
       // หา statement คู่
       let stmt = null;
@@ -4242,23 +4243,130 @@ async function restoreMainState() {
         b.matched_stmt_ref = stmt.ref_no || '';
         b.matched_stmt_uuid = stmt.stmt_uuid || '';
         statusSynced++;
+        if (b.bill_uuid) _touchedBills.add(b.bill_uuid);
       }
       // ถ้าบิล matched อยู่แล้วแต่ขาด confirmation → เติม
       else if (b.match_status === 'paid' && !b.confirmation && stmt.bank) {
         b.confirmation = stmt.bank;
         if (!b.pay_date) b.pay_date = b.date;
         confSynced++;
+        if (b.bill_uuid) _touchedBills.add(b.bill_uuid);
       }
       // ⭐ Backfill matched_stmt_uuid ถ้าหายแต่ ref ตรงกับ stmt → backfill จาก stmt
       //    เกิดเพราะ schema เก่าไม่มี column matched_stmt_uuid ใน sheet → pull ได้แต่ ref
       if (b.match_status === 'paid' && !b.matched_stmt_uuid && stmt.stmt_uuid) {
         b.matched_stmt_uuid = stmt.stmt_uuid;
         statusSynced++;
+        if (b.bill_uuid) _touchedBills.add(b.bill_uuid);
       }
     });
     
+    // ⭐ Mark dirty เพื่อให้ next push ส่งขึ้น cloud
+    if (_touchedBills.size > 0 && window.syncManager?.markDirty) {
+      _touchedBills.forEach(uuid => {
+        window.syncManager.markDirty('bills', uuid);
+      });
+      console.log(`[Auto-sync] markDirty ${_touchedBills.size} bills for next push`);
+    }
+    
     if (confSynced > 0 || statusSynced > 0) {
       console.log(`Auto-sync: status=${statusSynced} confirmation=${confSynced} bills`);
+    }
+  }
+  
+  // ── ⭐ Pass 2: Multi-bill backfill จาก stmt.match_bill (string) ──
+  //    case: 1 stmt ↔ N bills (เช่น OS+Refund, SS+SS, OS+OS, SS+SC)
+  //    Pass 1 ใช้ bill_no/composite key — ไม่ครอบ multi-bill match
+  //    Pass 2 parse stmt.match_bill string → backfill ทุก bill ใน list
+  //    Format: "OS001 + JS001"  /  "SS001 + SC001"  /  "OS001 (฿1,234.00)"  /  "OS001"
+  {
+    const allStmtsForBackfill = getAllStatements();
+    if (allStmtsForBackfill.length > 0 && billList.length > 0) {
+      // Index bills by bill_no
+      const billByNo = {};
+      billList.forEach(b => { 
+        if (b.bill_no) billByNo[String(b.bill_no).trim()] = b; 
+      });
+      
+      // Parse "OS001 + JS001 (฿1,234.00)" → ['OS001', 'JS001']
+      const parseBillNos = (mbStr) => {
+        if (!mbStr) return [];
+        const s = String(mbStr).trim();
+        // Strip composite key markers (Front1|Transfer|฿123 — Pass 1 handles these)
+        if (s.includes('|')) return [];
+        // Strip baht suffix "OS001 (฿1,234.00)" → "OS001"
+        const cleaned = s.replace(/\s*\(฿[^)]+\)/g, '').trim();
+        // Split by " + " or "+" or "," 
+        return cleaned.split(/\s*[+,]\s*/)
+          .map(x => x.trim())
+          .filter(x => x && /^[A-Z]{2}\d/.test(x)); // Must start with 2-letter prefix
+      };
+      
+      let multiBackfilled = 0;
+      let stmtsWithMulti = 0;
+      const _multiTouched = new Set();
+      
+      allStmtsForBackfill.forEach(s => {
+        if (s.match_status !== 'paid') return;
+        if (!s.stmt_uuid) return;
+        // Skip TL / SP-TEMP (different systems)
+        if (s.match_station === 'SP-TEMP' || 
+            s.match_station === 'TL-VAT' || 
+            s.match_station === 'TL-NOVAT') return;
+        
+        const billNos = parseBillNos(s.match_bill);
+        if (billNos.length === 0) return;
+        if (billNos.length > 1) stmtsWithMulti++;
+        
+        billNos.forEach(billNo => {
+          const b = billByNo[billNo];
+          if (!b) return;
+          let touched = false;
+          
+          // Backfill match_status
+          if (b.match_status !== 'paid' && b.match_status !== 'void') {
+            b.match_status = 'paid';
+            touched = true;
+          }
+          // Backfill matched_stmt_uuid (สำคัญสุด — ที่ user ขาด)
+          if (!b.matched_stmt_uuid) {
+            b.matched_stmt_uuid = s.stmt_uuid;
+            touched = true;
+          }
+          // Backfill matched_stmt_ref
+          if (!b.matched_stmt_ref && s.ref_no) {
+            b.matched_stmt_ref = String(s.ref_no);
+            touched = true;
+          }
+          // Backfill confirmation จาก stmt.bank
+          if (!b.confirmation && s.bank && b.type !== 'Cash') {
+            b.confirmation = s.bank;
+            touched = true;
+          }
+          // Backfill pay_date จาก stmt.date
+          if (!b.pay_date && s.date) {
+            b.pay_date = toISODate(s.date) || b.date;
+            touched = true;
+          }
+          
+          if (touched) {
+            multiBackfilled++;
+            if (b.bill_uuid) _multiTouched.add(b.bill_uuid);
+          }
+        });
+      });
+      
+      if (multiBackfilled > 0) {
+        console.log(`[Multi-bill backfill] ${multiBackfilled} bills linked (${stmtsWithMulti} multi-stmts)`);
+      }
+      
+      // ⭐ Mark dirty เพื่อให้ next push ส่งขึ้น cloud
+      if (_multiTouched.size > 0 && window.syncManager?.markDirty) {
+        _multiTouched.forEach(uuid => {
+          window.syncManager.markDirty('bills', uuid);
+        });
+        console.log(`[Auto-sync Pass 2] markDirty ${_multiTouched.size} bills for next push`);
+      }
     }
   }
   
