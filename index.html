@@ -2274,6 +2274,7 @@ const syncManager = {
                         (b.remarks1 || '') + '|' +
                         (b.remarks2 || '') + '|' +
                         (b.matched_stmt_ref || '') + '|' +
+                        (b.matched_stmt_uuid || '') + '|' +  // ⭐ FK link to stmt
                         (b.paid_by_sp || '') + '|' +
                         (b.due_date || '');
           }
