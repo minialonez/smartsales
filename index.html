@@ -1495,6 +1495,20 @@ function handleStmtUpload(result, fileName, opts = {}) {
   // Backward compat: uploadedStatements = รวมทุกธนาคารที่ sort แล้ว
   uploadedStatements = getAllStatements();
   
+  // ⭐ Mark dirty: stmts ใหม่ที่ import → push ขึ้น cloud ครั้งหน้า
+  //    เดิม: ไม่ markDirty → push คิดว่า "ไม่มีอะไรเปลี่ยน" → skip → user งงว่าทำไม sheet ไม่อัปเดต
+  if (added > 0 && window.syncManager?.markDirty) {
+    // Mark dirty per-uuid (selective push) สำหรับ stmts ที่เพิ่ง add
+    const newStmts = (statementsByBank[bank] || []).slice(-added);
+    newStmts.forEach(s => {
+      if (s.stmt_uuid) window.syncManager.markDirty('stmts', s.stmt_uuid);
+    });
+    // Fallback bulk markDirty
+    if (newStmts.some(s => !s.stmt_uuid)) {
+      window.syncManager.markDirty('stmts');
+    }
+  }
+  
   // Silent mode: ไม่ persist/toast/navigate — caller เป็นผู้รับผิดชอบ (batch upload)
   if (silent) {
     return { bank, added, skipped, buddhistCount };
