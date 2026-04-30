@@ -761,7 +761,16 @@ function sortByDateDesc(arr, getDate) {
 //   เรียกหลัง render() เพื่อ apply ให้ทุก <input type="date">
 // ══════════════════════════════════════════════════════════
 function applyFlatpickrAll() {
-  if (typeof flatpickr === 'undefined') return;
+  if (typeof flatpickr === 'undefined') {
+    // flatpickr ยังไม่ load — retry ใน 500ms (แต่ไม่เกิน 5 ครั้ง)
+    if (!window._fpLoadRetry) window._fpLoadRetry = 0;
+    if (window._fpLoadRetry < 5) {
+      window._fpLoadRetry++;
+      setTimeout(applyFlatpickrAll, 500);
+    }
+    return;
+  }
+  window._fpLoadRetry = 0;
   document.querySelectorAll('input[type="date"]').forEach(inp => {
     if (inp._flatpickr) return; // already applied
     try {
@@ -777,10 +786,24 @@ function applyFlatpickrAll() {
 
 // Auto-apply flatpickr เมื่อมี date input ใหม่เพิ่มใน DOM (modal, re-render)
 if (typeof window !== 'undefined') {
-  const _fpObserver = new MutationObserver(() => {
-    // debounce: รอ 200ms หลังเปลี่ยนแปลง — เผื่อ DOM ใหญ่ (bills 9000+ rows)
-    clearTimeout(window._fpTimer);
-    window._fpTimer = setTimeout(applyFlatpickrAll, 200);
+  const _fpObserver = new MutationObserver((muts) => {
+    // ⭐ Quick check: ถ้ามี date input ใหม่ → apply ทันที (debounce 50ms)
+    //    ก่อน 200ms — บาง render สร้าง input แล้ว observer trigger ช้าเกิน user เห็น native picker
+    let hasNewDate = false;
+    for (const m of muts) {
+      for (const n of m.addedNodes) {
+        if (n.nodeType !== 1) continue;
+        if (n.matches?.('input[type="date"]') || n.querySelector?.('input[type="date"]')) {
+          hasNewDate = true;
+          break;
+        }
+      }
+      if (hasNewDate) break;
+    }
+    if (hasNewDate) {
+      clearTimeout(window._fpTimer);
+      window._fpTimer = setTimeout(applyFlatpickrAll, 50);
+    }
   });
   // เริ่มสังเกตหลัง DOM พร้อม
   if (document.body) {
@@ -7377,13 +7400,18 @@ async function renderMain(el) {
         
         // Unmatch bills (ถ้า bill date อยู่ใน selection)
         let billCount = 0;
-        const stmtRefsToUnmatch = new Set();
+        // ⚠️ แยก uuid (unique) จาก ref_no (อาจซ้ำเช่น BBL NW = "MOB")
+        const stmtUuidsToUnmatch = new Set();
+        const stmtRefsLegacy = new Set(); // fallback สำหรับ bills ที่ยังไม่มี uuid
         billList.forEach(b => {
           if (b.match_status !== 'paid' || b.type === 'Cash') return;
           const d = toISODate(b.date);
           if (!targetDates.has(d)) return;
-          if (b.matched_stmt_ref) stmtRefsToUnmatch.add(b.matched_stmt_ref);
-          if (b.matched_stmt_uuid) stmtRefsToUnmatch.add(b.matched_stmt_uuid);
+          if (b.matched_stmt_uuid) {
+            stmtUuidsToUnmatch.add(b.matched_stmt_uuid);
+          } else if (b.matched_stmt_ref) {
+            stmtRefsLegacy.add(b.matched_stmt_ref);
+          }
           b.match_status = 'unpaid';
           b.confirmation = '';
           b.pay_date = '';
@@ -7399,9 +7427,10 @@ async function renderMain(el) {
         allStmts.forEach(s => {
           const sDate = toISODate(s.date || s.trans_date);
           const inDate = dayISOSet.has(sDate);
-          const refMatch = (s.ref_no && stmtRefsToUnmatch.has(s.ref_no)) ||
-                           (s.stmt_uuid && stmtRefsToUnmatch.has(s.stmt_uuid));
-          if (!inDate && !refMatch) return;
+          // Match by uuid (primary) or by ref_no (legacy fallback only for stmts without uuid)
+          const uuidMatch = s.stmt_uuid && stmtUuidsToUnmatch.has(s.stmt_uuid);
+          const refMatchLegacy = !s.stmt_uuid && s.ref_no && stmtRefsLegacy.has(s.ref_no);
+          if (!inDate && !uuidMatch && !refMatchLegacy) return;
           if (s.match_status !== 'paid') return;
           
           // Clear SP-TEMP partial links to this stmt
@@ -7461,10 +7490,18 @@ async function renderMain(el) {
         b.match_status === 'paid' && b.type !== 'Cash'
       );
       
-      // หา stmt ที่ผูกอยู่กับบิลของวันนี้
-      const stmtRefsOfDay = new Set();
+      // หา stmt ที่ผูกอยู่กับบิลของวันนี้ (ใช้ uuid — unique stable key)
+      // ⚠️ ห้ามใช้ ref_no เพราะธนาคารบางแห่งใช้ ref ซ้ำกัน เช่น BBL NW = "MOB" ทั้ง 900+ รายการ
+      //    → ถ้าใช้ ref_no จะดึง stmt ทุกเดือนที่ ref="MOB" มา unmatch (overkill!)
+      const stmtUuidsOfDay = new Set();
+      const stmtRefsOfDayLegacy = new Set(); // fallback สำหรับ bills เก่าที่ยังไม่มี matched_stmt_uuid
       billsToUnmatch.forEach(b => {
-        if (b.matched_stmt_ref) stmtRefsOfDay.add(b.matched_stmt_ref);
+        if (b.matched_stmt_uuid) {
+          stmtUuidsOfDay.add(b.matched_stmt_uuid);
+        } else if (b.matched_stmt_ref) {
+          // Legacy fallback — bill ที่ยังไม่ backfill uuid
+          stmtRefsOfDayLegacy.add(b.matched_stmt_ref);
+        }
       });
       
       // หา stmt ของวันนี้ที่ matched (ครอบคลุมกรณีที่ stmt match กับบิลวันอื่น)
@@ -7474,7 +7511,9 @@ async function renderMain(el) {
         if (s.match_status !== 'paid') return false;
         const sDate = toISODate(s.date || s.trans_date);
         if (sDate === dayISO) return true; // stmt ของวันนี้
-        if (stmtRefsOfDay.has(s.ref_no)) return true; // stmt ที่บิลวันนี้ผูกอยู่
+        if (s.stmt_uuid && stmtUuidsOfDay.has(s.stmt_uuid)) return true; // stmt ที่บิลวันนี้ผูกอยู่ (by uuid)
+        // Legacy fallback only if no uuid linkage exists for this stmt
+        if (!s.stmt_uuid && stmtRefsOfDayLegacy.has(s.ref_no)) return true;
         return false;
       });
       
