@@ -21365,6 +21365,7 @@ function renderData(el) {
             </div>
           </div>
           <div class="flex gap-2">
+            <button class="btn btn-outline btn-sm" id="btn-backfill-match-uuid" style="border-color:var(--success);color:var(--success)" title="Backfill matched_stmt_uuid จาก stmt — สำหรับ bills paid ที่ขาด FK link">🔗 Backfill Match UUID</button>
             <button class="btn btn-outline btn-sm" id="btn-scan-match-integrity" style="border-color:var(--info);color:var(--info)">🔍 ตรวจสอบ</button>
           </div>
         </div>
@@ -22447,6 +22448,125 @@ function renderData(el) {
     });
     
     // ── Scan Match Integrity (Bill ↔ Stmt desync) ──
+    // ── 🔗 Backfill matched_stmt_uuid — สำหรับ bills paid ที่ขาด FK link ──
+    document.getElementById('btn-backfill-match-uuid')?.addEventListener('click', async () => {
+      const btn = document.getElementById('btn-backfill-match-uuid');
+      btn.disabled = true;
+      const orig = btn.textContent;
+      btn.textContent = '⏳ Backfill...';
+      
+      try {
+        // Step 1: Build stmt indices
+        const allStmts = getAllStatements() || [];
+        const stmtByBillNo = {};
+        const stmtByCompositeKey = {};
+        
+        // Parse "OS001 + JS001 (฿1,234.00)" → ['OS001', 'JS001']
+        const parseBillNos = (mbStr) => {
+          if (!mbStr) return [];
+          const s = String(mbStr).trim();
+          if (s.includes('|')) return []; // composite key — handle separately
+          const cleaned = s.replace(/\s*\(฿[^)]+\)/g, '').trim();
+          return cleaned.split(/\s*[+,]\s*/)
+            .map(x => x.trim())
+            .filter(x => x && /^[A-Z]{2}\d/.test(x));
+        };
+        
+        allStmts.forEach(s => {
+          if (s.match_status !== 'paid' || !s.stmt_uuid) return;
+          if (s.match_station === 'SP-TEMP' || s.match_station === 'TL-VAT' || s.match_station === 'TL-NOVAT') return;
+          
+          // Parse match_bill string → list of bill_no
+          const billNos = parseBillNos(s.match_bill);
+          billNos.forEach(bn => {
+            if (!stmtByBillNo[bn]) stmtByBillNo[bn] = s;
+          });
+          
+          // Composite key fallback: "Front1|Transfer|฿123"
+          const mb = String(s.match_bill || '');
+          if (mb.includes('|')) {
+            const parts = mb.split('|');
+            const station = parts[0];
+            const type = parts[1];
+            const amtRaw = String(parts[2] || '').replace('฿', '').replace(/,/g, '');
+            const amt = Math.round(Number(amtRaw));
+            const sDate = toISODate(s.date || s.trans_date);
+            if (station && type && amt && sDate) {
+              const k = `${sDate}|${station}|${type}|${amt}`;
+              if (!stmtByCompositeKey[k]) stmtByCompositeKey[k] = s;
+            }
+          }
+        });
+        
+        // Step 2: Backfill loop
+        const touched = new Set();
+        let backfilled = 0;
+        let alreadyOk = 0;
+        let noMatch = 0;
+        const noMatchSamples = [];
+        
+        billList.forEach(b => {
+          if (b.match_status !== 'paid') return;
+          if (b.type === 'Cash' || b.type === 'Refund') return;
+          if (b.paid_by_sp) return; // SP-paid ไม่ผ่าน stmt
+          if (b.matched_stmt_uuid) { alreadyOk++; return; } // already filled
+          
+          // Find stmt
+          let stmt = stmtByBillNo[b.bill_no];
+          if (!stmt) {
+            const bDate = toISODate(b.date);
+            const amt = Math.round(Number(b.amount || 0));
+            if (bDate && b.station && b.type && amt) {
+              stmt = stmtByCompositeKey[`${bDate}|${b.station}|${b.type}|${amt}`];
+            }
+          }
+          
+          if (!stmt) {
+            noMatch++;
+            if (noMatchSamples.length < 5) {
+              noMatchSamples.push(`${b.bill_no} ${b.station}|${b.type}|฿${b.amount}|${b.date}`);
+            }
+            return;
+          }
+          
+          // Backfill
+          b.matched_stmt_uuid = stmt.stmt_uuid;
+          if (!b.matched_stmt_ref) b.matched_stmt_ref = String(stmt.ref_no || '');
+          if (!b.confirmation && stmt.bank) b.confirmation = stmt.bank;
+          if (!b.pay_date && stmt.date) b.pay_date = toISODate(stmt.date) || b.date;
+          
+          backfilled++;
+          if (b.bill_uuid) touched.add(b.bill_uuid);
+        });
+        
+        // Step 3: Mark dirty + persist
+        if (touched.size > 0 && window.syncManager?.markDirty) {
+          touched.forEach(uuid => window.syncManager.markDirty('bills', uuid));
+        }
+        if (backfilled > 0) persistMainState();
+        
+        const msg = `🔗 Backfill เสร็จสิ้น\n\n` +
+          `✅ Backfilled: ${backfilled} bills\n` +
+          `✓ Already OK: ${alreadyOk} bills\n` +
+          `⚠️ ไม่เจอ stmt match: ${noMatch} bills` +
+          (noMatchSamples.length > 0 ? `\n\nตัวอย่างที่ไม่เจอ:\n${noMatchSamples.join('\n')}` : '') +
+          `\n\n${backfilled > 0 ? '☁️ กด "บันทึก" เพื่อ push ขึ้น cloud' : ''}`;
+        
+        alert(msg);
+        
+        if (backfilled > 0) {
+          toast(`✓ Backfill ${backfilled} bills — กด บันทึก เพื่อ push`, 'success', 5000);
+          render();
+        }
+      } catch(e) {
+        console.error('[backfill]', e);
+        toast('Backfill ล้มเหลว: ' + e.message, 'error', 6000);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = orig;
+      }
+    });
+    
     document.getElementById('btn-scan-match-integrity')?.addEventListener('click', () => {
       const allStmts = getAllStatements();
       const stmtByUuid = new Map();
