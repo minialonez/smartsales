@@ -1492,6 +1492,25 @@ function handleStmtUpload(result, fileName, opts = {}) {
   // เก็บแยกธนาคาร + เรียงตามวันที่
   const { added, skipped } = addStatementRows(bank, rows);
   
+  // ⭐ Diagnostic logging — เปรียบเทียบ behavior ระหว่าง 5 banks
+  //    ถ้าครั้งต่อไป BBL/TTB ไม่ขึ้น sheet → console จะมี log ทำให้รู้ root cause
+  console.log(`[stmt-upload] bank=${bank} | parsed_rows=${rows.length} | added=${added} | skipped=${skipped}`);
+  if (rows.length > 0) {
+    const sample = rows[0];
+    console.log(`  sample: date=${sample.date} time=${sample.time} amt=${sample.amount} ref=${sample.ref_no} bank_field="${sample.bank}"`);
+    // Validate critical fields
+    const missing = [];
+    if (!sample.bank) missing.push('bank');
+    if (!sample.date) missing.push('date');
+    if (typeof sample.amount !== 'number') missing.push('amount(not number)');
+    if (missing.length > 0) {
+      console.warn(`  ⚠️ MISSING FIELDS: ${missing.join(', ')} — push อาจ fail!`);
+    }
+  }
+  if (added === 0 && rows.length > 0) {
+    console.warn(`  ⚠️ ${bank}: parsed ${rows.length} rows but added=0 (all skipped as duplicates) — ลองเช็คว่า dedup คิดว่าซ้ำผิดไหม`);
+  }
+  
   // Backward compat: uploadedStatements = รวมทุกธนาคารที่ sort แล้ว
   uploadedStatements = getAllStatements();
   
