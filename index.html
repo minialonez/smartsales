@@ -22708,6 +22708,10 @@ function renderData(el) {
       billList.forEach(b => {
         if (b.match_status !== 'paid') return;
         if (b.paid_by_sp) return; // paid via SP, no stmt link expected
+        // ⚠️ Skip Cash/Refund — auto-paid โดยไม่ต้องผ่าน stmt
+        //    Cash = เงินสด (ลิ้นชัก), Refund = คืนเงิน
+        //    matched_stmt_uuid อาจ exist (legacy/split-payment residue) แต่ไม่ใช่ issue
+        if (b.type === 'Cash' || b.type === 'Refund') return;
         
         let stmt = b.matched_stmt_uuid ? stmtByUuid.get(b.matched_stmt_uuid) : null;
         if (!stmt && b.matched_stmt_ref) {
