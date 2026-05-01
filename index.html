@@ -2422,6 +2422,8 @@ const syncManager = {
           this._fpCache.bills = fp;
           // ⭐ เคลียร์ dirty uuids ของ bills หลัง push สำเร็จ
           if (this.dirtyUuids?.bills) this.dirtyUuids.bills.clear();
+          // ⭐ เคลียร์ dirty type flag ด้วย — กัน stale flag (dirty=true แต่ no uuids to push)
+          this.dirty.delete('bills');
         } else if (type === 'stmts') {
           const allStmts = getAllStatements();
           if (allStmts.length === 0) continue;
@@ -2515,6 +2517,8 @@ const syncManager = {
           this._fpCache.stmts = fp;
           // ⭐ เคลียร์ dirty uuids ของ stmts หลัง push สำเร็จ
           if (this.dirtyUuids?.stmts) this.dirtyUuids.stmts.clear();
+          // ⭐ เคลียร์ dirty type flag — กัน stale flag
+          this.dirty.delete('stmts');
         } else if (type === 'payments') {
           if (paymentList.length === 0) continue;
           const fp = this._fp({n: paymentList.length, first: paymentList[0]?.sp_no, last: paymentList[paymentList.length-1]?.sp_no});
@@ -2522,6 +2526,7 @@ const syncManager = {
           const r = await api('savePayments', { payments: paymentList, created_by: by });
           if (r?.success === false) throw new Error(r.error || 'API error');
           this._fpCache.payments = fp;
+          this.dirty.delete('payments');
         } else if (type === 'sp_temps') {
           // ⭐ Flat schema — flatten nested state ก่อนส่ง backend
           //    1 row = 1 (bill × partial event)
@@ -2568,6 +2573,7 @@ const syncManager = {
             try { localStorage.removeItem('sf_deleted_sp_temp_nos'); } catch(_){}
           }
           this._fpCache.sp_temps = fp;
+          this.dirty.delete('sp_temps');
         } else if (type === 'cashflow') {
           if (cashflowList.length === 0) continue;
           const fp = this._fp({n: cashflowList.length, first: cashflowList[0]?.id, last: cashflowList[cashflowList.length-1]?.id});
@@ -2575,6 +2581,7 @@ const syncManager = {
           const r = await api('saveCashflow', { records: cashflowList, created_by: by });
           if (r?.success === false) throw new Error(r.error || 'API error');
           this._fpCache.cashflow = fp;
+          this.dirty.delete('cashflow');
         } else if (type === 'suppliers') {
           const fp = this._fp({sup: supplierList.length, pay: supplierPayments.length});
           if (fp === this._fpCache.suppliers) { results.skipped++; continue; }
@@ -2587,6 +2594,7 @@ const syncManager = {
             if (r2?.success === false) throw new Error(r2.error || 'API error');
           }
           this._fpCache.suppliers = fp;
+          this.dirty.delete('suppliers');
         } else if (type === 'meta') {
           // Meta สำคัญมาก — ใช้ full JSON fingerprint (หนักแต่คุ้ม กันบวม sheet)
           // ⭐ Include __lockedDates ใน fp — เปลี่ยน lock = trigger push
@@ -2697,6 +2705,7 @@ const syncManager = {
             console.warn('[meta push] SKIPPED — 0 rows built. __byDate keys:', Object.keys(mainSummary.__byDate || {}).slice(0, 5));
             if (this.dirtyUuids?.meta) this.dirtyUuids.meta.clear();
             this._fpCache.meta = fp;
+            this.dirty.delete('meta');
             results.skipped++;
             continue;
           }
@@ -2724,6 +2733,7 @@ const syncManager = {
             if (r?.success === false) throw new Error(r.error || 'API error');
           }
           this._fpCache.meta = fp;
+          this.dirty.delete('meta');
           // ⭐ Clear dirty dates + user-modified fields หลัง push สำเร็จ
           if (this.dirtyUuids?.meta) this.dirtyUuids.meta.clear();
           if (window._userModifiedMetaFields) window._userModifiedMetaFields.clear();
@@ -4339,10 +4349,15 @@ async function restoreMainState() {
   {
     const allStmtsForBackfill = getAllStatements();
     if (allStmtsForBackfill.length > 0 && billList.length > 0) {
-      // Index bills by bill_no
+      // Index bills by bill_no — ใช้ array เพราะ split-payment มี rows หลายอันที่ bill_no เดียวกัน
+      // (เก่า: overwrite เป็นตัวเดียว → row สุดท้ายอาจเป็น Cash → bug Cash + matched_stmt_uuid)
       const billByNo = {};
       billList.forEach(b => { 
-        if (b.bill_no) billByNo[String(b.bill_no).trim()] = b; 
+        if (b.bill_no) {
+          const key = String(b.bill_no).trim();
+          if (!billByNo[key]) billByNo[key] = [];
+          billByNo[key].push(b);
+        }
       });
       
       // Parse "OS001 + JS001 (฿1,234.00)" → ['OS001', 'JS001']
@@ -4376,8 +4391,16 @@ async function restoreMainState() {
         if (billNos.length > 1) stmtsWithMulti++;
         
         billNos.forEach(billNo => {
-          const b = billByNo[billNo];
-          if (!b) return;
+          const matchingBills = billByNo[billNo];
+          if (!matchingBills || matchingBills.length === 0) return;
+          
+          // Iterate ทุก row ที่ bill_no เดียวกัน (รองรับ split-payment)
+          // แต่ skip Cash/Refund — ไม่ผ่าน bank
+          //    Bug history (1/5/26): SP-661 มี 4 rows (Transfer + Transfer + Cash + Cash)
+          //    เดิม billByNo overwrite → Cash 12 บาท ผูกกับ stmt 1,513.61 ของ Transfer sibling
+          //    Fix: ใช้ array + iterate ทุก row + skip Cash/Refund
+          matchingBills.forEach(b => {
+          if (b.type === 'Cash' || b.type === 'Refund') return;
           let touched = false;
           
           // Backfill match_status
@@ -4410,6 +4433,7 @@ async function restoreMainState() {
             multiBackfilled++;
             if (b.bill_uuid) _multiTouched.add(b.bill_uuid);
           }
+          }); // matchingBills.forEach
         });
       });
       
