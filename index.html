@@ -2309,6 +2309,11 @@ const syncManager = {
     // last fingerprints per type — persist ใน memory (ถ้า refresh หน้า จะ push ครั้งแรกเต็ม)
     this._fpCache = this._fpCache || {};
     
+    // ⭐ try/finally — กัน status='pushing' ค้างถ้ามี uncaught throw
+    //    Bug history (1/5/26): user เห็น status='pushing' + lastPushAt=0 ค้าง 6 นาที 
+    //    → for-loop มี try/catch ภายในแต่ละ type แต่ uncaught error นอก loop ทำให้ skip cleanup
+    //    Fix: outer try/finally ให้ status + lastPushAt reset เสมอ
+    try {
     for (const type of types) {
       try {
         if (type === 'bills') {
@@ -2764,6 +2769,21 @@ const syncManager = {
     this.status = results.fail ? 'error' : 'idle';
     this.lastError = results.errors[0] || null;
     this._emit();
+    } catch (outerErr) {
+      // ⭐ Uncaught error — log + reset status (ห้าม status='pushing' ค้าง)
+      console.error('[sync] _flushPush uncaught error:', outerErr);
+      this.lastPushAt = Date.now();
+      this.status = 'error';
+      this.lastError = outerErr?.message || String(outerErr);
+      this._emit();
+    } finally {
+      // ⭐ Safety net — ถ้า status ยัง 'pushing' (uncaught throw บางจุด) → force idle
+      if (this.status === 'pushing') {
+        this.status = 'idle';
+        this.lastPushAt = Date.now();
+        this._emit();
+      }
+    }
   },
   
   // Auto-pull: เรียกจาก showApp หลัง login
