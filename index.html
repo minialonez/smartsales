@@ -27625,6 +27625,16 @@ function _monthlyClassifyVAT(prefix) {
   return 'UNKNOWN';
 }
 
+// Display label for VAT class (internal value stays 'VAT'/'NOVAT' — only UI label changes)
+//   VAT   → ใบสั่งขาย (sale order, no VAT included in price)
+//   NOVAT → ใบกำกับภาษี (tax invoice, VAT included)
+// NOTE: Naming follows business domain — confusing at first glance but matches user's terminology.
+function _monthlyVatClassLabel(cls) {
+  if (cls === 'VAT')   return 'ใบสั่งขาย';
+  if (cls === 'NOVAT') return 'ใบกำกับภาษี';
+  return cls || '';
+}
+
 // Extract bill_no parts: 'SR00126-000001' → {prefix:'SR', body:'00126', suffix:'000001'}
 function _monthlyParseBillNo(billNo) {
   const s = String(billNo || '').trim();
@@ -27894,9 +27904,10 @@ async function _monthlyShowPreviewModal(filename, kind, records, groups, onSaveS
     });
     
     const classBadge = (c) => {
-      if (c === 'VAT')   return '<span class="badge badge-warn">VAT</span>';
-      if (c === 'NOVAT') return '<span class="badge badge-purple">NOVAT</span>';
-      return `<span class="badge badge-muted">${c}</span>`;
+      const lbl = _monthlyVatClassLabel(c);
+      if (c === 'VAT')   return `<span class="badge badge-warn">${lbl}</span>`;
+      if (c === 'NOVAT') return `<span class="badge badge-purple">${lbl}</span>`;
+      return `<span class="badge badge-muted">${lbl}</span>`;
     };
     
     const classRows = ['VAT', 'NOVAT', 'UNKNOWN'].filter(c => byClass[c].count > 0).map(c => {
@@ -27964,7 +27975,7 @@ async function _monthlyShowPreviewModal(filename, kind, records, groups, onSaveS
   } else {
     // Invoice: show first 5 sorted records (so user sees VAT first then NOVAT)
     const sortedRecords = _monthlySortInvoiceRecords(records);
-    sampleHeader = `<tr><th>วันที่</th><th>เลขที่บิล</th><th>VAT</th><th>ลูกค้า</th><th style="text-align:right">รวม</th></tr>`;
+    sampleHeader = `<tr><th>วันที่</th><th>เลขที่บิล</th><th>ประเภท</th><th>ลูกค้า</th><th style="text-align:right">รวม</th></tr>`;
     sampleRows = sortedRecords.slice(0, 5).map(r => {
       const cls = r.vat_class === 'VAT' ? 'badge-warn'
                : r.vat_class === 'NOVAT' ? 'badge-purple' : 'badge-muted';
@@ -27973,7 +27984,7 @@ async function _monthlyShowPreviewModal(filename, kind, records, groups, onSaveS
         <tr>
           <td style="font-family:var(--mono);font-size:.78rem">${r.date}</td>
           <td style="font-family:var(--mono);font-size:.78rem">${r.bill_no || ''}</td>
-          <td><span class="badge ${cls}">${r.vat_class || ''}</span></td>
+          <td><span class="badge ${cls}" style="font-size:.7rem">${_monthlyVatClassLabel(r.vat_class)}</span></td>
           <td style="font-size:.78rem;color:var(--text2)">${cust}</td>
           <td style="text-align:right;font-family:var(--mono)">${fmt(r.total)}</td>
         </tr>
@@ -28239,7 +28250,7 @@ function _monthlyExportExcel(rows, kind, year, months, filter) {
       });
       
       // Class header
-      aoa.push([`══ ${cls} — ${cCount} รายการ ══`]);
+      aoa.push([`══ ${_monthlyVatClassLabel(cls)} (${cls}) — ${cCount} รายการ ══`]);
       
       prefixes.forEach(prefix => {
         const sectionRows = _monthlySortInvoiceRecords(byClass[cls][prefix]);
@@ -28259,7 +28270,7 @@ function _monthlyExportExcel(rows, kind, year, months, filter) {
             r.date || '',
             r.bill_no || '',
             r.bill_prefix || '',
-            r.vat_class || '',
+            _monthlyVatClassLabel(r.vat_class) || '',
             r.customer || '',
             r.tax_id || '',
             r.branch || '',
@@ -28276,7 +28287,7 @@ function _monthlyExportExcel(rows, kind, year, months, filter) {
       });
       
       // Class total
-      aoa.push(['', '', '', '', '', '', `ยอดรวม ${cls}`, fmt(cV), fmt(cVAT), fmt(cE), fmt(cT)]);
+      aoa.push(['', '', '', '', '', '', `ยอดรวม ${_monthlyVatClassLabel(cls)}`, fmt(cV), fmt(cVAT), fmt(cE), fmt(cT)]);
       aoa.push([]);  // spacer
     });
   }
@@ -28468,7 +28479,7 @@ function _monthlyExportPDF(rows, kind, year, months, filter) {
       
       return `
         <div class="section">
-          <div class="section-header class-${cls.toLowerCase()}">══ ${cls} — ${cCount} รายการ · ยอดรวมคลาส: ${fmt(cT)} ══</div>
+          <div class="section-header class-${cls.toLowerCase()}">══ ${_monthlyVatClassLabel(cls)} — ${cCount} รายการ · ยอดรวม: ${fmt(cT)} ══</div>
           ${prefixSectionsHtml}
         </div>
       `;
@@ -29051,7 +29062,7 @@ async function renderMonthly(el) {
         style="padding:5px 12px;font-size:.78rem;font-weight:700;border-radius:20px;cursor:pointer;transition:all .2s;
         ${isNovatActive
           ? 'background:var(--purple);border:1px solid var(--purple);color:#fff'
-          : 'background:transparent;border:1px solid var(--purple);color:var(--purple)'}">NOVAT</button>`;
+          : 'background:transparent;border:1px solid var(--purple);color:var(--purple)'}">${_monthlyVatClassLabel('NOVAT')}</button>`;
       const novatSubs = NOVAT_PREFIXES.map(p => {
         const isMe = filter.primary === p;
         // States:
@@ -29078,7 +29089,7 @@ async function renderMonthly(el) {
         style="padding:5px 12px;font-size:.78rem;font-weight:700;border-radius:20px;cursor:pointer;transition:all .2s;
         ${isVatActive
           ? 'background:var(--warn);border:1px solid var(--warn);color:#fff'
-          : 'background:transparent;border:1px solid var(--warn);color:var(--warn)'}">VAT</button>`;
+          : 'background:transparent;border:1px solid var(--warn);color:var(--warn)'}">${_monthlyVatClassLabel('VAT')}</button>`;
       const vatSubs = VAT_PREFIXES.map(p => {
         const isMe = filter.primary === p;
         let style;
@@ -29365,7 +29376,7 @@ async function renderMonthly(el) {
             <span style="display:flex;align-items:center;gap:12px">
               <span style="display:inline-flex;align-items:center;justify-content:center;width:42px;height:42px;border-radius:10px;background:${classColor};color:#fff;font-size:.78rem;font-weight:700;letter-spacing:.5px">${cls}</span>
               <span>
-                <div class="font-semi" style="font-size:1.15rem;color:${classColor};line-height:1.1">${cls}</div>
+                <div class="font-semi" style="font-size:1.15rem;color:${classColor};line-height:1.1">${_monthlyVatClassLabel(cls)}</div>
                 <div style="font-size:.78rem;color:var(--text-muted);margin-top:2px">${cCount.toLocaleString()} รายการ</div>
               </span>
             </span>
