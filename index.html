@@ -412,6 +412,7 @@ async function api(action, params = {}) {
       'savePPReport',
       'upsertBills', 'upsertStatements', 'upsertMeta',
       'saveSupplierPayments',
+      'upsertMonthlyFront', 'upsertMonthlyInvoice',
     ];
     const forcePost = FORCE_POST_ACTIONS.indexOf(action) !== -1;
     
@@ -17562,6 +17563,7 @@ const NAV_ITEMS = [
   { id:'alerts',    icon:'bell',    label:'แจ้งเตือน', badge: true },
   { id:'reports',   icon:'file',    label:'รายงานบัญชี' },
   { id:'tax_export',icon:'file',    label:'📋 Export สรรพากร' },
+  { id:'monthly',   icon:'file',    label:'📅 รายงานรายเดือน' },
   { id:'users',     icon:'users',   label:'จัดการผู้ใช้' },
 ];
 
@@ -17842,6 +17844,7 @@ const PAGE_RENDERERS = {
   alerts: renderAlerts,
   reports: renderReports,
   tax_export: renderTaxExport,
+  monthly: renderMonthly,
   users: renderUsers,
   sp_recon: renderSpRecon,
   pp_recon: renderPpRecon,
@@ -27400,6 +27403,339 @@ function exportReconReport(data, kind) {
   XLSX.writeFile(wb, fn);
   toast(`✅ Export: ${fn}`, 'success');
 }
+
+// ════════════════════════════════════════════════════════════════
+// MONTHLY MODULE — Phase 1A (Front Summary) + 1B (Invoice Summary)
+// ════════════════════════════════════════════════════════════════
+// Step 2: Page skeleton + tab switcher + year/month chips + data load
+// Step 3 (next): Upload modal + parser frontsum + period existence check
+// Step 4 (next): Parser invoicesum + VAT classification + sort
+// Step 5 (next): Multi-month view with sub-sections + grand total
+// Step 6 (next): Excel + PDF export
+
+const MONTHLY_STATE_KEY = 'sf_monthly_state';
+const MONTHLY_MONTH_LABELS = ['ม.ค.','ก.พ.','มี.ค.','เม.ย.','พ.ค.','มิ.ย.','ก.ค.','ส.ค.','ก.ย.','ต.ค.','พ.ย.','ธ.ค.'];
+
+function _monthlyLoadState() {
+  try {
+    const raw = localStorage.getItem(MONTHLY_STATE_KEY);
+    if (raw) {
+      const s = JSON.parse(raw);
+      if (s && typeof s === 'object') {
+        return {
+          tab: s.tab === 'invoice' ? 'invoice' : 'front',
+          year: Number(s.year) || new Date().getFullYear(),
+          months: Array.isArray(s.months) ? s.months.filter(m => m >= 1 && m <= 12) : [],
+        };
+      }
+    }
+  } catch(e) {}
+  // Default: current year, current month
+  const now = new Date();
+  return {
+    tab: 'front',
+    year: now.getFullYear(),
+    months: [now.getMonth() + 1],
+  };
+}
+
+function _monthlySaveState(state) {
+  try {
+    localStorage.setItem(MONTHLY_STATE_KEY, JSON.stringify({
+      tab: state.tab,
+      year: state.year,
+      months: state.months,
+    }));
+  } catch(e) {}
+}
+
+async function renderMonthly(el) {
+  const state = _monthlyLoadState();
+  // cache fetched rows in closure (not persisted)
+  let cachedRows = [];
+  let lastFetchKey = '';
+  
+  // Build year options (current ± 2)
+  const thisYear = new Date().getFullYear();
+  const years = [];
+  for (let y = thisYear - 2; y <= thisYear + 1; y++) years.push(y);
+  if (years.indexOf(state.year) < 0) years.push(state.year);
+  years.sort((a,b) => b - a);  // newest first
+  
+  function renderShell() {
+    el.innerHTML = `
+      <div class="flex justify-between items-center mb-3">
+        <div class="page-title">📅 รายงานรายเดือน (Monthly)</div>
+        <div class="flex" style="gap:8px">
+          <button class="btn btn-primary btn-sm" id="btn-monthly-upload" disabled title="เพิ่มใน Step 3">📂 อัปโหลด</button>
+          <button class="btn btn-ghost btn-sm" id="btn-monthly-excel" disabled title="เพิ่มใน Step 6">📊 Excel</button>
+          <button class="btn btn-ghost btn-sm" id="btn-monthly-pdf" disabled title="เพิ่มใน Step 6">🖨 PDF</button>
+        </div>
+      </div>
+      
+      <!-- Tab switcher -->
+      <div class="card-flat mb-3" style="padding:8px">
+        <div class="tab-bar" style="display:inline-flex">
+          <button class="tab-btn ${state.tab==='front'?'active':''}" data-tab="front">Front Summary</button>
+          <button class="tab-btn ${state.tab==='invoice'?'active':''}" data-tab="invoice">Invoice Summary</button>
+        </div>
+      </div>
+      
+      <!-- Filter bar: year + month chips -->
+      <div class="card-flat mb-3" style="padding:14px">
+        <div class="flex items-center" style="gap:14px;flex-wrap:wrap">
+          <label style="display:flex;align-items:center;gap:8px;font-size:.82rem;color:var(--text2)">
+            <span>ปี:</span>
+            <select id="monthly-year" class="input" style="width:100px;padding:6px 10px">
+              ${years.map(y => `<option value="${y}" ${y===state.year?'selected':''}>${y}</option>`).join('')}
+            </select>
+          </label>
+          
+          <div class="flex items-center" style="gap:6px;flex-wrap:wrap">
+            <span style="font-size:.82rem;color:var(--text2);margin-right:4px">เดือน:</span>
+            ${MONTHLY_MONTH_LABELS.map((label, i) => {
+              const m = i + 1;
+              const active = state.months.indexOf(m) >= 0;
+              return `<button class="pill ${active?'active':''}" data-month="${m}" style="padding:4px 10px;font-size:.78rem">${label}</button>`;
+            }).join('')}
+            <button class="btn btn-ghost btn-sm" id="btn-month-all" style="padding:4px 10px;font-size:.75rem;margin-left:8px">ทั้งปี</button>
+            <button class="btn btn-ghost btn-sm" id="btn-month-clear" style="padding:4px 10px;font-size:.75rem">ล้าง</button>
+          </div>
+        </div>
+        <div style="font-size:.72rem;color:var(--text-muted);margin-top:8px" id="monthly-summary-line"></div>
+      </div>
+      
+      <!-- Content area -->
+      <div id="monthly-content"></div>
+    `;
+    bindShell();
+  }
+  
+  function bindShell() {
+    // Tab switcher
+    el.querySelectorAll('.tab-btn[data-tab]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        if (state.tab === btn.dataset.tab) return;
+        state.tab = btn.dataset.tab;
+        _monthlySaveState(state);
+        cachedRows = [];
+        lastFetchKey = '';
+        renderShell();
+        await loadAndRender();
+      });
+    });
+    
+    // Year selector
+    const yearSel = document.getElementById('monthly-year');
+    if (yearSel) {
+      yearSel.addEventListener('change', async (e) => {
+        state.year = parseInt(e.target.value, 10);
+        _monthlySaveState(state);
+        await loadAndRender();
+      });
+    }
+    
+    // Month chips (toggle)
+    el.querySelectorAll('.pill[data-month]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const m = parseInt(btn.dataset.month, 10);
+        const idx = state.months.indexOf(m);
+        if (idx >= 0) state.months.splice(idx, 1);
+        else state.months.push(m);
+        state.months.sort((a,b) => a - b);
+        _monthlySaveState(state);
+        btn.classList.toggle('active');
+        await loadAndRender();
+      });
+    });
+    
+    // All / Clear
+    document.getElementById('btn-month-all')?.addEventListener('click', async () => {
+      state.months = [1,2,3,4,5,6,7,8,9,10,11,12];
+      _monthlySaveState(state);
+      renderShell();
+      await loadAndRender();
+    });
+    
+    document.getElementById('btn-month-clear')?.addEventListener('click', async () => {
+      state.months = [];
+      _monthlySaveState(state);
+      renderShell();
+      await loadAndRender();
+    });
+  }
+  
+  async function loadAndRender() {
+    const root = document.getElementById('monthly-content');
+    const summaryEl = document.getElementById('monthly-summary-line');
+    if (!root) return;
+    
+    if (!state.months || state.months.length === 0) {
+      root.innerHTML = `<div class="card text-center" style="padding:50px;color:var(--text-muted)">
+        <div style="font-size:1.5rem;margin-bottom:8px">📅</div>
+        <div>เลือกเดือนเพื่อดูรายงาน</div>
+        <div style="font-size:.75rem;margin-top:6px;color:var(--text-muted)">คลิก chip ของเดือน หรือกด "ทั้งปี"</div>
+      </div>`;
+      if (summaryEl) summaryEl.textContent = '';
+      return;
+    }
+    
+    const fetchKey = `${state.tab}-${state.year}-${state.months.join(',')}`;
+    
+    // Loading
+    root.innerHTML = `<div class="card text-center" style="padding:50px;color:var(--text-muted)">
+      <div style="margin-bottom:8px">⏳</div>
+      <div>กำลังโหลด...</div>
+    </div>`;
+    
+    try {
+      const action = state.tab === 'front' ? 'getMonthlyFront' : 'getMonthlyInvoice';
+      const res = await api(action, {
+        years:  JSON.stringify([state.year]),
+        months: JSON.stringify(state.months),
+      });
+      
+      if (!res || res.success === false) {
+        root.innerHTML = `<div class="card" style="padding:20px;color:var(--danger)">
+          ❌ ดึงข้อมูลไม่สำเร็จ: ${(res && res.error) || 'unknown'}
+        </div>`;
+        return;
+      }
+      
+      const rows = (res.data && res.data.rows) || [];
+      cachedRows = rows;
+      lastFetchKey = fetchKey;
+      
+      // Update summary line
+      if (summaryEl) {
+        const monthsLabel = state.months.length === 12 ? 'ทั้งปี' :
+                            state.months.map(m => MONTHLY_MONTH_LABELS[m-1]).join(', ');
+        summaryEl.textContent = `แสดง: ${monthsLabel} ${state.year} — ${rows.length} แถว`;
+      }
+      
+      if (rows.length === 0) {
+        root.innerHTML = `<div class="card text-center" style="padding:50px;color:var(--text-muted)">
+          <div style="font-size:1.5rem;margin-bottom:8px">📭</div>
+          <div>ยังไม่มีข้อมูลสำหรับช่วงที่เลือก</div>
+          <div style="font-size:.75rem;margin-top:6px;color:var(--text-muted)">
+            อัปโหลดไฟล์ raw เพื่อเริ่มต้น (เพิ่มใน Step 3)
+          </div>
+        </div>`;
+        return;
+      }
+      
+      // Step 2: simple preview table — Step 4/5 จะทำ Group B + sub-totals
+      renderPreviewTable(root, rows);
+    } catch(err) {
+      console.error('[Monthly] Load failed:', err);
+      root.innerHTML = `<div class="card" style="padding:20px;color:var(--danger)">
+        ❌ Error: ${err.message || err}
+      </div>`;
+    }
+  }
+  
+  function renderPreviewTable(root, rows) {
+    // Compute simple totals (preview)
+    let sumValue = 0, sumVat = 0, sumExempt = 0, sumTotal = 0;
+    rows.forEach(r => {
+      sumValue  += Number(r.value) || 0;
+      sumVat    += Number(r.vat) || 0;
+      sumExempt += Number(r.exempt) || 0;
+      sumTotal  += Number(r.total) || 0;
+    });
+    
+    const fmt = (n) => Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    
+    const isFront = state.tab === 'front';
+    const cols = isFront
+      ? [
+          { k: 'date', label: 'วันที่' },
+          { k: 'station', label: 'เครื่อง' },
+          { k: 'station_code', label: 'รหัส' },
+          { k: 'doc_sale_range', label: 'เลขใบขาย' },
+          { k: 'doc_return_range', label: 'เลขใบคืน' },
+          { k: 'value', label: 'มูลค่า', num: true },
+          { k: 'vat', label: 'VAT', num: true },
+          { k: 'exempt', label: 'ยกเว้น', num: true },
+          { k: 'total', label: 'รวม', num: true },
+        ]
+      : [
+          { k: 'date', label: 'วันที่' },
+          { k: 'bill_no', label: 'เลขที่บิล' },
+          { k: 'bill_prefix', label: 'Prefix' },
+          { k: 'vat_class', label: 'VAT' },
+          { k: 'customer', label: 'ลูกค้า' },
+          { k: 'tax_id', label: 'TaxID' },
+          { k: 'branch', label: 'สาขา' },
+          { k: 'value', label: 'มูลค่า', num: true },
+          { k: 'vat', label: 'VAT', num: true },
+          { k: 'exempt', label: 'ยกเว้น', num: true },
+          { k: 'total', label: 'รวม', num: true },
+        ];
+    
+    // Sort: by year, month, then date
+    const sorted = rows.slice().sort((a, b) => {
+      const ay = Number(a.year) || 0, by = Number(b.year) || 0;
+      if (ay !== by) return ay - by;
+      const am = Number(a.month) || 0, bm = Number(b.month) || 0;
+      if (am !== bm) return am - bm;
+      return String(a.date || '').localeCompare(String(b.date || ''));
+    });
+    
+    // Limit display to first 200 rows for preview (Step 4/5 จะทำ pagination/grouping)
+    const MAX_PREVIEW = 200;
+    const display = sorted.slice(0, MAX_PREVIEW);
+    const truncated = sorted.length > MAX_PREVIEW;
+    
+    root.innerHTML = `
+      <div class="card-flat mb-3" style="padding:14px">
+        <div class="flex justify-between items-center mb-2" style="flex-wrap:wrap;gap:10px">
+          <div class="font-semi" style="color:var(--text)">
+            ${isFront ? 'Front Summary' : 'Invoice Summary'} — ${sorted.length} แถว
+          </div>
+          <div style="font-size:.78rem;color:var(--text2)">
+            มูลค่า: <b style="color:var(--text)">${fmt(sumValue)}</b> ·
+            VAT: <b style="color:var(--text)">${fmt(sumVat)}</b> ·
+            ยกเว้น: <b style="color:var(--text)">${fmt(sumExempt)}</b> ·
+            รวม: <b style="color:var(--primary)">${fmt(sumTotal)}</b>
+          </div>
+        </div>
+        ${truncated ? `<div style="font-size:.72rem;color:var(--warn);margin-bottom:6px">
+          ⚠ แสดง ${MAX_PREVIEW} แถวแรก จากทั้งหมด ${sorted.length} — Group view + filter จะมาใน Step 4/5
+        </div>` : ''}
+      </div>
+      
+      <div class="card" style="padding:0">
+        <div class="table-wrap" style="max-height:60vh;overflow:auto">
+          <table>
+            <thead><tr>
+              ${cols.map(c => `<th style="${c.num?'text-align:right':''}">${c.label}</th>`).join('')}
+            </tr></thead>
+            <tbody>
+              ${display.map(r => `<tr>
+                ${cols.map(c => {
+                  let v = r[c.k];
+                  if (c.num) {
+                    return `<td style="text-align:right;font-family:var(--mono)">${fmt(v)}</td>`;
+                  }
+                  if (c.k === 'vat_class') {
+                    const cls = v === 'VAT' ? 'badge-warn' : 'badge-purple';
+                    return `<td><span class="badge ${cls}">${v || ''}</span></td>`;
+                  }
+                  return `<td>${v == null ? '' : String(v)}</td>`;
+                }).join('')}
+              </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    `;
+  }
+  
+  renderShell();
+  await loadAndRender();
+}
+
 
 async function renderUsers(el) {
   const res = await api('getUsers');
