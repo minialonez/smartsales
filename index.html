@@ -29483,27 +29483,36 @@ const PC_STATUSES = [
 const PC_STATIONS = ['FRONT1','FRONT2','FRONT3','FRONT4'];
 
 // ────────────────────────────────────────────────────────────────
-// Brand code mapping (3-char middle of product_code XXXX-YYY-NNNNN)
+// Brand resolution rules (ลำดับสำคัญ — ตรวจ override ก่อน):
+//
+// 1) Override rules (sub_type + brand_code คู่กัน):
+//    - {BLED|DLED|STRP|LWAL|LPAO|LPAN|LCEI|LTOP|LYRD}-ZBG  → "For You"
+//    - FANX-MIT                                             → "Mitsubishi"
+//
+// 2) Generic brand_code lookup:
+//    - PHL → PHILIPS
+//    - ZBG → Zeberg     (default ZBG ที่ไม่ใช่ For You sub-types)
+//    - SMN → SIMON
+//    - SIM → SIMON
+//
+// 3) Other (BEC, BCC, LCH, MIT-other, ...) → not tracked
 // ────────────────────────────────────────────────────────────────
-//   PHL → PHILIPS
-//   ZBG → Zeberg (default)
-//   MIT → Mitsubishi
-//   SMN → SIMON
-//   SIM → SIMON  (alias — both SMN/SIM map to same brand)
-//
-// Override rule (For You):
-//   BLED-ZBG-* / DLED-ZBG-* / STRP-ZBG-* → For You (LED bulb/downlight/strip)
-//
-// Other codes (BEC, BCC, LCH, CHG, PAN, REC, THU, 3MS, TPC, ...) → not tracked
 const PC_BRAND_CODE_MAP = {
   'PHL': 'PHILIPS',
   'ZBG': 'Zeberg',
-  'MIT': 'Mitsubishi',
   'SMN': 'SIMON',
   'SIM': 'SIMON',
 };
 
-const PC_FORYOU_SUBTYPES = ['BLED', 'DLED', 'STRP'];
+// For You override — sub-types ที่ขายโดย ZBG แต่นับเป็น "For You" brand
+//   LED group:  BLED (bulb), DLED (downlight), STRP (strip)
+//   Lamp group: LWAL (wall), LPAO (salapao), LPAN (pan),
+//               LCEI (ceiling), LTOP (post top), LYRD (yard)
+const PC_FORYOU_SUBTYPES = [
+  'BLED', 'DLED', 'STRP',
+  'LWAL', 'LPAO', 'LPAN', 'LCEI', 'LTOP', 'LYRD',
+];
+const PC_MITSUBISHI_SUBTYPES = ['FANX'];               // MIT → Mitsubishi override (only FANX)
 
 function _pcParseProductCode(code) {
   const s = String(code || '').trim().toUpperCase();
@@ -29514,10 +29523,15 @@ function _pcParseProductCode(code) {
   const brandCode = m[2];
   const suffix = m[3];
   
+  // Apply override rules FIRST (sub_type + brand_code combinations)
   let brand;
   if (brandCode === 'ZBG' && PC_FORYOU_SUBTYPES.indexOf(subType) >= 0) {
     brand = 'For You';
+  } else if (brandCode === 'MIT' && PC_MITSUBISHI_SUBTYPES.indexOf(subType) >= 0) {
+    brand = 'Mitsubishi';
   } else {
+    // Fall through to generic brand_code lookup
+    // ⚠ MIT NOT in PC_BRAND_CODE_MAP — only FANX-MIT is tracked (handled above)
     brand = PC_BRAND_CODE_MAP[brandCode];
   }
   
