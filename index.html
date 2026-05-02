@@ -29482,6 +29482,239 @@ const PC_STATUSES = [
 
 const PC_STATIONS = ['FRONT1','FRONT2','FRONT3','FRONT4'];
 
+// ────────────────────────────────────────────────────────────────
+// Brand code mapping (3-char middle of product_code XXXX-YYY-NNNNN)
+// ────────────────────────────────────────────────────────────────
+//   PHL → PHILIPS
+//   ZBG → Zeberg (default)
+//   MIT → Mitsubishi
+//   SMN → SIMON
+//   SIM → SIMON  (alias — both SMN/SIM map to same brand)
+//
+// Override rule (For You):
+//   BLED-ZBG-* / DLED-ZBG-* / STRP-ZBG-* → For You (LED bulb/downlight/strip)
+//
+// Other codes (BEC, BCC, LCH, CHG, PAN, REC, THU, 3MS, TPC, ...) → not tracked
+const PC_BRAND_CODE_MAP = {
+  'PHL': 'PHILIPS',
+  'ZBG': 'Zeberg',
+  'MIT': 'Mitsubishi',
+  'SMN': 'SIMON',
+  'SIM': 'SIMON',
+};
+
+const PC_FORYOU_SUBTYPES = ['BLED', 'DLED', 'STRP'];
+
+function _pcParseProductCode(code) {
+  const s = String(code || '').trim().toUpperCase();
+  const m = s.match(/^([A-Z0-9]{4})-([A-Z0-9]{3})-(\d+)/);
+  if (!m) return null;
+  
+  const subType = m[1];
+  const brandCode = m[2];
+  const suffix = m[3];
+  
+  let brand;
+  if (brandCode === 'ZBG' && PC_FORYOU_SUBTYPES.indexOf(subType) >= 0) {
+    brand = 'For You';
+  } else {
+    brand = PC_BRAND_CODE_MAP[brandCode];
+  }
+  
+  if (!brand) return null;  // brand not tracked
+  
+  return { sub_type: subType, brand_code: brandCode, suffix: suffix, brand: brand };
+}
+
+// ────────────────────────────────────────────────────────────────
+// Type.xlsx group lookup (76 sub-types × 10 groups)
+// ────────────────────────────────────────────────────────────────
+const PC_TYPE_MAP = {
+  // A01 Wire (23)
+  'VFFX': { gc: 'A01', gn: 'Wire' }, 'VTFX': { gc: 'A01', gn: 'Wire' },
+  'VSFX': { gc: 'A01', gn: 'Wire' }, 'VKFX': { gc: 'A01', gn: 'Wire' },
+  'VAFX': { gc: 'A01', gn: 'Wire' }, 'VAFG': { gc: 'A01', gn: 'Wire' },
+  'VCTX': { gc: 'A01', gn: 'Wire' }, 'THWX': { gc: 'A01', gn: 'Wire' },
+  'THWA': { gc: 'A01', gn: 'Wire' }, 'NAYX': { gc: 'A01', gn: 'Wire' },
+  'NYYX': { gc: 'A01', gn: 'Wire' }, 'CVXX': { gc: 'A01', gn: 'Wire' },
+  'TELX': { gc: 'A01', gn: 'Wire' }, 'LANX': { gc: 'A01', gn: 'Wire' },
+  'RG6X': { gc: 'A01', gn: 'Wire' }, 'CVVX': { gc: 'A01', gn: 'Wire' },
+  'CVVS': { gc: 'A01', gn: 'Wire' }, 'BCWX': { gc: 'A01', gn: 'Wire' },
+  'FRCX': { gc: 'A01', gn: 'Wire' }, 'MLTC': { gc: 'A01', gn: 'Wire' },
+  'SACX': { gc: 'A01', gn: 'Wire' }, 'TWIS': { gc: 'A01', gn: 'Wire' },
+  'PVXX': { gc: 'A01', gn: 'Wire' },
+  // A02 Switch (4)
+  'SWSI': { gc: 'A02', gn: 'Switch' }, 'SWSO': { gc: 'A02', gn: 'Switch' },
+  'METR': { gc: 'A02', gn: 'Switch' }, 'OPUT': { gc: 'A02', gn: 'Switch' },
+  // A03 Breaker (3)
+  'BRKR': { gc: 'A03', gn: 'Breaker' }, 'LOAD': { gc: 'A03', gn: 'Breaker' },
+  'MNTX': { gc: 'A03', gn: 'Breaker' },
+  // A04 Trunk (7)
+  'GRDX': { gc: 'A04', gn: 'Trunk' }, 'MTRK': { gc: 'A04', gn: 'Trunk' },
+  'KJLX': { gc: 'A04', gn: 'Trunk' }, 'MDBX': { gc: 'A04', gn: 'Trunk' },
+  'PTRK': { gc: 'A04', gn: 'Trunk' }, 'PCAB': { gc: 'A04', gn: 'Trunk' },
+  'HDPE': { gc: 'A04', gn: 'Trunk' },
+  // A05 Tool (7)
+  'CORD': { gc: 'A05', gn: 'Tool' }, 'TMNL': { gc: 'A05', gn: 'Tool' },
+  'HAND': { gc: 'A05', gn: 'Tool' }, 'TVAC': { gc: 'A05', gn: 'Tool' },
+  'KEYX': { gc: 'A05', gn: 'Tool' }, 'GRIP': { gc: 'A05', gn: 'Tool' },
+  'SAFE': { gc: 'A05', gn: 'Tool' },
+  // A06 Light (9)
+  'ICDC': { gc: 'A06', gn: 'Light' }, 'BCFL': { gc: 'A06', gn: 'Light' },
+  'BLED': { gc: 'A06', gn: 'Light' }, 'TFLX': { gc: 'A06', gn: 'Light' },
+  'TLED': { gc: 'A06', gn: 'Light' }, 'HGVL': { gc: 'A06', gn: 'Light' },
+  'SPHA': { gc: 'A06', gn: 'Light' }, 'SPLE': { gc: 'A06', gn: 'Light' },
+  'STRP': { gc: 'A06', gn: 'Light' },
+  // A07 Lamp (14)
+  'LWAL': { gc: 'A07', gn: 'Lamp' }, 'LPAO': { gc: 'A07', gn: 'Lamp' },
+  'LPAN': { gc: 'A07', gn: 'Lamp' }, 'LCEI': { gc: 'A07', gn: 'Lamp' },
+  'LTOP': { gc: 'A07', gn: 'Lamp' }, 'LYRD': { gc: 'A07', gn: 'Lamp' },
+  'CHAN': { gc: 'A07', gn: 'Lamp' }, 'LTAB': { gc: 'A07', gn: 'Lamp' },
+  'RTUB': { gc: 'A07', gn: 'Lamp' }, 'STUB': { gc: 'A07', gn: 'Lamp' },
+  'DE27': { gc: 'A07', gn: 'Lamp' }, 'DLED': { gc: 'A07', gn: 'Lamp' },
+  'MRHA': { gc: 'A07', gn: 'Lamp' }, 'MRED': { gc: 'A07', gn: 'Lamp' },
+  // A08 Machine (5)
+  'FANX': { gc: 'A08', gn: 'Machine' }, 'FONE': { gc: 'A08', gn: 'Machine' },
+  'IRON': { gc: 'A08', gn: 'Machine' }, 'HOME': { gc: 'A08', gn: 'Machine' },
+  'ACON': { gc: 'A08', gn: 'Machine' },
+  // A09 Battery (3)
+  'BATT': { gc: 'A09', gn: 'Battery' }, 'FLSH': { gc: 'A09', gn: 'Battery' },
+  'SOLR': { gc: 'A09', gn: 'Battery' },
+  // A10 Other (2)
+  'GELX': { gc: 'A10', gn: 'Other' }, 'JXXX': { gc: 'A10', gn: 'Other' },
+};
+
+function _pcLookupGroup(subType) {
+  const t = PC_TYPE_MAP[String(subType || '').toUpperCase()];
+  if (t) return { group_code: t.gc, group_name: t.gn };
+  return { group_code: 'A10', group_name: 'Other' };
+}
+
+// ────────────────────────────────────────────────────────────────
+// Station extraction from bill_no
+// ────────────────────────────────────────────────────────────────
+// Bill format: [SR]2YYMMSSSSS-NNNNNNN  e.g. S2601001001-0000001
+//   Last 3 digits before '-' = station number (001..004)
+function _pcExtractStation(billNo) {
+  const s = String(billNo || '').trim();
+  const m = s.match(/^([SR]2)(\d+)-/);
+  if (!m) return { code: '', station: '' };
+  const block = m[2];
+  const code = block.slice(-3).padStart(3, '0');
+  const stationMap = { '001': 'FRONT1', '002': 'FRONT2', '003': 'FRONT3', '004': 'FRONT4' };
+  return { code: code, station: stationMap[code] || code };
+}
+
+function _pcBillType(billNo) {
+  const s = String(billNo || '').trim().toUpperCase();
+  if (s.startsWith('S2')) return 'sale';
+  if (s.startsWith('R2')) return 'return';
+  return '';
+}
+
+// ────────────────────────────────────────────────────────────────
+// Parser: front_raw.xls (block-based)
+// ────────────────────────────────────────────────────────────────
+// Layout:
+//   Row 1-2: Headers (skip)
+//   [Block]
+//   Bill header:  A=bill_no(S2/R2), C=customer, D=date
+//   Line items:   A=seq(int), B=product_code, C=name, D=qty, E=unit,
+//                 F=price, G=total, H=disc, I=net, J=V/N
+//   Cash footer:  A starts with '_x000D_เงินสด...'
+//   Empty
+//   [Next block]
+//
+// Returns { records, stats } — records filtered to tracked brands only
+function _pcParseFrontRaw(rows) {
+  const records = [];
+  let currentBill = null;
+  const stats = {
+    bills_seen: 0, lines_seen: 0, lines_kept: 0,
+    lines_skipped_brand: 0, lines_skipped_invalid_code: 0,
+    brands_kept: {}, total_rows: rows.length,
+  };
+  
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i] || [];
+    const a = r[0];
+    
+    if (a == null || a === '') continue;
+    const aStr = String(a).trim();
+    
+    // Bill header: starts with S2/R2
+    if (/^[SR]2\d+-\d+/.test(aStr)) {
+      currentBill = {
+        bill_no: aStr,
+        bill_type: _pcBillType(aStr),
+        customer: String(r[2] || '').trim(),
+        date_raw: r[3],
+      };
+      stats.bills_seen++;
+      continue;
+    }
+    
+    // Skip cash settlement footer
+    if (aStr.indexOf('_x000D_') >= 0 || aStr.startsWith('เงินสด') || aStr.indexOf('มูลค่าสินค้า') >= 0) {
+      continue;
+    }
+    
+    // Line item: A is integer seq + currentBill exists
+    if (currentBill && /^\d+$/.test(aStr)) {
+      stats.lines_seen++;
+      const productCode = String(r[1] || '').trim();
+      
+      const parsed = _pcParseProductCode(productCode);
+      if (!parsed) {
+        if (/^[A-Z0-9]{4}-[A-Z0-9]{3}-/.test(productCode.toUpperCase())) {
+          stats.lines_skipped_brand++;
+        } else {
+          stats.lines_skipped_invalid_code++;
+        }
+        continue;
+      }
+      
+      const productName = String(r[2] || '').trim();
+      const qty   = Number(r[3]) || 0;
+      const unit  = String(r[4] || '').trim();
+      const price = Number(r[5]) || 0;
+      const total = Number(r[6]) || 0;
+      
+      const grp = _pcLookupGroup(parsed.sub_type);
+      const dateISO = _monthlyCellToISO(currentBill.date_raw);
+      const dt = dateISO ? new Date(dateISO + 'T00:00:00Z') : null;
+      const stn = _pcExtractStation(currentBill.bill_no);
+      
+      records.push({
+        original_date: dateISO,
+        original_year: dt ? dt.getUTCFullYear() : null,
+        original_month: dt ? (dt.getUTCMonth() + 1) : null,
+        bill_no: currentBill.bill_no,
+        bill_type: currentBill.bill_type,
+        station_code: stn.code,
+        station: stn.station,
+        product_code: productCode,
+        product_name: productName,
+        sub_type: parsed.sub_type,
+        group_code: grp.group_code,
+        group_name: grp.group_name,
+        brand: parsed.brand,
+        qty: qty,
+        unit: unit,
+        price: price,
+        total: total,
+        status: 'pending',
+      });
+      stats.lines_kept++;
+      stats.brands_kept[parsed.brand] = (stats.brands_kept[parsed.brand] || 0) + 1;
+    }
+  }
+  
+  console.log('[PC Parser] Stats:', stats);
+  return { records: records, stats: stats };
+}
+
+
 function _pcLoadState() {
   try {
     const raw = localStorage.getItem(PC_STATE_KEY);
