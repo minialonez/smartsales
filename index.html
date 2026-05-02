@@ -8220,6 +8220,13 @@ async function renderMain(el) {
         billList.push(newBill);
         persistMainState();
         invalidateBillsCache();
+        
+        // ⭐ markDirty per-uuid (was: missing — Add Bill silent push fail)
+        if (newBill.bill_uuid && window.syncManager?.markDirty) {
+          window.syncManager.markDirty('bills', newBill.bill_uuid);
+          if (window.syncManager._fpCache) window.syncManager._fpCache.bills = null;
+        }
+        
         closeModal();
         const netNote = (whtAmount || transferFee || cardFee) 
           ? ` (สุทธิ ฿${(amount - whtAmount - transferFee - cardFee).toFixed(2)})` 
@@ -8262,13 +8269,20 @@ async function renderMain(el) {
         const value = document.getElementById('bulk-value').value;
         if (!value) { toast('กรอกวันที่', 'error'); return; }
         let count = 0;
+        const dirtyUuids = [];
         billList.forEach(b => {
           if ((filterStation === 'ALL' || b.station === filterStation) && (filterType === 'ALL' || b.type === filterType)) {
             b[field] = value;
+            if (b.bill_uuid) dirtyUuids.push(b.bill_uuid);
             count++;
           }
         });
         persistMainState();
+        // ⭐ markDirty per-uuid (was: missing — Bulk Date silent)
+        if (window.syncManager?.markDirty) {
+          dirtyUuids.forEach(u => window.syncManager.markDirty('bills', u));
+          if (window.syncManager._fpCache) window.syncManager._fpCache.bills = null;
+        }
         closeModal();
         toast(`ตั้งค่า ${field} สำเร็จ ${count} รายการ`, 'success');
         renderKeepScroll();
@@ -8278,6 +8292,7 @@ async function renderMain(el) {
     // ── Auto Due Date (วันที่ 20 เดือนถัดไปของ bill_date) ──
     document.getElementById('btn-auto-duedate')?.addEventListener('click', () => {
       let count = 0, skippedLocked = 0;
+      const dirtyUuids = [];
       billList.forEach(b => {
         // เฉพาะบิลเครดิต (Invoice Credit / Order Credit) ที่ยังไม่มี Due Date
         if ((b.station === 'Invoice Credit' || b.station === 'Order Credit') && !b.due_date && b.date) {
@@ -8286,11 +8301,17 @@ async function renderMain(el) {
           const next = calcNextMonth20(b.date);
           if (next) {
             b.due_date = next;
+            if (b.bill_uuid) dirtyUuids.push(b.bill_uuid);
             count++;
           }
         }
       });
       persistMainState();
+      // ⭐ markDirty per-uuid (was: missing — Auto Due Date silent)
+      if (window.syncManager?.markDirty) {
+        dirtyUuids.forEach(u => window.syncManager.markDirty('bills', u));
+        if (window.syncManager._fpCache) window.syncManager._fpCache.bills = null;
+      }
       const lockMsg = skippedLocked > 0 ? ` (ข้าม ${skippedLocked} ในวัน lock)` : '';
       toast(`ตั้ง Due Date อัตโนมัติ ${count} รายการ (วันที่ 20 ของเดือนถัดไป)${lockMsg}`, 'success');
       renderKeepScroll();
@@ -9104,6 +9125,16 @@ async function renderMain(el) {
           
           persistMainState();
           invalidateBillsCache();    // ให้ Sum/Cash Drawer รีคำนวณจาก bills ล่าสุด
+          
+          // ⭐ markDirty per-uuid (was: missing — Edit Bill silent push fail)
+          //    bug: user แก้ pay_date / confirmation / remarks → save → ไม่ขึ้น cloud
+          //    cause: persistMainState() เซฟ local แต่ syncManager ไม่รู้ → push miss
+          //    fix: markDirty(bills, uuid) ทุกครั้ง save → push queue ครอบคลุม
+          if (b.bill_uuid && window.syncManager?.markDirty) {
+            window.syncManager.markDirty('bills', b.bill_uuid);
+            if (window.syncManager._fpCache) window.syncManager._fpCache.bills = null;
+          }
+          
           closeModal();
           toast(`✓ บันทึกแล้ว — ${b.bill_no||'(ไม่มีเลข)'}`, 'success');
           renderKeepScroll();
