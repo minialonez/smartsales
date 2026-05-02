@@ -29025,26 +29025,82 @@ async function renderMonthly(el) {
         return `<button class="pill ${active?'active':''}" data-primary="${s}" style="padding:5px 12px;font-size:.78rem">${lbl}</button>`;
       }).join('');
     } else {
-      // Invoice: All / NOVAT / VAT (top-level), then prefix sub-buttons depending on selection
-      const topBtns = [
-        { v: 'all', lbl: 'ทั้งหมด' },
-        { v: 'NOVAT', lbl: 'NOVAT' },
-        { v: 'VAT', lbl: 'VAT' },
-      ];
-      primaryBtns = topBtns.map(b => {
-        const active = filter.primary === b.v;
-        const cls = b.v === 'VAT' && active ? 'pill active' :
-                    b.v === 'NOVAT' && active ? 'pill active' :
-                    active ? 'pill active' : 'pill';
-        return `<button class="${cls}" data-primary="${b.v}" style="padding:5px 12px;font-size:.78rem">${b.lbl}</button>`;
+      // Invoice: layout = [ทั้งหมด] | [NOVAT: OR OS JR JS] | [VAT: SR SS SC]
+      // Color rule:
+      //   - NOVAT group  = purple   (var(--purple))
+      //   - VAT group    = warn     (var(--warn) — golden)
+      //   - "ทั้งหมด"    = primary
+      // Active states:
+      //   - selected primary = filled
+      //   - parent class active (e.g. "VAT" pressed) → all sub-prefixes show "in-group" ring highlight
+      
+      const NOVAT_PREFIXES = ['OR','OS','JR','JS'];
+      const VAT_PREFIXES   = ['SR','SS','SC'];
+      
+      const isAllActive   = filter.primary === 'all';
+      const isNovatActive = filter.primary === 'NOVAT';
+      const isVatActive   = filter.primary === 'VAT';
+      const inNovatGroup  = isNovatActive || NOVAT_PREFIXES.indexOf(filter.primary) >= 0;
+      const inVatGroup    = isVatActive   || VAT_PREFIXES.indexOf(filter.primary) >= 0;
+      
+      // 1) "ทั้งหมด" button (primary color)
+      const allBtn = `<button class="pill ${isAllActive?'active':''}" data-primary="all" style="padding:5px 14px;font-size:.78rem;font-weight:600">ทั้งหมด</button>`;
+      
+      // 2) NOVAT group: header + sub-prefixes (purple-themed)
+      const novatHeader = `<button data-primary="NOVAT"
+        style="padding:5px 12px;font-size:.78rem;font-weight:700;border-radius:20px;cursor:pointer;transition:all .2s;
+        ${isNovatActive
+          ? 'background:var(--purple);border:1px solid var(--purple);color:#fff'
+          : 'background:transparent;border:1px solid var(--purple);color:var(--purple)'}">NOVAT</button>`;
+      const novatSubs = NOVAT_PREFIXES.map(p => {
+        const isMe = filter.primary === p;
+        // States:
+        //   - direct active (clicked this button): solid purple
+        //   - in-group highlight (parent NOVAT pressed): subtle purple bg
+        //   - other group active (VAT pressed): faded
+        //   - default: outlined purple
+        let style;
+        if (isMe) {
+          style = 'background:var(--purple);border:1px solid var(--purple);color:#fff';
+        } else if (isNovatActive) {
+          style = 'background:rgba(160,124,245,.18);border:1px solid var(--purple);color:var(--purple)';
+        } else if (inVatGroup) {
+          style = 'background:transparent;border:1px dashed var(--border);color:var(--text-muted);opacity:.5';
+        } else {
+          style = 'background:transparent;border:1px solid var(--purple);color:var(--purple)';
+        }
+        return `<button data-primary="${p}"
+          style="padding:4px 10px;font-size:.72rem;font-weight:600;border-radius:14px;cursor:pointer;transition:all .2s;${style}">${p}</button>`;
       }).join('');
-      // Sub-prefix buttons (always visible; act as additional filter)
-      const subPrefixes = ['SR','SS','SC','OR','OS','JR','JS'];
-      const subBtns = subPrefixes.map(p => {
-        const active = filter.primary === p;
-        return `<button class="pill ${active?'active':''}" data-primary="${p}" style="padding:5px 10px;font-size:.72rem">${p}</button>`;
+      
+      // 3) VAT group: header + sub-prefixes (warn-themed = golden)
+      const vatHeader = `<button data-primary="VAT"
+        style="padding:5px 12px;font-size:.78rem;font-weight:700;border-radius:20px;cursor:pointer;transition:all .2s;
+        ${isVatActive
+          ? 'background:var(--warn);border:1px solid var(--warn);color:#fff'
+          : 'background:transparent;border:1px solid var(--warn);color:var(--warn)'}">VAT</button>`;
+      const vatSubs = VAT_PREFIXES.map(p => {
+        const isMe = filter.primary === p;
+        let style;
+        if (isMe) {
+          style = 'background:var(--warn);border:1px solid var(--warn);color:#fff';
+        } else if (isVatActive) {
+          style = 'background:rgba(245,158,66,.18);border:1px solid var(--warn);color:var(--warn)';
+        } else if (inNovatGroup) {
+          style = 'background:transparent;border:1px dashed var(--border);color:var(--text-muted);opacity:.5';
+        } else {
+          style = 'background:transparent;border:1px solid var(--warn);color:var(--warn)';
+        }
+        return `<button data-primary="${p}"
+          style="padding:4px 10px;font-size:.72rem;font-weight:600;border-radius:14px;cursor:pointer;transition:all .2s;${style}">${p}</button>`;
       }).join('');
-      primaryBtns += `<span style="margin:0 6px;color:var(--text-muted)">·</span>` + subBtns;
+      
+      // Layout: [ทั้งหมด] | [NOVAT [OR][OS][JR][JS]] | [VAT [SR][SS][SC]]
+      const sep = `<span style="margin:0 4px;color:var(--text-muted);font-weight:600">|</span>`;
+      const groupNovat = `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 8px;border-radius:14px;background:rgba(160,124,245,.06)">${novatHeader}<span style="color:var(--text-muted);font-size:.65rem;margin:0 2px">▸</span>${novatSubs}</span>`;
+      const groupVat   = `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 8px;border-radius:14px;background:rgba(245,158,66,.06)">${vatHeader}<span style="color:var(--text-muted);font-size:.65rem;margin:0 2px">▸</span>${vatSubs}</span>`;
+      
+      primaryBtns = allBtn + sep + groupNovat + sep + groupVat;
     }
     
     const filterBarHtml = `
@@ -29327,7 +29383,7 @@ async function renderMonthly(el) {
   // Helper: bind filter bar event listeners (search input + primary buttons + collapse memory)
   function bindFilterEvents(root) {
     // Primary filter buttons
-    root.querySelectorAll('.pill[data-primary]').forEach(btn => {
+    root.querySelectorAll('[data-primary]').forEach(btn => {
       btn.addEventListener('click', () => {
         filter.primary = btn.dataset.primary;
         renderGroupedView(root, cachedRows);
