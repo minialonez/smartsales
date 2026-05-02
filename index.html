@@ -27449,6 +27449,454 @@ function _monthlySaveState(state) {
   } catch(e) {}
 }
 
+// ────────────────────────────────────────────────────────────────
+// Date helpers (Excel serial / Date → ISO 'YYYY-MM-DD')
+// ────────────────────────────────────────────────────────────────
+
+// Excel serial number → 'YYYY-MM-DD'
+//   Excel epoch (Windows): 1900-01-01 = serial 1
+//   Unix epoch:            1970-01-01 = serial 25569
+//   Note: treat as UTC midnight to avoid timezone shifts on date-only values
+function _monthlyExcelSerialToISO(n) {
+  if (typeof n !== 'number' || !isFinite(n) || n < 1 || n > 100000) return '';
+  const utcMs = (n - 25569) * 86400 * 1000;
+  const d = new Date(utcMs);
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(d.getUTCDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+// JS Date → 'YYYY-MM-DD' (handles XLSX-parsed dates which may be UTC midnight)
+function _monthlyDateToISO(d) {
+  if (!(d instanceof Date) || isNaN(d)) return '';
+  // If time portion is exactly UTC midnight → use UTC components (typical XLSX date-only)
+  if (d.getUTCHours() === 0 && d.getUTCMinutes() === 0 && d.getUTCSeconds() === 0) {
+    const y = d.getUTCFullYear();
+    const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+    const day = String(d.getUTCDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  }
+  // Otherwise use local components
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+// Any cell value → 'YYYY-MM-DD' or '' if not a valid date
+function _monthlyCellToISO(v) {
+  if (v == null || v === '') return '';
+  if (v instanceof Date) return _monthlyDateToISO(v);
+  if (typeof v === 'number') return _monthlyExcelSerialToISO(v);
+  if (typeof v === 'string') {
+    const s = v.trim();
+    // ISO already
+    const m1 = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (m1) {
+      let y = Number(m1[1]);
+      if (y > 2400) y -= 543;  // พ.ศ. → ค.ศ.
+      return `${y}-${m1[2]}-${m1[3]}`;
+    }
+    // dd/mm/yyyy
+    const m2 = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
+    if (m2) {
+      const dd = String(m2[1]).padStart(2, '0');
+      const mm = String(m2[2]).padStart(2, '0');
+      let y = Number(m2[3]);
+      if (y < 100) y += 2000;
+      if (y > 2400) y -= 543;
+      return `${y}-${mm}-${dd}`;
+    }
+  }
+  return '';
+}
+
+// ────────────────────────────────────────────────────────────────
+// File type detection
+// ────────────────────────────────────────────────────────────────
+// Returns 'front' | 'invoice' | 'unknown'
+function _monthlyDetectFileType(filename, rows) {
+  const fn = String(filename || '').toLowerCase();
+  if (fn.indexOf('frontsum') >= 0) return 'front';
+  if (fn.indexOf('invoicesum') >= 0) return 'invoice';
+  
+  // Content-based fallback: scan first 30 rows for signature keywords
+  const scan = rows.slice(0, 30).map(r => (r || []).map(c => String(c || '')).join(' ')).join(' | ');
+  if (scan.indexOf('เครื่องขาย') >= 0) return 'front';
+  // Invoice files have bill_no like "SR00126-000001" / "OR00126-..."
+  if (scan.match(/[A-Z]{2}\d{5}-\d{6}/)) return 'invoice';
+  return 'unknown';
+}
+
+// ────────────────────────────────────────────────────────────────
+// Parser: frontsum_raw.xls
+// ────────────────────────────────────────────────────────────────
+// Returns array of records:
+//   { date, year, month, station, station_code, pid,
+//     doc_sale_range, doc_return_range, value, vat, exempt, total }
+function _monthlyParseFrontsum(rows) {
+  const records = [];
+  const stationMap = {'001':'FRONT1','002':'FRONT2','003':'FRONT3','004':'FRONT4'};
+  let currentStation = null;  // {code, pid}
+  
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    if (!r || r.length === 0) continue;
+    
+    // Concatenate row text to detect section headers
+    const rowText = r.map(c => String(c || '')).join(' ');
+    
+    // Section header: "เครื่องขาย : 001  PID : E129500002A"
+    const stnMatch = rowText.match(/เครื่องขาย\s*:\s*(\d+)\s*(?:PID\s*:\s*(\S+))?/);
+    if (stnMatch) {
+      currentStation = {
+        code: stnMatch[1].padStart(3, '0'),
+        pid: (stnMatch[2] || '').trim(),
+      };
+      continue;
+    }
+    
+    // Skip if no station context
+    if (!currentStation) continue;
+    
+    // Skip grand total row ("รวม" without station)
+    if (rowText.indexOf('สาขา') >= 0) continue;
+    if (rowText.trim().indexOf('รวม') === 0) continue;
+    
+    // Try to parse date from column A
+    const dateISO = _monthlyCellToISO(r[0]);
+    if (!dateISO) continue;
+    
+    // Parse fields
+    const docSale   = String(r[1] || '').trim();
+    const docReturn = String(r[2] || '').trim();
+    const value     = Number(r[3]) || 0;
+    const vat       = Number(r[4]) || 0;
+    const exempt    = Number(r[5]) || 0;
+    const total     = Number(r[6]) || 0;
+    
+    // Skip empty rows
+    if (!docSale && !docReturn && value === 0 && total === 0) continue;
+    
+    const dt = new Date(dateISO + 'T00:00:00Z');
+    records.push({
+      date: dateISO,
+      year: dt.getUTCFullYear(),
+      month: dt.getUTCMonth() + 1,
+      station: stationMap[currentStation.code] || currentStation.code,
+      station_code: currentStation.code,
+      pid: currentStation.pid,
+      doc_sale_range: docSale,
+      doc_return_range: docReturn,
+      value: value,
+      vat: vat,
+      exempt: exempt,
+      total: total,
+    });
+  }
+  
+  return records;
+}
+
+// ────────────────────────────────────────────────────────────────
+// Group records by (year, month) → { 'YYYY-MM': [records] }
+// ────────────────────────────────────────────────────────────────
+function _monthlyGroupByPeriod(records) {
+  const groups = {};
+  records.forEach(r => {
+    const key = `${r.year}-${String(r.month).padStart(2,'0')}`;
+    if (!groups[key]) groups[key] = [];
+    groups[key].push(r);
+  });
+  return groups;
+}
+
+// ────────────────────────────────────────────────────────────────
+// Upload flow: open file picker → parse → preview → save
+// ────────────────────────────────────────────────────────────────
+function _monthlyOpenUpload(onSaveSuccess) {
+  // Create hidden file input
+  const fileInput = document.createElement('input');
+  fileInput.type = 'file';
+  fileInput.accept = '.xls,.xlsx,.xlsm,.csv';
+  fileInput.style.display = 'none';
+  document.body.appendChild(fileInput);
+  
+  fileInput.addEventListener('change', async (e) => {
+    const file = e.target.files && e.target.files[0];
+    document.body.removeChild(fileInput);
+    if (!file) return;
+    
+    try {
+      toast('📖 กำลังอ่านไฟล์...', 'info');
+      const parsed = await parseExcelFile(file);
+      // Get first sheet's rows
+      const firstSheetName = parsed.sheetNames[0];
+      const rows = parsed.sheets[firstSheetName] || [];
+      
+      if (rows.length === 0) {
+        toast('❌ ไฟล์ว่างเปล่า', 'error');
+        return;
+      }
+      
+      // Detect type
+      const kind = _monthlyDetectFileType(file.name, rows);
+      if (kind === 'unknown') {
+        toast('❌ ไม่รู้จักประเภทไฟล์ — ต้องเป็น frontsum_raw.xls หรือ invoicesum_raw.xls', 'error');
+        return;
+      }
+      if (kind === 'invoice') {
+        toast('⚠ Invoice Summary จะรองรับใน Step 4 — ขณะนี้รองรับแค่ Front Summary', 'warn');
+        return;
+      }
+      
+      // Parse rows
+      const records = _monthlyParseFrontsum(rows);
+      if (records.length === 0) {
+        toast('❌ Parse ไฟล์แล้วไม่เจอข้อมูล — ตรวจสอบ format', 'error');
+        return;
+      }
+      
+      console.log(`[Monthly] Parsed ${records.length} records from ${file.name}`);
+      
+      // Group by period
+      const groups = _monthlyGroupByPeriod(records);
+      
+      // Show preview modal
+      await _monthlyShowPreviewModal(file.name, kind, records, groups, onSaveSuccess);
+    } catch (err) {
+      console.error('[Monthly] Upload error:', err);
+      toast('❌ Error: ' + (err.message || err), 'error');
+    }
+  });
+  
+  fileInput.click();
+}
+
+// ────────────────────────────────────────────────────────────────
+// Preview modal — show parsed data + period checks + confirm/cancel
+// ────────────────────────────────────────────────────────────────
+async function _monthlyShowPreviewModal(filename, kind, records, groups, onSaveSuccess) {
+  const fmt = (n) => Number(n || 0).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+  const monthLbl = (m) => MONTHLY_MONTH_LABELS[m - 1] || m;
+  const periods = Object.keys(groups).sort();
+  
+  // Open modal with loading state
+  openModal('📂 ตรวจสอบข้อมูลก่อนบันทึก', `
+    <div style="padding:20px;text-align:center;color:var(--text-muted)">
+      ⏳ กำลังตรวจสอบข้อมูลเดิม...
+    </div>
+  `);
+  
+  // Check existing data per period (parallel)
+  const checks = await Promise.all(periods.map(async (key) => {
+    const [y, m] = key.split('-').map(Number);
+    try {
+      const res = await api('checkMonthlyPeriod', { type: kind, year: y, month: m });
+      const d = (res && res.data) || {};
+      return { year: y, month: m, exists: !!d.exists, count: d.count || 0 };
+    } catch(e) {
+      return { year: y, month: m, exists: null, count: 0, error: e.message };
+    }
+  }));
+  
+  // Build preview HTML
+  const totalRecords = records.length;
+  let totalValue = 0, totalVat = 0, totalExempt = 0, totalTotal = 0;
+  records.forEach(r => {
+    totalValue  += Number(r.value) || 0;
+    totalVat    += Number(r.vat) || 0;
+    totalExempt += Number(r.exempt) || 0;
+    totalTotal  += Number(r.total) || 0;
+  });
+  
+  // Per-station breakdown (for front)
+  let stationBreakdownHtml = '';
+  if (kind === 'front') {
+    const byStation = {};
+    records.forEach(r => {
+      const s = r.station || '?';
+      if (!byStation[s]) byStation[s] = { count: 0, total: 0 };
+      byStation[s].count++;
+      byStation[s].total += Number(r.total) || 0;
+    });
+    const stnRows = Object.keys(byStation).sort().map(s => `
+      <tr>
+        <td><span class="badge badge-info">${s}</span></td>
+        <td style="text-align:right;font-family:var(--mono)">${byStation[s].count}</td>
+        <td style="text-align:right;font-family:var(--mono);color:var(--text)">${fmt(byStation[s].total)}</td>
+      </tr>
+    `).join('');
+    stationBreakdownHtml = `
+      <div class="font-semi text-sm mb-2" style="color:var(--text)">แยกตามเครื่อง</div>
+      <table style="margin-bottom:14px">
+        <thead><tr><th>เครื่อง</th><th style="text-align:right">จำนวน</th><th style="text-align:right">ยอดรวม</th></tr></thead>
+        <tbody>${stnRows}</tbody>
+      </table>
+    `;
+  }
+  
+  // Period rows (with existing-data warning)
+  const periodRowsHtml = periods.map((key, idx) => {
+    const [y, m] = key.split('-').map(Number);
+    const newCount = groups[key].length;
+    const check = checks[idx];
+    const existingCount = check.count || 0;
+    const willOverwrite = existingCount > 0;
+    const warnIcon = willOverwrite ? '⚠️' : '✨';
+    const warnText = willOverwrite
+      ? `<span style="color:var(--warn);font-weight:600">จะลบของเก่า ${existingCount} แถว → เขียนใหม่ ${newCount} แถว</span>`
+      : `<span style="color:var(--success);font-weight:600">ใหม่ทั้งหมด ${newCount} แถว</span>`;
+    return `
+      <tr>
+        <td>${warnIcon} ${monthLbl(m)} ${y}</td>
+        <td>${warnText}</td>
+      </tr>
+    `;
+  }).join('');
+  
+  // Sample preview (first 5 rows)
+  const sampleRows = records.slice(0, 5).map(r => `
+    <tr>
+      <td style="font-family:var(--mono);font-size:.78rem">${r.date}</td>
+      <td><span class="badge badge-info">${r.station}</span></td>
+      <td style="font-family:var(--mono);font-size:.72rem;color:var(--text2)">${r.doc_sale_range || '-'}</td>
+      <td style="text-align:right;font-family:var(--mono)">${fmt(r.total)}</td>
+    </tr>
+  `).join('');
+  
+  // Build modal body
+  const bodyHtml = `
+    <div style="padding:20px;max-height:70vh;overflow-y:auto;min-width:560px;max-width:760px">
+      
+      <!-- File info -->
+      <div class="card-flat mb-3" style="padding:12px">
+        <div class="text-xs" style="color:var(--text-muted);margin-bottom:4px">ไฟล์ที่อัปโหลด</div>
+        <div class="font-semi" style="color:var(--text);font-family:var(--mono);font-size:.85rem">
+          📄 ${filename}
+        </div>
+        <div class="text-xs" style="color:var(--text2);margin-top:6px">
+          ประเภท: <b>${kind === 'front' ? 'Front Summary' : 'Invoice Summary'}</b> ·
+          ทั้งหมด <b style="color:var(--text)">${totalRecords}</b> แถว
+        </div>
+      </div>
+      
+      <!-- Totals -->
+      <div class="card-flat mb-3" style="padding:12px">
+        <div class="font-semi text-sm mb-2" style="color:var(--text)">ยอดรวม</div>
+        <div class="flex" style="gap:16px;flex-wrap:wrap;font-size:.82rem">
+          <div>มูลค่า: <b style="color:var(--text)">${fmt(totalValue)}</b></div>
+          <div>VAT: <b style="color:var(--text)">${fmt(totalVat)}</b></div>
+          <div>ยกเว้น: <b style="color:var(--text)">${fmt(totalExempt)}</b></div>
+          <div>รวม: <b style="color:var(--primary)">${fmt(totalTotal)}</b></div>
+        </div>
+      </div>
+      
+      ${stationBreakdownHtml ? `<div class="card-flat mb-3" style="padding:12px">${stationBreakdownHtml}</div>` : ''}
+      
+      <!-- Period checks (overwrite warning) -->
+      <div class="card-flat mb-3" style="padding:12px">
+        <div class="font-semi text-sm mb-2" style="color:var(--text)">ช่วงเดือนที่จะบันทึก</div>
+        <table>
+          <tbody>${periodRowsHtml}</tbody>
+        </table>
+      </div>
+      
+      <!-- Sample preview -->
+      <div class="card-flat mb-3" style="padding:12px">
+        <div class="font-semi text-sm mb-2" style="color:var(--text)">ตัวอย่างข้อมูล (5 แถวแรก)</div>
+        <table>
+          <thead><tr><th>วันที่</th><th>เครื่อง</th><th>เลขใบขาย</th><th style="text-align:right">รวม</th></tr></thead>
+          <tbody>${sampleRows}</tbody>
+        </table>
+        ${records.length > 5 ? `<div class="text-xs text-muted mt-2">... และอีก ${records.length - 5} แถว</div>` : ''}
+      </div>
+      
+      <!-- Action buttons -->
+      <div class="flex justify-end" style="gap:10px;margin-top:16px">
+        <button class="btn btn-ghost" id="btn-monthly-cancel">❌ ยกเลิก</button>
+        <button class="btn btn-primary" id="btn-monthly-confirm">✅ ยืนยันบันทึก</button>
+      </div>
+    </div>
+  `;
+  
+  document.getElementById('modal-body').innerHTML = bodyHtml;
+  
+  // Bind buttons
+  document.getElementById('btn-monthly-cancel').addEventListener('click', () => {
+    closeModal();
+  });
+  
+  document.getElementById('btn-monthly-confirm').addEventListener('click', async () => {
+    await _monthlySaveBatch(kind, groups, onSaveSuccess);
+  });
+}
+
+// ────────────────────────────────────────────────────────────────
+// Save: call upsertMonthlyFront per period with replace=true
+// ────────────────────────────────────────────────────────────────
+async function _monthlySaveBatch(kind, groups, onSaveSuccess) {
+  const periods = Object.keys(groups).sort();
+  const action = kind === 'front' ? 'upsertMonthlyFront' : 'upsertMonthlyInvoice';
+  
+  // Replace modal body with progress UI
+  document.getElementById('modal-body').innerHTML = `
+    <div style="padding:30px;text-align:center;min-width:400px">
+      <div style="font-size:1.4rem;margin-bottom:12px">⏳</div>
+      <div class="font-semi" style="color:var(--text)">กำลังบันทึก...</div>
+      <div class="text-xs text-muted mt-2" id="monthly-progress">เตรียมข้อมูล</div>
+    </div>
+  `;
+  
+  let totalInserted = 0, totalDeleted = 0;
+  const errors = [];
+  
+  for (let i = 0; i < periods.length; i++) {
+    const key = periods[i];
+    const [y, m] = key.split('-').map(Number);
+    const records = groups[key];
+    
+    const progressEl = document.getElementById('monthly-progress');
+    if (progressEl) {
+      progressEl.textContent = `[${i+1}/${periods.length}] ${MONTHLY_MONTH_LABELS[m-1]} ${y} (${records.length} แถว)`;
+    }
+    
+    try {
+      const res = await api(action, {
+        year: y,
+        month: m,
+        replace: true,
+        records: records,
+      });
+      if (res && res.success !== false && res.data) {
+        totalInserted += Number(res.data.inserted) || 0;
+        totalDeleted  += Number(res.data.deleted) || 0;
+      } else {
+        errors.push(`${key}: ${(res && res.error) || 'unknown'}`);
+      }
+    } catch(e) {
+      errors.push(`${key}: ${e.message}`);
+    }
+  }
+  
+  closeModal();
+  
+  if (errors.length > 0) {
+    toast(`⚠ บันทึกบางส่วนล้มเหลว: ${errors.join(', ')}`, 'error');
+  } else {
+    const msg = totalDeleted > 0
+      ? `✅ บันทึกสำเร็จ — เพิ่ม ${totalInserted} ลบของเก่า ${totalDeleted}`
+      : `✅ บันทึกสำเร็จ — ${totalInserted} แถว`;
+    toast(msg, 'success');
+  }
+  
+  // Auto-reload data on the page
+  if (typeof onSaveSuccess === 'function') {
+    try { await onSaveSuccess(); } catch(_) {}
+  }
+}
+
 async function renderMonthly(el) {
   const state = _monthlyLoadState();
   // cache fetched rows in closure (not persisted)
@@ -27467,7 +27915,7 @@ async function renderMonthly(el) {
       <div class="flex justify-between items-center mb-3">
         <div class="page-title">📅 รายงานรายเดือน (Monthly)</div>
         <div class="flex" style="gap:8px">
-          <button class="btn btn-primary btn-sm" id="btn-monthly-upload" disabled title="เพิ่มใน Step 3">📂 อัปโหลด</button>
+          <button class="btn btn-primary btn-sm" id="btn-monthly-upload">📂 อัปโหลด</button>
           <button class="btn btn-ghost btn-sm" id="btn-monthly-excel" disabled title="เพิ่มใน Step 6">📊 Excel</button>
           <button class="btn btn-ghost btn-sm" id="btn-monthly-pdf" disabled title="เพิ่มใน Step 6">🖨 PDF</button>
         </div>
@@ -27562,6 +28010,14 @@ async function renderMonthly(el) {
       _monthlySaveState(state);
       renderShell();
       await loadAndRender();
+    });
+    
+    // Upload button — open file picker → parse → preview → confirm → save
+    document.getElementById('btn-monthly-upload')?.addEventListener('click', () => {
+      _monthlyOpenUpload(async () => {
+        // After successful save: reload data
+        await loadAndRender();
+      });
     });
   }
   
