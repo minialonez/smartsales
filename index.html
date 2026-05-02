@@ -28118,6 +28118,12 @@ async function renderMonthly(el) {
   let cachedRows = [];
   let lastFetchKey = '';
   
+  // Filter state (reset per page render — not persisted)
+  //   primary: 'all' | <station> | 'VAT' | 'NOVAT' | <prefix>
+  //   search: substring match across key fields
+  //   collapsed: { sectionKey: bool } — for <details> open/close memory
+  let filter = { primary: 'all', search: '', collapsed: {} };
+  
   // Build year options (current ± 2)
   const thisYear = new Date().getFullYear();
   const years = [];
@@ -28183,6 +28189,8 @@ async function renderMonthly(el) {
         _monthlySaveState(state);
         cachedRows = [];
         lastFetchKey = '';
+        // Reset filter — primary buttons differ per tab (FRONT1..4 vs VAT/NOVAT/SR..JS)
+        filter = { primary: 'all', search: '', collapsed: {} };
         renderShell();
         await loadAndRender();
       });
@@ -28295,8 +28303,8 @@ async function renderMonthly(el) {
         return;
       }
       
-      // Step 2: simple preview table — Step 4/5 จะทำ Group B + sub-totals
-      renderPreviewTable(root, rows);
+      // Step 5: Grouped view with filter bar + sub-totals + grand total
+      renderGroupedView(root, rows);
     } catch(err) {
       console.error('[Monthly] Load failed:', err);
       root.innerHTML = `<div class="card" style="padding:20px;color:var(--danger)">
@@ -28305,119 +28313,391 @@ async function renderMonthly(el) {
     }
   }
   
-  function renderPreviewTable(root, rows) {
-    // Compute simple totals (preview)
-    let sumValue = 0, sumVat = 0, sumExempt = 0, sumTotal = 0;
-    rows.forEach(r => {
-      sumValue  += Number(r.value) || 0;
-      sumVat    += Number(r.vat) || 0;
-      sumExempt += Number(r.exempt) || 0;
-      sumTotal  += Number(r.total) || 0;
-    });
-    
+  function renderGroupedView(root, rows) {
     const fmt = (n) => Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-    
     const isFront = state.tab === 'front';
-    const cols = isFront
-      ? [
-          { k: 'date', label: 'วันที่' },
-          { k: 'station', label: 'เครื่อง' },
-          { k: 'station_code', label: 'รหัส' },
-          { k: 'doc_sale_range', label: 'เลขใบขาย' },
-          { k: 'doc_return_range', label: 'เลขใบคืน' },
-          { k: 'value', label: 'มูลค่า', num: true },
-          { k: 'vat', label: 'VAT', num: true },
-          { k: 'exempt', label: 'ยกเว้น', num: true },
-          { k: 'total', label: 'รวม', num: true },
-        ]
-      : [
-          { k: 'date', label: 'วันที่' },
-          { k: 'bill_no', label: 'เลขที่บิล' },
-          { k: 'bill_prefix', label: 'Prefix' },
-          { k: 'vat_class', label: 'VAT' },
-          { k: 'customer', label: 'ลูกค้า' },
-          { k: 'tax_id', label: 'TaxID' },
-          { k: 'branch', label: 'สาขา' },
-          { k: 'value', label: 'มูลค่า', num: true },
-          { k: 'vat', label: 'VAT', num: true },
-          { k: 'exempt', label: 'ยกเว้น', num: true },
-          { k: 'total', label: 'รวม', num: true },
-        ];
     
-    // Sort:
-    //   - Front:   year → month → date (chronological)
-    //   - Invoice: VAT class → prefix order (SR>SS>SC, OR>OS>JR>JS) → suffix → date
-    let sorted;
-    if (isFront) {
-      sorted = rows.slice().sort((a, b) => {
-        const ay = Number(a.year) || 0, by = Number(b.year) || 0;
-        if (ay !== by) return ay - by;
-        const am = Number(a.month) || 0, bm = Number(b.month) || 0;
-        if (am !== bm) return am - bm;
-        return String(a.date || '').localeCompare(String(b.date || ''));
-      });
-    } else {
-      // Invoice: group by year/month first, then by VAT/prefix/suffix within each month
-      const grouped = {};
-      rows.forEach(r => {
-        const k = `${r.year}-${String(r.month).padStart(2,'0')}`;
-        if (!grouped[k]) grouped[k] = [];
-        grouped[k].push(r);
-      });
-      sorted = [];
-      Object.keys(grouped).sort().forEach(k => {
-        sorted = sorted.concat(_monthlySortInvoiceRecords(grouped[k]));
+    // ── Apply filters ──
+    let filtered = rows.slice();
+    
+    // Search filter (substring match)
+    const q = (filter.search || '').trim().toLowerCase();
+    if (q) {
+      filtered = filtered.filter(r => {
+        if (isFront) {
+          return String(r.station || '').toLowerCase().indexOf(q) >= 0
+              || String(r.station_code || '').toLowerCase().indexOf(q) >= 0
+              || String(r.doc_sale_range || '').toLowerCase().indexOf(q) >= 0
+              || String(r.doc_return_range || '').toLowerCase().indexOf(q) >= 0
+              || String(r.pid || '').toLowerCase().indexOf(q) >= 0;
+        } else {
+          return String(r.bill_no || '').toLowerCase().indexOf(q) >= 0
+              || String(r.customer || '').toLowerCase().indexOf(q) >= 0
+              || String(r.tax_id || '').toLowerCase().indexOf(q) >= 0
+              || String(r.branch || '').toLowerCase().indexOf(q) >= 0
+              || String(r.bill_prefix || '').toLowerCase().indexOf(q) >= 0;
+        }
       });
     }
     
-    // Limit display to first 200 rows for preview (Step 4/5 จะทำ pagination/grouping)
-    const MAX_PREVIEW = 200;
-    const display = sorted.slice(0, MAX_PREVIEW);
-    const truncated = sorted.length > MAX_PREVIEW;
+    // Primary filter (station / VAT class / prefix)
+    if (filter.primary && filter.primary !== 'all') {
+      const f = filter.primary;
+      if (isFront) {
+        filtered = filtered.filter(r => r.station === f);
+      } else {
+        if (f === 'VAT' || f === 'NOVAT') {
+          filtered = filtered.filter(r => r.vat_class === f);
+        } else {
+          // prefix filter (SR/SS/SC/OR/OS/JR/JS)
+          filtered = filtered.filter(r => r.bill_prefix === f);
+        }
+      }
+    }
     
-    root.innerHTML = `
-      <div class="card-flat mb-3" style="padding:14px">
-        <div class="flex justify-between items-center mb-2" style="flex-wrap:wrap;gap:10px">
-          <div class="font-semi" style="color:var(--text)">
-            ${isFront ? 'Front Summary' : 'Invoice Summary'} — ${sorted.length} แถว
-          </div>
-          <div style="font-size:.78rem;color:var(--text2)">
-            มูลค่า: <b style="color:var(--text)">${fmt(sumValue)}</b> ·
-            VAT: <b style="color:var(--text)">${fmt(sumVat)}</b> ·
-            ยกเว้น: <b style="color:var(--text)">${fmt(sumExempt)}</b> ·
-            รวม: <b style="color:var(--primary)">${fmt(sumTotal)}</b>
-          </div>
+    // ── Compute grand totals from FILTERED rows ──
+    let grandValue = 0, grandVat = 0, grandExempt = 0, grandTotal = 0;
+    filtered.forEach(r => {
+      grandValue  += Number(r.value) || 0;
+      grandVat    += Number(r.vat) || 0;
+      grandExempt += Number(r.exempt) || 0;
+      grandTotal  += Number(r.total) || 0;
+    });
+    
+    // ── Build filter bar HTML ──
+    let primaryBtns;
+    if (isFront) {
+      const stations = ['FRONT1','FRONT2','FRONT3','FRONT4'];
+      primaryBtns = ['all'].concat(stations).map(s => {
+        const lbl = s === 'all' ? 'ทั้งหมด' : s;
+        const active = filter.primary === s;
+        return `<button class="pill ${active?'active':''}" data-primary="${s}" style="padding:5px 12px;font-size:.78rem">${lbl}</button>`;
+      }).join('');
+    } else {
+      // Invoice: All / NOVAT / VAT (top-level), then prefix sub-buttons depending on selection
+      const topBtns = [
+        { v: 'all', lbl: 'ทั้งหมด' },
+        { v: 'NOVAT', lbl: 'NOVAT' },
+        { v: 'VAT', lbl: 'VAT' },
+      ];
+      primaryBtns = topBtns.map(b => {
+        const active = filter.primary === b.v;
+        const cls = b.v === 'VAT' && active ? 'pill active' :
+                    b.v === 'NOVAT' && active ? 'pill active' :
+                    active ? 'pill active' : 'pill';
+        return `<button class="${cls}" data-primary="${b.v}" style="padding:5px 12px;font-size:.78rem">${b.lbl}</button>`;
+      }).join('');
+      // Sub-prefix buttons (always visible; act as additional filter)
+      const subPrefixes = ['SR','SS','SC','OR','OS','JR','JS'];
+      const subBtns = subPrefixes.map(p => {
+        const active = filter.primary === p;
+        return `<button class="pill ${active?'active':''}" data-primary="${p}" style="padding:5px 10px;font-size:.72rem">${p}</button>`;
+      }).join('');
+      primaryBtns += `<span style="margin:0 6px;color:var(--text-muted)">·</span>` + subBtns;
+    }
+    
+    const filterBarHtml = `
+      <div class="card-flat mb-3" style="padding:12px">
+        <div class="flex items-center" style="gap:8px;flex-wrap:wrap;margin-bottom:8px">
+          <span style="font-size:.78rem;color:var(--text2);margin-right:4px">กรอง:</span>
+          ${primaryBtns}
         </div>
-        ${truncated ? `<div style="font-size:.72rem;color:var(--warn);margin-bottom:6px">
-          ⚠ แสดง ${MAX_PREVIEW} แถวแรก จากทั้งหมด ${sorted.length} — Group view + filter จะมาใน Step 4/5
-        </div>` : ''}
-      </div>
-      
-      <div class="card" style="padding:0">
-        <div class="table-wrap" style="max-height:60vh;overflow:auto">
-          <table>
-            <thead><tr>
-              ${cols.map(c => `<th style="${c.num?'text-align:right':''}">${c.label}</th>`).join('')}
-            </tr></thead>
-            <tbody>
-              ${display.map(r => `<tr>
-                ${cols.map(c => {
-                  let v = r[c.k];
-                  if (c.num) {
-                    return `<td style="text-align:right;font-family:var(--mono)">${fmt(v)}</td>`;
-                  }
-                  if (c.k === 'vat_class') {
-                    const cls = v === 'VAT' ? 'badge-warn' : 'badge-purple';
-                    return `<td><span class="badge ${cls}">${v || ''}</span></td>`;
-                  }
-                  return `<td>${v == null ? '' : String(v)}</td>`;
-                }).join('')}
-              </tr>`).join('')}
-            </tbody>
-          </table>
+        <div class="flex items-center" style="gap:8px">
+          <input type="text" id="monthly-search" class="input"
+            placeholder="🔍 ค้นหา (${isFront ? 'station / doc_sale_range' : 'bill_no / customer / tax_id'})"
+            value="${(filter.search || '').replace(/"/g,'&quot;')}"
+            style="flex:1;padding:6px 12px;font-size:.82rem">
+          ${filter.search ? `<button class="btn btn-ghost btn-sm" id="btn-clear-search" style="padding:5px 10px">✕</button>` : ''}
         </div>
       </div>
     `;
+    
+    // ── Empty state ──
+    if (filtered.length === 0) {
+      root.innerHTML = filterBarHtml + `
+        <div class="card text-center" style="padding:50px;color:var(--text-muted)">
+          <div style="font-size:1.5rem;margin-bottom:8px">🔍</div>
+          <div>ไม่พบข้อมูลตรงกับ filter ที่เลือก</div>
+          <div style="font-size:.75rem;margin-top:6px">ทั้งหมด ${rows.length} แถว — กรองแล้ว ${filtered.length} แถว</div>
+        </div>
+      `;
+      bindFilterEvents(root);
+      return;
+    }
+    
+    // ── Build sections ──
+    let sectionsHtml;
+    if (isFront) {
+      sectionsHtml = _buildFrontSections(filtered, fmt);
+    } else {
+      sectionsHtml = _buildInvoiceSections(filtered, fmt);
+    }
+    
+    // ── Grand total card (sticky bottom feel) ──
+    const grandTotalHtml = `
+      <div class="card-flat" style="padding:14px;background:var(--primary-bg);border:1px solid var(--primary)">
+        <div class="flex justify-between items-center" style="flex-wrap:wrap;gap:10px">
+          <div class="font-semi" style="color:var(--primary);font-size:.92rem">
+            💰 ยอดรวมทั้งหมด — ${filtered.length.toLocaleString()} แถว
+          </div>
+          <div style="font-size:.82rem;color:var(--text2)">
+            มูลค่า: <b style="color:var(--text)">${fmt(grandValue)}</b> ·
+            VAT: <b style="color:var(--text)">${fmt(grandVat)}</b> ·
+            ยกเว้น: <b style="color:var(--text)">${fmt(grandExempt)}</b> ·
+            <span style="font-size:1rem">รวม: <b style="color:var(--primary)">${fmt(grandTotal)}</b></span>
+          </div>
+        </div>
+      </div>
+    `;
+    
+    root.innerHTML = filterBarHtml + sectionsHtml + grandTotalHtml;
+    bindFilterEvents(root);
+  }
+  
+  // Helper: build Front sections grouped by station
+  function _buildFrontSections(rows, fmt) {
+    const stations = ['FRONT1','FRONT2','FRONT3','FRONT4'];
+    const byStation = {};
+    rows.forEach(r => {
+      const s = r.station || '?';
+      if (!byStation[s]) byStation[s] = [];
+      byStation[s].push(r);
+    });
+    
+    // Include known stations + any extra (sorted)
+    const keys = stations.filter(s => byStation[s]).concat(
+      Object.keys(byStation).filter(s => stations.indexOf(s) < 0).sort()
+    );
+    
+    const cols = [
+      { k: 'date', label: 'วันที่' },
+      { k: 'station_code', label: 'รหัส' },
+      { k: 'pid', label: 'PID' },
+      { k: 'doc_sale_range', label: 'เลขใบขาย' },
+      { k: 'doc_return_range', label: 'เลขใบคืน' },
+      { k: 'value', label: 'มูลค่า', num: true },
+      { k: 'vat', label: 'VAT', num: true },
+      { k: 'exempt', label: 'ยกเว้น', num: true },
+      { k: 'total', label: 'รวม', num: true },
+    ];
+    
+    return keys.map(stn => {
+      const sectionRows = byStation[stn].slice().sort((a, b) => {
+        return String(a.date || '').localeCompare(String(b.date || ''));
+      });
+      let sV = 0, sVAT = 0, sE = 0, sT = 0;
+      sectionRows.forEach(r => {
+        sV += Number(r.value) || 0;
+        sVAT += Number(r.vat) || 0;
+        sE += Number(r.exempt) || 0;
+        sT += Number(r.total) || 0;
+      });
+      
+      const isOpen = filter.collapsed[stn] !== true;  // default open
+      
+      return `
+        <details class="card mb-3" data-section="${stn}" ${isOpen?'open':''} style="padding:0">
+          <summary style="padding:14px;cursor:pointer;list-style:none;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+            <span class="font-semi" style="color:var(--text)">
+              <span class="badge badge-info" style="margin-right:8px">${stn}</span>
+              ${sectionRows.length} รายการ
+            </span>
+            <span style="font-size:.82rem;color:var(--text2)">
+              มูลค่า: <b style="color:var(--text)">${fmt(sV)}</b> ·
+              VAT: <b style="color:var(--text)">${fmt(sVAT)}</b> ·
+              ยกเว้น: <b style="color:var(--text)">${fmt(sE)}</b> ·
+              <b style="color:var(--primary)">รวม: ${fmt(sT)}</b>
+            </span>
+          </summary>
+          <div class="table-wrap" style="max-height:55vh;overflow:auto;border-top:1px solid var(--border)">
+            <table>
+              <thead><tr>${cols.map(c => `<th style="${c.num?'text-align:right':''}">${c.label}</th>`).join('')}</tr></thead>
+              <tbody>
+                ${sectionRows.map(r => `<tr>${cols.map(c => {
+                  const v = r[c.k];
+                  if (c.num) return `<td style="text-align:right;font-family:var(--mono)">${fmt(v)}</td>`;
+                  return `<td style="${c.k==='date'||c.k==='doc_sale_range'||c.k==='doc_return_range'||c.k==='pid'||c.k==='station_code'?'font-family:var(--mono);font-size:.78rem':''}">${v == null ? '' : String(v)}</td>`;
+                }).join('')}</tr>`).join('')}
+                <tr style="background:var(--surface2);font-weight:600">
+                  <td colspan="5" style="text-align:right;color:var(--text2)">ยอดรวม ${stn}</td>
+                  <td style="text-align:right;font-family:var(--mono);color:var(--text)">${fmt(sV)}</td>
+                  <td style="text-align:right;font-family:var(--mono);color:var(--text)">${fmt(sVAT)}</td>
+                  <td style="text-align:right;font-family:var(--mono);color:var(--text)">${fmt(sE)}</td>
+                  <td style="text-align:right;font-family:var(--mono);color:var(--primary)">${fmt(sT)}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      `;
+    }).join('');
+  }
+  
+  // Helper: build Invoice sections grouped by VAT class (NOVAT first), sub-grouped by prefix
+  function _buildInvoiceSections(rows, fmt) {
+    // 2 levels: vat_class (NOVAT first, then VAT) → prefix (per MONTHLY_PREFIX_ORDER)
+    const classOrder = ['NOVAT', 'VAT', 'UNKNOWN'];
+    const byClass = {};
+    rows.forEach(r => {
+      const c = r.vat_class || 'UNKNOWN';
+      if (!byClass[c]) byClass[c] = {};
+      const p = r.bill_prefix || '?';
+      if (!byClass[c][p]) byClass[c][p] = [];
+      byClass[c][p].push(r);
+    });
+    
+    const cols = [
+      { k: 'date', label: 'วันที่' },
+      { k: 'bill_no', label: 'เลขที่บิล' },
+      { k: 'customer', label: 'ลูกค้า' },
+      { k: 'tax_id', label: 'TaxID' },
+      { k: 'branch', label: 'สาขา' },
+      { k: 'value', label: 'มูลค่า', num: true },
+      { k: 'vat', label: 'VAT', num: true },
+      { k: 'exempt', label: 'ยกเว้น', num: true },
+      { k: 'total', label: 'รวม', num: true },
+    ];
+    
+    return classOrder.filter(c => byClass[c]).map(cls => {
+      const prefixes = Object.keys(byClass[cls]).sort((a, b) => {
+        return (MONTHLY_PREFIX_ORDER[a] || 999) - (MONTHLY_PREFIX_ORDER[b] || 999);
+      });
+      
+      // Class-level totals
+      let cV = 0, cVAT = 0, cE = 0, cT = 0, cCount = 0;
+      prefixes.forEach(p => {
+        byClass[cls][p].forEach(r => {
+          cV += Number(r.value) || 0;
+          cVAT += Number(r.vat) || 0;
+          cE += Number(r.exempt) || 0;
+          cT += Number(r.total) || 0;
+          cCount++;
+        });
+      });
+      
+      const classBadge = cls === 'VAT' ? 'badge-warn'
+                       : cls === 'NOVAT' ? 'badge-purple' : 'badge-muted';
+      
+      const isClassOpen = filter.collapsed[cls] !== true;
+      
+      const prefixSectionsHtml = prefixes.map(prefix => {
+        const sectionRows = _monthlySortInvoiceRecords(byClass[cls][prefix]);
+        let sV = 0, sVAT = 0, sE = 0, sT = 0;
+        sectionRows.forEach(r => {
+          sV += Number(r.value) || 0;
+          sVAT += Number(r.vat) || 0;
+          sE += Number(r.exempt) || 0;
+          sT += Number(r.total) || 0;
+        });
+        
+        const sectionKey = cls + '|' + prefix;
+        const isPrefixOpen = filter.collapsed[sectionKey] !== true;
+        
+        return `
+          <details data-section="${sectionKey}" ${isPrefixOpen?'open':''} style="border-top:1px solid var(--border)">
+            <summary style="padding:10px 14px;cursor:pointer;list-style:none;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;background:var(--surface2)">
+              <span class="font-semi" style="color:var(--text);font-size:.85rem">
+                <span class="badge ${classBadge}" style="margin-right:8px">${prefix}</span>
+                ${sectionRows.length} รายการ
+              </span>
+              <span style="font-size:.78rem;color:var(--text2)">
+                <b style="color:var(--primary)">รวม: ${fmt(sT)}</b>
+              </span>
+            </summary>
+            <div class="table-wrap" style="max-height:50vh;overflow:auto">
+              <table>
+                <thead><tr>${cols.map(c => `<th style="${c.num?'text-align:right':''}">${c.label}</th>`).join('')}</tr></thead>
+                <tbody>
+                  ${sectionRows.map(r => `<tr>${cols.map(c => {
+                    const v = r[c.k];
+                    if (c.num) return `<td style="text-align:right;font-family:var(--mono)">${fmt(v)}</td>`;
+                    if (c.k === 'customer') {
+                      const cust = String(v || '');
+                      const display = cust.length > 50 ? cust.substring(0, 50) + '…' : cust;
+                      return `<td style="font-size:.78rem" title="${cust.replace(/"/g,'&quot;')}">${display}</td>`;
+                    }
+                    return `<td style="${c.k==='date'||c.k==='bill_no'||c.k==='tax_id'?'font-family:var(--mono);font-size:.78rem':'font-size:.78rem'}">${v == null ? '' : String(v)}</td>`;
+                  }).join('')}</tr>`).join('')}
+                  <tr style="background:var(--surface2);font-weight:600">
+                    <td colspan="5" style="text-align:right;color:var(--text2)">ยอดรวม ${prefix}</td>
+                    <td style="text-align:right;font-family:var(--mono);color:var(--text)">${fmt(sV)}</td>
+                    <td style="text-align:right;font-family:var(--mono);color:var(--text)">${fmt(sVAT)}</td>
+                    <td style="text-align:right;font-family:var(--mono);color:var(--text)">${fmt(sE)}</td>
+                    <td style="text-align:right;font-family:var(--mono);color:var(--primary)">${fmt(sT)}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </details>
+        `;
+      }).join('');
+      
+      return `
+        <details class="card mb-3" data-section="${cls}" ${isClassOpen?'open':''} style="padding:0">
+          <summary style="padding:14px;cursor:pointer;list-style:none;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+            <span class="font-semi" style="color:var(--text);font-size:.95rem">
+              <span class="badge ${classBadge}" style="margin-right:8px;font-size:.78rem">${cls}</span>
+              ${cCount} รายการ
+            </span>
+            <span style="font-size:.82rem;color:var(--text2)">
+              มูลค่า: <b style="color:var(--text)">${fmt(cV)}</b> ·
+              VAT: <b style="color:var(--text)">${fmt(cVAT)}</b> ·
+              ยกเว้น: <b style="color:var(--text)">${fmt(cE)}</b> ·
+              <b style="color:var(--primary);font-size:.95rem">รวม: ${fmt(cT)}</b>
+            </span>
+          </summary>
+          ${prefixSectionsHtml}
+        </details>
+      `;
+    }).join('');
+  }
+  
+  // Helper: bind filter bar event listeners (search input + primary buttons + collapse memory)
+  function bindFilterEvents(root) {
+    // Primary filter buttons
+    root.querySelectorAll('.pill[data-primary]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        filter.primary = btn.dataset.primary;
+        renderGroupedView(root, cachedRows);
+      });
+    });
+    
+    // Search input (debounced)
+    const searchInput = document.getElementById('monthly-search');
+    if (searchInput) {
+      let searchTimer = null;
+      searchInput.addEventListener('input', (e) => {
+        clearTimeout(searchTimer);
+        const val = e.target.value;
+        searchTimer = setTimeout(() => {
+          filter.search = val;
+          renderGroupedView(root, cachedRows);
+          // Re-focus and restore cursor position after re-render
+          setTimeout(() => {
+            const newInput = document.getElementById('monthly-search');
+            if (newInput) {
+              newInput.focus();
+              newInput.setSelectionRange(val.length, val.length);
+            }
+          }, 0);
+        }, 250);
+      });
+    }
+    
+    // Clear search button
+    document.getElementById('btn-clear-search')?.addEventListener('click', () => {
+      filter.search = '';
+      renderGroupedView(root, cachedRows);
+    });
+    
+    // Track <details> open/close → save in filter.collapsed
+    root.querySelectorAll('details[data-section]').forEach(det => {
+      det.addEventListener('toggle', () => {
+        const key = det.dataset.section;
+        if (det.open) delete filter.collapsed[key];
+        else filter.collapsed[key] = true;
+      });
+    });
   }
   
   renderShell();
