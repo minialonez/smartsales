@@ -28165,7 +28165,7 @@ function _monthlyExportExcel(rows, kind, year, months, filter) {
   
   if (kind === 'front') {
     // Front: section per station
-    const cols = ['วันที่','สถานี','รหัส','PID','เลขใบขาย','เลขใบคืน','มูลค่า','VAT','ยกเว้น','รวม'];
+    const cols = ['วันที่','สถานี','รหัส','เลขใบขาย','เลขใบคืน','มูลค่า','VAT','ยกเว้น','รวม'];
     const stations = ['FRONT1','FRONT2','FRONT3','FRONT4'];
     const byStation = {};
     filtered.forEach(r => {
@@ -28196,7 +28196,6 @@ function _monthlyExportExcel(rows, kind, year, months, filter) {
           r.date || '',
           r.station || '',
           r.station_code || '',
-          r.pid || '',
           r.doc_sale_range || '',
           r.doc_return_range || '',
           fmt(r.value),
@@ -28206,8 +28205,8 @@ function _monthlyExportExcel(rows, kind, year, months, filter) {
         ]);
       });
       
-      // Sub-total row
-      aoa.push(['', '', '', '', '', `ยอดรวม ${stn}`, fmt(sV), fmt(sVAT), fmt(sE), fmt(sT)]);
+      // Sub-total row (5 empty cells then label + 4 totals)
+      aoa.push(['', '', '', '', `ยอดรวม ${stn}`, fmt(sV), fmt(sVAT), fmt(sE), fmt(sT)]);
       aoa.push([]);  // spacer
     });
   } else {
@@ -28282,17 +28281,22 @@ function _monthlyExportExcel(rows, kind, year, months, filter) {
     });
   }
   
-  // Grand total
+  // Grand total — placement depends on kind (Front=9 cols, Invoice=11 cols)
   aoa.push([]);
-  aoa.push(['', '', '', '', '', '', '', '', '', '✦ ยอดรวมทั้งหมด ✦']);
-  aoa.push(['', '', '', '', '', '', '', fmt(gV), fmt(gVAT), fmt(gE), fmt(gT)]);
+  if (kind === 'front') {
+    aoa.push(['', '', '', '', '', '', '', '', '✦ ยอดรวมทั้งหมด ✦']);
+    aoa.push(['', '', '', '', '', fmt(gV), fmt(gVAT), fmt(gE), fmt(gT)]);
+  } else {
+    aoa.push(['', '', '', '', '', '', '', '', '', '✦ ยอดรวมทั้งหมด ✦']);
+    aoa.push(['', '', '', '', '', '', '', fmt(gV), fmt(gVAT), fmt(gE), fmt(gT)]);
+  }
   
   const ws = XLSX.utils.aoa_to_sheet(aoa);
   
   // Column widths
   ws['!cols'] = (kind === 'front')
-    ? [{wch:12}, {wch:10}, {wch:8}, {wch:14}, {wch:42}, {wch:42}, {wch:14}, {wch:14}, {wch:14}, {wch:16}]
-    : [{wch:12}, {wch:18}, {wch:8}, {wch:8}, {wch:38}, {wch:20}, {wch:18}, {wch:14}, {wch:14}, {wch:14}, {wch:16}];
+    ? [{wch:12}, {wch:10}, {wch:8}, {wch:42}, {wch:42}, {wch:14}, {wch:14}, {wch:14}, {wch:16}]   // 9 cols (PID dropped)
+    : [{wch:12}, {wch:18}, {wch:8}, {wch:8}, {wch:38}, {wch:20}, {wch:18}, {wch:14}, {wch:14}, {wch:14}, {wch:16}];  // 11 cols
   
   const sheetName = kind === 'front' ? 'Front Summary' : 'Invoice Summary';
   XLSX.utils.book_append_sheet(wb, ws, sheetName);
@@ -28362,7 +28366,7 @@ function _monthlyExportPDF(rows, kind, year, months, filter) {
           <div class="section-header">${stn} — ${sectionRows.length} รายการ</div>
           <table>
             <thead><tr>
-              <th>วันที่</th><th>รหัส</th><th>PID</th>
+              <th>วันที่</th><th>รหัส</th>
               <th>เลขใบขาย</th><th>เลขใบคืน</th>
               <th class="num">มูลค่า</th><th class="num">VAT</th>
               <th class="num">ยกเว้น</th><th class="num">รวม</th>
@@ -28371,7 +28375,6 @@ function _monthlyExportPDF(rows, kind, year, months, filter) {
               ${sectionRows.map(r => `<tr>
                 <td>${r.date||''}</td>
                 <td>${r.station_code||''}</td>
-                <td>${r.pid||''}</td>
                 <td class="small">${r.doc_sale_range||''}</td>
                 <td class="small">${r.doc_return_range||''}</td>
                 <td class="num">${fmt(r.value)}</td>
@@ -28380,7 +28383,7 @@ function _monthlyExportPDF(rows, kind, year, months, filter) {
                 <td class="num">${fmt(r.total)}</td>
               </tr>`).join('')}
               <tr class="subtotal">
-                <td colspan="5">ยอดรวม ${stn}</td>
+                <td colspan="4">ยอดรวม ${stn}</td>
                 <td class="num">${fmt(sV)}</td>
                 <td class="num">${fmt(sVAT)}</td>
                 <td class="num">${fmt(sE)}</td>
@@ -29126,7 +29129,6 @@ async function renderMonthly(el) {
     const cols = [
       { k: 'date', label: 'วันที่' },
       { k: 'station_code', label: 'รหัส' },
-      { k: 'pid', label: 'PID' },
       { k: 'doc_sale_range', label: 'เลขใบขาย' },
       { k: 'doc_return_range', label: 'เลขใบคืน' },
       { k: 'value', label: 'มูลค่า', num: true },
@@ -29183,7 +29185,7 @@ async function renderMonthly(el) {
                   return `<td style="${c.k==='date'||c.k==='doc_sale_range'||c.k==='doc_return_range'||c.k==='pid'||c.k==='station_code'?'font-family:var(--mono);font-size:.78rem':''}">${v == null ? '' : String(v)}</td>`;
                 }).join('')}</tr>`).join('')}
                 <tr style="background:var(--surface2);font-weight:600">
-                  <td colspan="5" style="text-align:right;color:var(--text2)">ยอดรวม ${stn}</td>
+                  <td colspan="4" style="text-align:right;color:var(--text2)">ยอดรวม ${stn}</td>
                   <td style="text-align:right;font-family:var(--mono);color:var(--text)">${fmt(sV)}</td>
                   <td style="text-align:right;font-family:var(--mono);color:var(--text)">${fmt(sVAT)}</td>
                   <td style="text-align:right;font-family:var(--mono);color:var(--text)">${fmt(sE)}</td>
