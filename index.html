@@ -1832,6 +1832,76 @@ window.buildCompactMetaRows = function(filterDates) {
   if (skippedFuture > 0) {
     console.warn(`[buildCompactMetaRows] skipped ${skippedFuture} future/invalid dates (won't push to cloud)`);
   }
+  
+  // ⭐ Locks row: 1 row per year ที่มี __lockedDates dict
+  //    bug ก่อนหน้า: ไม่ build locks row → lockDate/unlockDate/bulk_unlock ไม่ sync cloud
+  //    fix: ใส่ locks row ทุกปีที่มี locked dates (group by year prefix)
+  //    meta_uuid format: '<year>-locks' (e.g., '2026-locks')
+  //    date field: '<year>-01-01' (anchor date, not business date)
+  //    Push เสมอเมื่อ filter ไม่บังคับ หรือ 'locks' อยู่ใน dirty set
+  if (mainSummary && mainSummary.__lockedDates) {
+    const allLocks = mainSummary.__lockedDates;
+    // Group by year
+    const locksByYear = {};
+    Object.keys(allLocks).forEach(function(d) {
+      if (!allLocks[d]) return;
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) return;
+      const yr = d.substring(0, 4);
+      if (!locksByYear[yr]) locksByYear[yr] = {};
+      locksByYear[yr][d] = true;
+    });
+    
+    // Decide which years to push
+    //   - If filterDates is undefined/null/empty → push all years (full save)
+    //   - If filterDates contains 'locks' marker OR any date → push every year that intersects
+    //   - To allow lock changes to flow when meta dirty for any reason — push every year always when no filter
+    Object.keys(locksByYear).forEach(function(yr) {
+      // Skip locks row if filter is on AND filter doesn't include 'locks' marker AND no date in this year
+      if (useFilter) {
+        const hasLocksMarker = filterDates.has('locks') || filterDates.has(yr + '-locks');
+        const hasDateInYear = [...filterDates].some(function(d) { return typeof d === 'string' && d.startsWith(yr); });
+        if (!hasLocksMarker && !hasDateInYear) return;
+      }
+      const yearLocks = locksByYear[yr];
+      rows.push({
+        meta_uuid: yr + '-locks',
+        date: yr + '-01-01',
+        meta_type: 'locks',
+        data_json: JSON.stringify(yearLocks),
+        updated_at: nowStr,
+        updated_by: user,
+      });
+    });
+    
+    // ⭐ EMPTY-LOCKS case: ถ้า user bulk_unlock จนหมด → mainSummary.__lockedDates = {} 
+    //    locksByYear = {} → ไม่มี row build → cloud ยังเก็บ locks เก่า (desync)
+    //    Fix: ถ้าไม่มี year — push empty data_json="{}" ไปแทน
+    //    ให้ครอบคลุมปีปัจจุบัน + ปีที่ filterDates อ้างถึง
+    if (Object.keys(locksByYear).length === 0) {
+      const yearsToReset = new Set();
+      if (useFilter) {
+        [...filterDates].forEach(function(d) {
+          if (typeof d !== 'string') return;
+          if (d === 'locks') yearsToReset.add(String(new Date().getFullYear()));
+          else if (/^\d{4}/.test(d)) yearsToReset.add(d.substring(0, 4));
+        });
+      } else {
+        // Full save → reset locks ของปีปัจจุบัน
+        yearsToReset.add(String(new Date().getFullYear()));
+      }
+      yearsToReset.forEach(function(yr) {
+        rows.push({
+          meta_uuid: yr + '-locks',
+          date: yr + '-01-01',
+          meta_type: 'locks',
+          data_json: '{}',
+          updated_at: nowStr,
+          updated_by: user,
+        });
+      });
+    }
+  }
+  
   return rows;
 };
 
