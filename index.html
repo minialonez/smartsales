@@ -413,6 +413,7 @@ async function api(action, params = {}) {
       'upsertBills', 'upsertStatements', 'upsertMeta',
       'saveSupplierPayments',
       'upsertMonthlyFront', 'upsertMonthlyInvoice',
+      'upsertPcBatch', 'updatePcStatus',
     ];
     const forcePost = FORCE_POST_ACTIONS.indexOf(action) !== -1;
     
@@ -17564,6 +17565,7 @@ const NAV_ITEMS = [
   { id:'reports',   icon:'file',    label:'รายงานบัญชี' },
   { id:'tax_export',icon:'file',    label:'📋 Export สรรพากร' },
   { id:'monthly',   icon:'file',    label:'📅 รายงานรายเดือน' },
+  { id:'pc_sales',  icon:'file',    label:'📊 ยอดขาย PC' },
   { id:'users',     icon:'users',   label:'จัดการผู้ใช้' },
 ];
 
@@ -17845,6 +17847,7 @@ const PAGE_RENDERERS = {
   reports: renderReports,
   tax_export: renderTaxExport,
   monthly: renderMonthly,
+  pc_sales: renderPcSales,
   users: renderUsers,
   sp_recon: renderSpRecon,
   pp_recon: renderPpRecon,
@@ -29437,6 +29440,450 @@ async function renderMonthly(el) {
         else filter.collapsed[key] = true;
       });
     });
+  }
+  
+  renderShell();
+  await loadAndRender();
+}
+
+
+// ════════════════════════════════════════════════════════════════
+// FRONT PC MODULE — ยอดขาย PC (Phase 2A)
+// ════════════════════════════════════════════════════════════════
+// 1 row = 1 line item (one product within one bill)
+// Status workflow: pending → submitted → submitted (move month) → pending
+//                  pending → excluded → pending (restore)
+// View-month rule:
+//   - status='pending'/'excluded' → match original_year/month
+//   - status='submitted'           → match submit_year/month
+// 
+// Step 2A.2: page skeleton + filter bar (Year/Month/Station/Brand/Status)
+// Step 2A.3+: Parser front_raw, brand mapping, type.xlsx group lookup
+// Step 2A.4: Upload + preview + save (default status=pending)
+// Step 2A.5: Bulk submit/unsubmit/exclude + Excel/PDF export
+
+const PC_STATE_KEY = 'sf_pc_state';
+const PC_MONTH_LABELS = ['ม.ค.','ก.พ.','มี.ค.','เม.ย.','พ.ค.','มิ.ย.','ก.ค.','ส.ค.','ก.ย.','ต.ค.','พ.ย.','ธ.ค.'];
+
+// 5 brands (per user spec, BEC dropped, SMN+SIM both → SIMON)
+const PC_BRANDS = [
+  { id: 'PHILIPS',    label: 'PHILIPS',    color: 'var(--primary)' },     // blue
+  { id: 'Zeberg',     label: 'Zeberg',     color: 'var(--warn)' },        // golden
+  { id: 'For You',    label: 'For You',    color: 'var(--purple)' },      // purple
+  { id: 'Mitsubishi', label: 'Mitsubishi', color: 'var(--danger)' },      // red
+  { id: 'SIMON',      label: 'SIMON',      color: 'var(--success)' },     // green
+];
+
+const PC_STATUSES = [
+  { id: 'pending',   label: 'ค้างส่ง',  color: 'var(--text2)',   bg: 'var(--surface2)' },
+  { id: 'submitted', label: 'ส่งแล้ว',  color: 'var(--success)', bg: 'rgba(34,197,94,.14)' },
+  { id: 'excluded',  label: 'ไม่นำส่ง', color: 'var(--danger)',  bg: 'rgba(239,68,68,.14)' },
+];
+
+const PC_STATIONS = ['FRONT1','FRONT2','FRONT3','FRONT4'];
+
+function _pcLoadState() {
+  try {
+    const raw = localStorage.getItem(PC_STATE_KEY);
+    if (raw) {
+      const s = JSON.parse(raw);
+      if (s && typeof s === 'object') {
+        return {
+          year: Number(s.year) || new Date().getFullYear(),
+          months: Array.isArray(s.months) ? s.months.filter(m => m >= 1 && m <= 12) : [],
+          station: s.station || 'all',
+          brand: s.brand || 'all',
+          status: s.status || 'all',
+        };
+      }
+    }
+  } catch(e) {}
+  const now = new Date();
+  return {
+    year: now.getFullYear(),
+    months: [now.getMonth() + 1],
+    station: 'all',
+    brand: 'all',
+    status: 'all',
+  };
+}
+
+function _pcSaveState(state) {
+  try {
+    localStorage.setItem(PC_STATE_KEY, JSON.stringify({
+      year: state.year,
+      months: state.months,
+      station: state.station,
+      brand: state.brand,
+      status: state.status,
+    }));
+  } catch(e) {}
+}
+
+async function renderPcSales(el) {
+  const state = _pcLoadState();
+  let cachedRows = [];
+  let lastFetchKey = '';
+  // Selection state for bulk actions (Step 2A.5)
+  let selectedUuids = new Set();
+  
+  // Build year options (current ± 2)
+  const thisYear = new Date().getFullYear();
+  const years = [];
+  for (let y = thisYear - 2; y <= thisYear + 1; y++) years.push(y);
+  if (years.indexOf(state.year) < 0) years.push(state.year);
+  years.sort((a, b) => b - a);
+  
+  function renderShell() {
+    el.innerHTML = `
+      <div class="flex justify-between items-center mb-3">
+        <div class="page-title">📊 ยอดขาย PC</div>
+        <div class="flex" style="gap:8px">
+          <button class="btn btn-primary btn-sm" id="btn-pc-upload" disabled title="เพิ่มใน Step 2A.4">📂 อัปโหลด Front Raw</button>
+          <button class="btn btn-ghost btn-sm" id="btn-pc-excel" disabled title="เพิ่มใน Step 2A.5">📊 Excel</button>
+          <button class="btn btn-ghost btn-sm" id="btn-pc-pdf" disabled title="เพิ่มใน Step 2A.5">🖨 PDF</button>
+        </div>
+      </div>
+      
+      <!-- Filter row 1: Year + Month chips -->
+      <div class="card-flat mb-2" style="padding:14px">
+        <div class="flex items-center" style="gap:14px;flex-wrap:wrap">
+          <label style="display:flex;align-items:center;gap:8px;font-size:.82rem;color:var(--text2)">
+            <span>ปี:</span>
+            <select id="pc-year" class="input" style="width:100px;padding:6px 10px">
+              ${years.map(y => `<option value="${y}" ${y===state.year?'selected':''}>${y}</option>`).join('')}
+            </select>
+          </label>
+          
+          <div class="flex items-center" style="gap:6px;flex-wrap:wrap">
+            <span style="font-size:.82rem;color:var(--text2);margin-right:4px">เดือนที่ดู:</span>
+            ${PC_MONTH_LABELS.map((label, i) => {
+              const m = i + 1;
+              const active = state.months.indexOf(m) >= 0;
+              return `<button class="pill ${active?'active':''}" data-month="${m}" style="padding:4px 10px;font-size:.78rem">${label}</button>`;
+            }).join('')}
+            <button class="btn btn-ghost btn-sm" id="btn-pc-month-all" style="padding:4px 10px;font-size:.75rem;margin-left:8px">ทั้งปี</button>
+            <button class="btn btn-ghost btn-sm" id="btn-pc-month-clear" style="padding:4px 10px;font-size:.75rem">ล้าง</button>
+          </div>
+        </div>
+      </div>
+      
+      <!-- Filter row 2: Station + Brand + Status -->
+      <div class="card-flat mb-3" style="padding:12px">
+        <div class="flex items-center" style="gap:14px;flex-wrap:wrap">
+          <!-- Station filter -->
+          <div class="flex items-center" style="gap:6px;flex-wrap:wrap">
+            <span style="font-size:.78rem;color:var(--text2);margin-right:4px">สถานี:</span>
+            <button class="pill ${state.station==='all'?'active':''}" data-station="all" style="padding:4px 10px;font-size:.74rem">ทั้งหมด</button>
+            ${PC_STATIONS.map(s => `<button class="pill ${state.station===s?'active':''}" data-station="${s}" style="padding:4px 10px;font-size:.74rem">${s}</button>`).join('')}
+          </div>
+          
+          <span style="color:var(--text-muted)">|</span>
+          
+          <!-- Brand filter -->
+          <div class="flex items-center" style="gap:6px;flex-wrap:wrap">
+            <span style="font-size:.78rem;color:var(--text2);margin-right:4px">แบรนด์:</span>
+            <button class="pill ${state.brand==='all'?'active':''}" data-brand="all" style="padding:4px 10px;font-size:.74rem">ทั้งหมด</button>
+            ${PC_BRANDS.map(b => {
+              const active = state.brand === b.id;
+              const style = active 
+                ? `background:${b.color};border:1px solid ${b.color};color:#fff;padding:4px 10px;font-size:.74rem;border-radius:20px;cursor:pointer;font-weight:600`
+                : `background:transparent;border:1px solid ${b.color};color:${b.color};padding:4px 10px;font-size:.74rem;border-radius:20px;cursor:pointer;font-weight:500`;
+              return `<button data-brand="${b.id}" style="${style}">${b.label}</button>`;
+            }).join('')}
+          </div>
+          
+          <span style="color:var(--text-muted)">|</span>
+          
+          <!-- Status filter -->
+          <div class="flex items-center" style="gap:6px;flex-wrap:wrap">
+            <span style="font-size:.78rem;color:var(--text2);margin-right:4px">สถานะ:</span>
+            <button class="pill ${state.status==='all'?'active':''}" data-status="all" style="padding:4px 10px;font-size:.74rem">ทั้งหมด</button>
+            ${PC_STATUSES.map(s => {
+              const active = state.status === s.id;
+              const style = active
+                ? `background:${s.color};border:1px solid ${s.color};color:#fff;padding:4px 10px;font-size:.74rem;border-radius:20px;cursor:pointer;font-weight:600`
+                : `background:transparent;border:1px solid ${s.color};color:${s.color};padding:4px 10px;font-size:.74rem;border-radius:20px;cursor:pointer;font-weight:500`;
+              return `<button data-status="${s.id}" style="${style}">${s.label}</button>`;
+            }).join('')}
+          </div>
+        </div>
+        <div style="font-size:.72rem;color:var(--text-muted);margin-top:8px" id="pc-summary-line"></div>
+      </div>
+      
+      <!-- Bulk action bar (visible when items selected — Step 2A.5) -->
+      <div id="pc-bulk-bar" style="display:none"></div>
+      
+      <!-- Content area -->
+      <div id="pc-content"></div>
+    `;
+    bindShell();
+  }
+  
+  function bindShell() {
+    // Year selector
+    document.getElementById('pc-year')?.addEventListener('change', async (e) => {
+      state.year = parseInt(e.target.value, 10);
+      _pcSaveState(state);
+      await loadAndRender();
+    });
+    
+    // Month chips
+    el.querySelectorAll('.pill[data-month]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const m = parseInt(btn.dataset.month, 10);
+        const idx = state.months.indexOf(m);
+        if (idx >= 0) state.months.splice(idx, 1);
+        else state.months.push(m);
+        state.months.sort((a, b) => a - b);
+        _pcSaveState(state);
+        btn.classList.toggle('active');
+        await loadAndRender();
+      });
+    });
+    
+    document.getElementById('btn-pc-month-all')?.addEventListener('click', async () => {
+      state.months = [1,2,3,4,5,6,7,8,9,10,11,12];
+      _pcSaveState(state);
+      renderShell();
+      await loadAndRender();
+    });
+    
+    document.getElementById('btn-pc-month-clear')?.addEventListener('click', async () => {
+      state.months = [];
+      _pcSaveState(state);
+      renderShell();
+      await loadAndRender();
+    });
+    
+    // Station/Brand/Status filter buttons
+    el.querySelectorAll('[data-station]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        state.station = btn.dataset.station;
+        _pcSaveState(state);
+        renderShell();
+        await loadAndRender();
+      });
+    });
+    el.querySelectorAll('[data-brand]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        state.brand = btn.dataset.brand;
+        _pcSaveState(state);
+        renderShell();
+        await loadAndRender();
+      });
+    });
+    el.querySelectorAll('[data-status]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        state.status = btn.dataset.status;
+        _pcSaveState(state);
+        renderShell();
+        await loadAndRender();
+      });
+    });
+  }
+  
+  async function loadAndRender() {
+    const root = document.getElementById('pc-content');
+    const summaryEl = document.getElementById('pc-summary-line');
+    if (!root) return;
+    
+    if (!state.months || state.months.length === 0) {
+      root.innerHTML = `<div class="card text-center" style="padding:50px;color:var(--text-muted)">
+        <div style="font-size:1.5rem;margin-bottom:8px">📅</div>
+        <div>เลือกเดือนเพื่อดูยอดขาย PC</div>
+        <div style="font-size:.75rem;margin-top:6px;color:var(--text-muted)">คลิก chip ของเดือน หรือกด "ทั้งปี"</div>
+      </div>`;
+      if (summaryEl) summaryEl.textContent = '';
+      return;
+    }
+    
+    // Build status filter param
+    let statusesToFetch;
+    if (state.status === 'all') {
+      statusesToFetch = ['pending', 'submitted', 'excluded'];
+    } else {
+      statusesToFetch = [state.status];
+    }
+    
+    const fetchKey = `${state.year}-${state.months.join(',')}-${state.status}`;
+    
+    root.innerHTML = `<div class="card text-center" style="padding:50px;color:var(--text-muted)">
+      <div style="margin-bottom:8px">⏳</div>
+      <div>กำลังโหลด...</div>
+    </div>`;
+    
+    try {
+      const res = await api('getPcLineitems', {
+        year: state.year,
+        months: JSON.stringify(state.months),
+        includeStatuses: JSON.stringify(statusesToFetch),
+      });
+      
+      if (!res || res.success === false) {
+        root.innerHTML = `<div class="card" style="padding:20px;color:var(--danger)">
+          ❌ ดึงข้อมูลไม่สำเร็จ: ${(res && res.error) || 'unknown'}
+        </div>`;
+        return;
+      }
+      
+      let rows = (res.data && res.data.rows) || [];
+      cachedRows = rows;
+      lastFetchKey = fetchKey;
+      
+      // Apply station/brand filters client-side
+      let filtered = rows.slice();
+      if (state.station !== 'all') {
+        filtered = filtered.filter(r => r.station === state.station);
+      }
+      if (state.brand !== 'all') {
+        filtered = filtered.filter(r => r.brand === state.brand);
+      }
+      
+      // Update summary line
+      if (summaryEl) {
+        const monthsLabel = state.months.length === 12 ? 'ทั้งปี' :
+                            state.months.map(m => PC_MONTH_LABELS[m-1]).join(', ');
+        const filterParts = [`แสดง: ${monthsLabel} ${state.year}`];
+        if (state.station !== 'all') filterParts.push(`สถานี ${state.station}`);
+        if (state.brand !== 'all') filterParts.push(`แบรนด์ ${state.brand}`);
+        if (state.status !== 'all') {
+          const stLbl = PC_STATUSES.find(s => s.id === state.status)?.label || state.status;
+          filterParts.push(`สถานะ ${stLbl}`);
+        }
+        summaryEl.textContent = `${filterParts.join(' · ')} — ${filtered.length} รายการ (จาก ${rows.length} ที่โหลด)`;
+      }
+      
+      if (filtered.length === 0) {
+        root.innerHTML = `<div class="card text-center" style="padding:50px;color:var(--text-muted)">
+          <div style="font-size:1.5rem;margin-bottom:8px">📭</div>
+          <div>ไม่มีข้อมูลตรงกับ filter ที่เลือก</div>
+          <div style="font-size:.75rem;margin-top:6px;color:var(--text-muted)">
+            ${rows.length === 0 ? 'อัปโหลด Front Raw เพื่อเริ่มต้น (Step 2A.4)' : `กรองแล้ว 0 จาก ${rows.length} แถว`}
+          </div>
+        </div>`;
+        return;
+      }
+      
+      // Step 2A.2: simple preview table
+      // Step 2A.5 จะเปลี่ยนเป็น grouped view + bulk select
+      _renderPcPreviewTable(root, filtered);
+    } catch(err) {
+      console.error('[PC] Load failed:', err);
+      root.innerHTML = `<div class="card" style="padding:20px;color:var(--danger)">
+        ❌ Error: ${err.message || err}
+      </div>`;
+    }
+  }
+  
+  function _renderPcPreviewTable(root, rows) {
+    // Compute totals
+    let totalQty = 0, totalAmount = 0;
+    const brandTotals = {};
+    rows.forEach(r => {
+      totalQty += Number(r.qty) || 0;
+      totalAmount += Number(r.total) || 0;
+      const b = r.brand || '?';
+      if (!brandTotals[b]) brandTotals[b] = { count: 0, total: 0 };
+      brandTotals[b].count++;
+      brandTotals[b].total += Number(r.total) || 0;
+    });
+    
+    const fmt = (n) => Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const fmtInt = (n) => Number(n || 0).toLocaleString('en-US', { maximumFractionDigits: 0 });
+    
+    // Brand summary cards
+    const brandCardsHtml = PC_BRANDS.map(b => {
+      const t = brandTotals[b.id] || { count: 0, total: 0 };
+      const isActive = t.count > 0;
+      return `
+        <div style="flex:1;min-width:140px;padding:12px 14px;border-radius:10px;border:1px solid ${isActive ? b.color : 'var(--border)'};border-left:4px solid ${b.color};background:${isActive ? b.color+'0d' : 'transparent'};opacity:${isActive?'1':'.45'}">
+          <div style="font-size:.7rem;color:${b.color};font-weight:700;text-transform:uppercase;letter-spacing:.5px">${b.label}</div>
+          <div style="font-size:1.1rem;font-weight:700;color:var(--text);margin-top:4px;font-variant-numeric:tabular-nums">฿${fmt(t.total)}</div>
+          <div style="font-size:.72rem;color:var(--text-muted);margin-top:2px">${t.count.toLocaleString()} รายการ</div>
+        </div>
+      `;
+    }).join('');
+    
+    // Sort: by date → bill_no → brand
+    const sorted = rows.slice().sort((a, b) => {
+      const c1 = String(a.original_date || '').localeCompare(String(b.original_date || ''));
+      if (c1 !== 0) return c1;
+      const c2 = String(a.bill_no || '').localeCompare(String(b.bill_no || ''));
+      if (c2 !== 0) return c2;
+      return String(a.brand || '').localeCompare(String(b.brand || ''));
+    });
+    
+    // Limit preview to 200 rows for now (Step 2A.5 will add grouping/pagination)
+    const MAX = 200;
+    const display = sorted.slice(0, MAX);
+    const truncated = sorted.length > MAX;
+    
+    root.innerHTML = `
+      <!-- Grand total + brand cards -->
+      <div class="card-flat mb-3" style="padding:18px 20px;background:linear-gradient(135deg, var(--primary-bg) 0%, transparent 100%);border:1px solid var(--primary);border-left:5px solid var(--primary)">
+        <div class="flex justify-between items-center" style="flex-wrap:wrap;gap:14px;margin-bottom:14px">
+          <div>
+            <div style="font-size:.7rem;color:var(--text2);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px">ยอดรวม PC</div>
+            <div style="font-size:1.6rem;font-weight:800;color:var(--primary);font-variant-numeric:tabular-nums">฿${fmt(totalAmount)}</div>
+            <div style="font-size:.78rem;color:var(--text-muted);margin-top:2px">${rows.length.toLocaleString()} รายการ · ${fmtInt(totalQty)} ชิ้น</div>
+          </div>
+        </div>
+        <div class="flex" style="gap:10px;flex-wrap:wrap">${brandCardsHtml}</div>
+      </div>
+      
+      ${truncated ? `<div class="card-flat mb-2" style="padding:10px;background:rgba(245,158,66,.06);border:1px solid var(--warn);font-size:.78rem;color:var(--warn)">
+        ⚠ แสดง ${MAX} แถวแรก จากทั้งหมด ${sorted.length} — Group view + bulk actions จะมาใน Step 2A.5
+      </div>` : ''}
+      
+      <!-- Line items table -->
+      <div class="card" style="padding:0">
+        <div class="table-wrap" style="max-height:60vh;overflow:auto">
+          <table>
+            <thead><tr>
+              <th style="width:30px"></th>
+              <th>วันที่</th>
+              <th>เลขที่บิล</th>
+              <th>สถานี</th>
+              <th>รหัสสินค้า</th>
+              <th>ชื่อสินค้า</th>
+              <th>แบรนด์</th>
+              <th>หมวด</th>
+              <th style="text-align:right">จำนวน</th>
+              <th style="text-align:right">ราคา</th>
+              <th style="text-align:right">ยอดรวม</th>
+              <th>สถานะ</th>
+            </tr></thead>
+            <tbody>
+              ${display.map(r => {
+                const brand = PC_BRANDS.find(b => b.id === r.brand);
+                const status = PC_STATUSES.find(s => s.id === r.status);
+                const brandColor = brand?.color || 'var(--text2)';
+                const stColor = status?.color || 'var(--text2)';
+                const stBg = status?.bg || 'var(--surface2)';
+                const stLabel = status?.label || r.status || '';
+                const isReturn = r.bill_type === 'return';
+                
+                return `<tr style="${isReturn?'background:rgba(239,68,68,.04)':''}">
+                  <td><input type="checkbox" class="pc-row-check" data-uuid="${r.pc_uuid}" disabled title="Bulk select มาใน Step 2A.5"></td>
+                  <td style="font-family:var(--mono);font-size:.78rem">${r.original_date || ''}</td>
+                  <td style="font-family:var(--mono);font-size:.76rem">${r.bill_no || ''}</td>
+                  <td style="font-size:.78rem">${r.station || ''}</td>
+                  <td style="font-family:var(--mono);font-size:.74rem;color:var(--text2)">${r.product_code || ''}</td>
+                  <td style="font-size:.78rem;max-width:280px" title="${(r.product_name || '').replace(/"/g,'&quot;')}">${r.product_name || ''}</td>
+                  <td><span style="display:inline-block;padding:2px 8px;border-radius:6px;background:${brandColor}1f;color:${brandColor};font-size:.7rem;font-weight:600">${r.brand || ''}</span></td>
+                  <td style="font-size:.74rem;color:var(--text-muted)">${r.group_name || ''}</td>
+                  <td style="text-align:right;font-family:var(--mono)">${fmtInt(r.qty)}</td>
+                  <td style="text-align:right;font-family:var(--mono)">${fmt(r.price)}</td>
+                  <td style="text-align:right;font-family:var(--mono);${isReturn?'color:var(--danger);font-weight:600':''}">${fmt(r.total)}</td>
+                  <td><span style="display:inline-block;padding:2px 8px;border-radius:6px;background:${stBg};color:${stColor};font-size:.7rem;font-weight:600">${stLabel}</span></td>
+                </tr>`;
+              }).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    `;
   }
   
   renderShell();
