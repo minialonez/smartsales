@@ -28112,6 +28112,581 @@ async function _monthlySaveBatch(kind, groups, onSaveSuccess) {
   }
 }
 
+// ════════════════════════════════════════════════════════════════
+// EXCEL EXPORT — SheetJS, multi-sheet by group
+// ════════════════════════════════════════════════════════════════
+function _monthlyExportExcel(rows, kind, year, months, filter) {
+  if (typeof XLSX === 'undefined') {
+    toast('❌ SheetJS ไม่ได้โหลด', 'error');
+    return;
+  }
+  
+  // ── Apply filters (same logic as renderGroupedView) ──
+  const filtered = _monthlyApplyFilter(rows, kind, filter);
+  if (filtered.length === 0) {
+    toast('⚠ ไม่มีข้อมูลตรงกับ filter', 'warn');
+    return;
+  }
+  
+  const fmt = (n) => Number(n || 0);  // raw numbers in Excel
+  const monthLbl = (m) => MONTHLY_MONTH_LABELS[m - 1] || m;
+  const periodLabel = (months || []).length === 12
+    ? `ทั้งปี ${year}`
+    : (months || []).map(m => monthLbl(m)).join(', ') + ' ' + year;
+  
+  const wb = XLSX.utils.book_new();
+  
+  // ── Build sheet content ──
+  // Format: header rows → section per group → sub-totals → grand total
+  const aoa = [];  // Array of arrays (worksheet content)
+  
+  // Title rows
+  const titleText = kind === 'front' ? 'รายงาน Front Summary' : 'รายงาน Invoice Summary';
+  aoa.push([titleText]);
+  aoa.push([`ช่วงเดือน: ${periodLabel}`]);
+  aoa.push([`Export เมื่อ: ${new Date().toLocaleString('th-TH')}`]);
+  if (filter.primary !== 'all' || filter.search) {
+    const filterParts = [];
+    if (filter.primary !== 'all') filterParts.push(`Filter: ${filter.primary}`);
+    if (filter.search) filterParts.push(`ค้นหา: "${filter.search}"`);
+    aoa.push([filterParts.join(' · ')]);
+  }
+  aoa.push([`รวม: ${filtered.length} รายการ`]);
+  aoa.push([]);  // blank row
+  
+  // Compute grand totals
+  let gV = 0, gVAT = 0, gE = 0, gT = 0;
+  filtered.forEach(r => {
+    gV  += Number(r.value) || 0;
+    gVAT += Number(r.vat) || 0;
+    gE  += Number(r.exempt) || 0;
+    gT  += Number(r.total) || 0;
+  });
+  
+  if (kind === 'front') {
+    // Front: section per station
+    const cols = ['วันที่','สถานี','รหัส','PID','เลขใบขาย','เลขใบคืน','มูลค่า','VAT','ยกเว้น','รวม'];
+    const stations = ['FRONT1','FRONT2','FRONT3','FRONT4'];
+    const byStation = {};
+    filtered.forEach(r => {
+      const s = r.station || '?';
+      if (!byStation[s]) byStation[s] = [];
+      byStation[s].push(r);
+    });
+    const keys = stations.filter(s => byStation[s]).concat(
+      Object.keys(byStation).filter(s => stations.indexOf(s) < 0).sort()
+    );
+    
+    keys.forEach(stn => {
+      const sectionRows = byStation[stn].slice().sort((a, b) => String(a.date||'').localeCompare(String(b.date||'')));
+      let sV=0, sVAT=0, sE=0, sT=0;
+      
+      // Section header
+      aoa.push([`▼ ${stn} — ${sectionRows.length} รายการ`]);
+      // Column header
+      aoa.push(cols);
+      
+      // Data rows
+      sectionRows.forEach(r => {
+        sV  += Number(r.value) || 0;
+        sVAT += Number(r.vat) || 0;
+        sE  += Number(r.exempt) || 0;
+        sT  += Number(r.total) || 0;
+        aoa.push([
+          r.date || '',
+          r.station || '',
+          r.station_code || '',
+          r.pid || '',
+          r.doc_sale_range || '',
+          r.doc_return_range || '',
+          fmt(r.value),
+          fmt(r.vat),
+          fmt(r.exempt),
+          fmt(r.total),
+        ]);
+      });
+      
+      // Sub-total row
+      aoa.push(['', '', '', '', '', `ยอดรวม ${stn}`, fmt(sV), fmt(sVAT), fmt(sE), fmt(sT)]);
+      aoa.push([]);  // spacer
+    });
+  } else {
+    // Invoice: section per VAT class → sub-section per prefix
+    const cols = ['วันที่','เลขที่บิล','Prefix','VAT','ลูกค้า','TaxID','สาขา','มูลค่า','VAT','ยกเว้น','รวม'];
+    const classOrder = ['NOVAT', 'VAT', 'UNKNOWN'];
+    const byClass = {};
+    filtered.forEach(r => {
+      const c = r.vat_class || 'UNKNOWN';
+      if (!byClass[c]) byClass[c] = {};
+      const p = r.bill_prefix || '?';
+      if (!byClass[c][p]) byClass[c][p] = [];
+      byClass[c][p].push(r);
+    });
+    
+    classOrder.filter(c => byClass[c]).forEach(cls => {
+      const prefixes = Object.keys(byClass[cls]).sort((a, b) => {
+        return (MONTHLY_PREFIX_ORDER[a] || 999) - (MONTHLY_PREFIX_ORDER[b] || 999);
+      });
+      
+      let cV=0, cVAT=0, cE=0, cT=0, cCount=0;
+      prefixes.forEach(p => {
+        byClass[cls][p].forEach(r => {
+          cV += Number(r.value) || 0;
+          cVAT += Number(r.vat) || 0;
+          cE += Number(r.exempt) || 0;
+          cT += Number(r.total) || 0;
+          cCount++;
+        });
+      });
+      
+      // Class header
+      aoa.push([`══ ${cls} — ${cCount} รายการ ══`]);
+      
+      prefixes.forEach(prefix => {
+        const sectionRows = _monthlySortInvoiceRecords(byClass[cls][prefix]);
+        let sV=0, sVAT=0, sE=0, sT=0;
+        
+        // Sub-section header
+        aoa.push([`  ▶ ${prefix} — ${sectionRows.length} รายการ`]);
+        // Column header
+        aoa.push(cols);
+        
+        sectionRows.forEach(r => {
+          sV  += Number(r.value) || 0;
+          sVAT += Number(r.vat) || 0;
+          sE  += Number(r.exempt) || 0;
+          sT  += Number(r.total) || 0;
+          aoa.push([
+            r.date || '',
+            r.bill_no || '',
+            r.bill_prefix || '',
+            r.vat_class || '',
+            r.customer || '',
+            r.tax_id || '',
+            r.branch || '',
+            fmt(r.value),
+            fmt(r.vat),
+            fmt(r.exempt),
+            fmt(r.total),
+          ]);
+        });
+        
+        // Prefix sub-total
+        aoa.push(['', '', '', '', '', '', `ยอดรวม ${prefix}`, fmt(sV), fmt(sVAT), fmt(sE), fmt(sT)]);
+        aoa.push([]);  // spacer
+      });
+      
+      // Class total
+      aoa.push(['', '', '', '', '', '', `ยอดรวม ${cls}`, fmt(cV), fmt(cVAT), fmt(cE), fmt(cT)]);
+      aoa.push([]);  // spacer
+    });
+  }
+  
+  // Grand total
+  aoa.push([]);
+  aoa.push(['', '', '', '', '', '', '', '', '', '✦ ยอดรวมทั้งหมด ✦']);
+  aoa.push(['', '', '', '', '', '', '', fmt(gV), fmt(gVAT), fmt(gE), fmt(gT)]);
+  
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
+  
+  // Column widths
+  ws['!cols'] = (kind === 'front')
+    ? [{wch:12}, {wch:10}, {wch:8}, {wch:14}, {wch:42}, {wch:42}, {wch:14}, {wch:14}, {wch:14}, {wch:16}]
+    : [{wch:12}, {wch:18}, {wch:8}, {wch:8}, {wch:38}, {wch:20}, {wch:18}, {wch:14}, {wch:14}, {wch:14}, {wch:16}];
+  
+  const sheetName = kind === 'front' ? 'Front Summary' : 'Invoice Summary';
+  XLSX.utils.book_append_sheet(wb, ws, sheetName);
+  
+  // Filename: Monthly_Front_2026-01.xlsx
+  const monthsCode = (months || []).length === 12 ? 'all'
+                   : (months || []).map(m => String(m).padStart(2,'0')).join('-');
+  const fn = `Monthly_${kind === 'front' ? 'Front' : 'Invoice'}_${year}_${monthsCode}.xlsx`;
+  XLSX.writeFile(wb, fn);
+  toast(`✅ Export Excel: ${fn}`, 'success');
+}
+
+// ════════════════════════════════════════════════════════════════
+// PDF EXPORT — opens new window with print-styled HTML, calls print
+// ════════════════════════════════════════════════════════════════
+function _monthlyExportPDF(rows, kind, year, months, filter) {
+  // Apply same filter
+  const filtered = _monthlyApplyFilter(rows, kind, filter);
+  if (filtered.length === 0) {
+    toast('⚠ ไม่มีข้อมูลตรงกับ filter', 'warn');
+    return;
+  }
+  
+  const fmt = (n) => Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const monthLbl = (m) => MONTHLY_MONTH_LABELS[m - 1] || m;
+  const periodLabel = (months || []).length === 12
+    ? `ทั้งปี ${year}`
+    : (months || []).map(m => monthLbl(m)).join(', ') + ' ' + year;
+  
+  // Compute grand totals
+  let gV = 0, gVAT = 0, gE = 0, gT = 0;
+  filtered.forEach(r => {
+    gV  += Number(r.value) || 0;
+    gVAT += Number(r.vat) || 0;
+    gE  += Number(r.exempt) || 0;
+    gT  += Number(r.total) || 0;
+  });
+  
+  const titleText = kind === 'front' ? 'รายงาน Front Summary' : 'รายงาน Invoice Summary';
+  
+  // ── Build sections HTML ──
+  let sectionsHtml = '';
+  if (kind === 'front') {
+    const stations = ['FRONT1','FRONT2','FRONT3','FRONT4'];
+    const byStation = {};
+    filtered.forEach(r => {
+      const s = r.station || '?';
+      if (!byStation[s]) byStation[s] = [];
+      byStation[s].push(r);
+    });
+    const keys = stations.filter(s => byStation[s]).concat(
+      Object.keys(byStation).filter(s => stations.indexOf(s) < 0).sort()
+    );
+    
+    sectionsHtml = keys.map(stn => {
+      const sectionRows = byStation[stn].slice().sort((a, b) => String(a.date||'').localeCompare(String(b.date||'')));
+      let sV=0, sVAT=0, sE=0, sT=0;
+      sectionRows.forEach(r => {
+        sV += Number(r.value) || 0;
+        sVAT += Number(r.vat) || 0;
+        sE += Number(r.exempt) || 0;
+        sT += Number(r.total) || 0;
+      });
+      
+      return `
+        <div class="section">
+          <div class="section-header">${stn} — ${sectionRows.length} รายการ</div>
+          <table>
+            <thead><tr>
+              <th>วันที่</th><th>รหัส</th><th>PID</th>
+              <th>เลขใบขาย</th><th>เลขใบคืน</th>
+              <th class="num">มูลค่า</th><th class="num">VAT</th>
+              <th class="num">ยกเว้น</th><th class="num">รวม</th>
+            </tr></thead>
+            <tbody>
+              ${sectionRows.map(r => `<tr>
+                <td>${r.date||''}</td>
+                <td>${r.station_code||''}</td>
+                <td>${r.pid||''}</td>
+                <td class="small">${r.doc_sale_range||''}</td>
+                <td class="small">${r.doc_return_range||''}</td>
+                <td class="num">${fmt(r.value)}</td>
+                <td class="num">${fmt(r.vat)}</td>
+                <td class="num">${fmt(r.exempt)}</td>
+                <td class="num">${fmt(r.total)}</td>
+              </tr>`).join('')}
+              <tr class="subtotal">
+                <td colspan="5">ยอดรวม ${stn}</td>
+                <td class="num">${fmt(sV)}</td>
+                <td class="num">${fmt(sVAT)}</td>
+                <td class="num">${fmt(sE)}</td>
+                <td class="num">${fmt(sT)}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      `;
+    }).join('');
+  } else {
+    const classOrder = ['NOVAT', 'VAT', 'UNKNOWN'];
+    const byClass = {};
+    filtered.forEach(r => {
+      const c = r.vat_class || 'UNKNOWN';
+      if (!byClass[c]) byClass[c] = {};
+      const p = r.bill_prefix || '?';
+      if (!byClass[c][p]) byClass[c][p] = [];
+      byClass[c][p].push(r);
+    });
+    
+    sectionsHtml = classOrder.filter(c => byClass[c]).map(cls => {
+      const prefixes = Object.keys(byClass[cls]).sort((a, b) => {
+        return (MONTHLY_PREFIX_ORDER[a] || 999) - (MONTHLY_PREFIX_ORDER[b] || 999);
+      });
+      
+      let cV=0, cVAT=0, cE=0, cT=0, cCount=0;
+      prefixes.forEach(p => {
+        byClass[cls][p].forEach(r => {
+          cV += Number(r.value) || 0;
+          cVAT += Number(r.vat) || 0;
+          cE += Number(r.exempt) || 0;
+          cT += Number(r.total) || 0;
+          cCount++;
+        });
+      });
+      
+      const prefixSectionsHtml = prefixes.map(prefix => {
+        const sectionRows = _monthlySortInvoiceRecords(byClass[cls][prefix]);
+        let sV=0, sVAT=0, sE=0, sT=0;
+        sectionRows.forEach(r => {
+          sV += Number(r.value) || 0;
+          sVAT += Number(r.vat) || 0;
+          sE += Number(r.exempt) || 0;
+          sT += Number(r.total) || 0;
+        });
+        
+        return `
+          <div class="sub-section">
+            <div class="sub-section-header">${prefix} — ${sectionRows.length} รายการ</div>
+            <table>
+              <thead><tr>
+                <th>วันที่</th><th>เลขที่บิล</th>
+                <th>ลูกค้า</th><th>TaxID</th><th>สาขา</th>
+                <th class="num">มูลค่า</th><th class="num">VAT</th>
+                <th class="num">ยกเว้น</th><th class="num">รวม</th>
+              </tr></thead>
+              <tbody>
+                ${sectionRows.map(r => `<tr>
+                  <td>${r.date||''}</td>
+                  <td>${r.bill_no||''}</td>
+                  <td class="small">${r.customer||''}</td>
+                  <td class="small">${r.tax_id||''}</td>
+                  <td class="small">${r.branch||''}</td>
+                  <td class="num">${fmt(r.value)}</td>
+                  <td class="num">${fmt(r.vat)}</td>
+                  <td class="num">${fmt(r.exempt)}</td>
+                  <td class="num">${fmt(r.total)}</td>
+                </tr>`).join('')}
+                <tr class="subtotal">
+                  <td colspan="5">ยอดรวม ${prefix}</td>
+                  <td class="num">${fmt(sV)}</td>
+                  <td class="num">${fmt(sVAT)}</td>
+                  <td class="num">${fmt(sE)}</td>
+                  <td class="num">${fmt(sT)}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        `;
+      }).join('');
+      
+      return `
+        <div class="section">
+          <div class="section-header class-${cls.toLowerCase()}">══ ${cls} — ${cCount} รายการ · ยอดรวมคลาส: ${fmt(cT)} ══</div>
+          ${prefixSectionsHtml}
+        </div>
+      `;
+    }).join('');
+  }
+  
+  // Filter info
+  let filterInfo = '';
+  if (filter.primary !== 'all' || filter.search) {
+    const parts = [];
+    if (filter.primary !== 'all') parts.push(`Filter: ${filter.primary}`);
+    if (filter.search) parts.push(`ค้นหา: "${filter.search}"`);
+    filterInfo = `<div class="filter-info">${parts.join(' · ')}</div>`;
+  }
+  
+  // ── Build full HTML for print window ──
+  const html = `<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<title>${titleText} — ${periodLabel}</title>
+<style>
+  @page {
+    size: A4 landscape;
+    margin: 12mm 10mm;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: 'Sarabun', 'Tahoma', sans-serif;
+    margin: 0;
+    color: #222;
+    font-size: 11px;
+    line-height: 1.4;
+  }
+  .header {
+    border-bottom: 3px solid #333;
+    padding-bottom: 8px;
+    margin-bottom: 12px;
+  }
+  .header h1 {
+    margin: 0 0 4px 0;
+    font-size: 18px;
+    color: #111;
+  }
+  .header .meta {
+    font-size: 10px;
+    color: #666;
+    display: flex;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+  .filter-info {
+    font-size: 10px;
+    color: #b35;
+    margin-top: 4px;
+  }
+  .grand-total {
+    background: #f4f4f8;
+    border: 2px solid #333;
+    padding: 10px 14px;
+    margin-bottom: 14px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+  .grand-total .gt-label { font-size: 11px; color: #555; }
+  .grand-total .gt-amount { font-size: 18px; font-weight: 700; color: #000; }
+  .grand-total .gt-detail { font-size: 10px; color: #444; text-align: right; }
+  .section {
+    margin-bottom: 14px;
+    page-break-inside: avoid;
+  }
+  .section-header {
+    background: #2a2a3a;
+    color: #fff;
+    padding: 7px 12px;
+    font-weight: 600;
+    font-size: 12px;
+    border-radius: 0;
+  }
+  .section-header.class-vat { background: #b8860b; }
+  .section-header.class-novat { background: #6a5acd; }
+  .sub-section { margin-top: 6px; }
+  .sub-section-header {
+    background: #ddd;
+    padding: 5px 10px;
+    font-weight: 600;
+    font-size: 11px;
+    border-left: 4px solid #666;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 0;
+  }
+  th {
+    background: #f0f0f0;
+    border: 1px solid #999;
+    padding: 4px 6px;
+    text-align: left;
+    font-size: 10px;
+    font-weight: 600;
+  }
+  td {
+    border: 1px solid #ccc;
+    padding: 3px 6px;
+    font-size: 10px;
+    vertical-align: top;
+  }
+  td.num, th.num { text-align: right; font-family: 'Courier New', monospace; }
+  td.small { font-size: 9px; }
+  tr.subtotal td {
+    background: #eee;
+    font-weight: 700;
+    border-top: 2px solid #333;
+  }
+  .footer {
+    margin-top: 20px;
+    border-top: 1px solid #999;
+    padding-top: 8px;
+    font-size: 9px;
+    color: #888;
+    text-align: center;
+  }
+  @media print {
+    body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  }
+</style>
+</head>
+<body>
+  <div class="header">
+    <h1>${titleText}</h1>
+    <div class="meta">
+      <span>ช่วงเดือน: <b>${periodLabel}</b></span>
+      <span>Export เมื่อ: ${new Date().toLocaleString('th-TH')}</span>
+      <span>รวม ${filtered.length.toLocaleString()} รายการ</span>
+    </div>
+    ${filterInfo}
+  </div>
+  
+  <div class="grand-total">
+    <div>
+      <div class="gt-label">ยอดรวมทั้งหมด</div>
+      <div class="gt-amount">฿ ${fmt(gT)}</div>
+    </div>
+    <div class="gt-detail">
+      <div>มูลค่า: <b>${fmt(gV)}</b></div>
+      <div>VAT: <b>${fmt(gVAT)}</b></div>
+      <div>ยกเว้น: <b>${fmt(gE)}</b></div>
+    </div>
+  </div>
+  
+  ${sectionsHtml}
+  
+  <div class="footer">
+    Smart Finance — รายงานรายเดือน · พิมพ์เมื่อ ${new Date().toLocaleString('th-TH')}
+  </div>
+  
+  <scr` + `ipt>
+    window.addEventListener('load', () => {
+      setTimeout(() => { window.print(); }, 250);
+    });
+  <\/scr` + `ipt>
+</body>
+</html>`;
+  
+  // Open in new window
+  const w = window.open('', '_blank');
+  if (!w) {
+    toast('❌ Browser block popup — กรุณาอนุญาต popup ของ site นี้', 'error');
+    return;
+  }
+  w.document.open();
+  w.document.write(html);
+  w.document.close();
+  toast('🖨 เปิดหน้าต่าง print — เลือก "Save as PDF" ใน dialog', 'info');
+}
+
+// Helper: apply filter (search + primary) — same logic as renderGroupedView
+function _monthlyApplyFilter(rows, kind, filter) {
+  let filtered = rows.slice();
+  const isFront = kind === 'front';
+  
+  const q = (filter && filter.search || '').trim().toLowerCase();
+  if (q) {
+    filtered = filtered.filter(r => {
+      if (isFront) {
+        return String(r.station || '').toLowerCase().indexOf(q) >= 0
+            || String(r.station_code || '').toLowerCase().indexOf(q) >= 0
+            || String(r.doc_sale_range || '').toLowerCase().indexOf(q) >= 0
+            || String(r.doc_return_range || '').toLowerCase().indexOf(q) >= 0
+            || String(r.pid || '').toLowerCase().indexOf(q) >= 0;
+      } else {
+        return String(r.bill_no || '').toLowerCase().indexOf(q) >= 0
+            || String(r.customer || '').toLowerCase().indexOf(q) >= 0
+            || String(r.tax_id || '').toLowerCase().indexOf(q) >= 0
+            || String(r.branch || '').toLowerCase().indexOf(q) >= 0
+            || String(r.bill_prefix || '').toLowerCase().indexOf(q) >= 0;
+      }
+    });
+  }
+  
+  const p = filter && filter.primary;
+  if (p && p !== 'all') {
+    if (isFront) {
+      filtered = filtered.filter(r => r.station === p);
+    } else {
+      if (p === 'VAT' || p === 'NOVAT') {
+        filtered = filtered.filter(r => r.vat_class === p);
+      } else {
+        filtered = filtered.filter(r => r.bill_prefix === p);
+      }
+    }
+  }
+  
+  return filtered;
+}
+
 async function renderMonthly(el) {
   const state = _monthlyLoadState();
   // cache fetched rows in closure (not persisted)
@@ -28137,8 +28712,8 @@ async function renderMonthly(el) {
         <div class="page-title">📅 รายงานรายเดือน (Monthly)</div>
         <div class="flex" style="gap:8px">
           <button class="btn btn-primary btn-sm" id="btn-monthly-upload">📂 อัปโหลด</button>
-          <button class="btn btn-ghost btn-sm" id="btn-monthly-excel" disabled title="เพิ่มใน Step 6">📊 Excel</button>
-          <button class="btn btn-ghost btn-sm" id="btn-monthly-pdf" disabled title="เพิ่มใน Step 6">🖨 PDF</button>
+          <button class="btn btn-ghost btn-sm" id="btn-monthly-excel">📊 Excel</button>
+          <button class="btn btn-ghost btn-sm" id="btn-monthly-pdf">🖨 PDF</button>
         </div>
       </div>
       
@@ -28241,6 +28816,24 @@ async function renderMonthly(el) {
         // After successful save: reload data
         await loadAndRender();
       });
+    });
+    
+    // Excel export — uses SheetJS (already loaded)
+    document.getElementById('btn-monthly-excel')?.addEventListener('click', () => {
+      if (!cachedRows || cachedRows.length === 0) {
+        toast('⚠ ไม่มีข้อมูลให้ export', 'warn');
+        return;
+      }
+      _monthlyExportExcel(cachedRows, state.tab, state.year, state.months, filter);
+    });
+    
+    // PDF export — uses window.print() (no extra lib needed)
+    document.getElementById('btn-monthly-pdf')?.addEventListener('click', () => {
+      if (!cachedRows || cachedRows.length === 0) {
+        toast('⚠ ไม่มีข้อมูลให้ export', 'warn');
+        return;
+      }
+      _monthlyExportPDF(cachedRows, state.tab, state.year, state.months, filter);
     });
   }
   
