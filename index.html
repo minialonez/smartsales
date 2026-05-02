@@ -1163,14 +1163,35 @@ function handleStmtUpload(result, fileName, opts = {}) {
     m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
     if (m) {
       let y = Number(m[3]); if (y > 2400) { y -= 543; buddhistCount++; }
-      return `${y}-${String(m[2]).padStart(2,'0')}-${String(m[1]).padStart(2,'0')}`;
+      let day = Number(m[1]);
+      let mon = Number(m[2]);
+      // ⭐ ตรวจ month > 12 → น่าจะเป็น mm/dd/yyyy (en-US) → swap
+      //    เช่น Excel save บนเครื่องที่ locale en-US: "4/30/2569" → swap เป็น day=30 mon=4
+      //    ป้องกัน case ที่ user เปิด CSV ใน Excel แล้ว save ใหม่ → date format เพี้ยน
+      if (mon > 12 && day <= 12) {
+        [day, mon] = [mon, day];
+        console.warn(`[convertDate] Detected en-US format "${s}" → corrected to dd/mm/yyyy`);
+      }
+      // ⭐ Validate output — ถ้า day หรือ month ยังเกินขอบเขต → คืนค่าว่าง (ไม่ silent garbage)
+      if (mon < 1 || mon > 12 || day < 1 || day > 31) {
+        console.warn(`[convertDate] Invalid date "${s}" → returning empty`);
+        return '';
+      }
+      return `${y}-${String(mon).padStart(2,'0')}-${String(day).padStart(2,'0')}`;
     }
     
     // dd/mm/yy (2-digit year — assume 20xx)
     m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2})$/);
     if (m) {
       let y = 2000 + Number(m[3]);
-      return `${y}-${String(m[2]).padStart(2,'0')}-${String(m[1]).padStart(2,'0')}`;
+      let day = Number(m[1]);
+      let mon = Number(m[2]);
+      // Same en-US guard
+      if (mon > 12 && day <= 12) {
+        [day, mon] = [mon, day];
+      }
+      if (mon < 1 || mon > 12 || day < 1 || day > 31) return '';
+      return `${y}-${String(mon).padStart(2,'0')}-${String(day).padStart(2,'0')}`;
     }
     
     // Fallback: parse as Date
@@ -17054,8 +17075,54 @@ function toISODate(d) {
   const m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
   if (m) {
     let y = Number(m[3]); if (y > 2400) y -= 543;
-    return `${y}-${String(m[2]).padStart(2,'0')}-${String(m[1]).padStart(2,'0')}`;
+    let day = Number(m[1]);
+    let mon = Number(m[2]);
+    // ⭐ Auto-detect en-US (mm/dd/yyyy): ถ้า month > 12 + day <= 12 → swap
+    //    Cause: User เปิด CSV ใน Excel locale en-US แล้ว save ใหม่
+    if (mon > 12 && day <= 12) [day, mon] = [mon, day];
+    if (mon < 1 || mon > 12 || day < 1 || day > 31) return '';
+    return `${y}-${String(mon).padStart(2,'0')}-${String(day).padStart(2,'0')}`;
   }
+
+  // ⭐ dd-mm-yyyy (dash separator)
+  const dashFmt = s.match(/^(\d{1,2})-(\d{1,2})-(\d{4})/);
+  if (dashFmt) {
+    let y = Number(dashFmt[3]); if (y > 2400) y -= 543;
+    let day = Number(dashFmt[1]);
+    let mon = Number(dashFmt[2]);
+    if (mon > 12 && day <= 12) [day, mon] = [mon, day];
+    if (mon < 1 || mon > 12 || day < 1 || day > 31) return '';
+    return `${y}-${String(mon).padStart(2,'0')}-${String(day).padStart(2,'0')}`;
+  }
+
+  // ⭐ Thai short month: "17 เม.ย. 2569" หรือ "17 เม.ย. 2569 03:20"
+  //    ใช้ใน BBL CSV (Activity-*) + BBL_NW CSV (MyDownLoad-*)
+  const thMonthMap = { 'ม.ค.':'01','ก.พ.':'02','มี.ค.':'03','เม.ย.':'04','พ.ค.':'05','มิ.ย.':'06','ก.ค.':'07','ส.ค.':'08','ก.ย.':'09','ต.ค.':'10','พ.ย.':'11','ธ.ค.':'12' };
+  const thaiShort = s.match(/^(\d{1,2})\s+(\S+\.?)\s+(\d{4})/);
+  if (thaiShort) {
+    const moStr = thaiShort[2];
+    const mo = thMonthMap[moStr];
+    if (mo) {
+      let y = Number(thaiShort[3]); if (y > 2400) y -= 543;
+      const day = Number(thaiShort[1]);
+      if (day < 1 || day > 31) return '';
+      return `${y}-${mo}-${String(day).padStart(2,'0')}`;
+    }
+  }
+
+  // ⭐ Thai full month: "17 เมษายน 2569"
+  const thMonthFullMap = { 'มกราคม':'01','กุมภาพันธ์':'02','มีนาคม':'03','เมษายน':'04','พฤษภาคม':'05','มิถุนายน':'06','กรกฎาคม':'07','สิงหาคม':'08','กันยายน':'09','ตุลาคม':'10','พฤศจิกายน':'11','ธันวาคม':'12' };
+  const thaiFull = s.match(/^(\d{1,2})\s+([\u0E00-\u0E7F]+)\s+(\d{4})/);
+  if (thaiFull) {
+    const mo = thMonthFullMap[thaiFull[2]];
+    if (mo) {
+      let y = Number(thaiFull[3]); if (y > 2400) y -= 543;
+      const day = Number(thaiFull[1]);
+      if (day < 1 || day > 31) return '';
+      return `${y}-${mo}-${String(day).padStart(2,'0')}`;
+    }
+  }
+
   return '';
   })(); // end IIFE
   
