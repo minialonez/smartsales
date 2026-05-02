@@ -27560,9 +27560,13 @@ function _monthlyParseFrontsum(rows) {
     // Skip if no station context
     if (!currentStation) continue;
     
-    // Skip grand total row ("รวม" without station)
-    if (rowText.indexOf('สาขา') >= 0) continue;
-    if (rowText.trim().indexOf('รวม') === 0) continue;
+    // Skip header/grand total — match by col[0] only (row label position)
+    //   - Header:      col[0] = "สาขา : (001) สำนักงานใหญ่"
+    //   - Grand total: col[0] = "รวม"
+    // ⚠ DO NOT scan the entire row — keep this precise for safety/consistency
+    const c0 = String(r[0] || '').trim();
+    if (/^สาขา\s*:/.test(c0)) continue;
+    if (/^รวม/.test(c0)) continue;
     
     // Try to parse date from column A
     const dateISO = _monthlyCellToISO(r[0]);
@@ -27682,20 +27686,23 @@ function _monthlyParseInvoicesum(rows) {
     const r = rows[i];
     if (!r || r.length === 0) continue;
     
-    // Concatenate row text for noise detection
-    const rowText = r.map(c => String(c || '')).join(' ');
-    
-    // Skip header/branch lines
-    if (rowText.indexOf('สาขา') >= 0) continue;
-    if (rowText.trim().indexOf('รวม') === 0) continue;
-    if (rowText.indexOf('ภาษีขาย') >= 0) continue;
+    // Skip header / footer / title rows — match by col[0] only (row label position)
+    //   - Header pattern:  col[0] = "สาขา : (001) สำนักงานใหญ่"
+    //   - Footer (grand):  col[0] = "รวม"
+    //   - Title pattern:   col[0] contains "ภาษีขาย"
+    // ⚠ DO NOT scan the entire row — col[6] (branch) often contains "สาขา / xxx" for
+    //   non-headquarters customers, which would falsely skip 40+ data rows.
+    const c0 = String(r[0] || '').trim();
+    if (/^สาขา\s*:/.test(c0)) continue;
+    if (/^รวม/.test(c0)) continue;
+    if (c0.indexOf('ภาษีขาย') >= 0) continue;
     
     // Extract bill_no from column C (index 2)
     const billNoRaw = String(r[2] || '').trim();
     if (!billNoRaw) continue;
     
     const billParts = _monthlyParseBillNo(billNoRaw);
-    if (!billParts.prefix) continue;  // not a valid bill row
+    if (!billParts.prefix) continue;  // not a valid bill row (also catches headers/footers)
     
     // Date from column B (index 1)
     const dateISO = _monthlyCellToISO(r[1]);
