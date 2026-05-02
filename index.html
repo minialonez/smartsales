@@ -3411,7 +3411,28 @@ const syncManager = {
     if (this.status === 'pushing') return { text: '☁ กำลังบันทึก…', color: 'var(--info)' };
     if (this.status === 'pulling') return { text: '☁ กำลังดึงข้อมูล…', color: 'var(--info)' };
     if (this.status === 'error') return { text: '⚠ Sync ผิดพลาด', color: 'var(--warn)' };
-    if (this.dirty.size > 0) return { text: `● มี ${this.dirty.size} ที่ยังไม่ได้บันทึก`, color: 'var(--warn)' };
+    if (this.dirty.size > 0) {
+      // ⭐ คำนวณ record count จริงจาก dirtyUuids (ถ้ามี)
+      //    เก่า: "มี 1 ที่ยังไม่ได้บันทึก" (= 1 type) — สับสนเพราะดูเหมือน 1 record
+      //    ใหม่: "มี 2,081 ที่ยังไม่ได้บันทึก" (รวม records ของทุก type)
+      let totalRecords = 0;
+      let hasUuidTracking = false;
+      if (this.dirtyUuids) {
+        for (const type of this.dirty) {
+          const uuids = this.dirtyUuids[type];
+          if (uuids && uuids.size > 0) {
+            totalRecords += uuids.size;
+            hasUuidTracking = true;
+          }
+        }
+      }
+      // ถ้ามี uuid tracking + count > 0 → แสดง record count
+      // ถ้าไม่มี (legacy push types) → fall back type count
+      const display = (hasUuidTracking && totalRecords > 0) 
+        ? totalRecords 
+        : this.dirty.size;
+      return { text: `● มี ${display} ที่ยังไม่ได้บันทึก`, color: 'var(--warn)' };
+    }
     if (this.lastPushAt > 0) {
       const ago = Math.round((Date.now() - this.lastPushAt) / 1000);
       const agoStr = ago < 60 ? `${ago}s` : ago < 3600 ? `${Math.round(ago/60)}m` : `${Math.round(ago/3600)}h`;
@@ -4949,7 +4970,15 @@ function generateBillList(result, fileName) {
 
     // Amount Incl VAT (col 8) หรือ col สุดท้าย
     const amount = Number(r[8]) || Number(r[6]) || 0;
-    const customer = String(r[2] || '').replace(/^\[[^\]]+\]/, '').replace(/\n/g,' ').trim();
+    // ⭐ Customer format conversion:
+    //   "[AC-01803]นาย สุกรี บากา" → "(AC-01803) นาย สุกรี บากา"
+    //   เก็บ customer code ไว้ + เพิ่ม space หลัง ) ให้ตรงกับ schema customer table
+    //   ถ้าไม่มี code → ใช้ตามเดิม (strip whitespace)
+    const customerRaw = String(r[2] || '').replace(/\n/g, ' ').trim();
+    const codeMatch = customerRaw.match(/^\[([^\]]+)\]\s*(.*)$/);
+    const customer = codeMatch 
+      ? `(${codeMatch[1]}) ${codeMatch[2].trim()}`
+      : customerRaw;
     const date = fmtDate(r[3]) || todayISO();
 
     const bill = transformBill(billNo, amount, customer, date);
