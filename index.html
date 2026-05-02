@@ -27600,6 +27600,143 @@ function _monthlyParseFrontsum(rows) {
 }
 
 // ────────────────────────────────────────────────────────────────
+// VAT classification + sort order for Invoice Summary
+// ────────────────────────────────────────────────────────────────
+// VAT (สีอำพัน):  SR, SS, SC
+// NOVAT (สีม่วง): OR, OS, JR, JS
+// อื่นๆ:          UNKNOWN (เก็บไว้แต่ไม่จัดกลุ่ม)
+const MONTHLY_VAT_PREFIXES   = ['SR', 'SS', 'SC'];
+const MONTHLY_NOVAT_PREFIXES = ['OR', 'OS', 'JR', 'JS'];
+
+// Display order: VAT [SR > SS > SC] → NOVAT [OR > OS > JR > JS]
+const MONTHLY_PREFIX_ORDER = {
+  'SR': 1, 'SS': 2, 'SC': 3,
+  'OR': 11, 'OS': 12, 'JR': 13, 'JS': 14,
+};
+
+function _monthlyClassifyVAT(prefix) {
+  const p = String(prefix || '').toUpperCase();
+  if (MONTHLY_VAT_PREFIXES.indexOf(p) >= 0) return 'VAT';
+  if (MONTHLY_NOVAT_PREFIXES.indexOf(p) >= 0) return 'NOVAT';
+  return 'UNKNOWN';
+}
+
+// Extract bill_no parts: 'SR00126-000001' → {prefix:'SR', body:'00126', suffix:'000001'}
+function _monthlyParseBillNo(billNo) {
+  const s = String(billNo || '').trim();
+  const m = s.match(/^([A-Z]{2})(\d{5})-(\d{6})/);
+  if (!m) return { prefix: '', body: '', suffix: '', raw: s };
+  return {
+    prefix: m[1],
+    body: m[2],
+    suffix: m[3],
+    raw: s,
+  };
+}
+
+// Sort invoice records: VAT first (SR>SS>SC), then NOVAT (OR>OS>JR>JS), suffix asc
+function _monthlySortInvoiceRecords(records) {
+  return records.slice().sort((a, b) => {
+    const pa = String(a.bill_prefix || '').toUpperCase();
+    const pb = String(b.bill_prefix || '').toUpperCase();
+    const oa = MONTHLY_PREFIX_ORDER[pa] || 999;
+    const ob = MONTHLY_PREFIX_ORDER[pb] || 999;
+    if (oa !== ob) return oa - ob;
+    // Same prefix → sort by suffix number
+    const sa = Number(String(a.bill_no || '').split('-')[1]) || 0;
+    const sb = Number(String(b.bill_no || '').split('-')[1]) || 0;
+    if (sa !== sb) return sa - sb;
+    // Tiebreak: by date
+    return String(a.date || '').localeCompare(String(b.date || ''));
+  });
+}
+
+// ────────────────────────────────────────────────────────────────
+// Parser: invoicesum_raw.xls
+// ────────────────────────────────────────────────────────────────
+// Returns array of records:
+//   { date, year, month, bill_no, bill_prefix, vat_class,
+//     customer, tax_id, branch, value, vat, exempt, total }
+//
+// Layout (per handoff spec):
+//   R1-7:  Company header (skip)
+//   R8:    'สาขา : (001) สำนักงานใหญ่' + grand totals (skip)
+//   R9+:   Data rows (one continuous list, no section breaks)
+//
+// Data row columns:
+//   A: row index '1.0', '2.0', ... (skip)
+//   B: Excel serial date
+//   C: bill_no 'OR00126-002909'
+//   D: (empty)
+//   E: customer '(BE-00789)บริษัท ฟาฉายไลติ้งโฮ...'
+//   F: tax_id '0 9555 62000 16 6'
+//   G: branch 'สำนักงานใหญ่' or '-'
+//   H: value
+//   I: vat
+//   J: exempt
+//   K: total
+function _monthlyParseInvoicesum(rows) {
+  const records = [];
+  
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    if (!r || r.length === 0) continue;
+    
+    // Concatenate row text for noise detection
+    const rowText = r.map(c => String(c || '')).join(' ');
+    
+    // Skip header/branch lines
+    if (rowText.indexOf('สาขา') >= 0) continue;
+    if (rowText.trim().indexOf('รวม') === 0) continue;
+    if (rowText.indexOf('ภาษีขาย') >= 0) continue;
+    
+    // Extract bill_no from column C (index 2)
+    const billNoRaw = String(r[2] || '').trim();
+    if (!billNoRaw) continue;
+    
+    const billParts = _monthlyParseBillNo(billNoRaw);
+    if (!billParts.prefix) continue;  // not a valid bill row
+    
+    // Date from column B (index 1)
+    const dateISO = _monthlyCellToISO(r[1]);
+    if (!dateISO) continue;
+    
+    // Other fields
+    const customer = String(r[4] || '').trim();
+    const taxId    = String(r[5] || '').trim();
+    const branch   = String(r[6] || '').trim();
+    const value    = Number(r[7]) || 0;
+    const vat      = Number(r[8]) || 0;
+    const exempt   = Number(r[9]) || 0;
+    const total    = Number(r[10]) || 0;
+    
+    // Skip empty rows (no amount + no customer)
+    if (!customer && value === 0 && total === 0) continue;
+    
+    const dt = new Date(dateISO + 'T00:00:00Z');
+    const vatClass = _monthlyClassifyVAT(billParts.prefix);
+    
+    records.push({
+      date: dateISO,
+      year: dt.getUTCFullYear(),
+      month: dt.getUTCMonth() + 1,
+      bill_no: billNoRaw,
+      bill_prefix: billParts.prefix,
+      vat_class: vatClass,
+      customer: customer,
+      tax_id: taxId,
+      branch: branch,
+      value: value,
+      vat: vat,
+      exempt: exempt,
+      total: total,
+    });
+  }
+  
+  return records;
+}
+
+// ────────────────────────────────────────────────────────────────
 // Group records by (year, month) → { 'YYYY-MM': [records] }
 // ────────────────────────────────────────────────────────────────
 function _monthlyGroupByPeriod(records) {
@@ -27646,19 +27783,17 @@ function _monthlyOpenUpload(onSaveSuccess) {
         toast('❌ ไม่รู้จักประเภทไฟล์ — ต้องเป็น frontsum_raw.xls หรือ invoicesum_raw.xls', 'error');
         return;
       }
-      if (kind === 'invoice') {
-        toast('⚠ Invoice Summary จะรองรับใน Step 4 — ขณะนี้รองรับแค่ Front Summary', 'warn');
-        return;
-      }
       
-      // Parse rows
-      const records = _monthlyParseFrontsum(rows);
+      // Parse rows by kind
+      const records = (kind === 'front')
+        ? _monthlyParseFrontsum(rows)
+        : _monthlyParseInvoicesum(rows);
       if (records.length === 0) {
         toast('❌ Parse ไฟล์แล้วไม่เจอข้อมูล — ตรวจสอบ format', 'error');
         return;
       }
       
-      console.log(`[Monthly] Parsed ${records.length} records from ${file.name}`);
+      console.log(`[Monthly] Parsed ${records.length} ${kind} records from ${file.name}`);
       
       // Group by period
       const groups = _monthlyGroupByPeriod(records);
@@ -27711,8 +27846,8 @@ async function _monthlyShowPreviewModal(filename, kind, records, groups, onSaveS
     totalTotal  += Number(r.total) || 0;
   });
   
-  // Per-station breakdown (for front)
-  let stationBreakdownHtml = '';
+  // Per-station breakdown (for front) OR per-VAT-class breakdown (for invoice)
+  let breakdownHtml = '';
   if (kind === 'front') {
     const byStation = {};
     records.forEach(r => {
@@ -27728,11 +27863,61 @@ async function _monthlyShowPreviewModal(filename, kind, records, groups, onSaveS
         <td style="text-align:right;font-family:var(--mono);color:var(--text)">${fmt(byStation[s].total)}</td>
       </tr>
     `).join('');
-    stationBreakdownHtml = `
+    breakdownHtml = `
       <div class="font-semi text-sm mb-2" style="color:var(--text)">แยกตามเครื่อง</div>
       <table style="margin-bottom:14px">
         <thead><tr><th>เครื่อง</th><th style="text-align:right">จำนวน</th><th style="text-align:right">ยอดรวม</th></tr></thead>
         <tbody>${stnRows}</tbody>
+      </table>
+    `;
+  } else {
+    // Invoice: breakdown by VAT class (VAT/NOVAT) + sub-breakdown by prefix
+    const byClass = { VAT: { count: 0, total: 0, prefixes: {} },
+                      NOVAT: { count: 0, total: 0, prefixes: {} },
+                      UNKNOWN: { count: 0, total: 0, prefixes: {} } };
+    records.forEach(r => {
+      const c = r.vat_class || 'UNKNOWN';
+      const p = r.bill_prefix || '?';
+      if (!byClass[c]) byClass[c] = { count: 0, total: 0, prefixes: {} };
+      byClass[c].count++;
+      byClass[c].total += Number(r.total) || 0;
+      if (!byClass[c].prefixes[p]) byClass[c].prefixes[p] = { count: 0, total: 0 };
+      byClass[c].prefixes[p].count++;
+      byClass[c].prefixes[p].total += Number(r.total) || 0;
+    });
+    
+    const classBadge = (c) => {
+      if (c === 'VAT')   return '<span class="badge badge-warn">VAT</span>';
+      if (c === 'NOVAT') return '<span class="badge badge-purple">NOVAT</span>';
+      return `<span class="badge badge-muted">${c}</span>`;
+    };
+    
+    const classRows = ['VAT', 'NOVAT', 'UNKNOWN'].filter(c => byClass[c].count > 0).map(c => {
+      const cls = byClass[c];
+      const subPrefixes = Object.keys(cls.prefixes).sort((a, b) => {
+        return (MONTHLY_PREFIX_ORDER[a] || 999) - (MONTHLY_PREFIX_ORDER[b] || 999);
+      });
+      const subParts = subPrefixes.map(p => `${p}:${cls.prefixes[p].count}`).join(' · ');
+      return `
+        <tr>
+          <td>${classBadge(c)}</td>
+          <td style="text-align:right;font-family:var(--mono)">${cls.count}</td>
+          <td style="text-align:right;font-family:var(--mono);color:var(--text)">${fmt(cls.total)}</td>
+          <td style="font-size:.72rem;color:var(--text2)">${subParts}</td>
+        </tr>
+      `;
+    }).join('');
+    
+    breakdownHtml = `
+      <div class="font-semi text-sm mb-2" style="color:var(--text)">แยกตามประเภทภาษี</div>
+      <table style="margin-bottom:14px">
+        <thead><tr>
+          <th>ประเภท</th>
+          <th style="text-align:right">จำนวน</th>
+          <th style="text-align:right">ยอดรวม</th>
+          <th>แยกตาม Prefix</th>
+        </tr></thead>
+        <tbody>${classRows}</tbody>
       </table>
     `;
   }
@@ -27756,15 +27941,38 @@ async function _monthlyShowPreviewModal(filename, kind, records, groups, onSaveS
     `;
   }).join('');
   
-  // Sample preview (first 5 rows)
-  const sampleRows = records.slice(0, 5).map(r => `
-    <tr>
-      <td style="font-family:var(--mono);font-size:.78rem">${r.date}</td>
-      <td><span class="badge badge-info">${r.station}</span></td>
-      <td style="font-family:var(--mono);font-size:.72rem;color:var(--text2)">${r.doc_sale_range || '-'}</td>
-      <td style="text-align:right;font-family:var(--mono)">${fmt(r.total)}</td>
-    </tr>
-  `).join('');
+  // Sample preview (first 5 rows) — dynamic per kind
+  let sampleRows;
+  let sampleHeader;
+  if (kind === 'front') {
+    sampleHeader = `<tr><th>วันที่</th><th>เครื่อง</th><th>เลขใบขาย</th><th style="text-align:right">รวม</th></tr>`;
+    sampleRows = records.slice(0, 5).map(r => `
+      <tr>
+        <td style="font-family:var(--mono);font-size:.78rem">${r.date}</td>
+        <td><span class="badge badge-info">${r.station || ''}</span></td>
+        <td style="font-family:var(--mono);font-size:.72rem;color:var(--text2)">${r.doc_sale_range || '-'}</td>
+        <td style="text-align:right;font-family:var(--mono)">${fmt(r.total)}</td>
+      </tr>
+    `).join('');
+  } else {
+    // Invoice: show first 5 sorted records (so user sees VAT first then NOVAT)
+    const sortedRecords = _monthlySortInvoiceRecords(records);
+    sampleHeader = `<tr><th>วันที่</th><th>เลขที่บิล</th><th>VAT</th><th>ลูกค้า</th><th style="text-align:right">รวม</th></tr>`;
+    sampleRows = sortedRecords.slice(0, 5).map(r => {
+      const cls = r.vat_class === 'VAT' ? 'badge-warn'
+               : r.vat_class === 'NOVAT' ? 'badge-purple' : 'badge-muted';
+      const cust = (r.customer || '').length > 30 ? (r.customer || '').substring(0, 30) + '…' : (r.customer || '');
+      return `
+        <tr>
+          <td style="font-family:var(--mono);font-size:.78rem">${r.date}</td>
+          <td style="font-family:var(--mono);font-size:.78rem">${r.bill_no || ''}</td>
+          <td><span class="badge ${cls}">${r.vat_class || ''}</span></td>
+          <td style="font-size:.78rem;color:var(--text2)">${cust}</td>
+          <td style="text-align:right;font-family:var(--mono)">${fmt(r.total)}</td>
+        </tr>
+      `;
+    }).join('');
+  }
   
   // Build modal body
   const bodyHtml = `
@@ -27793,7 +28001,7 @@ async function _monthlyShowPreviewModal(filename, kind, records, groups, onSaveS
         </div>
       </div>
       
-      ${stationBreakdownHtml ? `<div class="card-flat mb-3" style="padding:12px">${stationBreakdownHtml}</div>` : ''}
+      ${breakdownHtml ? `<div class="card-flat mb-3" style="padding:12px">${breakdownHtml}</div>` : ''}
       
       <!-- Period checks (overwrite warning) -->
       <div class="card-flat mb-3" style="padding:12px">
@@ -27807,7 +28015,7 @@ async function _monthlyShowPreviewModal(filename, kind, records, groups, onSaveS
       <div class="card-flat mb-3" style="padding:12px">
         <div class="font-semi text-sm mb-2" style="color:var(--text)">ตัวอย่างข้อมูล (5 แถวแรก)</div>
         <table>
-          <thead><tr><th>วันที่</th><th>เครื่อง</th><th>เลขใบขาย</th><th style="text-align:right">รวม</th></tr></thead>
+          <thead>${sampleHeader}</thead>
           <tbody>${sampleRows}</tbody>
         </table>
         ${records.length > 5 ? `<div class="text-xs text-muted mt-2">... และอีก ${records.length - 5} แถว</div>` : ''}
@@ -28129,14 +28337,31 @@ async function renderMonthly(el) {
           { k: 'total', label: 'รวม', num: true },
         ];
     
-    // Sort: by year, month, then date
-    const sorted = rows.slice().sort((a, b) => {
-      const ay = Number(a.year) || 0, by = Number(b.year) || 0;
-      if (ay !== by) return ay - by;
-      const am = Number(a.month) || 0, bm = Number(b.month) || 0;
-      if (am !== bm) return am - bm;
-      return String(a.date || '').localeCompare(String(b.date || ''));
-    });
+    // Sort:
+    //   - Front:   year → month → date (chronological)
+    //   - Invoice: VAT class → prefix order (SR>SS>SC, OR>OS>JR>JS) → suffix → date
+    let sorted;
+    if (isFront) {
+      sorted = rows.slice().sort((a, b) => {
+        const ay = Number(a.year) || 0, by = Number(b.year) || 0;
+        if (ay !== by) return ay - by;
+        const am = Number(a.month) || 0, bm = Number(b.month) || 0;
+        if (am !== bm) return am - bm;
+        return String(a.date || '').localeCompare(String(b.date || ''));
+      });
+    } else {
+      // Invoice: group by year/month first, then by VAT/prefix/suffix within each month
+      const grouped = {};
+      rows.forEach(r => {
+        const k = `${r.year}-${String(r.month).padStart(2,'0')}`;
+        if (!grouped[k]) grouped[k] = [];
+        grouped[k].push(r);
+      });
+      sorted = [];
+      Object.keys(grouped).sort().forEach(k => {
+        sorted = sorted.concat(_monthlySortInvoiceRecords(grouped[k]));
+      });
+    }
     
     // Limit display to first 200 rows for preview (Step 4/5 จะทำ pagination/grouping)
     const MAX_PREVIEW = 200;
