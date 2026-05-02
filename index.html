@@ -28496,101 +28496,156 @@ function _monthlyExportPDF(rows, kind, year, months, filter) {
   body {
     font-family: 'Sarabun', 'Tahoma', sans-serif;
     margin: 0;
-    color: #222;
-    font-size: 11px;
-    line-height: 1.4;
+    color: #000;
+    font-size: 12px;
+    line-height: 1.45;
   }
   .header {
-    border-bottom: 3px solid #333;
-    padding-bottom: 8px;
-    margin-bottom: 12px;
+    border-bottom: 3px solid #222;
+    padding-bottom: 10px;
+    margin-bottom: 14px;
   }
   .header h1 {
-    margin: 0 0 4px 0;
-    font-size: 18px;
-    color: #111;
+    margin: 0 0 6px 0;
+    font-size: 20px;
+    color: #000;
+    font-weight: 700;
   }
   .header .meta {
-    font-size: 10px;
-    color: #666;
+    font-size: 11.5px;
+    color: #444;
     display: flex;
     justify-content: space-between;
     flex-wrap: wrap;
-    gap: 10px;
+    gap: 12px;
   }
+  .header .meta b { color: #000; }
   .filter-info {
-    font-size: 10px;
+    font-size: 11px;
     color: #b35;
-    margin-top: 4px;
+    margin-top: 5px;
+    font-weight: 600;
   }
   .grand-total {
-    background: #f4f4f8;
-    border: 2px solid #333;
-    padding: 10px 14px;
-    margin-bottom: 14px;
+    background: #f0f0f8;
+    border: 2.5px solid #222;
+    padding: 14px 18px;
+    margin-bottom: 16px;
     display: flex;
     justify-content: space-between;
     align-items: center;
     flex-wrap: wrap;
     gap: 10px;
   }
-  .grand-total .gt-label { font-size: 11px; color: #555; }
-  .grand-total .gt-amount { font-size: 18px; font-weight: 700; color: #000; }
-  .grand-total .gt-detail { font-size: 10px; color: #444; text-align: right; }
+  .grand-total .gt-label {
+    font-size: 12px;
+    color: #444;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    font-weight: 600;
+  }
+  .grand-total .gt-amount {
+    font-size: 26px;
+    font-weight: 800;
+    color: #000;
+    font-variant-numeric: tabular-nums;
+    margin-top: 2px;
+  }
+  .grand-total .gt-detail {
+    font-size: 12px;
+    color: #222;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.7;
+  }
+  .grand-total .gt-detail b {
+    color: #000;
+    font-weight: 700;
+    margin-left: 6px;
+  }
   .section {
-    margin-bottom: 14px;
+    margin-bottom: 16px;
     page-break-inside: avoid;
   }
   .section-header {
     background: #2a2a3a;
     color: #fff;
-    padding: 7px 12px;
-    font-weight: 600;
-    font-size: 12px;
+    padding: 9px 14px;
+    font-weight: 700;
+    font-size: 13px;
     border-radius: 0;
+    letter-spacing: 0.3px;
   }
   .section-header.class-vat { background: #b8860b; }
   .section-header.class-novat { background: #6a5acd; }
-  .sub-section { margin-top: 6px; }
+  .sub-section { margin-top: 8px; }
   .sub-section-header {
-    background: #ddd;
-    padding: 5px 10px;
-    font-weight: 600;
-    font-size: 11px;
-    border-left: 4px solid #666;
+    background: #d8d8d8;
+    padding: 7px 12px;
+    font-weight: 700;
+    font-size: 12px;
+    color: #000;
+    border-left: 4px solid #555;
   }
   table {
     width: 100%;
     border-collapse: collapse;
     margin-top: 0;
+    font-variant-numeric: tabular-nums;
   }
   th {
-    background: #f0f0f0;
-    border: 1px solid #999;
-    padding: 4px 6px;
+    background: #e8e8e8;
+    border: 1px solid #888;
+    padding: 7px 8px;
     text-align: left;
-    font-size: 10px;
-    font-weight: 600;
+    font-size: 11.5px;
+    font-weight: 700;
+    color: #000;
   }
   td {
-    border: 1px solid #ccc;
-    padding: 3px 6px;
-    font-size: 10px;
-    vertical-align: top;
+    border: 1px solid #b8b8b8;
+    padding: 5px 8px;
+    font-size: 11px;
+    color: #000;
+    vertical-align: middle;
   }
-  td.num, th.num { text-align: right; font-family: 'Courier New', monospace; }
-  td.small { font-size: 9px; }
+  td.num, th.num {
+    text-align: right;
+    font-family: 'Consolas', 'Courier New', monospace;
+    font-weight: 600;
+    font-size: 11.5px;
+    letter-spacing: -0.2px;
+    padding-right: 10px;
+  }
+  th.num { font-weight: 700; }
+  td.small {
+    font-size: 10.5px;
+    color: #222;
+  }
+  /* Sub-total row — extra prominence */
   tr.subtotal td {
-    background: #eee;
+    background: #e6e6f0;
     font-weight: 700;
-    border-top: 2px solid #333;
+    font-size: 12px;
+    color: #000;
+    border-top: 2.5px solid #222;
+    border-bottom: 1.5px solid #222;
+    padding: 7px 8px;
+  }
+  tr.subtotal td.num {
+    font-size: 12.5px;
+    font-weight: 800;
+  }
+  /* Zebra rows for readability */
+  tbody tr:nth-child(even):not(.subtotal) td {
+    background: #fafafa;
   }
   .footer {
     margin-top: 20px;
     border-top: 1px solid #999;
     padding-top: 8px;
-    font-size: 9px;
-    color: #888;
+    font-size: 9.5px;
+    color: #777;
     text-align: center;
   }
   @media print {
