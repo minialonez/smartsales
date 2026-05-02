@@ -2208,6 +2208,9 @@ const syncManager = {
     if (saved === '0' || saved === 'false') this.enabled = false;
     const lp = Number(localStorage.getItem('sf_sync_last_pull') || 0);
     if (lp) this.lastPullAt = lp;
+    // ⭐ Restore lastPushAt (was: missing — reload showed "never" even after successful push)
+    const lpush = Number(localStorage.getItem('sf_sync_last_push') || 0);
+    if (lpush) this.lastPushAt = lpush;
     // Restore deletedUuids from localStorage
     try {
       const dBills = JSON.parse(localStorage.getItem('sf_deleted_bill_uuids') || '[]');
@@ -2506,14 +2509,28 @@ const syncManager = {
               // ⚠️ ลบไม่ครบ — keep uuids ที่ยัง track ไว้ → retry next push
               // (อาจเกิดจาก uuid mismatch ระหว่าง local กับ cloud, race condition, partial backend fail)
               console.warn(`[sync] Bills delete partial: ${totalDeleted}/${delUuids.length} → keep tracked uuids for retry`);
-              // schedule push อีก 10s ลอง delete ที่ค้าง
-              setTimeout(() => {
-                if (this.deletedBillUuids.size > 0) {
-                  this.dirty.add('bills');
-                  this._schedulePush();
-                }
-              }, 10000);
+              
+              // ⭐ Retry counter — กัน infinite loop (e.g., uuid ที่ลบ manual แล้ว backend คืน deleted=0)
+              //    เก่า: setTimeout retry forever → waste quota
+              //    ใหม่: track attempts, give up หลัง 3 ครั้ง → clear orphan uuids
+              this._billDeleteRetries = (this._billDeleteRetries || 0) + 1;
+              if (this._billDeleteRetries >= 3) {
+                console.error(`[sync] Bills delete: gave up after 3 retries — clearing ${delUuids.length} orphan uuids`);
+                this.deletedBillUuids.clear();
+                try { localStorage.removeItem('sf_deleted_bill_uuids'); } catch(_){}
+                this._billDeleteRetries = 0;
+              } else {
+                // schedule push อีก 10s ลอง delete ที่ค้าง
+                setTimeout(() => {
+                  if (this.deletedBillUuids.size > 0) {
+                    this.dirty.add('bills');
+                    this._schedulePush();
+                  }
+                }, 10000);
+              }
             }
+            // Reset retry counter on success
+            if (totalDeleted >= delUuids.length) this._billDeleteRetries = 0;
           }
           this._fpCache.bills = fp;
           // ⭐ เคลียร์ dirty uuids ของ bills หลัง push สำเร็จ
@@ -2600,14 +2617,25 @@ const syncManager = {
               this.deletedStmtUuids.clear();
               try { localStorage.removeItem('sf_deleted_stmt_uuids'); } catch(_){}
               console.log(`[sync] Deleted ${totalDeletedStmts}/${delStmtUuids.length} stmts from cloud ✓`);
+              this._stmtDeleteRetries = 0;
             } else {
               console.warn(`[sync] Stmts delete partial: ${totalDeletedStmts}/${delStmtUuids.length} → keep tracked uuids for retry`);
-              setTimeout(() => {
-                if (this.deletedStmtUuids.size > 0) {
-                  this.dirty.add('stmts');
-                  this._schedulePush();
-                }
-              }, 10000);
+              
+              // ⭐ Retry counter — กัน infinite loop (orphan uuids ที่ลบ manual แล้ว)
+              this._stmtDeleteRetries = (this._stmtDeleteRetries || 0) + 1;
+              if (this._stmtDeleteRetries >= 3) {
+                console.error(`[sync] Stmts delete: gave up after 3 retries — clearing ${delStmtUuids.length} orphan uuids`);
+                this.deletedStmtUuids.clear();
+                try { localStorage.removeItem('sf_deleted_stmt_uuids'); } catch(_){}
+                this._stmtDeleteRetries = 0;
+              } else {
+                setTimeout(() => {
+                  if (this.deletedStmtUuids.size > 0) {
+                    this.dirty.add('stmts');
+                    this._schedulePush();
+                  }
+                }, 10000);
+              }
             }
           }
           this._fpCache.stmts = fp;
@@ -2855,6 +2883,8 @@ const syncManager = {
     if (results.skipped > 0) console.log(`[sync] skipped ${results.skipped} unchanged types`);
     
     this.lastPushAt = Date.now();
+    // ⭐ Persist to localStorage (was: missing — reload showed "never")
+    try { localStorage.setItem('sf_sync_last_push', String(this.lastPushAt)); } catch(_){}
     this.stats.pushed += results.ok;
     this.stats.errors += results.fail;
     this.status = results.fail ? 'error' : 'idle';
@@ -2864,6 +2894,7 @@ const syncManager = {
       // ⭐ Uncaught error — log + reset status (ห้าม status='pushing' ค้าง)
       console.error('[sync] _flushPush uncaught error:', outerErr);
       this.lastPushAt = Date.now();
+      try { localStorage.setItem('sf_sync_last_push', String(this.lastPushAt)); } catch(_){}
       this.status = 'error';
       this.lastError = outerErr?.message || String(outerErr);
       this._emit();
@@ -2872,6 +2903,7 @@ const syncManager = {
       if (this.status === 'pushing') {
         this.status = 'idle';
         this.lastPushAt = Date.now();
+        try { localStorage.setItem('sf_sync_last_push', String(this.lastPushAt)); } catch(_){}
         this._emit();
       }
     }
