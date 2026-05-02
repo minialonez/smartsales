@@ -7672,6 +7672,7 @@ async function renderMain(el) {
       
       // Unmatch bills
       let billCount = 0;
+      const unmatchedBillUuids = [];
       billsToUnmatch.forEach(b => {
         b.match_status = 'pending';
         b.confirmation = '';
@@ -7679,11 +7680,13 @@ async function renderMain(el) {
         b.matched_stmt_ref = '';
         b.matched_stmt_uuid = '';
         b.matched_at = '';
+        if (b.bill_uuid) unmatchedBillUuids.push(b.bill_uuid);
         billCount++;
       });
       
       // Unmatch statements
       let stmtCount = 0;
+      const unmatchedStmtUuids = [];
       stmtsToUnmatch.forEach(s => {
         // ⚡ ถ้า stmt ผูกกับ SP-TEMP partial → clear stmt_ref ใน spTempList ด้วย
         const stmtRef = s.ref_no;
@@ -7713,16 +7716,26 @@ async function renderMain(el) {
         s.match_method = '';
         s.match_reason = '';
         s.overpay_amount = '';
+        if (s.stmt_uuid) unmatchedStmtUuids.push(s.stmt_uuid);
         stmtCount++;
       });
       
       try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(_){}
       persistMainState();
       
-      // Mark dirty
+      // ⭐ Mark dirty per-uuid (was: type-only, broke selective push)
+      //    เก่า: markDirty('bills') / markDirty('stmts') — ไม่ใส่ uuid
+      //    → dirtyUuids.bills/stmts ว่าง → ถ้ามี uuid อื่นใน dirtyUuids
+      //    → selective push filter เฉพาะ uuid นั้น → unmatch records หายไป
+      //    ใหม่: markDirty(type, uuid) per record → ครอบคลุมแน่นอน
       if (window.syncManager?.markDirty) {
-        if (billCount > 0) window.syncManager.markDirty('bills');
-        if (stmtCount > 0) window.syncManager.markDirty('stmts');
+        unmatchedBillUuids.forEach(u => window.syncManager.markDirty('bills', u));
+        unmatchedStmtUuids.forEach(u => window.syncManager.markDirty('stmts', u));
+        // Reset fingerprint cache to ensure push detects changes
+        if (window.syncManager._fpCache) {
+          window.syncManager._fpCache.bills = null;
+          window.syncManager._fpCache.stmts = null;
+        }
       }
       
       toast(`↩ Unmatch ${dateStr} — บิล ${billCount} · Stmt ${stmtCount}`, 'success', 5000);
@@ -10495,7 +10508,11 @@ function wireSpTempV2Events(container, renderFn) {
           stmt.matched_bills = remainingKeys;
           stmt.match_bill = remainingKeys[0];
         }
-        if (window.syncManager) syncManager.markDirty('stmts');
+        // ⭐ markDirty per-uuid (was: markDirty('stmts') ขาด uuid → selective push miss)
+        if (window.syncManager?.markDirty && stmt.stmt_uuid) {
+          syncManager.markDirty('stmts', stmt.stmt_uuid);
+          if (syncManager._fpCache) syncManager._fpCache.stmts = null;
+        }
       }
       
       if (t) {
@@ -10539,7 +10556,11 @@ function wireSpTempV2Events(container, renderFn) {
           stmt.match_station = '';
           stmt.match_bill = '';
           stmt.matched_bills = [];
-          if (window.syncManager) syncManager.markDirty('stmts');
+          // ⭐ markDirty per-uuid (was: markDirty('stmts') ขาด uuid → selective push miss)
+          if (window.syncManager?.markDirty && stmt.stmt_uuid) {
+            syncManager.markDirty('stmts', stmt.stmt_uuid);
+            if (syncManager._fpCache) syncManager._fpCache.stmts = null;
+          }
         }
       }
       // Remove from t.partials
@@ -11153,7 +11174,11 @@ function openSpTempPartialEditModal(no, partialUuid, onChange) {
         stmt.match_station = '';
         stmt.match_bill = '';
         stmt.matched_bills = [];
-        if (window.syncManager) syncManager.markDirty('stmts');
+        // ⭐ markDirty per-uuid (was: ขาด uuid → selective push miss)
+        if (window.syncManager?.markDirty && stmt.stmt_uuid) {
+          syncManager.markDirty('stmts', stmt.stmt_uuid);
+          if (syncManager._fpCache) syncManager._fpCache.stmts = null;
+        }
       }
     }
     pr.matched_stmt_uuid = '';
@@ -11201,7 +11226,11 @@ function openSpTempPartialEditModal(no, partialUuid, onChange) {
         stmt.match_station = '';
         stmt.match_bill = '';
         stmt.matched_bills = [];
-        if (window.syncManager) syncManager.markDirty('stmts');
+        // ⭐ markDirty per-uuid (was: ขาด uuid → selective push miss)
+        if (window.syncManager?.markDirty && stmt.stmt_uuid) {
+          syncManager.markDirty('stmts', stmt.stmt_uuid);
+          if (syncManager._fpCache) syncManager._fpCache.stmts = null;
+        }
       }
     }
     t.partials = (t.partials||[]).filter(p => (p.partial_uuid||'') !== partialUuid);
@@ -11430,7 +11459,11 @@ function openSpTempPartialMatchModal(no, partialUuid, onChange) {
     t.updated_at = new Date().toISOString();
     recomputeSpTempStatus(t);
     markDirtySpTemps();
-    if (window.syncManager) syncManager.markDirty('stmts');
+    // ⭐ markDirty per-uuid (was: ขาด uuid → selective push miss)
+    if (window.syncManager?.markDirty && stmt.stmt_uuid) {
+      syncManager.markDirty('stmts', stmt.stmt_uuid);
+      if (syncManager._fpCache) syncManager._fpCache.stmts = null;
+    }
     closeModal();
     toast(`✓ ผูก ${matchedKeys.length} partial → ${stmt.bank} ${fmtDate(stmt.date)} ฿${fmtNum(stmtAmt)}`, 'success');
     if (onChange) onChange();
@@ -21011,6 +21044,8 @@ async function renderMatching(el) {
         };
         
         let unmatchedBills = 0, stmtsCleared = 0;
+        const dirtyBillUuids = [];
+        const dirtyStmtUuids = [];
         
         // 1. Unmatch bills
         billList.forEach(b => {
@@ -21025,6 +21060,7 @@ async function renderMatching(el) {
           b.matched_stmt_ref = '';
           b.matched_stmt_uuid = '';
           b.matched_at = '';
+          if (b.bill_uuid) dirtyBillUuids.push(b.bill_uuid);
           unmatchedBills++;
         });
         
@@ -21043,6 +21079,7 @@ async function renderMatching(el) {
             s.match_method = '';
             s.match_reason = '';
             s.overpay_amount = '';
+            if (s.stmt_uuid) dirtyStmtUuids.push(s.stmt_uuid);
             stmtsCleared++;
           });
         });
@@ -21050,6 +21087,18 @@ async function renderMatching(el) {
         uploadedStatements = getAllStatements();
         try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(e) {}
         persistMainState();
+        
+        // ⭐ markDirty per-uuid — CRITICAL FIX
+        //    เก่า: ไม่มี markDirty เลย → unmatch ทั้งหมดเป็น silent (lost on push)
+        //    ใหม่: per-uuid → selective push ทำงานครบ
+        if (window.syncManager?.markDirty) {
+          dirtyBillUuids.forEach(u => window.syncManager.markDirty('bills', u));
+          dirtyStmtUuids.forEach(u => window.syncManager.markDirty('stmts', u));
+          if (window.syncManager._fpCache) {
+            window.syncManager._fpCache.bills = null;
+            window.syncManager._fpCache.stmts = null;
+          }
+        }
         
         const rangeMsg = useRange ? ` ช่วง ${fmtDate(dateFrom)} → ${fmtDate(dateTo)}` : ' ทั้งหมด';
         toast(`↩ Unmatch${rangeMsg} — บิล: ${unmatchedBills} · Stmt: ${stmtsCleared}`, 'success', 6000);
