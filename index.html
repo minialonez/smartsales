@@ -29486,8 +29486,8 @@ const PC_STATIONS = ['FRONT1','FRONT2','FRONT3','FRONT4'];
 // Brand resolution rules (ลำดับสำคัญ — ตรวจ override ก่อน):
 //
 // 1) Override rules (sub_type + brand_code คู่กัน):
-//    - {BLED|DLED|STRP|LWAL|LPAO|LPAN|LCEI|LTOP|LYRD}-ZBG  → "For You"
-//    - FANX-MIT                                             → "Mitsubishi"
+//    - {ทุก sub-type ใน A06 Light + A07 Lamp}-ZBG  → "For You"  (23 sub-types)
+//    - FANX-MIT                                     → "Mitsubishi"
 //
 // 2) Generic brand_code lookup:
 //    - PHL → PHILIPS
@@ -29505,12 +29505,17 @@ const PC_BRAND_CODE_MAP = {
 };
 
 // For You override — sub-types ที่ขายโดย ZBG แต่นับเป็น "For You" brand
-//   LED group:  BLED (bulb), DLED (downlight), STRP (strip)
-//   Lamp group: LWAL (wall), LPAO (salapao), LPAN (pan),
-//               LCEI (ceiling), LTOP (post top), LYRD (yard)
+//   = ทั้งหมดของ A06 Light (9 ตัว) + A07 Lamp (14 ตัว) = 23 sub-types
+//
+// A06 Light:  ICDC, BCFL, BLED, TFLX, TLED, HGVL, SPHA, SPLE, STRP
+// A07 Lamp:   LWAL, LPAO, LPAN, LCEI, LTOP, LYRD, CHAN, LTAB,
+//             RTUB, STUB, DE27, DLED, MRHA, MRED
 const PC_FORYOU_SUBTYPES = [
-  'BLED', 'DLED', 'STRP',
+  // A06 Light (9)
+  'ICDC', 'BCFL', 'BLED', 'TFLX', 'TLED', 'HGVL', 'SPHA', 'SPLE', 'STRP',
+  // A07 Lamp (14)
   'LWAL', 'LPAO', 'LPAN', 'LCEI', 'LTOP', 'LYRD',
+  'CHAN', 'LTAB', 'RTUB', 'STUB', 'DE27', 'DLED', 'MRHA', 'MRED',
 ];
 const PC_MITSUBISHI_SUBTYPES = ['FANX'];               // MIT → Mitsubishi override (only FANX)
 
