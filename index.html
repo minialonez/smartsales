@@ -30497,6 +30497,9 @@ async function renderPcSales(el) {
         </div>
       </div>
       
+      <!-- Combined summary card (Front + Invoice รวมกัน) — populated by loadAndRender -->
+      <div id="pc-combined-summary" class="mb-3"></div>
+      
       <!-- Source tabs: Front | Invoice -->
       <div class="card-flat mb-2" style="padding:6px;display:inline-flex;gap:4px;border-radius:10px;background:var(--surface2)">
         ${[
@@ -30858,6 +30861,9 @@ async function renderPcSales(el) {
         console.log('[PC] Sample row:', rows[0]);
       }
       
+      // Render combined summary card (Front + Invoice รวมกัน — applies to ALL rows, not filtered)
+      _renderCombinedSummary(rows);
+      
       // Source filter (front | invoice) — primary tab
       filtered = filtered.filter(r => (r.source || 'front') === state.source);
       
@@ -30922,6 +30928,95 @@ async function renderPcSales(el) {
         ❌ Error: ${err.message || err}
       </div>`;
     }
+  }
+  
+  // ────────────────────────────────────────────────────────────────
+  // Combined summary card — Front + Invoice รวมกัน
+  // แสดงเฉพาะ status ที่ user filter (pending/submitted/excluded/all)
+  // และ year/months ที่เลือก — แต่ไม่ filter ตาม source/station/brand
+  // (เพื่อให้ user เห็นภาพรวมทั้ง 2 sources)
+  // ────────────────────────────────────────────────────────────────
+  function _renderCombinedSummary(allRows) {
+    const root = document.getElementById('pc-combined-summary');
+    if (!root) return;
+    
+    if (!allRows || allRows.length === 0) {
+      root.innerHTML = '';
+      return;
+    }
+    
+    const fmt = (n) => Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const fmtInt = (n) => Number(n || 0).toLocaleString('en-US', { maximumFractionDigits: 0 });
+    
+    // Split by source
+    const frontRows = allRows.filter(r => (r.source || 'front') === 'front');
+    const invoiceRows = allRows.filter(r => r.source === 'invoice');
+    
+    const sumOf = (rows) => rows.reduce((s, r) => s + (Number(r.total) || 0), 0);
+    const frontTotal = sumOf(frontRows);
+    const invoiceTotal = sumOf(invoiceRows);
+    const grandTotal = frontTotal + invoiceTotal;
+    const grandCount = allRows.length;
+    
+    // Brand totals across both sources
+    const brandTotals = {};
+    allRows.forEach(r => {
+      const b = r.brand || '?';
+      if (!brandTotals[b]) brandTotals[b] = { count: 0, total: 0 };
+      brandTotals[b].count++;
+      brandTotals[b].total += Number(r.total) || 0;
+    });
+    
+    const brandPillsHtml = PC_BRANDS.map(b => {
+      const t = brandTotals[b.id] || { count: 0, total: 0 };
+      if (t.count === 0) {
+        return `
+          <div style="padding:8px 12px;border-radius:8px;border:1px dashed var(--border);background:transparent;opacity:.4">
+            <div style="font-size:.65rem;color:var(--text-muted);font-weight:600">${b.label}</div>
+            <div style="font-size:.85rem;color:var(--text-muted);font-variant-numeric:tabular-nums">฿0.00</div>
+          </div>
+        `;
+      }
+      return `
+        <div style="padding:8px 12px;border-radius:8px;border:1px solid ${b.color};border-left:3px solid ${b.color};background:${b.color}0d">
+          <div style="font-size:.65rem;color:${b.color};font-weight:700;letter-spacing:.3px">${b.label}</div>
+          <div style="font-size:.95rem;color:var(--text);font-weight:700;font-variant-numeric:tabular-nums;margin-top:1px">฿${fmt(t.total)}</div>
+          <div style="font-size:.65rem;color:var(--text-muted)">${fmtInt(t.count)} รายการ</div>
+        </div>
+      `;
+    }).join('');
+    
+    root.innerHTML = `
+      <div class="card-flat" style="padding:18px 20px;background:linear-gradient(135deg, rgba(91,124,250,.08) 0%, rgba(245,158,66,.08) 100%);border:2px solid var(--primary);border-left:5px solid var(--primary)">
+        <div class="flex items-center" style="justify-content:space-between;flex-wrap:wrap;gap:14px;margin-bottom:14px">
+          <div>
+            <div style="font-size:.7rem;color:var(--text2);text-transform:uppercase;letter-spacing:1.2px;margin-bottom:4px">💰 ยอดรวม PC ทั้งหมด (Front + Invoice)</div>
+            <div style="font-size:1.7rem;font-weight:800;color:var(--text);font-variant-numeric:tabular-nums;line-height:1.1">฿${fmt(grandTotal)}</div>
+            <div style="font-size:.78rem;color:var(--text-muted);margin-top:3px">${fmtInt(grandCount)} รายการ รวม</div>
+          </div>
+          
+          <!-- Source breakdown -->
+          <div class="flex" style="gap:14px;flex-wrap:wrap">
+            <div style="padding:10px 14px;border-radius:10px;border:1px solid var(--primary);border-left:4px solid var(--primary);background:rgba(91,124,250,.06);min-width:160px">
+              <div style="font-size:.7rem;color:var(--primary);font-weight:700;text-transform:uppercase;letter-spacing:.5px">📦 Front</div>
+              <div style="font-size:1.15rem;font-weight:700;color:var(--text);font-variant-numeric:tabular-nums;margin-top:2px">฿${fmt(frontTotal)}</div>
+              <div style="font-size:.7rem;color:var(--text-muted)">${fmtInt(frontRows.length)} รายการ</div>
+            </div>
+            <div style="padding:10px 14px;border-radius:10px;border:1px solid var(--warn);border-left:4px solid var(--warn);background:rgba(245,158,66,.06);min-width:160px">
+              <div style="font-size:.7rem;color:var(--warn);font-weight:700;text-transform:uppercase;letter-spacing:.5px">🧾 Invoice</div>
+              <div style="font-size:1.15rem;font-weight:700;color:var(--text);font-variant-numeric:tabular-nums;margin-top:2px">฿${fmt(invoiceTotal)}</div>
+              <div style="font-size:.7rem;color:var(--text-muted)">${fmtInt(invoiceRows.length)} รายการ</div>
+            </div>
+          </div>
+        </div>
+        
+        <!-- Brand breakdown across both sources -->
+        <div style="border-top:1px solid var(--border);padding-top:12px">
+          <div style="font-size:.7rem;color:var(--text-muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px">แบ่งตามแบรนด์ (รวม Front + Invoice)</div>
+          <div class="flex" style="gap:8px;flex-wrap:wrap">${brandPillsHtml}</div>
+        </div>
+      </div>
+    `;
   }
   
   function _renderPcPreviewTable(root, rows) {
