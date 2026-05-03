@@ -30194,14 +30194,37 @@ async function renderPcSales(el) {
         </div>
       </div>
       
-      <!-- Filter row 2: Station + Brand + Status -->
+      <!-- Filter row 2: Station + Brand + Status (Monthly-style states) -->
+      <!-- States: active (solid) / dimmed (other selected) / default (outlined) -->
       <div class="card-flat mb-3" style="padding:12px">
         <div class="flex items-center" style="gap:14px;flex-wrap:wrap">
           <!-- Station filter -->
           <div class="flex items-center" style="gap:6px;flex-wrap:wrap">
             <span style="font-size:.78rem;color:var(--text2);margin-right:4px">สถานี:</span>
-            <button class="pill ${state.station==='all'?'active':''}" data-station="all" style="padding:4px 10px;font-size:.74rem">ทั้งหมด</button>
-            ${PC_STATIONS.map(s => `<button class="pill ${state.station===s?'active':''}" data-station="${s}" style="padding:4px 10px;font-size:.74rem">${s}</button>`).join('')}
+            ${(() => {
+              const isAllActive = state.station === 'all';
+              const allBtnStyle = isAllActive
+                ? 'background:var(--primary);border:1px solid var(--primary);color:#fff'
+                : 'background:transparent;border:1px solid var(--border);color:var(--text2)';
+              return `<button data-station="all" style="${allBtnStyle};padding:4px 10px;font-size:.74rem;border-radius:20px;cursor:pointer;font-weight:${isAllActive?600:500};transition:all .2s">ทั้งหมด</button>`;
+            })()}
+            ${PC_STATIONS.map(s => {
+              const isMe = state.station === s;
+              const isAll = state.station === 'all';
+              // Color per station (same scheme used in section header)
+              const stnColorMap = { 'FRONT1': 'var(--primary)', 'FRONT2': 'var(--success)', 'FRONT3': 'var(--warn)', 'FRONT4': 'var(--purple)' };
+              const stnColor = stnColorMap[s] || 'var(--primary)';
+              let style;
+              if (isMe) {
+                style = `background:${stnColor};border:1px solid ${stnColor};color:#fff;font-weight:600`;
+              } else if (isAll) {
+                style = `background:transparent;border:1px solid ${stnColor};color:${stnColor};font-weight:500`;
+              } else {
+                // Other station selected → dim this one
+                style = `background:transparent;border:1px dashed var(--border);color:var(--text-muted);opacity:.5;font-weight:500`;
+              }
+              return `<button data-station="${s}" style="${style};padding:4px 10px;font-size:.74rem;border-radius:20px;cursor:pointer;transition:all .2s">${s}</button>`;
+            }).join('')}
           </div>
           
           <span style="color:var(--text-muted)">|</span>
@@ -30209,13 +30232,26 @@ async function renderPcSales(el) {
           <!-- Brand filter -->
           <div class="flex items-center" style="gap:6px;flex-wrap:wrap">
             <span style="font-size:.78rem;color:var(--text2);margin-right:4px">แบรนด์:</span>
-            <button class="pill ${state.brand==='all'?'active':''}" data-brand="all" style="padding:4px 10px;font-size:.74rem">ทั้งหมด</button>
+            ${(() => {
+              const isAllActive = state.brand === 'all';
+              const allBtnStyle = isAllActive
+                ? 'background:var(--primary);border:1px solid var(--primary);color:#fff'
+                : 'background:transparent;border:1px solid var(--border);color:var(--text2)';
+              return `<button data-brand="all" style="${allBtnStyle};padding:4px 10px;font-size:.74rem;border-radius:20px;cursor:pointer;font-weight:${isAllActive?600:500};transition:all .2s">ทั้งหมด</button>`;
+            })()}
             ${PC_BRANDS.map(b => {
-              const active = state.brand === b.id;
-              const style = active 
-                ? `background:${b.color};border:1px solid ${b.color};color:#fff;padding:4px 10px;font-size:.74rem;border-radius:20px;cursor:pointer;font-weight:600`
-                : `background:transparent;border:1px solid ${b.color};color:${b.color};padding:4px 10px;font-size:.74rem;border-radius:20px;cursor:pointer;font-weight:500`;
-              return `<button data-brand="${b.id}" style="${style}">${b.label}</button>`;
+              const isMe = state.brand === b.id;
+              const isAll = state.brand === 'all';
+              let style;
+              if (isMe) {
+                style = `background:${b.color};border:1px solid ${b.color};color:#fff;font-weight:600`;
+              } else if (isAll) {
+                style = `background:transparent;border:1px solid ${b.color};color:${b.color};font-weight:500`;
+              } else {
+                // Other brand selected → dim
+                style = `background:transparent;border:1px dashed var(--border);color:var(--text-muted);opacity:.5;font-weight:500`;
+              }
+              return `<button data-brand="${b.id}" style="${style};padding:4px 10px;font-size:.74rem;border-radius:20px;cursor:pointer;transition:all .2s">${b.label}</button>`;
             }).join('')}
           </div>
           
@@ -30224,13 +30260,25 @@ async function renderPcSales(el) {
           <!-- Status filter -->
           <div class="flex items-center" style="gap:6px;flex-wrap:wrap">
             <span style="font-size:.78rem;color:var(--text2);margin-right:4px">สถานะ:</span>
-            <button class="pill ${state.status==='all'?'active':''}" data-status="all" style="padding:4px 10px;font-size:.74rem">ทั้งหมด</button>
+            ${(() => {
+              const isAllActive = state.status === 'all';
+              const allBtnStyle = isAllActive
+                ? 'background:var(--primary);border:1px solid var(--primary);color:#fff'
+                : 'background:transparent;border:1px solid var(--border);color:var(--text2)';
+              return `<button data-status="all" style="${allBtnStyle};padding:4px 10px;font-size:.74rem;border-radius:20px;cursor:pointer;font-weight:${isAllActive?600:500};transition:all .2s">ทั้งหมด</button>`;
+            })()}
             ${PC_STATUSES.map(s => {
-              const active = state.status === s.id;
-              const style = active
-                ? `background:${s.color};border:1px solid ${s.color};color:#fff;padding:4px 10px;font-size:.74rem;border-radius:20px;cursor:pointer;font-weight:600`
-                : `background:transparent;border:1px solid ${s.color};color:${s.color};padding:4px 10px;font-size:.74rem;border-radius:20px;cursor:pointer;font-weight:500`;
-              return `<button data-status="${s.id}" style="${style}">${s.label}</button>`;
+              const isMe = state.status === s.id;
+              const isAll = state.status === 'all';
+              let style;
+              if (isMe) {
+                style = `background:${s.color};border:1px solid ${s.color};color:#fff;font-weight:600`;
+              } else if (isAll) {
+                style = `background:transparent;border:1px solid ${s.color};color:${s.color};font-weight:500`;
+              } else {
+                style = `background:transparent;border:1px dashed var(--border);color:var(--text-muted);opacity:.5;font-weight:500`;
+              }
+              return `<button data-status="${s.id}" style="${style};padding:4px 10px;font-size:.74rem;border-radius:20px;cursor:pointer;transition:all .2s">${s.label}</button>`;
             }).join('')}
           </div>
         </div>
