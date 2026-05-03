@@ -29673,8 +29673,18 @@ function _pcParseFrontRaw(rows) {
       continue;
     }
     
-    // Skip cash settlement footer
-    if (aStr.indexOf('_x000D_') >= 0 || aStr.startsWith('เงินสด') || aStr.indexOf('มูลค่าสินค้า') >= 0) {
+    // Skip cash settlement footer (รองรับทั้ง .xls และ .xlsm format)
+    //   .xlsm:  '_x000D_เงินสด...'      (Apps Script escape)
+    //   .xls:   '\rเงินสด...'            (raw carriage return)
+    //   อื่นๆ:  'บัตรเครดิต...', 'มูลค่าสินค้า...', 'ยอดปัดเศษ...'
+    // Strategy: ถอด \r และ _x000D_ ออก แล้วเช็ค prefix
+    const aClean = aStr.replace(/_x000D_/g, '').replace(/[\r\n]/g, '').trim();
+    if (aClean.startsWith('เงินสด') ||
+        aClean.startsWith('บัตรเครดิต') ||
+        aClean.startsWith('เงินโอน') ||
+        aClean.startsWith('มูลค่าสินค้า') ||
+        aClean.startsWith('ยอดปัดเศษ') ||
+        aClean.indexOf('ภาษี') === 0) {
       continue;
     }
     
@@ -29768,11 +29778,19 @@ function _pcOpenUpload(onSaveSuccess) {
       toast('📖 กำลังอ่านไฟล์...', 'info');
       const parsed = await parseExcelFile(file);
       
-      // Find Front Raw sheet (case-insensitive, fuzzy match)
-      const frontSheetName = parsed.sheetNames.find(n => {
+      // Find Front Raw sheet
+      //   .xlsm: sheet ชื่อ "Front Raw" (case-insensitive, fuzzy)
+      //   .xls:  มักมี sheet เดียวชื่อ "Sheet1" — ใช้ sheet แรกเลย
+      let frontSheetName = parsed.sheetNames.find(n => {
         const lc = String(n).toLowerCase().trim();
         return lc === 'front raw' || lc === 'frontraw' || lc.indexOf('front raw') >= 0;
       });
+      
+      // Fallback: ถ้าไฟล์มี sheet เดียว (เช่น .xls export แบบ raw) — ใช้ sheet แรก
+      if (!frontSheetName && parsed.sheetNames.length === 1) {
+        frontSheetName = parsed.sheetNames[0];
+        console.log(`[PC Upload] Single-sheet file — using "${frontSheetName}" as Front Raw`);
+      }
       
       if (!frontSheetName) {
         toast(`❌ ไม่พบ sheet "Front Raw" ในไฟล์ — มี: ${parsed.sheetNames.join(', ')}`, 'error');
