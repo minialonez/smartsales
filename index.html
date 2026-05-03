@@ -29715,13 +29715,18 @@ function _pcParseFrontRaw(rows) {
       const stn = _pcExtractStation(currentBill.bill_no);
       
       records.push({
+        source: 'front',                        // ← NEW
         original_date: dateISO,
         original_year: dt ? dt.getUTCFullYear() : null,
         original_month: dt ? (dt.getUTCMonth() + 1) : null,
         bill_no: currentBill.bill_no,
+        bill_prefix: '',                        // (front: ไม่ใช้)
         bill_type: currentBill.bill_type,
+        vat_class: '',                          // (front: ไม่ track VAT class)
         station_code: stn.code,
         station: stn.station,
+        customer: '',                           // (front: ไม่เก็บ)
+        salesperson: '',                        // (front: ไม่เก็บ)
         product_code: productCode,
         product_name: productName,
         sub_type: parsed.sub_type,
@@ -29739,8 +29744,210 @@ function _pcParseFrontRaw(rows) {
     }
   }
   
-  console.log('[PC Parser] Stats:', stats);
-  return { records: records, stats: stats };
+  console.log('[PC Parser:Front] Stats:', stats);
+  return { records: records, stats: stats, source: 'front' };
+}
+
+
+// ────────────────────────────────────────────────────────────────
+// Invoice bill_prefix → vat_class mapping (per Phase 1B)
+//   VAT (ใบสั่งขาย):     SR, SS, SC
+//   NOVAT (ใบกำกับภาษี): OR, OS, JR, JS
+// ────────────────────────────────────────────────────────────────
+const PC_INVOICE_VAT_PREFIXES   = ['SR', 'SS', 'SC'];
+const PC_INVOICE_NOVAT_PREFIXES = ['OR', 'OS', 'JR', 'JS'];
+
+function _pcInvoiceClassifyVAT(prefix) {
+  const p = String(prefix || '').toUpperCase();
+  if (PC_INVOICE_VAT_PREFIXES.indexOf(p) >= 0) return 'VAT';
+  if (PC_INVOICE_NOVAT_PREFIXES.indexOf(p) >= 0) return 'NOVAT';
+  return '';
+}
+
+// Determine bill_type from invoice prefix
+//   JR/SC = ใบลดหนี้ (credit note) → qty/total ติดลบ → bill_type='credit_note'
+//   อื่นๆ (SR/SS/OR/OS) = ขายปกติ → bill_type='sale'
+function _pcInvoiceBillType(prefix) {
+  const p = String(prefix || '').toUpperCase();
+  if (p === 'JR' || p === 'SC') return 'credit_note';
+  return 'sale';
+}
+
+// ────────────────────────────────────────────────────────────────
+// Parser: invoice_raw.xls (block-based, similar to Front)
+// ────────────────────────────────────────────────────────────────
+// Layout:
+//   Row 0-2: Company header (skip)
+//   
+//   ['พนักงานขาย : XXX']         (section divider, salesperson)
+//   
+//   [Block per bill]
+//   Bill header: A=bill_no (e.g. SR00126-000001), C=customer, D=date
+//   Line items:  A=seq(int), B=product_code, C=name,
+//                D=qty, E=unit, F=price, G=total, H=disc, I=net, J=V/N
+//   ['หมายเหตุ : '] (skip — appears 5,682×)
+//   Subtotal row (mixed numbers in many cols, no bill_no)
+//   Empty row
+//   [Next block]
+//   
+//   Page footer: 'รวม :', 'รวมทั้งหมด :' (skip)
+//
+// Returns { records, stats, source: 'invoice' }
+function _pcParseInvoiceRaw(rows) {
+  const records = [];
+  let currentBill = null;
+  let currentSalesperson = '';
+  const stats = {
+    bills_seen: 0, lines_seen: 0, lines_kept: 0,
+    lines_skipped_brand: 0, lines_skipped_invalid_code: 0,
+    brands_kept: {}, prefixes_seen: {},
+    total_rows: rows.length,
+  };
+  
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i] || [];
+    const a = r[0];
+    
+    if (a == null || a === '') continue;
+    const aStr = String(a).trim();
+    
+    // Salesperson section divider: 'พนักงานขาย : XXX'
+    const spMatch = aStr.match(/^พนักงานขาย\s*:\s*(.+)/);
+    if (spMatch) {
+      currentSalesperson = spMatch[1].trim();
+      continue;
+    }
+    
+    // Skip noise rows
+    if (aStr.startsWith('หมายเหตุ') ||
+        aStr.startsWith('รวมทั้งหมด') ||
+        aStr === 'รวม :' ||
+        aStr.startsWith('บริษัท') ||
+        aStr.startsWith('D:\\\\') ||
+        aStr.startsWith('D:/')) {
+      continue;
+    }
+    
+    // Strip \r/_x000D_ before footer check
+    const aClean = aStr.replace(/_x000D_/g, '').replace(/[\r\n]/g, '').trim();
+    if (aClean.startsWith('เงินสด') ||
+        aClean.startsWith('บัตรเครดิต') ||
+        aClean.startsWith('เงินโอน') ||
+        aClean.startsWith('มูลค่าสินค้า') ||
+        aClean.startsWith('ยอดปัดเศษ') ||
+        aClean.startsWith('ยกเว้นภาษี')) {
+      continue;
+    }
+    
+    // Bill header: 2-letter prefix + 5 digits + dash
+    //   SR00126-000001, OR00126-002909, OS00126-002712, etc.
+    const billMatch = aStr.match(/^([A-Z]{2})\d{5}-\d+/);
+    if (billMatch) {
+      const prefix = billMatch[1];
+      const dateCell = r[3];
+      currentBill = {
+        bill_no: aStr,
+        bill_prefix: prefix,
+        vat_class: _pcInvoiceClassifyVAT(prefix),
+        bill_type: _pcInvoiceBillType(prefix),
+        customer: String(r[2] || '').trim(),
+        date_raw: dateCell,
+      };
+      stats.bills_seen++;
+      stats.prefixes_seen[prefix] = (stats.prefixes_seen[prefix] || 0) + 1;
+      continue;
+    }
+    
+    // Line item: A is integer seq + currentBill exists + B has product code
+    if (currentBill && /^\d+$/.test(aStr) && r[1]) {
+      stats.lines_seen++;
+      const productCode = String(r[1] || '').trim();
+      
+      const parsed = _pcParseProductCode(productCode);
+      if (!parsed) {
+        if (/^[A-Z0-9]{4}-[A-Z0-9]{3}-/.test(productCode.toUpperCase())) {
+          stats.lines_skipped_brand++;
+        } else {
+          stats.lines_skipped_invalid_code++;
+        }
+        continue;
+      }
+      
+      const productName = String(r[2] || '').trim();
+      const qty   = Number(r[3]) || 0;
+      const unit  = String(r[4] || '').trim();
+      const price = Number(r[5]) || 0;
+      const total = Number(r[6]) || 0;  // col G = total (qty × price)
+      
+      const grp = _pcLookupGroup(parsed.sub_type);
+      const dateISO = _monthlyCellToISO(currentBill.date_raw);
+      const dt = dateISO ? new Date(dateISO + 'T00:00:00Z') : null;
+      
+      records.push({
+        source: 'invoice',                      // ← invoice source
+        original_date: dateISO,
+        original_year: dt ? dt.getUTCFullYear() : null,
+        original_month: dt ? (dt.getUTCMonth() + 1) : null,
+        bill_no: currentBill.bill_no,
+        bill_prefix: currentBill.bill_prefix,
+        bill_type: currentBill.bill_type,
+        vat_class: currentBill.vat_class,
+        station_code: '',                       // (invoice: ไม่มีสถานี)
+        station: '',
+        customer: currentBill.customer,
+        salesperson: currentSalesperson,
+        product_code: productCode,
+        product_name: productName,
+        sub_type: parsed.sub_type,
+        group_code: grp.group_code,
+        group_name: grp.group_name,
+        brand: parsed.brand,
+        qty: qty,
+        unit: unit,
+        price: price,
+        total: total,
+        status: 'pending',
+      });
+      stats.lines_kept++;
+      stats.brands_kept[parsed.brand] = (stats.brands_kept[parsed.brand] || 0) + 1;
+    }
+  }
+  
+  console.log('[PC Parser:Invoice] Stats:', stats);
+  return { records: records, stats: stats, source: 'invoice' };
+}
+
+// ────────────────────────────────────────────────────────────────
+// Auto-detect file type from sheet content
+// ────────────────────────────────────────────────────────────────
+// Front Raw:   col A bill_no = 'S2.../R2...'  (digit prefix + station code)
+// Invoice Raw: col A bill_no = 'SR00126-...' / 'OR.../OS...' (2 letters)
+// 
+// Heuristic: scan first 200 rows, count how many match each pattern
+// Returns 'front' | 'invoice' | null (unknown)
+function _pcDetectFileType(rows) {
+  let frontCount = 0, invoiceCount = 0;
+  const sample = Math.min(rows.length, 200);
+  for (let i = 0; i < sample; i++) {
+    const a = rows[i] && rows[i][0];
+    if (a == null) continue;
+    const s = String(a).trim();
+    if (/^[SR]2\d+-\d+/.test(s)) frontCount++;
+    else if (/^[A-Z]{2}\d{5}-\d+/.test(s)) invoiceCount++;
+  }
+  if (frontCount > invoiceCount && frontCount >= 3) return 'front';
+  if (invoiceCount > frontCount && invoiceCount >= 3) return 'invoice';
+  // Tie or no matches — scan more
+  for (let i = sample; i < Math.min(rows.length, 1000); i++) {
+    const a = rows[i] && rows[i][0];
+    if (a == null) continue;
+    const s = String(a).trim();
+    if (/^[SR]2\d+-\d+/.test(s)) frontCount++;
+    else if (/^[A-Z]{2}\d{5}-\d+/.test(s)) invoiceCount++;
+    if (frontCount >= 5) return 'front';
+    if (invoiceCount >= 5) return 'invoice';
+  }
+  return frontCount > invoiceCount ? 'front' : (invoiceCount > 0 ? 'invoice' : null);
 }
 
 
@@ -29778,49 +29985,68 @@ function _pcOpenUpload(onSaveSuccess) {
       toast('📖 กำลังอ่านไฟล์...', 'info');
       const parsed = await parseExcelFile(file);
       
-      // Find Front Raw sheet
-      //   .xlsm: sheet ชื่อ "Front Raw" (case-insensitive, fuzzy)
-      //   .xls:  มักมี sheet เดียวชื่อ "Sheet1" — ใช้ sheet แรกเลย
-      let frontSheetName = parsed.sheetNames.find(n => {
+      // Sheet selection priority:
+      //   1) ชื่อ "Front Raw" หรือ "Invoice Raw" (case-insensitive)
+      //   2) ถ้ามี sheet เดียว (เช่น .xls export) → ใช้ sheet แรก
+      let sheetName = parsed.sheetNames.find(n => {
         const lc = String(n).toLowerCase().trim();
-        return lc === 'front raw' || lc === 'frontraw' || lc.indexOf('front raw') >= 0;
+        return lc === 'front raw' || lc === 'frontraw' ||
+               lc === 'invoice raw' || lc === 'invoiceraw' ||
+               lc.indexOf('front raw') >= 0 || lc.indexOf('invoice raw') >= 0;
       });
-      
-      // Fallback: ถ้าไฟล์มี sheet เดียว (เช่น .xls export แบบ raw) — ใช้ sheet แรก
-      if (!frontSheetName && parsed.sheetNames.length === 1) {
-        frontSheetName = parsed.sheetNames[0];
-        console.log(`[PC Upload] Single-sheet file — using "${frontSheetName}" as Front Raw`);
+      if (!sheetName && parsed.sheetNames.length === 1) {
+        sheetName = parsed.sheetNames[0];
+        console.log(`[PC Upload] Single-sheet file — using "${sheetName}"`);
       }
-      
-      if (!frontSheetName) {
-        toast(`❌ ไม่พบ sheet "Front Raw" ในไฟล์ — มี: ${parsed.sheetNames.join(', ')}`, 'error');
+      if (!sheetName) {
+        toast(`❌ ไม่พบ sheet "Front Raw" หรือ "Invoice Raw" — มี: ${parsed.sheetNames.join(', ')}`, 'error');
         return;
       }
       
-      const rows = parsed.sheets[frontSheetName] || [];
+      const rows = parsed.sheets[sheetName] || [];
       if (rows.length === 0) {
-        toast('❌ Sheet "Front Raw" ว่างเปล่า', 'error');
+        toast(`❌ Sheet "${sheetName}" ว่างเปล่า`, 'error');
         return;
       }
+      console.log(`[PC Upload] Reading sheet "${sheetName}", ${rows.length} rows`);
       
-      console.log(`[PC Upload] Reading sheet "${frontSheetName}", ${rows.length} rows`);
+      // Auto-detect: front vs invoice
+      // Hint: sheet name takes priority over content scan
+      let detectedType = null;
+      const lcName = String(sheetName).toLowerCase();
+      if (lcName.indexOf('front') >= 0) {
+        detectedType = 'front';
+      } else if (lcName.indexOf('invoice') >= 0) {
+        detectedType = 'invoice';
+      } else {
+        detectedType = _pcDetectFileType(rows);
+      }
       
-      // Parse + filter brand
-      const result = _pcParseFrontRaw(rows);
+      if (!detectedType) {
+        toast('❌ ไม่สามารถระบุประเภทไฟล์ได้ — Front Raw หรือ Invoice Raw?', 'error');
+        return;
+      }
+      console.log(`[PC Upload] Detected type: ${detectedType}`);
+      
+      // Parse using appropriate parser
+      const result = (detectedType === 'invoice')
+        ? _pcParseInvoiceRaw(rows)
+        : _pcParseFrontRaw(rows);
       const records = result.records;
       const stats = result.stats;
+      const source = result.source;
       
       if (records.length === 0) {
-        toast(`❌ Parse แล้วไม่เจอข้อมูลที่ตรง brand — ดู console (เห็น ${stats.bills_seen} บิล / ${stats.lines_seen} line items)`, 'error');
+        toast(`❌ Parse แล้วไม่เจอข้อมูลที่ตรง brand — เห็น ${stats.bills_seen} บิล / ${stats.lines_seen} line items (ดู console)`, 'error');
         console.log('[PC Upload] Stats:', stats);
         return;
       }
       
-      // Group by period (year-month)
+      // Group by period (year-month) — separately by source if mixed (shouldn't happen)
       const groups = _pcGroupByPeriod(records);
       
       // Show preview modal
-      await _pcShowPreviewModal(file.name, frontSheetName, records, groups, stats, onSaveSuccess);
+      await _pcShowPreviewModal(file.name, sheetName, source, records, groups, stats, onSaveSuccess);
     } catch (err) {
       console.error('[PC Upload] Error:', err);
       toast('❌ Error: ' + (err.message || err), 'error');
@@ -29833,24 +30059,27 @@ function _pcOpenUpload(onSaveSuccess) {
 // ────────────────────────────────────────────────────────────────
 // Preview modal — show parsed data + period checks + confirm
 // ────────────────────────────────────────────────────────────────
-async function _pcShowPreviewModal(filename, sheetName, records, groups, stats, onSaveSuccess) {
+async function _pcShowPreviewModal(filename, sheetName, source, records, groups, stats, onSaveSuccess) {
   const fmt = (n) => Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   const fmtInt = (n) => Number(n || 0).toLocaleString('en-US', { maximumFractionDigits: 0 });
   const monthLbl = (m) => PC_MONTH_LABELS[m - 1] || m;
   const periods = Object.keys(groups).sort();
+  const isInvoice = source === 'invoice';
+  const sourceLabel = isInvoice ? 'Invoice Raw' : 'Front Raw';
+  const sourceColor = isInvoice ? 'var(--warn)' : 'var(--primary)';
   
   // Open modal with loading state
-  openModal('📂 ตรวจสอบยอดขาย PC ก่อนบันทึก', `
+  openModal(`📂 ตรวจสอบยอดขาย PC (${sourceLabel}) ก่อนบันทึก`, `
     <div style="padding:20px;text-align:center;color:var(--text-muted)">
       ⏳ กำลังตรวจสอบข้อมูลเดิมในระบบ...
     </div>
   `);
   
-  // Check existing data per period (parallel)
+  // Check existing data per period (parallel) — filter by source
   const checks = await Promise.all(periods.map(async (key) => {
     const [y, m] = key.split('-').map(Number);
     try {
-      const res = await api('checkPcPeriod', { year: y, month: m });
+      const res = await api('checkPcPeriod', { year: y, month: m, source: source });
       const d = (res && res.data) || {};
       return {
         year: y, month: m,
@@ -29891,25 +30120,103 @@ async function _pcShowPreviewModal(filename, sheetName, records, groups, stats, 
     `;
   }).filter(Boolean).join('');
   
-  // Station breakdown
-  const stationTotals = {};
-  records.forEach(r => {
-    const s = r.station || '?';
-    if (!stationTotals[s]) stationTotals[s] = { count: 0, total: 0 };
-    stationTotals[s].count++;
-    stationTotals[s].total += Number(r.total) || 0;
-  });
-  const stationRowsHtml = PC_STATIONS.map(s => {
-    const t = stationTotals[s] || { count: 0, total: 0 };
-    if (t.count === 0) return '';
-    return `
-      <tr>
-        <td><span class="badge badge-info">${s}</span></td>
-        <td style="text-align:right;font-family:var(--mono)">${fmtInt(t.count)}</td>
-        <td style="text-align:right;font-family:var(--mono);color:var(--text);font-weight:600">${fmt(t.total)}</td>
-      </tr>
+  // Source-specific breakdown: Front=station, Invoice=vat_class+prefix
+  let secondaryBreakdownHtml = '';
+  if (!isInvoice) {
+    // Front: Station breakdown
+    const stationTotals = {};
+    records.forEach(r => {
+      const s = r.station || '?';
+      if (!stationTotals[s]) stationTotals[s] = { count: 0, total: 0 };
+      stationTotals[s].count++;
+      stationTotals[s].total += Number(r.total) || 0;
+    });
+    const stationRowsHtml = PC_STATIONS.map(s => {
+      const t = stationTotals[s] || { count: 0, total: 0 };
+      if (t.count === 0) return '';
+      return `
+        <tr>
+          <td><span class="badge badge-info">${s}</span></td>
+          <td style="text-align:right;font-family:var(--mono)">${fmtInt(t.count)}</td>
+          <td style="text-align:right;font-family:var(--mono);color:var(--text);font-weight:600">${fmt(t.total)}</td>
+        </tr>
+      `;
+    }).filter(Boolean).join('');
+    if (stationRowsHtml) {
+      secondaryBreakdownHtml = `<div class="card-flat mb-3" style="padding:12px">
+        <div class="font-semi text-sm mb-2" style="color:var(--text)">แยกตามสถานี</div>
+        <table>
+          <thead><tr><th>สถานี</th><th style="text-align:right">รายการ</th><th style="text-align:right">ยอดรวม</th></tr></thead>
+          <tbody>${stationRowsHtml}</tbody>
+        </table>
+      </div>`;
+    }
+  } else {
+    // Invoice: VAT class + bill_prefix breakdown
+    const vatTotals = {};   // VAT/NOVAT
+    const prefixTotals = {}; // SR/SS/SC/OR/OS/JR
+    records.forEach(r => {
+      const v = r.vat_class || '?';
+      if (!vatTotals[v]) vatTotals[v] = { count: 0, total: 0 };
+      vatTotals[v].count++;
+      vatTotals[v].total += Number(r.total) || 0;
+      
+      const p = r.bill_prefix || '?';
+      if (!prefixTotals[p]) prefixTotals[p] = { count: 0, total: 0, vat: r.vat_class };
+      prefixTotals[p].count++;
+      prefixTotals[p].total += Number(r.total) || 0;
+    });
+    
+    const vatLabel = (v) => v === 'VAT' ? 'ใบสั่งขาย' : v === 'NOVAT' ? 'ใบกำกับภาษี' : v;
+    const vatColor = (v) => v === 'VAT' ? 'var(--warn)' : v === 'NOVAT' ? 'var(--purple)' : 'var(--text2)';
+    
+    const vatRowsHtml = ['VAT', 'NOVAT'].map(v => {
+      const t = vatTotals[v];
+      if (!t || t.count === 0) return '';
+      return `
+        <tr>
+          <td><span style="display:inline-block;padding:3px 10px;border-radius:6px;background:${vatColor(v)};color:#fff;font-size:.72rem;font-weight:700">${vatLabel(v)} (${v})</span></td>
+          <td style="text-align:right;font-family:var(--mono)">${fmtInt(t.count)}</td>
+          <td style="text-align:right;font-family:var(--mono);color:var(--text);font-weight:600">${fmt(t.total)}</td>
+        </tr>
+      `;
+    }).filter(Boolean).join('');
+    
+    // Prefix order matches Phase 1B
+    const prefixOrder = ['SR','SS','SC','OR','OS','JR','JS'];
+    const prefixRowsHtml = prefixOrder.map(p => {
+      const t = prefixTotals[p];
+      if (!t || t.count === 0) return '';
+      const cls = t.vat;
+      return `
+        <tr>
+          <td>
+            <span style="display:inline-block;padding:2px 8px;border-radius:4px;background:${vatColor(cls)};color:#fff;font-size:.7rem;font-weight:700;margin-right:6px">${p}</span>
+            <span style="font-size:.7rem;color:var(--text-muted)">${vatLabel(cls)}</span>
+          </td>
+          <td style="text-align:right;font-family:var(--mono)">${fmtInt(t.count)}</td>
+          <td style="text-align:right;font-family:var(--mono);color:var(--text);font-weight:600">${fmt(t.total)}</td>
+        </tr>
+      `;
+    }).filter(Boolean).join('');
+    
+    secondaryBreakdownHtml = `
+      <div class="card-flat mb-3" style="padding:12px">
+        <div class="font-semi text-sm mb-2" style="color:var(--text)">แยกตามคลาส VAT</div>
+        <table>
+          <thead><tr><th>คลาส</th><th style="text-align:right">รายการ</th><th style="text-align:right">ยอดรวม</th></tr></thead>
+          <tbody>${vatRowsHtml}</tbody>
+        </table>
+      </div>
+      <div class="card-flat mb-3" style="padding:12px">
+        <div class="font-semi text-sm mb-2" style="color:var(--text)">แยกตาม Prefix</div>
+        <table>
+          <thead><tr><th>Prefix</th><th style="text-align:right">รายการ</th><th style="text-align:right">ยอดรวม</th></tr></thead>
+          <tbody>${prefixRowsHtml}</tbody>
+        </table>
+      </div>
     `;
-  }).filter(Boolean).join('');
+  }
   
   // Period rows (with overwrite warning)
   const periodRowsHtml = periods.map((key, idx) => {
@@ -29943,27 +30250,34 @@ async function _pcShowPreviewModal(filename, sheetName, records, groups, stats, 
     `;
   }).join('');
   
-  // Sample preview (5 sale + 3 return rows)
-  const saleRecs = records.filter(r => r.bill_type === 'sale').slice(0, 5);
-  const returnRecs = records.filter(r => r.bill_type === 'return').slice(0, 3);
-  const sampleRecords = saleRecs.concat(returnRecs);
+  // Sample preview (5 sale + 3 return/credit_note rows)
+  const positiveRecs = records.filter(r => r.bill_type === 'sale').slice(0, 5);
+  const negativeRecs = records.filter(r => r.bill_type === 'return' || r.bill_type === 'credit_note').slice(0, 3);
+  const sampleRecords = positiveRecs.concat(negativeRecs);
   
   const sampleRowsHtml = sampleRecords.map(r => {
     const brand = PC_BRANDS.find(b => b.id === r.brand);
     const brandColor = brand?.color || 'var(--text2)';
-    const isReturn = r.bill_type === 'return';
+    const isNegative = r.bill_type === 'return' || r.bill_type === 'credit_note';
+    // Source-specific 3rd column: station (front) | vat_class+prefix (invoice)
+    const middleCell = isInvoice
+      ? `<td style="font-size:.7rem"><span style="display:inline-block;padding:1px 5px;border-radius:3px;background:${r.vat_class==='VAT'?'var(--warn)':'var(--purple)'};color:#fff;font-size:.6rem;font-weight:600;margin-right:3px">${r.bill_prefix}</span></td>`
+      : `<td style="font-size:.7rem">${r.station || ''}</td>`;
     return `
-      <tr style="${isReturn?'background:rgba(239,68,68,.04)':''}">
+      <tr style="${isNegative?'background:rgba(239,68,68,.04)':''}">
         <td style="font-family:var(--mono);font-size:.72rem">${r.original_date || ''}</td>
         <td style="font-family:var(--mono);font-size:.7rem">${r.bill_no || ''}</td>
-        <td style="font-size:.7rem">${r.station || ''}</td>
+        ${middleCell}
         <td style="font-family:var(--mono);font-size:.7rem">${r.product_code || ''}</td>
         <td><span style="display:inline-block;padding:1px 6px;border-radius:4px;background:${brandColor}1f;color:${brandColor};font-size:.65rem;font-weight:600">${r.brand || ''}</span></td>
-        <td style="text-align:right;font-family:var(--mono);${isReturn?'color:var(--danger);font-weight:600':''}">${fmtInt(r.qty)}</td>
-        <td style="text-align:right;font-family:var(--mono);${isReturn?'color:var(--danger);font-weight:600':''}">${fmt(r.total)}</td>
+        <td style="text-align:right;font-family:var(--mono);${isNegative?'color:var(--danger);font-weight:600':''}">${fmtInt(r.qty)}</td>
+        <td style="text-align:right;font-family:var(--mono);${isNegative?'color:var(--danger);font-weight:600':''}">${fmt(r.total)}</td>
       </tr>
     `;
   }).join('');
+  
+  const middleHeader = isInvoice ? 'Prefix' : 'สถานี';
+  const negativeBillLabel = isInvoice ? 'ใบลดหนี้ (JR/SC)' : 'บิลคืน (R2)';
   
   // Stats line
   const skippedTotal = stats.lines_skipped_brand + stats.lines_skipped_invalid_code;
@@ -29976,18 +30290,21 @@ async function _pcShowPreviewModal(filename, sheetName, records, groups, stats, 
   const bodyHtml = `
     <div style="padding:20px;max-height:75vh;overflow-y:auto;min-width:640px;max-width:840px">
       
-      <!-- File info -->
-      <div class="card-flat mb-3" style="padding:12px">
-        <div class="text-xs" style="color:var(--text-muted);margin-bottom:4px">ไฟล์ที่อัปโหลด</div>
+      <!-- File info + source badge -->
+      <div class="card-flat mb-3" style="padding:12px;border-left:4px solid ${sourceColor}">
+        <div class="flex justify-between items-center" style="margin-bottom:6px">
+          <div class="text-xs" style="color:var(--text-muted)">ไฟล์ที่อัปโหลด</div>
+          <span style="display:inline-block;padding:2px 10px;border-radius:6px;background:${sourceColor};color:#fff;font-size:.7rem;font-weight:700">${sourceLabel}</span>
+        </div>
         <div class="font-semi" style="color:var(--text);font-family:var(--mono);font-size:.85rem">📄 ${filename}</div>
         <div class="text-xs" style="color:var(--text-muted);margin-top:4px">Sheet: <b style="color:var(--text2)">${sheetName}</b></div>
         <div class="text-xs" style="color:var(--text2);margin-top:6px;line-height:1.5">${statsLine}</div>
       </div>
       
       <!-- Grand total -->
-      <div class="card-flat mb-3" style="padding:14px 18px;background:linear-gradient(135deg, var(--primary-bg) 0%, transparent 100%);border:1px solid var(--primary);border-left:5px solid var(--primary)">
+      <div class="card-flat mb-3" style="padding:14px 18px;background:linear-gradient(135deg, ${sourceColor}1a 0%, transparent 100%);border:1px solid ${sourceColor};border-left:5px solid ${sourceColor}">
         <div style="font-size:.7rem;color:var(--text2);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px">ยอดรวมจากไฟล์</div>
-        <div style="font-size:1.5rem;font-weight:800;color:var(--primary);font-variant-numeric:tabular-nums">฿${fmt(totalAmount)}</div>
+        <div style="font-size:1.5rem;font-weight:800;color:${sourceColor};font-variant-numeric:tabular-nums">฿${fmt(totalAmount)}</div>
         <div style="font-size:.78rem;color:var(--text-muted);margin-top:2px">${fmtInt(records.length)} รายการ · ${fmtInt(totalQty)} ชิ้น</div>
       </div>
       
@@ -30000,13 +30317,7 @@ async function _pcShowPreviewModal(filename, sheetName, records, groups, stats, 
         </table>
       </div>
       
-      ${stationRowsHtml ? `<div class="card-flat mb-3" style="padding:12px">
-        <div class="font-semi text-sm mb-2" style="color:var(--text)">แยกตามสถานี</div>
-        <table>
-          <thead><tr><th>สถานี</th><th style="text-align:right">รายการ</th><th style="text-align:right">ยอดรวม</th></tr></thead>
-          <tbody>${stationRowsHtml}</tbody>
-        </table>
-      </div>` : ''}
+      ${secondaryBreakdownHtml}
       
       <!-- Period checks -->
       <div class="card-flat mb-3" style="padding:12px">
@@ -30022,9 +30333,9 @@ async function _pcShowPreviewModal(filename, sheetName, records, groups, stats, 
       <!-- Sample preview -->
       <div class="card-flat mb-3" style="padding:12px">
         <div class="font-semi text-sm mb-2" style="color:var(--text)">ตัวอย่าง ${sampleRecords.length} แถวแรก</div>
-        ${returnRecs.length > 0 ? `<div style="font-size:.7rem;color:var(--text-muted);margin-bottom:6px">⚠ บิลคืน (R2) qty/รวม ติดลบ</div>` : ''}
+        ${negativeRecs.length > 0 ? `<div style="font-size:.7rem;color:var(--text-muted);margin-bottom:6px">⚠ ${negativeBillLabel} qty/รวม ติดลบ</div>` : ''}
         <table>
-          <thead><tr><th>วันที่</th><th>เลขที่บิล</th><th>สถานี</th><th>รหัสสินค้า</th><th>แบรนด์</th><th style="text-align:right">จำนวน</th><th style="text-align:right">รวม</th></tr></thead>
+          <thead><tr><th>วันที่</th><th>เลขที่บิล</th><th>${middleHeader}</th><th>รหัสสินค้า</th><th>แบรนด์</th><th style="text-align:right">จำนวน</th><th style="text-align:right">รวม</th></tr></thead>
           <tbody>${sampleRowsHtml}</tbody>
         </table>
       </div>
@@ -30042,20 +30353,21 @@ async function _pcShowPreviewModal(filename, sheetName, records, groups, stats, 
   document.getElementById('btn-pc-cancel').addEventListener('click', () => closeModal());
   
   document.getElementById('btn-pc-confirm').addEventListener('click', async () => {
-    await _pcSaveBatch(records, groups, onSaveSuccess);
+    await _pcSaveBatch(records, groups, source, onSaveSuccess);
   });
 }
 
 // ────────────────────────────────────────────────────────────────
 // Save: call upsertPcBatch per period (replace=true preserves submitted/excluded)
 // ────────────────────────────────────────────────────────────────
-async function _pcSaveBatch(records, groups, onSaveSuccess) {
+async function _pcSaveBatch(records, groups, source, onSaveSuccess) {
   const periods = Object.keys(groups).sort();
+  const sourceLabel = source === 'invoice' ? 'Invoice' : 'Front';
   
   document.getElementById('modal-body').innerHTML = `
     <div style="padding:30px;text-align:center;min-width:400px">
       <div style="font-size:1.4rem;margin-bottom:12px">⏳</div>
-      <div class="font-semi" style="color:var(--text)">กำลังบันทึก...</div>
+      <div class="font-semi" style="color:var(--text)">กำลังบันทึก ${sourceLabel}...</div>
       <div class="text-xs text-muted mt-2" id="pc-progress">เตรียมข้อมูล</div>
     </div>
   `;
@@ -30076,6 +30388,7 @@ async function _pcSaveBatch(records, groups, onSaveSuccess) {
     try {
       const res = await api('upsertPcBatch', {
         year: y, month: m,
+        source: source,
         replace: true,
         records: recs,
       });
@@ -30096,7 +30409,7 @@ async function _pcSaveBatch(records, groups, onSaveSuccess) {
   if (errors.length > 0) {
     toast(`⚠ บันทึกบางส่วนล้มเหลว: ${errors.join(', ')}`, 'error');
   } else {
-    const parts = [`✅ บันทึก ${totalInserted.toLocaleString()} แถว`];
+    const parts = [`✅ บันทึก ${sourceLabel} ${totalInserted.toLocaleString()} แถว`];
     if (totalDeleted > 0)   parts.push(`ลบ pending เก่า ${totalDeleted.toLocaleString()}`);
     if (totalPreserved > 0) parts.push(`คงสถานะส่งแล้ว/ไม่ส่ง ${totalPreserved.toLocaleString()}`);
     toast(parts.join(' · '), 'success');
@@ -30117,7 +30430,10 @@ function _pcLoadState() {
         return {
           year: Number(s.year) || new Date().getFullYear(),
           months: Array.isArray(s.months) ? s.months.filter(m => m >= 1 && m <= 12) : [],
+          source: (s.source === 'invoice') ? 'invoice' : 'front',  // tab ('front' | 'invoice')
           station: s.station || 'all',
+          vatClass: s.vatClass || 'all',
+          billPrefix: s.billPrefix || 'all',
           brand: s.brand || 'all',
           status: s.status || 'all',
         };
@@ -30128,7 +30444,10 @@ function _pcLoadState() {
   return {
     year: now.getFullYear(),
     months: [now.getMonth() + 1],
+    source: 'front',
     station: 'all',
+    vatClass: 'all',
+    billPrefix: 'all',
     brand: 'all',
     status: 'all',
   };
@@ -30139,7 +30458,10 @@ function _pcSaveState(state) {
     localStorage.setItem(PC_STATE_KEY, JSON.stringify({
       year: state.year,
       months: state.months,
+      source: state.source,
       station: state.station,
+      vatClass: state.vatClass,
+      billPrefix: state.billPrefix,
       brand: state.brand,
       status: state.status,
     }));
@@ -30161,14 +30483,32 @@ async function renderPcSales(el) {
   years.sort((a, b) => b - a);
   
   function renderShell() {
+    const isInvoice = state.source === 'invoice';
+    const sourceLabel = isInvoice ? 'Invoice Raw' : 'Front Raw';
+    const sourceColor = isInvoice ? 'var(--warn)' : 'var(--primary)';
+    
     el.innerHTML = `
       <div class="flex justify-between items-center mb-3">
         <div class="page-title">📊 ยอดขาย PC</div>
         <div class="flex" style="gap:8px">
-          <button class="btn btn-primary btn-sm" id="btn-pc-upload">📂 อัปโหลด Front Raw</button>
+          <button class="btn btn-primary btn-sm" id="btn-pc-upload">📂 อัปโหลด ${sourceLabel}</button>
           <button class="btn btn-ghost btn-sm" id="btn-pc-excel" disabled title="เพิ่มใน Step 2A.5">📊 Excel</button>
           <button class="btn btn-ghost btn-sm" id="btn-pc-pdf" disabled title="เพิ่มใน Step 2A.5">🖨 PDF</button>
         </div>
+      </div>
+      
+      <!-- Source tabs: Front | Invoice -->
+      <div class="card-flat mb-2" style="padding:6px;display:inline-flex;gap:4px;border-radius:10px;background:var(--surface2)">
+        ${[
+          { id: 'front',   label: '📦 Front',   color: 'var(--primary)' },
+          { id: 'invoice', label: '🧾 Invoice', color: 'var(--warn)' },
+        ].map(t => {
+          const active = state.source === t.id;
+          const style = active
+            ? `background:${t.color};color:#fff;font-weight:700;border:1px solid ${t.color}`
+            : `background:transparent;color:var(--text2);font-weight:500;border:1px solid transparent`;
+          return `<button data-source="${t.id}" style="${style};padding:6px 16px;font-size:.85rem;border-radius:8px;cursor:pointer;transition:all .2s">${t.label}</button>`;
+        }).join('')}
       </div>
       
       <!-- Filter row 1: Year + Month chips -->
@@ -30198,7 +30538,57 @@ async function renderPcSales(el) {
       <!-- States: active (solid) / dimmed (other selected) / default (outlined) -->
       <div class="card-flat mb-3" style="padding:12px">
         <div class="flex items-center" style="gap:14px;flex-wrap:wrap">
-          <!-- Station filter -->
+          ${isInvoice ? `
+          <!-- Invoice: VAT class filter -->
+          <div class="flex items-center" style="gap:6px;flex-wrap:wrap">
+            <span style="font-size:.78rem;color:var(--text2);margin-right:4px">คลาส:</span>
+            ${(() => {
+              const isAllActive = state.vatClass === 'all';
+              const allBtnStyle = isAllActive
+                ? 'background:var(--primary);border:1px solid var(--primary);color:#fff'
+                : 'background:transparent;border:1px solid var(--border);color:var(--text2)';
+              return `<button data-vatclass="all" style="${allBtnStyle};padding:4px 10px;font-size:.74rem;border-radius:20px;cursor:pointer;font-weight:${isAllActive?600:500};transition:all .2s">ทั้งหมด</button>`;
+            })()}
+            ${[
+              { id: 'VAT',   label: 'ใบสั่งขาย',    color: 'var(--warn)' },
+              { id: 'NOVAT', label: 'ใบกำกับภาษี', color: 'var(--purple)' },
+            ].map(v => {
+              const isMe = state.vatClass === v.id;
+              const isAll = state.vatClass === 'all';
+              let style;
+              if (isMe)        style = `background:${v.color};border:1px solid ${v.color};color:#fff;font-weight:600`;
+              else if (isAll)  style = `background:transparent;border:1px solid ${v.color};color:${v.color};font-weight:500`;
+              else             style = `background:transparent;border:1px dashed var(--border);color:var(--text-muted);opacity:.5;font-weight:500`;
+              return `<button data-vatclass="${v.id}" style="${style};padding:4px 10px;font-size:.74rem;border-radius:20px;cursor:pointer;transition:all .2s">${v.label}</button>`;
+            }).join('')}
+          </div>
+          
+          <span style="color:var(--text-muted)">|</span>
+          
+          <!-- Invoice: Bill prefix filter -->
+          <div class="flex items-center" style="gap:6px;flex-wrap:wrap">
+            <span style="font-size:.78rem;color:var(--text2);margin-right:4px">Prefix:</span>
+            ${(() => {
+              const isAllActive = state.billPrefix === 'all';
+              const allBtnStyle = isAllActive
+                ? 'background:var(--primary);border:1px solid var(--primary);color:#fff'
+                : 'background:transparent;border:1px solid var(--border);color:var(--text2)';
+              return `<button data-prefix="all" style="${allBtnStyle};padding:4px 10px;font-size:.74rem;border-radius:20px;cursor:pointer;font-weight:${isAllActive?600:500};transition:all .2s">ทั้งหมด</button>`;
+            })()}
+            ${['SR','SS','SC','OR','OS','JR'].map(p => {
+              const isMe = state.billPrefix === p;
+              const isAll = state.billPrefix === 'all';
+              const isVat = ['SR','SS','SC'].indexOf(p) >= 0;
+              const c = isVat ? 'var(--warn)' : 'var(--purple)';
+              let style;
+              if (isMe)        style = `background:${c};border:1px solid ${c};color:#fff;font-weight:600`;
+              else if (isAll)  style = `background:transparent;border:1px solid ${c};color:${c};font-weight:500`;
+              else             style = `background:transparent;border:1px dashed var(--border);color:var(--text-muted);opacity:.5;font-weight:500`;
+              return `<button data-prefix="${p}" style="${style};padding:4px 10px;font-size:.72rem;border-radius:20px;cursor:pointer;transition:all .2s">${p}</button>`;
+            }).join('')}
+          </div>
+          ` : `
+          <!-- Front: Station filter -->
           <div class="flex items-center" style="gap:6px;flex-wrap:wrap">
             <span style="font-size:.78rem;color:var(--text2);margin-right:4px">สถานี:</span>
             ${(() => {
@@ -30211,21 +30601,16 @@ async function renderPcSales(el) {
             ${PC_STATIONS.map(s => {
               const isMe = state.station === s;
               const isAll = state.station === 'all';
-              // Color per station (same scheme used in section header)
               const stnColorMap = { 'FRONT1': 'var(--primary)', 'FRONT2': 'var(--success)', 'FRONT3': 'var(--warn)', 'FRONT4': 'var(--purple)' };
               const stnColor = stnColorMap[s] || 'var(--primary)';
               let style;
-              if (isMe) {
-                style = `background:${stnColor};border:1px solid ${stnColor};color:#fff;font-weight:600`;
-              } else if (isAll) {
-                style = `background:transparent;border:1px solid ${stnColor};color:${stnColor};font-weight:500`;
-              } else {
-                // Other station selected → dim this one
-                style = `background:transparent;border:1px dashed var(--border);color:var(--text-muted);opacity:.5;font-weight:500`;
-              }
+              if (isMe)        style = `background:${stnColor};border:1px solid ${stnColor};color:#fff;font-weight:600`;
+              else if (isAll)  style = `background:transparent;border:1px solid ${stnColor};color:${stnColor};font-weight:500`;
+              else             style = `background:transparent;border:1px dashed var(--border);color:var(--text-muted);opacity:.5;font-weight:500`;
               return `<button data-station="${s}" style="${style};padding:4px 10px;font-size:.74rem;border-radius:20px;cursor:pointer;transition:all .2s">${s}</button>`;
             }).join('')}
           </div>
+          `}
           
           <span style="color:var(--text-muted)">|</span>
           
@@ -30330,10 +30715,50 @@ async function renderPcSales(el) {
       await loadAndRender();
     });
     
+    // Source tabs (Front | Invoice)
+    el.querySelectorAll('[data-source]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const newSource = btn.dataset.source;
+        if (state.source === newSource) return;
+        state.source = newSource;
+        // Reset source-specific filters when switching
+        if (newSource === 'invoice') {
+          state.station = 'all';
+        } else {
+          state.vatClass = 'all';
+          state.billPrefix = 'all';
+        }
+        _pcSaveState(state);
+        renderShell();
+        await loadAndRender();
+      });
+    });
+    
     // Station/Brand/Status filter buttons
     el.querySelectorAll('[data-station]').forEach(btn => {
       btn.addEventListener('click', async () => {
         state.station = btn.dataset.station;
+        _pcSaveState(state);
+        renderShell();
+        await loadAndRender();
+      });
+    });
+    el.querySelectorAll('[data-vatclass]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        state.vatClass = btn.dataset.vatclass;
+        // If user picks specific VAT class, reset bill_prefix to 'all'
+        // (because prefix filter is sub-category of vat_class)
+        if (state.vatClass !== 'all') state.billPrefix = 'all';
+        _pcSaveState(state);
+        renderShell();
+        await loadAndRender();
+      });
+    });
+    el.querySelectorAll('[data-prefix]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        state.billPrefix = btn.dataset.prefix;
+        // If user picks specific prefix, reset vat_class to 'all' to avoid contradictions
+        if (state.billPrefix !== 'all') state.vatClass = 'all';
         _pcSaveState(state);
         renderShell();
         await loadAndRender();
@@ -30412,11 +30837,44 @@ async function renderPcSales(el) {
       cachedRows = rows;
       lastFetchKey = fetchKey;
       
-      // Apply station/brand filters client-side
+      // Apply client-side filters
       let filtered = rows.slice();
-      if (state.station !== 'all') {
-        filtered = filtered.filter(r => r.station === state.station);
+      
+      // Debug: store raw rows for inspection
+      window._pcLastRows = rows;
+      console.log(`[PC] Loaded ${rows.length} rows from API`);
+      if (rows.length > 0) {
+        // Sample first row + station/source distribution
+        const stnDist = {};
+        const srcDist = {};
+        rows.forEach(r => {
+          const stn = r.station || '(empty)';
+          const src = r.source || '(empty)';
+          stnDist[stn] = (stnDist[stn] || 0) + 1;
+          srcDist[src] = (srcDist[src] || 0) + 1;
+        });
+        console.log('[PC] Source distribution:', srcDist);
+        console.log('[PC] Station distribution:', stnDist);
+        console.log('[PC] Sample row:', rows[0]);
       }
+      
+      // Source filter (front | invoice) — primary tab
+      filtered = filtered.filter(r => (r.source || 'front') === state.source);
+      
+      // Source-specific filter
+      if (state.source === 'invoice') {
+        if (state.vatClass !== 'all') {
+          filtered = filtered.filter(r => r.vat_class === state.vatClass);
+        }
+        if (state.billPrefix !== 'all') {
+          filtered = filtered.filter(r => r.bill_prefix === state.billPrefix);
+        }
+      } else {
+        if (state.station !== 'all') {
+          filtered = filtered.filter(r => r.station === state.station);
+        }
+      }
+      
       if (state.brand !== 'all') {
         filtered = filtered.filter(r => r.brand === state.brand);
       }
@@ -30425,22 +30883,31 @@ async function renderPcSales(el) {
       if (summaryEl) {
         const monthsLabel = state.months.length === 12 ? 'ทั้งปี' :
                             state.months.map(m => PC_MONTH_LABELS[m-1]).join(', ');
-        const filterParts = [`แสดง: ${monthsLabel} ${state.year}`];
-        if (state.station !== 'all') filterParts.push(`สถานี ${state.station}`);
+        const sourceLabel = state.source === 'invoice' ? 'Invoice' : 'Front';
+        const filterParts = [`${sourceLabel} · ${monthsLabel} ${state.year}`];
+        if (state.source === 'invoice') {
+          if (state.vatClass !== 'all') {
+            filterParts.push(state.vatClass === 'VAT' ? 'ใบสั่งขาย' : 'ใบกำกับภาษี');
+          }
+          if (state.billPrefix !== 'all') filterParts.push(`Prefix ${state.billPrefix}`);
+        } else {
+          if (state.station !== 'all') filterParts.push(`สถานี ${state.station}`);
+        }
         if (state.brand !== 'all') filterParts.push(`แบรนด์ ${state.brand}`);
         if (state.status !== 'all') {
           const stLbl = PC_STATUSES.find(s => s.id === state.status)?.label || state.status;
           filterParts.push(`สถานะ ${stLbl}`);
         }
-        summaryEl.textContent = `${filterParts.join(' · ')} — ${filtered.length} รายการ (จาก ${rows.length} ที่โหลด)`;
+        summaryEl.textContent = `${filterParts.join(' · ')} — ${filtered.length} รายการ (โหลด ${rows.length} แถว)`;
       }
       
       if (filtered.length === 0) {
+        const sourceLabel = state.source === 'invoice' ? 'Invoice Raw' : 'Front Raw';
         root.innerHTML = `<div class="card text-center" style="padding:50px;color:var(--text-muted)">
           <div style="font-size:1.5rem;margin-bottom:8px">📭</div>
-          <div>ไม่มีข้อมูลตรงกับ filter ที่เลือก</div>
+          <div>ไม่มีข้อมูล ${sourceLabel} ตรงกับ filter ที่เลือก</div>
           <div style="font-size:.75rem;margin-top:6px;color:var(--text-muted)">
-            ${rows.length === 0 ? 'อัปโหลด Front Raw เพื่อเริ่มต้น (Step 2A.4)' : `กรองแล้ว 0 จาก ${rows.length} แถว`}
+            ${rows.length === 0 ? `อัปโหลด ${sourceLabel} เพื่อเริ่มต้น` : `กรองแล้ว 0 จาก ${rows.length} แถว`}
           </div>
         </div>`;
         return;
@@ -30458,6 +30925,10 @@ async function renderPcSales(el) {
   }
   
   function _renderPcPreviewTable(root, rows) {
+    const isInvoice = state.source === 'invoice';
+    const sourceColor = isInvoice ? 'var(--warn)' : 'var(--primary)';
+    const sourceBg = isInvoice ? 'rgba(245,158,66,.08)' : 'var(--primary-bg)';
+    
     // Compute totals
     let totalQty = 0, totalAmount = 0;
     const brandTotals = {};
@@ -30495,18 +30966,47 @@ async function renderPcSales(el) {
       return String(a.brand || '').localeCompare(String(b.brand || ''));
     });
     
-    // Limit preview to 200 rows for now (Step 2A.5 will add grouping/pagination)
     const MAX = 200;
     const display = sorted.slice(0, MAX);
     const truncated = sorted.length > MAX;
     
+    // Source-aware table headers
+    const tableHeaders = isInvoice ? `
+      <th style="width:30px"></th>
+      <th>วันที่</th>
+      <th>เลขที่บิล</th>
+      <th>คลาส</th>
+      <th>รหัสสินค้า</th>
+      <th>ชื่อสินค้า</th>
+      <th>ลูกค้า</th>
+      <th>แบรนด์</th>
+      <th>หมวด</th>
+      <th style="text-align:right">จำนวน</th>
+      <th style="text-align:right">ราคา</th>
+      <th style="text-align:right">ยอดรวม</th>
+      <th>สถานะ</th>
+    ` : `
+      <th style="width:30px"></th>
+      <th>วันที่</th>
+      <th>เลขที่บิล</th>
+      <th>สถานี</th>
+      <th>รหัสสินค้า</th>
+      <th>ชื่อสินค้า</th>
+      <th>แบรนด์</th>
+      <th>หมวด</th>
+      <th style="text-align:right">จำนวน</th>
+      <th style="text-align:right">ราคา</th>
+      <th style="text-align:right">ยอดรวม</th>
+      <th>สถานะ</th>
+    `;
+    
     root.innerHTML = `
       <!-- Grand total + brand cards -->
-      <div class="card-flat mb-3" style="padding:18px 20px;background:linear-gradient(135deg, var(--primary-bg) 0%, transparent 100%);border:1px solid var(--primary);border-left:5px solid var(--primary)">
+      <div class="card-flat mb-3" style="padding:18px 20px;background:linear-gradient(135deg, ${sourceBg} 0%, transparent 100%);border:1px solid ${sourceColor};border-left:5px solid ${sourceColor}">
         <div class="flex justify-between items-center" style="flex-wrap:wrap;gap:14px;margin-bottom:14px">
           <div>
-            <div style="font-size:.7rem;color:var(--text2);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px">ยอดรวม PC</div>
-            <div style="font-size:1.6rem;font-weight:800;color:var(--primary);font-variant-numeric:tabular-nums">฿${fmt(totalAmount)}</div>
+            <div style="font-size:.7rem;color:var(--text2);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px">ยอดรวม PC ${isInvoice ? '(Invoice)' : '(Front)'}</div>
+            <div style="font-size:1.6rem;font-weight:800;color:${sourceColor};font-variant-numeric:tabular-nums">฿${fmt(totalAmount)}</div>
             <div style="font-size:.78rem;color:var(--text-muted);margin-top:2px">${rows.length.toLocaleString()} รายการ · ${fmtInt(totalQty)} ชิ้น</div>
           </div>
         </div>
@@ -30521,20 +31021,7 @@ async function renderPcSales(el) {
       <div class="card" style="padding:0">
         <div class="table-wrap" style="max-height:60vh;overflow:auto">
           <table>
-            <thead><tr>
-              <th style="width:30px"></th>
-              <th>วันที่</th>
-              <th>เลขที่บิล</th>
-              <th>สถานี</th>
-              <th>รหัสสินค้า</th>
-              <th>ชื่อสินค้า</th>
-              <th>แบรนด์</th>
-              <th>หมวด</th>
-              <th style="text-align:right">จำนวน</th>
-              <th style="text-align:right">ราคา</th>
-              <th style="text-align:right">ยอดรวม</th>
-              <th>สถานะ</th>
-            </tr></thead>
+            <thead><tr>${tableHeaders}</tr></thead>
             <tbody>
               ${display.map(r => {
                 const brand = PC_BRANDS.find(b => b.id === r.brand);
@@ -30543,20 +31030,32 @@ async function renderPcSales(el) {
                 const stColor = status?.color || 'var(--text2)';
                 const stBg = status?.bg || 'var(--surface2)';
                 const stLabel = status?.label || r.status || '';
-                const isReturn = r.bill_type === 'return';
+                const isNegative = r.bill_type === 'return' || r.bill_type === 'credit_note';
                 
-                return `<tr style="${isReturn?'background:rgba(239,68,68,.04)':''}">
-                  <td><input type="checkbox" class="pc-row-check" data-uuid="${r.pc_uuid}" disabled title="Bulk select มาใน Step 2A.5"></td>
-                  <td style="font-family:var(--mono);font-size:.78rem">${r.original_date || ''}</td>
-                  <td style="font-family:var(--mono);font-size:.76rem">${r.bill_no || ''}</td>
+                // Source-specific middle columns
+                const middleCols = isInvoice ? `
+                  <td style="font-size:.74rem">
+                    <span style="display:inline-block;padding:1px 6px;border-radius:4px;background:${r.vat_class==='VAT'?'var(--warn)':'var(--purple)'};color:#fff;font-size:.65rem;font-weight:700;margin-right:3px">${r.bill_prefix||''}</span>
+                  </td>
+                  <td style="font-family:var(--mono);font-size:.74rem;color:var(--text2)">${r.product_code || ''}</td>
+                  <td style="font-size:.78rem;max-width:240px" title="${(r.product_name || '').replace(/"/g,'&quot;')}">${r.product_name || ''}</td>
+                  <td style="font-size:.72rem;max-width:180px;color:var(--text2)" title="${(r.customer || '').replace(/"/g,'&quot;')}">${(r.customer || '').replace(/^\([^)]+\)\s*/,'')}</td>
+                ` : `
                   <td style="font-size:.78rem">${r.station || ''}</td>
                   <td style="font-family:var(--mono);font-size:.74rem;color:var(--text2)">${r.product_code || ''}</td>
                   <td style="font-size:.78rem;max-width:280px" title="${(r.product_name || '').replace(/"/g,'&quot;')}">${r.product_name || ''}</td>
+                `;
+                
+                return `<tr style="${isNegative?'background:rgba(239,68,68,.04)':''}">
+                  <td><input type="checkbox" class="pc-row-check" data-uuid="${r.pc_uuid}" disabled title="Bulk select มาใน Step 2A.5"></td>
+                  <td style="font-family:var(--mono);font-size:.78rem">${r.original_date || ''}</td>
+                  <td style="font-family:var(--mono);font-size:.76rem">${r.bill_no || ''}</td>
+                  ${middleCols}
                   <td><span style="display:inline-block;padding:2px 8px;border-radius:6px;background:${brandColor}1f;color:${brandColor};font-size:.7rem;font-weight:600">${r.brand || ''}</span></td>
                   <td style="font-size:.74rem;color:var(--text-muted)">${r.group_name || ''}</td>
                   <td style="text-align:right;font-family:var(--mono)">${fmtInt(r.qty)}</td>
                   <td style="text-align:right;font-family:var(--mono)">${fmt(r.price)}</td>
-                  <td style="text-align:right;font-family:var(--mono);${isReturn?'color:var(--danger);font-weight:600':''}">${fmt(r.total)}</td>
+                  <td style="text-align:right;font-family:var(--mono);${isNegative?'color:var(--danger);font-weight:600':''}">${fmt(r.total)}</td>
                   <td><span style="display:inline-block;padding:2px 8px;border-radius:6px;background:${stBg};color:${stColor};font-size:.7rem;font-weight:600">${stLabel}</span></td>
                 </tr>`;
               }).join('')}
