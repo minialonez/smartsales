@@ -17400,7 +17400,15 @@ function openModal(title, html) {
     });
   }
 }
-function closeModal() { document.getElementById('modal-overlay').classList.remove('open'); }
+function closeModal() {
+  document.getElementById('modal-overlay').classList.remove('open');
+  // Reset any inline width override (e.g. set by PC preview modal)
+  const modalEl = document.getElementById('modal-card');
+  if (modalEl) {
+    modalEl.style.width = '';
+    modalEl.style.maxWidth = '';
+  }
+}
 
 // ── Storage: IndexedDB สำหรับข้อมูลใหญ่ (ไม่มี 5MB limit) ──
 const _mem = {};
@@ -30075,6 +30083,13 @@ async function _pcShowPreviewModal(filename, sheetName, source, records, groups,
     </div>
   `);
   
+  // Override outer modal width — preview ต้องการพื้นที่เยอะ
+  const modalEl = document.getElementById('modal-card');
+  if (modalEl) {
+    modalEl.style.width = 'min(960px, 95vw)';
+    modalEl.style.maxWidth = '95vw';
+  }
+  
   // Check existing data per period (parallel) — filter by source
   const checks = await Promise.all(periods.map(async (key) => {
     const [y, m] = key.split('-').map(Number);
@@ -30288,7 +30303,7 @@ async function _pcShowPreviewModal(filename, sheetName, source, records, groups,
   `;
   
   const bodyHtml = `
-    <div style="padding:20px;max-height:75vh;overflow-y:auto;min-width:640px;max-width:840px">
+    <div style="padding:20px;max-height:80vh;overflow-y:auto;width:100%;box-sizing:border-box">
       
       <!-- File info + source badge -->
       <div class="card-flat mb-3" style="padding:12px;border-left:4px solid ${sourceColor}">
