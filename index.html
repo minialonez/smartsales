@@ -30507,6 +30507,7 @@ async function renderPcSales(el) {
         <div class="page-title">📊 ยอดขาย PC</div>
         <div class="flex" style="gap:8px">
           <button class="btn btn-primary btn-sm" id="btn-pc-upload">📂 อัปโหลด ${sourceLabel}</button>
+          <button class="btn btn-ghost btn-sm" id="btn-pc-auto-select" title="เลือกบิลตามยอดเป้า">🎯 เลือกตามยอด</button>
           <button class="btn btn-ghost btn-sm" id="btn-pc-excel">📊 Excel</button>
           <button class="btn btn-ghost btn-sm" id="btn-pc-pdf">🖨 PDF</button>
         </div>
@@ -30804,6 +30805,11 @@ async function renderPcSales(el) {
       _pcOpenUpload(async () => {
         await loadAndRender();
       });
+    });
+    
+    // Auto-select by target amount
+    document.getElementById('btn-pc-auto-select')?.addEventListener('click', () => {
+      _pcOpenAutoSelectModal();
     });
     
     // Excel + PDF export
@@ -31440,6 +31446,288 @@ async function renderPcSales(el) {
     
     // Re-render bulk bar
     _renderBulkBar();
+  }
+  
+  // ────────────────────────────────────────────────────────────────
+  // Auto Select by Target Amount
+  // ────────────────────────────────────────────────────────────────
+  // Logic:
+  //   1. Filter: status=pending + 1 brand
+  //   2. Group by bill_no — รวม line items เป็น "บิล" (1 บิล = 1 หน่วย)
+  //   3. Sort: เดือนเก่าสุด→ใหม่สุด → ในเดือนเดียวกัน: บิลใหญ่→เล็ก
+  //   4. Greedy add บิลทีละใบ จน sum >= target → STOP
+  //   5. Return: list ของ pc_uuid ทั้งหมดของบิลที่เลือก
+  // ────────────────────────────────────────────────────────────────
+  function _pcOpenAutoSelectModal() {
+    const isInvoice = state.source === 'invoice';
+    const sourceLabel = isInvoice ? 'Invoice' : 'Front';
+    
+    // Pending rows ของ source ปัจจุบัน
+    const allRows = (cachedRows || []).filter(r => 
+      (r.source || 'front') === state.source && 
+      (r.status || 'pending') === 'pending'
+    );
+    
+    // Brand options (เฉพาะ brands ที่มี data จริง)
+    const brandsAvailable = new Set();
+    allRows.forEach(r => brandsAvailable.add(r.brand || ''));
+    const brandOpts = PC_BRANDS
+      .filter(b => brandsAvailable.has(b.id))
+      .map(b => `<option value="${b.id}" data-color="${b.color}">${b.label}</option>`).join('');
+    
+    if (!brandOpts) {
+      toast(`❌ ไม่มีรายการค้างส่งใน ${sourceLabel}`, 'error');
+      return;
+    }
+    
+    openModal(`🎯 เลือกบิล PC ${sourceLabel} ตามยอดเป้า`, `
+      <div style="padding:18px;max-width:680px">
+        
+        <!-- Inputs -->
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:16px">
+          <div>
+            <label style="display:block;font-size:.78rem;color:var(--text2);margin-bottom:5px;font-weight:600">แบรนด์</label>
+            <select id="auto-brand" class="input" style="padding:8px 10px;width:100%">${brandOpts}</select>
+          </div>
+          <div>
+            <label style="display:block;font-size:.78rem;color:var(--text2);margin-bottom:5px;font-weight:600">ยอดเป้าหมาย (฿)</label>
+            <input type="number" id="auto-target" class="input" style="padding:8px 10px;width:100%;font-family:var(--mono);text-align:right" placeholder="300000" min="0" step="1000">
+          </div>
+        </div>
+        
+        <!-- Submit period -->
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:16px">
+          <div>
+            <label style="display:block;font-size:.78rem;color:var(--text2);margin-bottom:5px;font-weight:600">ปีที่ส่ง</label>
+            <select id="auto-submit-year" class="input" style="padding:8px 10px;width:100%">
+              ${years.map(y => `<option value="${y}" ${y===new Date().getFullYear()?'selected':''}>${y}</option>`).join('')}
+            </select>
+          </div>
+          <div>
+            <label style="display:block;font-size:.78rem;color:var(--text2);margin-bottom:5px;font-weight:600">เดือนที่ส่ง</label>
+            <select id="auto-submit-month" class="input" style="padding:8px 10px;width:100%">
+              ${PC_MONTH_LABELS.map((label, i) => 
+                `<option value="${i+1}" ${(i+1)===new Date().getMonth()+1?'selected':''}>${label}</option>`
+              ).join('')}
+            </select>
+          </div>
+        </div>
+        
+        <!-- Logic explanation -->
+        <div style="background:rgba(91,124,250,.06);padding:10px 12px;border-radius:8px;border-left:3px solid var(--primary);font-size:.76rem;color:var(--text2);margin-bottom:14px;line-height:1.6">
+          🎯 <b>Logic การเลือก:</b><br>
+          1. เลือกเฉพาะบิลค้างส่ง (pending) ของแบรนด์ที่ระบุ<br>
+          2. ใช้เดือนเก่าที่สุดก่อน — สะสมบิลของเดือนนั้นจนยอด ≥ เป้า<br>
+          3. ในเดือนเดียวกัน — เรียงบิลใหญ่ → เล็ก (greedy)<br>
+          4. ระบบจะเลือกให้ <b>≥ ยอดเป้า เสมอ</b> (ไม่ต่ำกว่า)
+        </div>
+        
+        <!-- Preview area -->
+        <div id="auto-preview" style="background:var(--surface2);padding:14px;border-radius:8px;margin-bottom:14px;min-height:80px;display:flex;align-items:center;justify-content:center;color:var(--text-muted);font-size:.85rem;text-align:center">
+          ✏️ ใส่ยอดเป้า แล้วระบบจะคำนวณให้
+        </div>
+        
+        <!-- Actions -->
+        <div class="flex justify-end" style="gap:10px">
+          <button class="btn btn-ghost" id="btn-auto-cancel">ยกเลิก</button>
+          <button class="btn btn-primary" id="btn-auto-calc">🧮 คำนวณ</button>
+          <button class="btn btn-primary" id="btn-auto-apply" disabled style="opacity:.5">✅ ส่ง PC ตามนี้</button>
+        </div>
+      </div>
+    `);
+    
+    let lastResult = null;  // {selectedUuids, totalAmount, billCount, lineCount}
+    
+    document.getElementById('btn-auto-cancel').addEventListener('click', closeModal);
+    
+    // Calculate button
+    const recalc = () => {
+      const brand = document.getElementById('auto-brand').value;
+      const target = parseFloat(document.getElementById('auto-target').value) || 0;
+      
+      if (target <= 0) {
+        document.getElementById('auto-preview').innerHTML = `<span style="color:var(--warn)">⚠ ใส่ยอดเป้าก่อน</span>`;
+        document.getElementById('btn-auto-apply').disabled = true;
+        document.getElementById('btn-auto-apply').style.opacity = .5;
+        return;
+      }
+      
+      const result = _pcCalculateAutoSelect(allRows, brand, target);
+      lastResult = result;
+      _renderAutoPreview(result, target);
+      
+      // Enable apply if result reaches target
+      const canApply = result && result.lineCount > 0 && result.totalAmount >= target;
+      document.getElementById('btn-auto-apply').disabled = !canApply;
+      document.getElementById('btn-auto-apply').style.opacity = canApply ? 1 : .5;
+    };
+    
+    document.getElementById('btn-auto-calc').addEventListener('click', recalc);
+    document.getElementById('auto-target').addEventListener('keypress', (e) => {
+      if (e.key === 'Enter') recalc();
+    });
+    document.getElementById('auto-brand').addEventListener('change', recalc);
+    
+    // Apply button — ส่ง PC
+    document.getElementById('btn-auto-apply').addEventListener('click', async () => {
+      if (!lastResult || lastResult.selectedUuids.length === 0) return;
+      const subY = parseInt(document.getElementById('auto-submit-year').value, 10);
+      const subM = parseInt(document.getElementById('auto-submit-month').value, 10);
+      
+      // Set selectedUuids แล้วเรียก bulk update
+      selectedUuids.clear();
+      lastResult.selectedUuids.forEach(u => selectedUuids.add(u));
+      
+      closeModal();
+      await _bulkUpdateStatus('submitted', subY, subM);
+    });
+  }
+  
+  // ────────────────────────────────────────────────────────────────
+  // Algorithm: Greedy bill selection by target amount
+  // ────────────────────────────────────────────────────────────────
+  // Returns:
+  //   {
+  //     bills: [{bill_no, year, month, billTotal, billLineCount, lineUuids}, ...],
+  //     selectedUuids: [pc_uuid, ...],
+  //     totalAmount: number,
+  //     billCount: number,
+  //     lineCount: number,
+  //     reachedTarget: boolean
+  //   }
+  function _pcCalculateAutoSelect(rows, brand, target) {
+    // Filter brand
+    const brandRows = rows.filter(r => r.brand === brand);
+    if (brandRows.length === 0) {
+      return { bills: [], selectedUuids: [], totalAmount: 0, billCount: 0, lineCount: 0, reachedTarget: false };
+    }
+    
+    // Group by bill_no — รวม line items เป็น 1 หน่วย
+    const billMap = {};
+    brandRows.forEach(r => {
+      const billNo = r.bill_no || '(no-bill)';
+      if (!billMap[billNo]) {
+        billMap[billNo] = {
+          bill_no: billNo,
+          year: r.original_year,
+          month: r.original_month,
+          date: r.original_date,
+          billTotal: 0,
+          lines: [],
+          lineUuids: [],
+        };
+      }
+      billMap[billNo].billTotal += Number(r.total) || 0;
+      billMap[billNo].lines.push(r);
+      billMap[billNo].lineUuids.push(r.pc_uuid);
+    });
+    
+    // Sort bills:
+    //   1. เดือนเก่าสุด → ใหม่สุด (year, month asc)
+    //   2. ในเดือนเดียวกัน — billTotal ใหญ่ → เล็ก (desc)
+    const allBills = Object.values(billMap)
+      .filter(b => b.billTotal > 0)  // skip บิลที่ยอด ≤ 0 (เช่น net=0 หลัง credit note)
+      .sort((a, b) => {
+        if (a.year !== b.year) return a.year - b.year;
+        if (a.month !== b.month) return a.month - b.month;
+        return b.billTotal - a.billTotal;  // larger first within same month
+      });
+    
+    // Greedy add until total >= target
+    const selected = [];
+    let runningTotal = 0;
+    let reachedTarget = false;
+    for (let i = 0; i < allBills.length; i++) {
+      selected.push(allBills[i]);
+      runningTotal += allBills[i].billTotal;
+      if (runningTotal >= target) {
+        reachedTarget = true;
+        break;
+      }
+    }
+    
+    // Build result
+    const selectedUuids = [];
+    selected.forEach(b => {
+      b.lineUuids.forEach(u => selectedUuids.push(u));
+    });
+    
+    return {
+      bills: selected,
+      selectedUuids: selectedUuids,
+      totalAmount: runningTotal,
+      billCount: selected.length,
+      lineCount: selectedUuids.length,
+      reachedTarget: reachedTarget,
+    };
+  }
+  
+  // ────────────────────────────────────────────────────────────────
+  // Render auto-select preview
+  // ────────────────────────────────────────────────────────────────
+  function _renderAutoPreview(result, target) {
+    const preview = document.getElementById('auto-preview');
+    if (!preview) return;
+    
+    const fmt = (n) => Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const fmtInt = (n) => Number(n || 0).toLocaleString('en-US', { maximumFractionDigits: 0 });
+    
+    if (!result || result.lineCount === 0) {
+      preview.style.display = 'flex';
+      preview.style.alignItems = 'center';
+      preview.style.justifyContent = 'center';
+      preview.innerHTML = `<span style="color:var(--warn)">⚠ ไม่มีบิล pending ของแบรนด์นี้</span>`;
+      return;
+    }
+    
+    if (!result.reachedTarget) {
+      preview.style.display = 'block';
+      preview.innerHTML = `
+        <div style="text-align:center;color:var(--warn);padding:8px">
+          <div style="font-weight:700;margin-bottom:6px">⚠ ยอดที่มี ไม่ถึงเป้า</div>
+          <div style="font-size:.78rem;color:var(--text2)">
+            มีให้เลือกได้ทั้งหมด <b style="color:var(--text)">฿${fmt(result.totalAmount)}</b>
+            จากเป้า <b>฿${fmt(target)}</b><br>
+            (${fmtInt(result.billCount)} บิล · ${fmtInt(result.lineCount)} รายการ)
+          </div>
+        </div>
+      `;
+      return;
+    }
+    
+    // Reached target — show breakdown by month
+    const byMonth = {};
+    result.bills.forEach(b => {
+      const key = `${b.year}-${String(b.month).padStart(2,'0')}`;
+      if (!byMonth[key]) byMonth[key] = { year: b.year, month: b.month, billCount: 0, total: 0 };
+      byMonth[key].billCount++;
+      byMonth[key].total += b.billTotal;
+    });
+    const monthsBreakdown = Object.values(byMonth).sort((a,b) => 
+      a.year !== b.year ? a.year - b.year : a.month - b.month
+    );
+    const monthsHtml = monthsBreakdown.map(m =>
+      `<span style="display:inline-block;padding:3px 10px;border-radius:4px;background:var(--surface);border:1px solid var(--border);font-size:.72rem;margin:2px">
+        ${PC_MONTH_LABELS[m.month-1]} ${m.year}: ${fmtInt(m.billCount)} บิล · ฿${fmt(m.total)}
+      </span>`
+    ).join('');
+    
+    const overflow = result.totalAmount - target;
+    
+    preview.style.display = 'block';
+    preview.innerHTML = `
+      <div style="text-align:center;margin-bottom:10px">
+        <div style="font-size:.7rem;color:var(--text-muted);text-transform:uppercase;letter-spacing:.8px">ระบบเลือกให้</div>
+        <div style="font-size:1.6rem;font-weight:800;color:var(--success);font-variant-numeric:tabular-nums">฿${fmt(result.totalAmount)}</div>
+        <div style="font-size:.78rem;color:var(--text2);margin-top:2px">
+          ${fmtInt(result.billCount)} บิล · ${fmtInt(result.lineCount)} รายการ · เกินเป้า ฿${fmt(overflow)}
+        </div>
+      </div>
+      <div style="border-top:1px solid var(--border);padding-top:10px;text-align:center">
+        <div style="font-size:.7rem;color:var(--text-muted);margin-bottom:4px">แบ่งตามเดือนต้นทาง</div>
+        <div>${monthsHtml}</div>
+      </div>
+    `;
   }
   
   // ────────────────────────────────────────────────────────────────
