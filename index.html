@@ -29734,6 +29734,362 @@ function _pcParseFrontRaw(rows) {
 }
 
 
+// ────────────────────────────────────────────────────────────────
+// Group records by (year, month) — for batch period detection
+// ────────────────────────────────────────────────────────────────
+function _pcGroupByPeriod(records) {
+  const groups = {};
+  records.forEach(r => {
+    const y = r.original_year, m = r.original_month;
+    if (!y || !m) return;
+    const key = `${y}-${String(m).padStart(2, '0')}`;
+    if (!groups[key]) groups[key] = [];
+    groups[key].push(r);
+  });
+  return groups;
+}
+
+// ────────────────────────────────────────────────────────────────
+// Upload flow: file picker → parse → preview → confirm → save
+// ────────────────────────────────────────────────────────────────
+function _pcOpenUpload(onSaveSuccess) {
+  const fileInput = document.createElement('input');
+  fileInput.type = 'file';
+  fileInput.accept = '.xls,.xlsx,.xlsm,.csv';
+  fileInput.style.display = 'none';
+  document.body.appendChild(fileInput);
+  
+  fileInput.addEventListener('change', async (e) => {
+    const file = e.target.files && e.target.files[0];
+    document.body.removeChild(fileInput);
+    if (!file) return;
+    
+    try {
+      toast('📖 กำลังอ่านไฟล์...', 'info');
+      const parsed = await parseExcelFile(file);
+      
+      // Find Front Raw sheet (case-insensitive, fuzzy match)
+      const frontSheetName = parsed.sheetNames.find(n => {
+        const lc = String(n).toLowerCase().trim();
+        return lc === 'front raw' || lc === 'frontraw' || lc.indexOf('front raw') >= 0;
+      });
+      
+      if (!frontSheetName) {
+        toast(`❌ ไม่พบ sheet "Front Raw" ในไฟล์ — มี: ${parsed.sheetNames.join(', ')}`, 'error');
+        return;
+      }
+      
+      const rows = parsed.sheets[frontSheetName] || [];
+      if (rows.length === 0) {
+        toast('❌ Sheet "Front Raw" ว่างเปล่า', 'error');
+        return;
+      }
+      
+      console.log(`[PC Upload] Reading sheet "${frontSheetName}", ${rows.length} rows`);
+      
+      // Parse + filter brand
+      const result = _pcParseFrontRaw(rows);
+      const records = result.records;
+      const stats = result.stats;
+      
+      if (records.length === 0) {
+        toast(`❌ Parse แล้วไม่เจอข้อมูลที่ตรง brand — ดู console (เห็น ${stats.bills_seen} บิล / ${stats.lines_seen} line items)`, 'error');
+        console.log('[PC Upload] Stats:', stats);
+        return;
+      }
+      
+      // Group by period (year-month)
+      const groups = _pcGroupByPeriod(records);
+      
+      // Show preview modal
+      await _pcShowPreviewModal(file.name, frontSheetName, records, groups, stats, onSaveSuccess);
+    } catch (err) {
+      console.error('[PC Upload] Error:', err);
+      toast('❌ Error: ' + (err.message || err), 'error');
+    }
+  });
+  
+  fileInput.click();
+}
+
+// ────────────────────────────────────────────────────────────────
+// Preview modal — show parsed data + period checks + confirm
+// ────────────────────────────────────────────────────────────────
+async function _pcShowPreviewModal(filename, sheetName, records, groups, stats, onSaveSuccess) {
+  const fmt = (n) => Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const fmtInt = (n) => Number(n || 0).toLocaleString('en-US', { maximumFractionDigits: 0 });
+  const monthLbl = (m) => PC_MONTH_LABELS[m - 1] || m;
+  const periods = Object.keys(groups).sort();
+  
+  // Open modal with loading state
+  openModal('📂 ตรวจสอบยอดขาย PC ก่อนบันทึก', `
+    <div style="padding:20px;text-align:center;color:var(--text-muted)">
+      ⏳ กำลังตรวจสอบข้อมูลเดิมในระบบ...
+    </div>
+  `);
+  
+  // Check existing data per period (parallel)
+  const checks = await Promise.all(periods.map(async (key) => {
+    const [y, m] = key.split('-').map(Number);
+    try {
+      const res = await api('checkPcPeriod', { year: y, month: m });
+      const d = (res && res.data) || {};
+      return {
+        year: y, month: m,
+        pending: d.pending || 0,
+        submitted: d.submitted || 0,
+        excluded: d.excluded || 0,
+        total: d.total || 0,
+      };
+    } catch(e) {
+      return { year: y, month: m, error: e.message };
+    }
+  }));
+  
+  // Compute totals
+  let totalQty = 0, totalAmount = 0;
+  const brandTotals = {};
+  records.forEach(r => {
+    totalQty += Number(r.qty) || 0;
+    totalAmount += Number(r.total) || 0;
+    const b = r.brand || '?';
+    if (!brandTotals[b]) brandTotals[b] = { count: 0, qty: 0, total: 0 };
+    brandTotals[b].count++;
+    brandTotals[b].qty += Number(r.qty) || 0;
+    brandTotals[b].total += Number(r.total) || 0;
+  });
+  
+  // Brand breakdown rows
+  const brandRowsHtml = PC_BRANDS.map(b => {
+    const t = brandTotals[b.id] || { count: 0, qty: 0, total: 0 };
+    if (t.count === 0) return '';
+    return `
+      <tr>
+        <td><span style="display:inline-block;padding:3px 10px;border-radius:6px;background:${b.color};color:#fff;font-size:.72rem;font-weight:700">${b.label}</span></td>
+        <td style="text-align:right;font-family:var(--mono)">${fmtInt(t.count)}</td>
+        <td style="text-align:right;font-family:var(--mono)">${fmtInt(t.qty)}</td>
+        <td style="text-align:right;font-family:var(--mono);color:var(--text);font-weight:600">${fmt(t.total)}</td>
+      </tr>
+    `;
+  }).filter(Boolean).join('');
+  
+  // Station breakdown
+  const stationTotals = {};
+  records.forEach(r => {
+    const s = r.station || '?';
+    if (!stationTotals[s]) stationTotals[s] = { count: 0, total: 0 };
+    stationTotals[s].count++;
+    stationTotals[s].total += Number(r.total) || 0;
+  });
+  const stationRowsHtml = PC_STATIONS.map(s => {
+    const t = stationTotals[s] || { count: 0, total: 0 };
+    if (t.count === 0) return '';
+    return `
+      <tr>
+        <td><span class="badge badge-info">${s}</span></td>
+        <td style="text-align:right;font-family:var(--mono)">${fmtInt(t.count)}</td>
+        <td style="text-align:right;font-family:var(--mono);color:var(--text);font-weight:600">${fmt(t.total)}</td>
+      </tr>
+    `;
+  }).filter(Boolean).join('');
+  
+  // Period rows (with overwrite warning)
+  const periodRowsHtml = periods.map((key, idx) => {
+    const [y, m] = key.split('-').map(Number);
+    const newCount = groups[key].length;
+    const check = checks[idx];
+    const hasExisting = (check.pending + check.submitted + check.excluded) > 0;
+    const hasPreserved = (check.submitted + check.excluded) > 0;
+    
+    let warningText;
+    if (!hasExisting) {
+      warningText = `<span style="color:var(--success);font-weight:600">✨ ใหม่ทั้งหมด ${fmtInt(newCount)} แถว</span>`;
+    } else {
+      const parts = [];
+      if (check.pending > 0) parts.push(`<span style="color:var(--warn)">ลบ pending เก่า ${fmtInt(check.pending)}</span>`);
+      if (hasPreserved) {
+        const pp = [];
+        if (check.submitted > 0) pp.push(`ส่งแล้ว ${fmtInt(check.submitted)}`);
+        if (check.excluded > 0) pp.push(`ไม่นำส่ง ${fmtInt(check.excluded)}`);
+        parts.push(`<span style="color:var(--success)">เก็บไว้ (${pp.join(', ')})</span>`);
+      }
+      parts.push(`<span style="color:var(--text)">เพิ่ม ${fmtInt(newCount)} แถวใหม่</span>`);
+      warningText = parts.join(' · ');
+    }
+    
+    return `
+      <tr>
+        <td>${hasExisting ? '⚠️' : '✨'} ${monthLbl(m)} ${y}</td>
+        <td>${warningText}</td>
+      </tr>
+    `;
+  }).join('');
+  
+  // Sample preview (5 sale + 3 return rows)
+  const saleRecs = records.filter(r => r.bill_type === 'sale').slice(0, 5);
+  const returnRecs = records.filter(r => r.bill_type === 'return').slice(0, 3);
+  const sampleRecords = saleRecs.concat(returnRecs);
+  
+  const sampleRowsHtml = sampleRecords.map(r => {
+    const brand = PC_BRANDS.find(b => b.id === r.brand);
+    const brandColor = brand?.color || 'var(--text2)';
+    const isReturn = r.bill_type === 'return';
+    return `
+      <tr style="${isReturn?'background:rgba(239,68,68,.04)':''}">
+        <td style="font-family:var(--mono);font-size:.72rem">${r.original_date || ''}</td>
+        <td style="font-family:var(--mono);font-size:.7rem">${r.bill_no || ''}</td>
+        <td style="font-size:.7rem">${r.station || ''}</td>
+        <td style="font-family:var(--mono);font-size:.7rem">${r.product_code || ''}</td>
+        <td><span style="display:inline-block;padding:1px 6px;border-radius:4px;background:${brandColor}1f;color:${brandColor};font-size:.65rem;font-weight:600">${r.brand || ''}</span></td>
+        <td style="text-align:right;font-family:var(--mono);${isReturn?'color:var(--danger);font-weight:600':''}">${fmtInt(r.qty)}</td>
+        <td style="text-align:right;font-family:var(--mono);${isReturn?'color:var(--danger);font-weight:600':''}">${fmt(r.total)}</td>
+      </tr>
+    `;
+  }).join('');
+  
+  // Stats line
+  const skippedTotal = stats.lines_skipped_brand + stats.lines_skipped_invalid_code;
+  const statsLine = `
+    Parse: ${fmtInt(stats.bills_seen)} บิล · ${fmtInt(stats.lines_seen)} line items
+    → เก็บ <b style="color:var(--text)">${fmtInt(stats.lines_kept)}</b> · 
+    ตัด ${fmtInt(skippedTotal)} (brand อื่น ${fmtInt(stats.lines_skipped_brand)}, format ผิด ${fmtInt(stats.lines_skipped_invalid_code)})
+  `;
+  
+  const bodyHtml = `
+    <div style="padding:20px;max-height:75vh;overflow-y:auto;min-width:640px;max-width:840px">
+      
+      <!-- File info -->
+      <div class="card-flat mb-3" style="padding:12px">
+        <div class="text-xs" style="color:var(--text-muted);margin-bottom:4px">ไฟล์ที่อัปโหลด</div>
+        <div class="font-semi" style="color:var(--text);font-family:var(--mono);font-size:.85rem">📄 ${filename}</div>
+        <div class="text-xs" style="color:var(--text-muted);margin-top:4px">Sheet: <b style="color:var(--text2)">${sheetName}</b></div>
+        <div class="text-xs" style="color:var(--text2);margin-top:6px;line-height:1.5">${statsLine}</div>
+      </div>
+      
+      <!-- Grand total -->
+      <div class="card-flat mb-3" style="padding:14px 18px;background:linear-gradient(135deg, var(--primary-bg) 0%, transparent 100%);border:1px solid var(--primary);border-left:5px solid var(--primary)">
+        <div style="font-size:.7rem;color:var(--text2);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px">ยอดรวมจากไฟล์</div>
+        <div style="font-size:1.5rem;font-weight:800;color:var(--primary);font-variant-numeric:tabular-nums">฿${fmt(totalAmount)}</div>
+        <div style="font-size:.78rem;color:var(--text-muted);margin-top:2px">${fmtInt(records.length)} รายการ · ${fmtInt(totalQty)} ชิ้น</div>
+      </div>
+      
+      <!-- Brand breakdown -->
+      <div class="card-flat mb-3" style="padding:12px">
+        <div class="font-semi text-sm mb-2" style="color:var(--text)">แยกตามแบรนด์</div>
+        <table>
+          <thead><tr><th>แบรนด์</th><th style="text-align:right">รายการ</th><th style="text-align:right">จำนวน</th><th style="text-align:right">ยอดรวม</th></tr></thead>
+          <tbody>${brandRowsHtml}</tbody>
+        </table>
+      </div>
+      
+      ${stationRowsHtml ? `<div class="card-flat mb-3" style="padding:12px">
+        <div class="font-semi text-sm mb-2" style="color:var(--text)">แยกตามสถานี</div>
+        <table>
+          <thead><tr><th>สถานี</th><th style="text-align:right">รายการ</th><th style="text-align:right">ยอดรวม</th></tr></thead>
+          <tbody>${stationRowsHtml}</tbody>
+        </table>
+      </div>` : ''}
+      
+      <!-- Period checks -->
+      <div class="card-flat mb-3" style="padding:12px">
+        <div class="font-semi text-sm mb-2" style="color:var(--text)">ช่วงเดือนที่จะบันทึก</div>
+        <div style="font-size:.72rem;color:var(--text-muted);margin-bottom:6px">
+          💡 บิลที่ส่งแล้ว / ไม่นำส่ง จะคงไว้ — แทนที่เฉพาะ pending เก่า
+        </div>
+        <table>
+          <tbody>${periodRowsHtml}</tbody>
+        </table>
+      </div>
+      
+      <!-- Sample preview -->
+      <div class="card-flat mb-3" style="padding:12px">
+        <div class="font-semi text-sm mb-2" style="color:var(--text)">ตัวอย่าง ${sampleRecords.length} แถวแรก</div>
+        ${returnRecs.length > 0 ? `<div style="font-size:.7rem;color:var(--text-muted);margin-bottom:6px">⚠ บิลคืน (R2) qty/รวม ติดลบ</div>` : ''}
+        <table>
+          <thead><tr><th>วันที่</th><th>เลขที่บิล</th><th>สถานี</th><th>รหัสสินค้า</th><th>แบรนด์</th><th style="text-align:right">จำนวน</th><th style="text-align:right">รวม</th></tr></thead>
+          <tbody>${sampleRowsHtml}</tbody>
+        </table>
+      </div>
+      
+      <!-- Action buttons -->
+      <div class="flex justify-end" style="gap:10px;margin-top:16px">
+        <button class="btn btn-ghost" id="btn-pc-cancel">❌ ยกเลิก</button>
+        <button class="btn btn-primary" id="btn-pc-confirm">✅ ยืนยันบันทึก</button>
+      </div>
+    </div>
+  `;
+  
+  document.getElementById('modal-body').innerHTML = bodyHtml;
+  
+  document.getElementById('btn-pc-cancel').addEventListener('click', () => closeModal());
+  
+  document.getElementById('btn-pc-confirm').addEventListener('click', async () => {
+    await _pcSaveBatch(records, groups, onSaveSuccess);
+  });
+}
+
+// ────────────────────────────────────────────────────────────────
+// Save: call upsertPcBatch per period (replace=true preserves submitted/excluded)
+// ────────────────────────────────────────────────────────────────
+async function _pcSaveBatch(records, groups, onSaveSuccess) {
+  const periods = Object.keys(groups).sort();
+  
+  document.getElementById('modal-body').innerHTML = `
+    <div style="padding:30px;text-align:center;min-width:400px">
+      <div style="font-size:1.4rem;margin-bottom:12px">⏳</div>
+      <div class="font-semi" style="color:var(--text)">กำลังบันทึก...</div>
+      <div class="text-xs text-muted mt-2" id="pc-progress">เตรียมข้อมูล</div>
+    </div>
+  `;
+  
+  let totalInserted = 0, totalDeleted = 0, totalPreserved = 0;
+  const errors = [];
+  
+  for (let i = 0; i < periods.length; i++) {
+    const key = periods[i];
+    const [y, m] = key.split('-').map(Number);
+    const recs = groups[key];
+    
+    const progressEl = document.getElementById('pc-progress');
+    if (progressEl) {
+      progressEl.textContent = `[${i+1}/${periods.length}] ${PC_MONTH_LABELS[m-1]} ${y} (${recs.length.toLocaleString()} แถว)`;
+    }
+    
+    try {
+      const res = await api('upsertPcBatch', {
+        year: y, month: m,
+        replace: true,
+        records: recs,
+      });
+      if (res && res.success !== false && res.data) {
+        totalInserted += Number(res.data.inserted) || 0;
+        totalDeleted  += Number(res.data.deleted) || 0;
+        totalPreserved += Number(res.data.preserved) || 0;
+      } else {
+        errors.push(`${key}: ${(res && res.error) || 'unknown'}`);
+      }
+    } catch(e) {
+      errors.push(`${key}: ${e.message}`);
+    }
+  }
+  
+  closeModal();
+  
+  if (errors.length > 0) {
+    toast(`⚠ บันทึกบางส่วนล้มเหลว: ${errors.join(', ')}`, 'error');
+  } else {
+    const parts = [`✅ บันทึก ${totalInserted.toLocaleString()} แถว`];
+    if (totalDeleted > 0)   parts.push(`ลบ pending เก่า ${totalDeleted.toLocaleString()}`);
+    if (totalPreserved > 0) parts.push(`คงสถานะส่งแล้ว/ไม่ส่ง ${totalPreserved.toLocaleString()}`);
+    toast(parts.join(' · '), 'success');
+  }
+  
+  if (typeof onSaveSuccess === 'function') {
+    try { await onSaveSuccess(); } catch(_) {}
+  }
+}
+
+
 function _pcLoadState() {
   try {
     const raw = localStorage.getItem(PC_STATE_KEY);
@@ -29791,7 +30147,7 @@ async function renderPcSales(el) {
       <div class="flex justify-between items-center mb-3">
         <div class="page-title">📊 ยอดขาย PC</div>
         <div class="flex" style="gap:8px">
-          <button class="btn btn-primary btn-sm" id="btn-pc-upload" disabled title="เพิ่มใน Step 2A.4">📂 อัปโหลด Front Raw</button>
+          <button class="btn btn-primary btn-sm" id="btn-pc-upload">📂 อัปโหลด Front Raw</button>
           <button class="btn btn-ghost btn-sm" id="btn-pc-excel" disabled title="เพิ่มใน Step 2A.5">📊 Excel</button>
           <button class="btn btn-ghost btn-sm" id="btn-pc-pdf" disabled title="เพิ่มใน Step 2A.5">🖨 PDF</button>
         </div>
@@ -29930,6 +30286,13 @@ async function renderPcSales(el) {
         state.status = btn.dataset.status;
         _pcSaveState(state);
         renderShell();
+        await loadAndRender();
+      });
+    });
+    
+    // Upload button — open file picker → parse → preview → save
+    document.getElementById('btn-pc-upload')?.addEventListener('click', () => {
+      _pcOpenUpload(async () => {
         await loadAndRender();
       });
     });
