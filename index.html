@@ -2477,6 +2477,69 @@ const syncManager = {
     if (this.dirty.size === 0) return { ok: 0, fail: 0, skipped: 0, errors: [] };
     if (this.status === 'pushing') return { ok: 0, fail: 0, skipped: 0, errors: ['already pushing'] };
     
+    // ══════════════════════════════════════════════════════════════
+    // ⭐ DATA LOSS GUARD (4/5/26 — Pattern B Phase 2a)
+    // ══════════════════════════════════════════════════════════════
+    // เหตุการณ์: Phase 1 ครั้งแรก → loadAllFromCloud fail บางส่วน → memory partial
+    //            → user กดบันทึก → _flushPush push partial memory → cloud ทับด้วย empty
+    //            → ข้อมูลใน Google Sheets หายหมด (ต้อง restore version history)
+    //
+    // Guard logic:
+    //   1. Track high-water-mark: count สูงสุดของ session นี้
+    //   2. ก่อน push: ถ้า memory < 50% ของ high-water → ABORT + แจ้ง user
+    //   3. user สามารถ override ได้ผ่าน window._allowPushPartial (manual confirm)
+    // ══════════════════════════════════════════════════════════════
+    if (!window._billsPushHighWater) window._billsPushHighWater = 0;
+    if (!window._stmtsPushHighWater) window._stmtsPushHighWater = 0;
+    
+    const _currentBills = Array.isArray(billList) ? billList.length : 0;
+    const _currentStmts = (typeof getAllStatements === 'function') ? getAllStatements().length : 0;
+    
+    // Update high-water (only ขึ้น ไม่ลง)
+    if (_currentBills > window._billsPushHighWater) window._billsPushHighWater = _currentBills;
+    if (_currentStmts > window._stmtsPushHighWater) window._stmtsPushHighWater = _currentStmts;
+    
+    // Pre-flight check
+    const willPushBills = this.dirty.has('bills');
+    const willPushStmts = this.dirty.has('stmts');
+    const dangerThreshold = 0.5; // 50%
+    
+    let abortReasons = [];
+    
+    if (willPushBills && window._billsPushHighWater > 100) {
+      const ratio = _currentBills / window._billsPushHighWater;
+      if (ratio < dangerThreshold) {
+        abortReasons.push(`Bills: memory มี ${_currentBills} ลด > 50% จาก ${window._billsPushHighWater} (high-water)`);
+      }
+    }
+    if (willPushStmts && window._stmtsPushHighWater > 100) {
+      const ratio = _currentStmts / window._stmtsPushHighWater;
+      if (ratio < dangerThreshold) {
+        abortReasons.push(`Stmts: memory มี ${_currentStmts} ลด > 50% จาก ${window._stmtsPushHighWater} (high-water)`);
+      }
+    }
+    
+    if (abortReasons.length > 0 && !window._allowPushPartial) {
+      const msg = `🛑 ABORT push — กันข้อมูลหาย:\n\n${abortReasons.join('\n')}\n\n` +
+                  `ถ้าจงใจลบเยอะ → กด F12 → console พิมพ์: window._allowPushPartial = true → กดบันทึกใหม่\n` +
+                  `ถ้าไม่ได้ลบ → กดปุ่ม 🔄 Refresh ที่ sidebar เพื่อ reload จาก cloud`;
+      console.error('[syncManager] DATA LOSS GUARD TRIPPED', abortReasons);
+      if (typeof toast === 'function') toast(msg, 'error', 15000);
+      // Keep dirty flags — user สามารถ retry ได้หลัง refresh
+      this.status = 'error';
+      this.lastError = 'data-loss-guard';
+      this._emit();
+      return { ok: 0, fail: 0, skipped: 0, errors: abortReasons, aborted: true };
+    }
+    
+    // ⭐ Reset _allowPushPartial หลังใช้แล้ว — ป้องกันใช้ซ้ำโดยไม่ตั้งใจ
+    if (window._allowPushPartial) {
+      window._allowPushPartial = false;
+      console.warn('[syncManager] _allowPushPartial consumed — reset to false');
+    }
+    
+    console.log(`[syncManager] _flushPush start — dirty=${[...this.dirty].join(',')} bills=${_currentBills}/${window._billsPushHighWater} stmts=${_currentStmts}/${window._stmtsPushHighWater}`);
+    
     const types = Array.from(this.dirty);
     this.dirty.clear();
     this.status = 'pushing';
@@ -17942,10 +18005,14 @@ async function loadAllFromCloud(opts) {
     } catch (e) { _log('Supplier Payments', 0, e); }
     
     // ── PARALLEL FETCH (group 2: per-year bills + stmts + meta) ──
+    // ── Capture "before" count สำหรับ threshold validation ──
+    const beforeStmtsCount = (typeof getAllStatements === 'function') ? getAllStatements().length : 0;
+    const beforeBillsCount = Array.isArray(billList) ? billList.length : 0;
+    
     for (const y of years) {
-      const [resBills, resStmts, resMeta] = await Promise.all([
+      // Bills + Meta — parallel (2 requests, OK)
+      const [resBills, resMeta] = await Promise.all([
         api('getBillsWithUuid', { year: y }).catch(e => ({ success: false, error: e.message })),
-        pullStatementsCompat(y).catch(e => ({ _err: e.message })),
         api('getMetaWithUuid', { year: y }).catch(e => ({ success: false, error: e.message })),
       ]);
       
@@ -17959,19 +18026,48 @@ async function loadAllFromCloud(opts) {
         }
       } catch (e) { _log(`Bills ${y}`, 0, e); }
       
-      // Stmts
-      try {
-        if (Array.isArray(resStmts)) {
-          resStmts.forEach(s => {
-            const bank = s.bank || 'UNKNOWN';
-            if (!tempStmts[bank]) tempStmts[bank] = [];
-            tempStmts[bank].push(s);
-          });
-          _log(`Stmts ${y}`, resStmts.length);
-        } else if (resStmts?._err) {
-          _log(`Stmts ${y}`, 0, new Error(resStmts._err));
+      // ── Stmts: per-bank fetch (sequential, แต่ละ bank แยก request) ──
+      // เปลี่ยนจาก v2_getAllStatementsByYear (1 request × 5 banks) → v2_getStatementsByBank (5 requests)
+      // เหตุผล: 1 request × 5 banks = อาจ Apps Script timeout 30s → fail ทั้งปี
+      //          แยก request = ถ้า bank ใด timeout, อื่น ๆ ยังได้
+      const BANKS = ['KTB', 'KBANK', 'BBL_NW', 'BBL', 'TTB'];
+      for (const bank of BANKS) {
+        const displayBank = (bank === 'BBL_NW') ? 'BBL NW' : bank;
+        let attempt = 0;
+        let success = false;
+        while (attempt < 2 && !success) {
+          attempt++;
+          try {
+            const r = await api('v2_getStatementsByBank', { bank, year: y });
+            if (r?.success && Array.isArray(r.data?.rows)) {
+              if (!tempStmts[displayBank]) tempStmts[displayBank] = [];
+              r.data.rows.forEach(s => {
+                s.bank = displayBank;
+                tempStmts[displayBank].push(s);
+              });
+              _log(`Stmts ${y} ${displayBank}`, r.data.rows.length);
+              success = true;
+            } else if (r?.success === false) {
+              if (attempt >= 2) {
+                _log(`Stmts ${y} ${displayBank}`, 0, new Error(r.error || 'unknown'));
+              } else {
+                console.warn(`[loadAllFromCloud] Stmts ${y} ${displayBank} attempt ${attempt} failed, retrying...`);
+                await new Promise(r => setTimeout(r, 1000));
+              }
+            } else {
+              success = true; // No error, no rows — empty bank, OK
+              _log(`Stmts ${y} ${displayBank}`, 0);
+            }
+          } catch (e) {
+            if (attempt >= 2) {
+              _log(`Stmts ${y} ${displayBank}`, 0, e);
+            } else {
+              console.warn(`[loadAllFromCloud] Stmts ${y} ${displayBank} attempt ${attempt} exception, retrying...`);
+              await new Promise(r => setTimeout(r, 1000));
+            }
+          }
         }
-      } catch (e) { _log(`Stmts ${y}`, 0, e); }
+      }
       
       // Meta
       try {
@@ -17994,20 +18090,51 @@ async function loadAllFromCloud(opts) {
       } catch (e) { _log(`Meta ${y}`, 0, e); }
     }
     
-    // ── VALIDATE: ถ้า fail หมดทุก type ที่สำคัญ → abort (เช่น offline) ──
+    // ══════════════════════════════════════════════════════════════
+    // VALIDATE + SELECTIVE SWAP: ป้องกัน partial-fail → ทับข้อมูลเก่าหายหมด
+    // ══════════════════════════════════════════════════════════════
+    // เกณฑ์ abort:
+    //   - ก่อน load มี data — pull ได้น้อยกว่า 10% ของก่อน → likely fail → abort swap type นั้น ๆ
+    //   - ก่อน load ว่าง — accept ทุกค่า (รวม 0)
+    // ผลลัพธ์: bug "KTB+KBANK หาย" จะไม่เกิดอีก เพราะถ้า pull stmts ได้แค่ 200 จาก 7000 → keep เก่า
+    
     const totalStmts = Object.values(tempStmts).reduce((s, arr) => s + arr.length, 0);
-    if (errors.length >= 3 && tempBills.length === 0 && totalStmts === 0) {
+    
+    // Hard fail: ทุก type fail หมด → likely offline → abort ทั้งหมด
+    if (errors.length >= 5 && tempBills.length === 0 && totalStmts === 0) {
       throw new Error(`Cloud unreachable — ${errors.length} errors. ตรวจ network/Apps Script.`);
     }
     
-    // ── SWAP: replace memory ทั้งหมด ──
-    billList = tempBills;
-    statementsByBank = { KTB: [], KBANK: [], 'BBL NW': [], BBL: [], TTB: [], UNKNOWN: [] };
-    Object.keys(tempStmts).forEach(bank => {
-      statementsByBank[bank] = tempStmts[bank];
-    });
-    if (typeof getAllStatements === 'function') {
-      uploadedStatements = getAllStatements();
+    // ── Per-type threshold ──
+    const swapBills = (beforeBillsCount === 0) || (tempBills.length >= beforeBillsCount * 0.1);
+    const swapStmts = (beforeStmtsCount === 0) || (totalStmts >= beforeStmtsCount * 0.1);
+    
+    const skipReasons = [];
+    if (!swapBills) {
+      skipReasons.push(`Bills ${tempBills.length}/${beforeBillsCount} (< 10%)`);
+      console.warn(`[loadAllFromCloud] ABORT bills swap: pulled ${tempBills.length}, before ${beforeBillsCount}`);
+    }
+    if (!swapStmts) {
+      skipReasons.push(`Stmts ${totalStmts}/${beforeStmtsCount} (< 10%)`);
+      console.warn(`[loadAllFromCloud] ABORT stmts swap: pulled ${totalStmts}, before ${beforeStmtsCount}`);
+    }
+    
+    if (skipReasons.length > 0 && !silent) {
+      toast(`⚠️ ดึงข้อมูลได้น้อยกว่าเดิม — ไม่ swap: ${skipReasons.join(', ')}\n(ข้อมูลเดิมยังครบ)`, 'warning', 8000);
+    }
+    
+    // ── SWAP (selective) ──
+    if (swapBills) {
+      billList = tempBills;
+    }
+    if (swapStmts) {
+      statementsByBank = { KTB: [], KBANK: [], 'BBL NW': [], BBL: [], TTB: [], UNKNOWN: [] };
+      Object.keys(tempStmts).forEach(bank => {
+        statementsByBank[bank] = tempStmts[bank];
+      });
+      if (typeof getAllStatements === 'function') {
+        uploadedStatements = getAllStatements();
+      }
     }
     paymentList = tempPayments;
     spTempList = tempSpTemps;
@@ -18015,7 +18142,7 @@ async function loadAllFromCloud(opts) {
     supplierList = tempSuppliers;
     supplierPayments = tempSupplierPayments;
     
-    // Merge meta
+    // Merge meta (always merge — additive, ไม่ใช่ replace)
     if (!mainSummary.__byDate) mainSummary.__byDate = {};
     Object.entries(tempSummary.__byDate).forEach(([d, v]) => {
       mainSummary.__byDate[d] = v;
@@ -18032,6 +18159,14 @@ async function loadAllFromCloud(opts) {
     if (typeof syncManager !== 'undefined' && syncManager.dirty) {
       syncManager.dirty.clear();
     }
+    
+    // ⭐ Update high-water marks หลัง load สำเร็จ
+    //    ทำให้ data-loss guard เปรียบเทียบกับ count ที่เพิ่ง load มา
+    const newBillsCount = Array.isArray(billList) ? billList.length : 0;
+    const newStmtsCount = (typeof getAllStatements === 'function') ? getAllStatements().length : 0;
+    if (newBillsCount > 0) window._billsPushHighWater = newBillsCount;
+    if (newStmtsCount > 0) window._stmtsPushHighWater = newStmtsCount;
+    console.log(`[loadAllFromCloud] high-water set: bills=${newBillsCount} stmts=${newStmtsCount}`);
     
     window._lastCloudLoad = Date.now();
     const elapsed = Math.round((Date.now() - t0) / 1000);
