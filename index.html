@@ -17925,9 +17925,19 @@ async function loadAllFromCloud(opts) {
   
   // ⭐ Concurrency guard — ห้าม load ซ้อน
   if (window._loadingFromCloud) {
-    console.warn('[loadAllFromCloud] skipped — already loading');
+    console.warn(`[loadAllFromCloud] skipped (${reason}) — already loading`);
     return { ok: false, reason: 'already-loading' };
   }
+  
+  // ⭐ Time-based guard (4/5/26): ห้ามเรียกซ้ำใน 10s ยกเว้น manual-click
+  //    Bug fix: showApp + manual-click + tab-focus เคยยิง 3 ครั้งติดกัน → 33s + 36 invocations
+  //    Manual-click bypass guard (user explicitly request)
+  const sinceLast = Date.now() - (Number(window._lastCloudLoad) || 0);
+  if (sinceLast < 10000 && reason !== 'manual-click') {
+    console.warn(`[loadAllFromCloud] skipped (${reason}) — last load ${Math.round(sinceLast/1000)}s ago, debounce 10s`);
+    return { ok: false, reason: 'debounce' };
+  }
+  
   window._loadingFromCloud = true;
   
   // Update sidebar badge
@@ -17986,6 +17996,11 @@ async function loadAllFromCloud(opts) {
     fetchPromises.push(api('getCashflow').catch(e => ({ _err: e.message })));        fetchLabels.push('Cashflow');
     fetchPromises.push(api('getSuppliers').catch(e => ({ _err: e.message })));       fetchLabels.push('Suppliers');
     fetchPromises.push(api('getSupplierPayments').catch(e => ({ _err: e.message }))); fetchLabels.push('Supplier Payments');
+    // ⭐ Transfer Log (4/5/26) — เดิม lazy-load → ทำให้หน้า Transfer Log ว่างตอนเข้าใหม่
+    //    Fix: load ตอน initial เสมอ (ปกติ ~6s, ทำ parallel ไม่กระทบเวลารวม)
+    const TRANSFER_LOG_IDX = fetchPromises.length;
+    fetchPromises.push(api('v2_getTransferLog', {}).catch(e => ({ _err: e.message })));    fetchLabels.push('Transfer Log');
+    fetchPromises.push(api('v2_getTransferMaster', {}).catch(e => ({ _err: e.message }))); fetchLabels.push('Transfer Master');
     
     // Per year: bills + meta + 5 banks
     const yearPromiseStart = {};
@@ -18050,6 +18065,39 @@ async function loadAllFromCloud(opts) {
       items.forEach(p => tempSupplierPayments.push(p));
       _log('Supplier Payments', items.length);
     } catch (e) { _log('Supplier Payments', 0, e); }
+    
+    // ⭐ Transfer Log (idx 5) + Master (idx 6)
+    try {
+      const rLog = results[TRANSFER_LOG_IDX];
+      const rMaster = results[TRANSFER_LOG_IDX + 1];
+      if (rLog?._err) throw new Error(rLog._err);
+      if (rMaster?._err) throw new Error(rMaster._err);
+      const logData = rLog?.data || rLog || {};
+      const masterData = rMaster?.data || rMaster || {};
+      // Apply ทันทีเพราะ transferLog เป็น global state อยู่แล้ว (ไม่มี temp staging)
+      if (typeof transferLog !== 'undefined') {
+        const vatTL = Array.isArray(logData.vat) ? logData.vat : [];
+        const novatTL = Array.isArray(logData.novat) ? logData.novat : [];
+        const vatMaster = Array.isArray(masterData.vat) ? masterData.vat : [];
+        const novatMaster = Array.isArray(masterData.novat) ? masterData.novat : [];
+        if (typeof _tlNormalize === 'function') {
+          transferLog.vatTransfers = vatTL.map(_tlNormalize);
+          transferLog.novatTransfers = novatTL.map(_tlNormalize);
+        } else {
+          transferLog.vatTransfers = vatTL;
+          transferLog.novatTransfers = novatTL;
+        }
+        if (typeof _tmNormalize === 'function') {
+          transferLog.vatSuppliers = vatMaster.map(_tmNormalize);
+          transferLog.novatSuppliers = novatMaster.map(_tmNormalize);
+        } else {
+          transferLog.vatSuppliers = vatMaster;
+          transferLog.novatSuppliers = novatMaster;
+        }
+        _log(`Transfer Log`, vatTL.length + novatTL.length);
+        _log(`Transfer Master`, vatMaster.length + novatMaster.length);
+      }
+    } catch (e) { _log('Transfer Log', 0, e); }
     
     // ── Process per-year results ──
     for (const y of years) {
