@@ -2272,6 +2272,52 @@ async function pullStatementsCompat(year) {
 window.pushStatementsCompat = pushStatementsCompat;
 window.pullStatementsCompat = pullStatementsCompat;
 
+// ══════════════════════════════════════════════════════════════
+// STMT HEAL — single source of truth for match_status logic
+// ══════════════════════════════════════════════════════════════
+// Bug fix (4/5/26): heal เก่ามี 2 problem
+//   1. (hasStation && hasBill) — strict AND → ถ้า bill ถูก clear เหลือแค่ station → 
+//      heal เห็นว่า "ไม่ matched" → downgrade paid → unpaid (TIME BOMB)
+//   2. allowDowngrade ทำงานเสมอ → state ครึ่ง ๆ กลาง ๆ ของ paid stmt ถูก revert
+//
+// Fix:
+//   - Loosen: ใช้ OR แทน AND — มี signal ใด signal หนึ่ง = matched
+//   - Default NO DOWNGRADE — เลิก revert paid → unpaid (ทำให้เกิด time bomb)
+//     ถ้า user ต้องการ unmatch จริง → กด unmatch action ตรง (clear ทุก field)
+// ══════════════════════════════════════════════════════════════
+function _isStmtMatched(s) {
+  if (!s) return false;
+  const hasStation = !!(s.match_station && String(s.match_station).trim());
+  const hasBill = !!(s.match_bill && String(s.match_bill).trim());
+  const hasMatchedBills = Array.isArray(s.matched_bills) && s.matched_bills.length > 0;
+  const isReasonOnly = s.match_method === 'manual_reason';
+  const isSpTemp = s.match_station === 'SP-TEMP';
+  const hasReason = !!(s.match_reason && String(s.match_reason).trim());
+  // ⭐ ANY signal of match → counts as matched (loose check, no time bomb)
+  return hasStation || hasBill || hasMatchedBills || isReasonOnly || isSpTemp || hasReason;
+}
+window._isStmtMatched = _isStmtMatched;
+
+function healStmtMatchStatus(stmts, opts) {
+  opts = opts || {};
+  const allowDowngrade = !!opts.allowDowngrade; // default false — กัน time bomb
+  let healedUp = 0, healedDown = 0;
+  if (!Array.isArray(stmts)) return { up: 0, down: 0 };
+  stmts.forEach(s => {
+    const matched = _isStmtMatched(s);
+    if (matched && s.match_status !== 'paid') {
+      s.match_status = 'paid';
+      healedUp++;
+    } else if (allowDowngrade && !matched && s.match_status === 'paid') {
+      // ⚠️ ใช้เฉพาะที่จำเป็นจริง (default false)
+      s.match_status = 'unpaid';
+      healedDown++;
+    }
+  });
+  return { up: healedUp, down: healedDown };
+}
+window.healStmtMatchStatus = healStmtMatchStatus;
+
 const syncManager = {
   enabled: true,            // toggle ผ่าน localStorage['sf_sync_enabled']
   pushDelayMs: 5000,        // debounce 5s หลัง mutation สุดท้าย
@@ -2521,10 +2567,20 @@ const syncManager = {
     
     if (abortReasons.length > 0 && !window._allowPushPartial) {
       const msg = `🛑 ABORT push — กันข้อมูลหาย:\n\n${abortReasons.join('\n')}\n\n` +
-                  `ถ้าจงใจลบเยอะ → กด F12 → console พิมพ์: window._allowPushPartial = true → กดบันทึกใหม่\n` +
-                  `ถ้าไม่ได้ลบ → กดปุ่ม 🔄 Refresh ที่ sidebar เพื่อ reload จาก cloud`;
+                  `วิธีแก้ที่ปลอดภัย:\n` +
+                  `1. กดปุ่ม 🔄 Refresh ที่ sidebar (มุมล่างซ้าย) เพื่อ reload จาก cloud\n` +
+                  `2. high-water จะ reset ตามค่าจริง\n` +
+                  `3. กดบันทึกใหม่อีกครั้ง\n\n` +
+                  `(ถ้าจงใจลบเยอะจริง → F12 → console พิมพ์: window._allowPushPartial = true → กดบันทึกใหม่)`;
       console.error('[syncManager] DATA LOSS GUARD TRIPPED', abortReasons);
-      if (typeof toast === 'function') toast(msg, 'error', 15000);
+      // ⭐ ใช้ทั้ง toast + alert เพื่อให้แน่ใจว่า user เห็น
+      if (typeof toast === 'function') toast(msg, 'error', 20000);
+      // Backup: alert popup ถ้า toast ไม่ทำงาน (เช่น user เรียก _flushPush ผ่าน console ตรง)
+      try { 
+        setTimeout(() => {
+          if (typeof alert === 'function') alert(msg);
+        }, 100);
+      } catch(_){}
       // Keep dirty flags — user สามารถ retry ได้หลัง refresh
       this.status = 'error';
       this.lastError = 'data-loss-guard';
@@ -3443,28 +3499,11 @@ const syncManager = {
       
       // ⭐ Self-heal stmts after pull: match_station+match_bill มี แต่ match_status ไม่ใช่ 'matched'
       //    เกิดจาก partial sync race ตอน user A push → user B pull
+      //    Bug fix (4/5/26): ใช้ healStmtMatchStatus helper + NO downgrade (กัน time bomb)
       {
-        let healedM = 0, healedU = 0;
-        uploadedStatements.forEach(s => {
-          const hasStation = !!(s.match_station && String(s.match_station).trim());
-          const hasBill = !!(s.match_bill && String(s.match_bill).trim());
-          const hasMatchedBills = Array.isArray(s.matched_bills) && s.matched_bills.length > 0;
-          // ⭐ manual_reason / SP-TEMP เป็น valid paid โดยไม่ต้องมี bill link
-          const isReasonOnly = s.match_method === 'manual_reason';
-          const isSpTemp = s.match_station === 'SP-TEMP';
-          const hasReason = !!(s.match_reason && String(s.match_reason).trim());
-          const hasMatchData = (hasStation && hasBill) || hasMatchedBills || isReasonOnly || isSpTemp || hasReason;
-          
-          if (hasMatchData && s.match_status !== 'paid') {
-            s.match_status = 'paid';
-            healedM++;
-          } else if (!hasMatchData && s.match_status === 'paid') {
-            s.match_status = 'unpaid';
-            healedU++;
-          }
-        });
-        if (healedM + healedU > 0) {
-          console.log(`[sync heal stmts] matched:+${healedM} unmatched:+${healedU}`);
+        const r = healStmtMatchStatus(uploadedStatements);
+        if (r.up > 0) {
+          console.log(`[sync heal stmts] ${r.up} stmts → paid`);
         }
       }
       
@@ -4613,28 +4652,11 @@ async function restoreMainState() {
   // ⭐ Self-heal stmts: match_station+match_bill มี แต่ match_status ไม่ใช่ 'matched'
   //    สาเหตุ: partial sync push / pull cloud-wins overwrite match_status field
   //    → กลับสถานะให้ตรงกับข้อมูลจริง
+  //    Bug fix (4/5/26): ใช้ helper + NO downgrade
   {
-    let healedMatched = 0, healedUnmatched = 0;
-    uploadedStatements.forEach(s => {
-      const hasStation = !!(s.match_station && String(s.match_station).trim());
-      const hasBill = !!(s.match_bill && String(s.match_bill).trim());
-      const hasMatchedBills = Array.isArray(s.matched_bills) && s.matched_bills.length > 0;
-      // ⭐ manual_reason / SP-TEMP / มี match_reason = valid paid (no bill link by design)
-      const isReasonOnly = s.match_method === 'manual_reason';
-      const isSpTemp = s.match_station === 'SP-TEMP';
-      const hasReason = !!(s.match_reason && String(s.match_reason).trim());
-      const hasMatchData = (hasStation && hasBill) || hasMatchedBills || isReasonOnly || isSpTemp || hasReason;
-      
-      if (hasMatchData && s.match_status !== 'paid') {
-        s.match_status = 'paid';
-        healedMatched++;
-      } else if (!hasMatchData && s.match_status === 'paid') {
-        s.match_status = 'unpaid';
-        healedUnmatched++;
-      }
-    });
-    if (healedMatched + healedUnmatched > 0) {
-      console.log(`[heal stmts] matched:+${healedMatched} unmatched:+${healedUnmatched}`);
+    const r = healStmtMatchStatus(uploadedStatements);
+    if (r.up > 0) {
+      console.log(`[heal stmts] ${r.up} stmts → paid`);
     }
   }
   
@@ -17888,15 +17910,31 @@ function showApp() {
   })();
   
   // ⭐ PATTERN B: Auto-refresh on tab focus ถ้า idle > 5 นาที
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden) return;
-    const lastLoad = Number(window._lastCloudLoad || 0);
-    const idleMs = Date.now() - lastLoad;
-    if (idleMs > 5 * 60 * 1000) {
-      console.log(`[Pattern B] tab focus + idle ${Math.round(idleMs/60000)} min → reload from cloud`);
-      loadAllFromCloud({ silent: true, reason: 'tab-focus' });
-    }
-  });
+  // Bug fix (4/5/26): 
+  //   - prevent duplicate listener (showApp อาจถูก call หลายครั้ง)
+  //   - guard against idle overflow (lastLoad=0 ทำให้ idleMs=Date.now() = 50+ years)
+  //   - debounce 3s กัน trigger ติด ๆ กัน
+  if (!window._visibilityListenerAdded) {
+    window._visibilityListenerAdded = true;
+    let _vcDebounce = 0;
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) return;
+      // Debounce: ถ้า fire ซ้ำใน 3s → skip
+      const now = Date.now();
+      if (now - _vcDebounce < 3000) return;
+      _vcDebounce = now;
+      
+      const lastLoad = Number(window._lastCloudLoad || 0);
+      // ⭐ Guard: ถ้ายังไม่เคย load (lastLoad=0) → skip — initial load จะ set lastLoad เอง
+      if (lastLoad === 0) return;
+      
+      const idleMs = now - lastLoad;
+      if (idleMs > 5 * 60 * 1000) {
+        console.log(`[Pattern B] tab focus + idle ${Math.round(idleMs/60000)} min → reload from cloud`);
+        loadAllFromCloud({ silent: true, reason: 'tab-focus' });
+      }
+    });
+  }
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -18232,6 +18270,19 @@ async function loadAllFromCloud(opts) {
     if (newBillsCount > 0) window._billsPushHighWater = newBillsCount;
     if (newStmtsCount > 0) window._stmtsPushHighWater = newStmtsCount;
     console.log(`[loadAllFromCloud] high-water set: bills=${newBillsCount} stmts=${newStmtsCount}`);
+    
+    // ⭐ HEAL stmts หลัง pull (Bug B fix 4/5/26)
+    //    Reason: stmts ที่ user mark ผ่าน "Mark as paid by reason" 
+    //    มี match_method='manual_reason' + match_reason แต่ status ยัง 'unpaid'
+    //    เดิม: heal trigger เฉพาะ render-matching → stmts เหล่านี้ไม่ผ่าน heal
+    //    ใหม่: heal ทุก stmts หลัง pull เลย → fix ทันที
+    if (swapStmts && typeof window.healStmtMatchStatus === 'function') {
+      const all = getAllStatements();
+      const r = window.healStmtMatchStatus(all);
+      if (r.up > 0) {
+        console.log(`[loadAllFromCloud] heal: ${r.up} stmts → paid (manual_reason / partial match data)`);
+      }
+    }
     
     window._lastCloudLoad = Date.now();
     const elapsed = Math.round((Date.now() - t0) / 1000);
@@ -20874,24 +20925,11 @@ async function renderSales(el) {
 // ── Matching ────────────────────────────────────────────────
 async function renderMatching(el) {
   // ⭐ Self-heal stmts on render — กัน case multi-device race
-  //    ถ้า stmt มี match_station+match_bill แต่ status ไม่ใช่ 'matched' → fix ตอนนี้
+  //    Bug fix (4/5/26): ใช้ helper + NO downgrade (กัน time bomb)
   if (uploadedStatements && uploadedStatements.length > 0) {
-    let healedM = 0, healedU = 0;
-    uploadedStatements.forEach(s => {
-      const hasStation = !!(s.match_station && String(s.match_station).trim());
-      const hasBill = !!(s.match_bill && String(s.match_bill).trim());
-      const hasMatchedBills = Array.isArray(s.matched_bills) && s.matched_bills.length > 0;
-      const hasMatchData = (hasStation && hasBill) || hasMatchedBills;
-      if (hasMatchData && s.match_status !== 'paid') {
-        s.match_status = 'paid';
-        healedM++;
-      } else if (!hasMatchData && s.match_status === 'paid') {
-        s.match_status = 'unpaid';
-        healedU++;
-      }
-    });
-    if (healedM + healedU > 0) {
-      console.log(`[matching render heal] +${healedM} matched, +${healedU} unmatched`);
+    const r = healStmtMatchStatus(uploadedStatements);
+    if (r.up > 0) {
+      console.log(`[matching render heal] +${r.up} stmts → paid`);
       try { persistMainState(); } catch(_) {}
     }
   }
