@@ -2318,6 +2318,99 @@ function healStmtMatchStatus(stmts, opts) {
 }
 window.healStmtMatchStatus = healStmtMatchStatus;
 
+// ══════════════════════════════════════════════════════════════
+// HEAL BILL ↔ STMT LINKS — fill missing matched_stmt_uuid
+// ══════════════════════════════════════════════════════════════
+// Bug fix (4/5/26): Bills ที่ paid แต่ matched_stmt_uuid ว่าง (legacy)
+//   → unmatch logic หาบิลผิดเมื่อ bill_no ซ้ำ (split payment)
+//   → fix: link bill ↔ stmt ผ่าน matched_stmt_ref + matched_bills array
+//
+// Algorithm (conservative — ไม่ link ถ้า ambiguous):
+//   1. หา bills: paid + matched_stmt_ref ไม่ว่าง + matched_stmt_uuid ว่าง
+//   2. group stmts by ref_no
+//   3. สำหรับแต่ละ orphan bill:
+//      a) ถ้า ref_no มี stmt 1 ตัว → link (unique → certain)
+//      b) ถ้า ref_no มี stmt หลายตัว → หา stmt ที่ matched_bills มี bill_no นี้
+//         - เจอ 1 ตัว → link
+//         - เจอหลายตัว / ไม่เจอ → SKIP (ambiguous, รักษา data integrity)
+//      c) ไม่เจอ ref_no เลย → SKIP (ref อาจถูกลบจาก Sheet)
+// ══════════════════════════════════════════════════════════════
+function healBillStmtLinks(bills, stmts) {
+  if (!Array.isArray(bills) || !Array.isArray(stmts)) {
+    return { healed: 0, ambiguous: 0, notFound: 0, total: 0 };
+  }
+  
+  // หา orphan bills (paid + มี ref + ไม่มี uuid)
+  const orphans = bills.filter(b => {
+    const isPaid = b.match_status === 'paid' || b.match_status === 'matched';
+    return isPaid && b.matched_stmt_ref && !b.matched_stmt_uuid;
+  });
+  
+  if (orphans.length === 0) {
+    return { healed: 0, ambiguous: 0, notFound: 0, total: 0 };
+  }
+  
+  // Index stmts by ref_no
+  const stmtsByRef = {};
+  stmts.forEach(s => {
+    if (!s.ref_no || !s.stmt_uuid) return;
+    const ref = String(s.ref_no).trim();
+    if (!ref) return;
+    if (!stmtsByRef[ref]) stmtsByRef[ref] = [];
+    stmtsByRef[ref].push(s);
+  });
+  
+  let healed = 0, ambiguous = 0, notFound = 0;
+  const ambiguousLog = [];
+  
+  orphans.forEach(b => {
+    const ref = String(b.matched_stmt_ref).trim();
+    const candidates = stmtsByRef[ref] || [];
+    
+    if (candidates.length === 0) {
+      notFound++;
+      return;
+    }
+    
+    if (candidates.length === 1) {
+      // Unique ref → link ได้แน่นอน
+      b.matched_stmt_uuid = candidates[0].stmt_uuid;
+      healed++;
+      return;
+    }
+    
+    // candidates.length > 1 — ref ซ้ำ (รัฐบาล batch payment, etc.)
+    // ใช้ matched_bills array เป็น tie-breaker
+    const billNo = String(b.bill_no || '').trim();
+    if (!billNo) {
+      ambiguous++;
+      return;
+    }
+    
+    const linked = candidates.filter(s => {
+      const mb = Array.isArray(s.matched_bills) ? s.matched_bills : [];
+      return mb.includes(billNo);
+    });
+    
+    if (linked.length === 1) {
+      b.matched_stmt_uuid = linked[0].stmt_uuid;
+      healed++;
+    } else {
+      ambiguous++;
+      if (ambiguousLog.length < 5) {
+        ambiguousLog.push(`bill_no=${billNo} ref=${ref} candidates=${candidates.length} matched_bills_links=${linked.length}`);
+      }
+    }
+  });
+  
+  if (ambiguousLog.length > 0) {
+    console.warn(`[healBillStmtLinks] ${ambiguous} ambiguous (sample):\n  ` + ambiguousLog.join('\n  '));
+  }
+  
+  return { healed, ambiguous, notFound, total: orphans.length };
+}
+window.healBillStmtLinks = healBillStmtLinks;
+
 const syncManager = {
   enabled: true,            // toggle ผ่าน localStorage['sf_sync_enabled']
   pushDelayMs: 5000,        // debounce 5s หลัง mutation สุดท้าย
@@ -18284,6 +18377,28 @@ async function loadAllFromCloud(opts) {
       }
     }
     
+    // ⭐ HEAL bill ↔ stmt links (4/5/26)
+    //    Reason: legacy bills ที่ paid แต่ matched_stmt_uuid ว่าง 
+    //    → unmatch หาบิลผิดเมื่อ bill_no ซ้ำ (split payment)
+    //    Conservative: link เฉพาะที่มั่นใจ (unique ref หรือ matched_bills tie-break)
+    if (swapBills && swapStmts && typeof window.healBillStmtLinks === 'function') {
+      const allStmts = getAllStatements();
+      const r = window.healBillStmtLinks(billList, allStmts);
+      if (r.total > 0) {
+        console.log(`[loadAllFromCloud] heal links: ${r.healed}/${r.total} bills → linked uuid (ambiguous=${r.ambiguous}, notFound=${r.notFound})`);
+        // ถ้า heal ได้ → mark dirty เพื่อ sync ขึ้น cloud
+        if (r.healed > 0 && window.syncManager?.markDirty) {
+          billList.forEach(b => {
+            if (b.matched_stmt_uuid && b.bill_uuid) {
+              // เพิ่ม dirty (จะ push ตอน save ถัดไป — ไม่ auto-push เอง)
+              window.syncManager.markDirty('bills', b.bill_uuid);
+            }
+          });
+          console.log(`[loadAllFromCloud] marked ${r.healed} healed bills dirty — push ครั้งถัดไปจะ sync ขึ้น cloud`);
+        }
+      }
+    }
+    
     window._lastCloudLoad = Date.now();
     const elapsed = Math.round((Date.now() - t0) / 1000);
     console.log(`[loadAllFromCloud] DONE (${reason}) ${elapsed}s — bills=${billList.length} stmts=${totalStmts} sp=${paymentList.length}`);
@@ -21556,8 +21671,18 @@ async function renderMatching(el) {
       let unmatchedBillCount = 0;
       if (isMatched) {
         billList.forEach(b => {
-          const linked = (b.matched_stmt_uuid === stmtUuid) ||
-                         (matchedBillsArr.includes(String(b.bill_no||'').trim()));
+          // ⭐ Bug fix (4/5/26): Split-payment bill_no duplicates
+          //    เดิม: (matched_stmt_uuid===stmtUuid) || (matchedBillsArr.includes(bill_no))
+          //    ปัญหา: bill_no ซ้ำ (split payment) + bill อื่นไม่ใช่ของ stmt นี้ → unmatch ผิด
+          //    Fix: prefer uuid; fallback ใช้ bill_no + matched_stmt_ref ตรงกันด้วย
+          let linked;
+          if (b.matched_stmt_uuid) {
+            linked = (b.matched_stmt_uuid === stmtUuid);
+          } else {
+            // Legacy bill (ไม่มี matched_stmt_uuid) — ใช้ matched_stmt_ref + bill_no
+            linked = (b.matched_stmt_ref === stmt.ref_no) 
+                  && matchedBillsArr.includes(String(b.bill_no||'').trim());
+          }
           if (!linked) return;
           b.match_status = 'unpaid';
           b.confirmation = '';
@@ -22314,12 +22439,24 @@ async function renderMatching(el) {
           // Legacy fallback: SP-TEMP-XXXX#N
           const oldPattern = String(bn).match(/^(SP-TEMP-\d+)#(\d+)$/);
           if (oldPattern) return; // skip — schema เก่าไม่ support แล้ว
-          // ⭐ Prefer linked bill (by matched_stmt_ref) over first bill_no match
+          // ⭐ Prefer linked bill (by matched_stmt_uuid) over first bill_no match
           //    เพราะถ้ามีบิลหลายตัว bill_no = "SP-XXX" → find() คืนแค่อันแรก (ผิด)
+          //    Bug fix (4/5/26): Split-payment กรณี bill_no ซ้ำ → fallback ต้องเช็ค matched_stmt_ref ด้วย
           let bill = linkedBills.find(b => b.bill_no === bn);
           if (!bill) {
-            // Fallback: bill_no match (อาจไม่มี matched_stmt_ref ตรง — เช่น เคยลบไปแล้ว)
-            bill = billList.find(b => b.bill_no === bn && (b.match_status === 'paid' || b.match_status === 'matched'));
+            // Fallback 1: bill_no + matched_stmt_ref ตรงกัน (legacy bills)
+            bill = billList.find(b => b.bill_no === bn 
+                                   && b.matched_stmt_ref === stmt.ref_no
+                                   && (b.match_status === 'paid' || b.match_status === 'matched'));
+          }
+          if (!bill) {
+            // Fallback 2: bill_no + paid status (อาจไม่มี ref ตรง — เช่น เคยลบไปแล้ว)
+            // ⚠️ Warning: ถ้า bill_no ซ้ำในระบบ — find() คืนตัวแรก (อาจผิด)
+            const candidates = billList.filter(b => b.bill_no === bn && (b.match_status === 'paid' || b.match_status === 'matched'));
+            if (candidates.length > 1) {
+              console.warn(`[unmatch] bill_no=${bn} duplicate (${candidates.length}) — using first; may unmatch wrong bill if split payment`);
+            }
+            bill = candidates[0];
           }
           if (!bill) {
             // Last fallback: any bill with this bill_no
