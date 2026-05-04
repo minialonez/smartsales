@@ -414,6 +414,7 @@ async function api(action, params = {}) {
       'saveSupplierPayments',
       'upsertMonthlyFront', 'upsertMonthlyInvoice',
       'upsertPcBatch', 'updatePcStatus',
+      'createOrAddPcSubmission', 'removeFromPcSubmission', 'deletePcSubmission',
     ];
     const forcePost = FORCE_POST_ACTIONS.indexOf(action) !== -1;
     
@@ -30578,11 +30579,12 @@ async function renderPcSales(el) {
       <!-- Combined summary card (Front + Invoice รวมกัน) — populated by loadAndRender -->
       <div id="pc-combined-summary" class="mb-3"></div>
       
-      <!-- Source tabs: Front | Invoice -->
+      <!-- Source tabs: Front | Invoice | Submissions -->
       <div class="card-flat mb-2" style="padding:6px;display:inline-flex;gap:4px;border-radius:10px;background:var(--surface2)">
         ${[
-          { id: 'front',   label: '📦 Front',   color: 'var(--primary)' },
-          { id: 'invoice', label: '🧾 Invoice', color: 'var(--warn)' },
+          { id: 'front',        label: '📦 Front',         color: 'var(--primary)' },
+          { id: 'invoice',      label: '🧾 Invoice',       color: 'var(--warn)' },
+          { id: 'submissions',  label: '📤 ใบส่ง',         color: 'var(--success)' },
         ].map(t => {
           const active = state.source === t.id;
           const style = active
@@ -30887,6 +30889,15 @@ async function renderPcSales(el) {
     const root = document.getElementById('pc-content');
     const summaryEl = document.getElementById('pc-summary-line');
     if (!root) return;
+    
+    // Branch: submissions tab — render submission list view (different data + UI)
+    if (state.source === 'submissions') {
+      await _pcRenderSubmissionsView(root, summaryEl);
+      // Hide combined card on submissions tab (different data shape)
+      const combEl = document.getElementById('pc-combined-summary');
+      if (combEl) combEl.innerHTML = '';
+      return;
+    }
     
     if (!state.months || state.months.length === 0) {
       root.innerHTML = `<div class="card text-center" style="padding:50px;color:var(--text-muted)">
@@ -31447,6 +31458,588 @@ async function renderPcSales(el) {
     toast(`✅ เปิด print preview (${sorted.length.toLocaleString()} แถว)`, 'success');
   }
   
+  // ════════════════════════════════════════════════════════════════
+  // SUBMISSIONS VIEW — list ใบส่ง PC ทั้งหมด
+  // ════════════════════════════════════════════════════════════════
+  async function _pcRenderSubmissionsView(root, summaryEl) {
+    root.innerHTML = `<div class="card text-center" style="padding:40px;color:var(--text-muted)">
+      <div style="font-size:1.4rem;margin-bottom:8px">⏳</div>
+      <div>กำลังโหลดใบส่ง...</div>
+    </div>`;
+    if (summaryEl) summaryEl.textContent = '';
+    
+    try {
+      // Filter by year/month if specified
+      const params = {};
+      if (state.year) params.year = state.year;
+      // เลือกเดือนเดียว → filter; เลือกหลายเดือน → ไม่ filter (เห็นทั้งปี)
+      if (state.months && state.months.length === 1) params.month = state.months[0];
+      if (state.brand !== 'all') params.brand = state.brand;
+      
+      const res = await api('listPcSubmissions', params);
+      const submissions = (res.data && res.data.submissions) || [];
+      
+      const fmt = (n) => Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      const fmtInt = (n) => Number(n || 0).toLocaleString('en-US', { maximumFractionDigits: 0 });
+      
+      // Update summary line
+      if (summaryEl) {
+        const monthsLbl = state.months.length === 1 ? PC_MONTH_LABELS[state.months[0]-1] :
+                          state.months.length === 12 ? 'ทั้งปี' :
+                          `${state.months.length} เดือน`;
+        let label = `📤 ใบส่ง PC ${state.year}`;
+        if (state.months.length === 1) label += ` · ${monthsLbl}`;
+        if (state.brand !== 'all') label += ` · ${state.brand}`;
+        summaryEl.textContent = `${label} — ${submissions.length.toLocaleString()} ใบ`;
+      }
+      
+      if (submissions.length === 0) {
+        root.innerHTML = `<div class="card text-center" style="padding:50px;color:var(--text-muted)">
+          <div style="font-size:1.5rem;margin-bottom:8px">📭</div>
+          <div>ยังไม่มีใบส่ง PC</div>
+          <div style="font-size:.78rem;margin-top:8px;color:var(--text-muted)">
+            ไปแท็บ Front/Invoice → เลือกบิล → กดส่ง → จะสร้างใบส่งให้อัตโนมัติ
+          </div>
+        </div>`;
+        return;
+      }
+      
+      // Group by target month
+      const byMonth = {};
+      submissions.forEach(s => {
+        const key = `${s.target_year}-${String(s.target_month).padStart(2,'0')}`;
+        if (!byMonth[key]) byMonth[key] = { year: s.target_year, month: s.target_month, items: [] };
+        byMonth[key].items.push(s);
+      });
+      const monthGroups = Object.values(byMonth).sort((a,b) => 
+        a.year !== b.year ? b.year - a.year : b.month - a.month
+      );
+      
+      // Aggregate totals
+      let grandTotal = 0, grandLines = 0, grandBills = 0;
+      submissions.forEach(s => {
+        grandTotal += Number(s.total_amount) || 0;
+        grandLines += Number(s.total_lines) || 0;
+        grandBills += Number(s.total_bills) || 0;
+      });
+      
+      const grandHtml = `
+        <div class="card-flat mb-3" style="padding:16px 20px;background:linear-gradient(135deg, rgba(34,197,94,.1), transparent);border:1px solid var(--success);border-left:5px solid var(--success)">
+          <div style="font-size:.7rem;color:var(--text2);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px">📤 ใบส่ง PC ทั้งหมด</div>
+          <div style="font-size:1.5rem;font-weight:800;color:var(--success);font-variant-numeric:tabular-nums">฿${fmt(grandTotal)}</div>
+          <div style="font-size:.78rem;color:var(--text-muted);margin-top:2px">
+            ${submissions.length.toLocaleString()} ใบ · ${fmtInt(grandBills)} บิล · ${fmtInt(grandLines)} รายการ
+          </div>
+        </div>
+      `;
+      
+      const monthSectionsHtml = monthGroups.map(grp => {
+        const monthLbl = PC_MONTH_LABELS[grp.month - 1];
+        const monthTotal = grp.items.reduce((s, x) => s + (Number(x.total_amount) || 0), 0);
+        const monthBills = grp.items.reduce((s, x) => s + (Number(x.total_bills) || 0), 0);
+        
+        const itemsHtml = grp.items.map(s => {
+          const brand = PC_BRANDS.find(b => b.id === s.brand);
+          const brandColor = brand?.color || 'var(--text2)';
+          const updated = s.updated_at ? String(s.updated_at).replace('T', ' ').slice(0, 16) : '';
+          const created = s.created_at ? String(s.created_at).replace('T', ' ').slice(0, 16) : '';
+          
+          const frontVal = Number(s.front_amount) || 0;
+          const frontLines = Number(s.front_lines) || 0;
+          const invoiceVal = Number(s.invoice_amount) || 0;
+          const invoiceLines = Number(s.invoice_lines) || 0;
+          
+          return `
+            <div class="card-flat" style="padding:14px 16px;border-left:4px solid ${brandColor};margin-bottom:10px;display:flex;flex-direction:column;gap:8px">
+              <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:14px;flex-wrap:wrap">
+                <div style="flex:1;min-width:200px">
+                  <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+                    <span style="display:inline-block;padding:3px 10px;border-radius:6px;background:${brandColor};color:#fff;font-size:.75rem;font-weight:700">${s.brand}</span>
+                    <span style="font-size:.85rem;color:var(--text);font-weight:600">${monthLbl} ${s.target_year}</span>
+                  </div>
+                  <div style="font-size:.7rem;color:var(--text-muted)">
+                    สร้าง: ${created} · อัปเดต: ${updated}
+                  </div>
+                </div>
+                <div style="text-align:right">
+                  <div style="font-size:1.2rem;font-weight:700;color:var(--text);font-variant-numeric:tabular-nums">฿${fmt(s.total_amount)}</div>
+                  <div style="font-size:.72rem;color:var(--text-muted)">${fmtInt(s.total_bills)} บิล · ${fmtInt(s.total_lines)} รายการ</div>
+                </div>
+              </div>
+              
+              <!-- Source breakdown -->
+              <div style="display:flex;gap:10px;flex-wrap:wrap;font-size:.75rem">
+                ${frontLines > 0 ? `
+                  <div style="padding:4px 10px;border-radius:6px;background:rgba(91,124,250,.1);color:var(--primary)">
+                    📦 Front: <b>฿${fmt(frontVal)}</b> (${fmtInt(frontLines)})
+                  </div>
+                ` : ''}
+                ${invoiceLines > 0 ? `
+                  <div style="padding:4px 10px;border-radius:6px;background:rgba(245,158,66,.1);color:var(--warn)">
+                    🧾 Invoice: <b>฿${fmt(invoiceVal)}</b> (${fmtInt(invoiceLines)})
+                  </div>
+                ` : ''}
+              </div>
+              
+              <!-- Action buttons -->
+              <div style="display:flex;gap:6px;flex-wrap:wrap">
+                <button class="btn btn-primary btn-sm" data-sub-action="view" data-sub-id="${s.submission_id}" style="padding:5px 12px;font-size:.74rem">👀 ดูบิล</button>
+                <button class="btn btn-ghost btn-sm" data-sub-action="add-front" data-sub-id="${s.submission_id}" data-brand="${s.brand}" data-year="${s.target_year}" data-month="${s.target_month}" style="padding:5px 12px;font-size:.74rem;color:var(--primary)">➕ Front</button>
+                <button class="btn btn-ghost btn-sm" data-sub-action="add-invoice" data-sub-id="${s.submission_id}" data-brand="${s.brand}" data-year="${s.target_year}" data-month="${s.target_month}" style="padding:5px 12px;font-size:.74rem;color:var(--warn)">➕ Invoice</button>
+                <button class="btn btn-ghost btn-sm" data-sub-action="excel" data-sub-id="${s.submission_id}" style="padding:5px 12px;font-size:.74rem">📊 Excel</button>
+                <button class="btn btn-ghost btn-sm" data-sub-action="pdf" data-sub-id="${s.submission_id}" style="padding:5px 12px;font-size:.74rem">🖨 PDF</button>
+                <button class="btn btn-ghost btn-sm" data-sub-action="delete" data-sub-id="${s.submission_id}" style="padding:5px 12px;font-size:.74rem;color:var(--danger);margin-left:auto">✕ ลบใบ</button>
+              </div>
+            </div>
+          `;
+        }).join('');
+        
+        return `
+          <div style="margin-bottom:24px">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;padding-bottom:6px;border-bottom:2px solid var(--border)">
+              <div style="font-weight:700;font-size:1rem;color:var(--text)">📅 ${monthLbl} ${grp.year}</div>
+              <div style="font-size:.78rem;color:var(--text-muted)">
+                ${grp.items.length} ใบ · ${fmtInt(monthBills)} บิล · <b style="color:var(--text)">฿${fmt(monthTotal)}</b>
+              </div>
+            </div>
+            ${itemsHtml}
+          </div>
+        `;
+      }).join('');
+      
+      root.innerHTML = grandHtml + monthSectionsHtml;
+      
+      // Bind action buttons
+      root.querySelectorAll('[data-sub-action]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const action = btn.dataset.subAction;
+          const subId = btn.dataset.subId;
+          if (action === 'view')         await _pcOpenSubmissionDetail(subId);
+          else if (action === 'add-front')   _pcOpenAddToSubmission(subId, btn.dataset.brand, +btn.dataset.year, +btn.dataset.month, 'front');
+          else if (action === 'add-invoice') _pcOpenAddToSubmission(subId, btn.dataset.brand, +btn.dataset.year, +btn.dataset.month, 'invoice');
+          else if (action === 'excel')   await _pcSubExportExcel(subId);
+          else if (action === 'pdf')     await _pcSubExportPDF(subId);
+          else if (action === 'delete')  await _pcSubDelete(subId);
+        });
+      });
+    } catch (err) {
+      console.error('[PC Submissions]', err);
+      root.innerHTML = `<div class="card" style="padding:30px;color:var(--danger)">❌ Error: ${err.message || err}</div>`;
+    }
+  }
+  
+  // ────────────────────────────────────────────────────────────────
+  // Submission detail modal — show all bills in a submission
+  // ────────────────────────────────────────────────────────────────
+  async function _pcOpenSubmissionDetail(subId) {
+    openModal('📤 รายละเอียดใบส่ง', `
+      <div style="padding:30px;text-align:center;color:var(--text-muted)">⏳ กำลังโหลด...</div>
+    `);
+    
+    const modalEl = document.getElementById('modal-card');
+    if (modalEl) {
+      modalEl.style.width = 'min(960px, 95vw)';
+      modalEl.style.maxWidth = '95vw';
+    }
+    
+    try {
+      const res = await api('getPcSubmissionDetail', { submission_id: subId });
+      if (!res.success || !res.data) {
+        document.getElementById('modal-body').innerHTML = `<div style="padding:30px;color:var(--danger)">❌ Error: ${res.error || 'unknown'}</div>`;
+        return;
+      }
+      
+      const sub = res.data.submission;
+      const items = res.data.lineitems || [];
+      const fmt = (n) => Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      const fmtInt = (n) => Number(n || 0).toLocaleString('en-US', { maximumFractionDigits: 0 });
+      const monthLbl = PC_MONTH_LABELS[sub.target_month - 1];
+      const brand = PC_BRANDS.find(b => b.id === sub.brand);
+      const brandColor = brand?.color || 'var(--text2)';
+      
+      // Group items by source → bills
+      const byBill = {};
+      items.forEach(r => {
+        const src = r.source || 'front';
+        const billNo = r.bill_no || '(no-bill)';
+        const key = src + '::' + billNo;
+        if (!byBill[key]) byBill[key] = { source: src, bill_no: billNo, date: r.original_date, total: 0, lines: [] };
+        byBill[key].total += Number(r.total) || 0;
+        byBill[key].lines.push(r);
+      });
+      const allBills = Object.values(byBill).sort((a, b) => {
+        if (a.source !== b.source) return a.source === 'front' ? -1 : 1;
+        return String(a.bill_no).localeCompare(String(b.bill_no));
+      });
+      
+      const frontBills = allBills.filter(b => b.source === 'front');
+      const invoiceBills = allBills.filter(b => b.source === 'invoice');
+      
+      const renderBillRow = (bill) => {
+        const lineCount = bill.lines.length;
+        const isNeg = bill.total < 0;
+        return `
+          <tr data-bill-uuids="${bill.lines.map(l => l.pc_uuid).join(',')}">
+            <td><input type="checkbox" class="sub-detail-check" data-uuids="${bill.lines.map(l => l.pc_uuid).join(',')}"></td>
+            <td style="font-family:var(--mono);font-size:.74rem">${bill.date || ''}</td>
+            <td style="font-family:var(--mono);font-size:.74rem">${bill.bill_no}</td>
+            <td style="font-size:.74rem;color:var(--text-muted)">${lineCount} รายการ</td>
+            <td style="text-align:right;font-family:var(--mono);${isNeg?'color:var(--danger);font-weight:600':''}">${fmt(bill.total)}</td>
+          </tr>
+        `;
+      };
+      
+      const frontTableHtml = frontBills.length > 0 ? `
+        <div style="margin-bottom:16px">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+            <div style="font-weight:700;color:var(--primary);font-size:.85rem">📦 Front (${frontBills.length} บิล)</div>
+            <div style="font-size:.78rem;color:var(--text2);font-variant-numeric:tabular-nums">฿${fmt(sub.front_amount)}</div>
+          </div>
+          <div style="max-height:240px;overflow-y:auto;border:1px solid var(--border);border-radius:6px">
+            <table>
+              <thead style="position:sticky;top:0;background:var(--surface)">
+                <tr><th style="width:30px"><input type="checkbox" data-source-toggle="front"></th><th>วันที่</th><th>บิล</th><th>รายการ</th><th style="text-align:right">ยอด</th></tr>
+              </thead>
+              <tbody>${frontBills.map(renderBillRow).join('')}</tbody>
+            </table>
+          </div>
+        </div>
+      ` : '';
+      
+      const invoiceTableHtml = invoiceBills.length > 0 ? `
+        <div style="margin-bottom:16px">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+            <div style="font-weight:700;color:var(--warn);font-size:.85rem">🧾 Invoice (${invoiceBills.length} บิล)</div>
+            <div style="font-size:.78rem;color:var(--text2);font-variant-numeric:tabular-nums">฿${fmt(sub.invoice_amount)}</div>
+          </div>
+          <div style="max-height:240px;overflow-y:auto;border:1px solid var(--border);border-radius:6px">
+            <table>
+              <thead style="position:sticky;top:0;background:var(--surface)">
+                <tr><th style="width:30px"><input type="checkbox" data-source-toggle="invoice"></th><th>วันที่</th><th>บิล</th><th>รายการ</th><th style="text-align:right">ยอด</th></tr>
+              </thead>
+              <tbody>${invoiceBills.map(renderBillRow).join('')}</tbody>
+            </table>
+          </div>
+        </div>
+      ` : '';
+      
+      document.getElementById('modal-body').innerHTML = `
+        <div style="padding:18px;max-height:80vh;overflow-y:auto">
+          <!-- Header -->
+          <div class="card-flat mb-3" style="padding:14px 16px;border-left:4px solid ${brandColor}">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:10px">
+              <div>
+                <div style="display:flex;align-items:center;gap:10px">
+                  <span style="display:inline-block;padding:4px 12px;border-radius:6px;background:${brandColor};color:#fff;font-weight:700">${sub.brand}</span>
+                  <span style="font-size:1.05rem;font-weight:600;color:var(--text)">${monthLbl} ${sub.target_year}</span>
+                </div>
+                <div style="font-size:.72rem;color:var(--text-muted);margin-top:6px">
+                  ID: <code style="font-family:var(--mono)">${sub.submission_id}</code>
+                </div>
+              </div>
+              <div style="text-align:right">
+                <div style="font-size:1.5rem;font-weight:800;color:var(--text);font-variant-numeric:tabular-nums">฿${fmt(sub.total_amount)}</div>
+                <div style="font-size:.74rem;color:var(--text-muted)">${fmtInt(sub.total_bills)} บิล · ${fmtInt(sub.total_lines)} รายการ</div>
+              </div>
+            </div>
+          </div>
+          
+          <!-- Toolbar -->
+          <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
+            <button class="btn btn-ghost btn-sm" id="sub-detail-remove" style="color:var(--danger)" disabled>➖ ลบบิลที่เลือก</button>
+            <div style="flex:1"></div>
+            <span id="sub-detail-selected-info" style="font-size:.78rem;color:var(--text-muted);align-self:center"></span>
+          </div>
+          
+          ${frontTableHtml}
+          ${invoiceTableHtml}
+          
+          <div style="text-align:right;margin-top:14px">
+            <button class="btn btn-ghost" id="sub-detail-close">ปิด</button>
+          </div>
+        </div>
+      `;
+      
+      // Bind events
+      document.getElementById('sub-detail-close').addEventListener('click', closeModal);
+      
+      // Per-source select-all toggle
+      document.querySelectorAll('[data-source-toggle]').forEach(cb => {
+        cb.addEventListener('change', () => {
+          const src = cb.dataset.sourceToggle;
+          const checks = document.querySelectorAll(`.sub-detail-check`);
+          checks.forEach(c => {
+            // Find parent row's source by checking which table it's in
+            const tr = c.closest('tr');
+            const table = tr.closest('table');
+            const headerCb = table.querySelector('[data-source-toggle]');
+            if (headerCb && headerCb.dataset.sourceToggle === src) {
+              c.checked = cb.checked;
+            }
+          });
+          updateRemoveBtn();
+        });
+      });
+      
+      const updateRemoveBtn = () => {
+        const checks = document.querySelectorAll('.sub-detail-check:checked');
+        const removeBtn = document.getElementById('sub-detail-remove');
+        const info = document.getElementById('sub-detail-selected-info');
+        if (checks.length === 0) {
+          removeBtn.disabled = true;
+          info.textContent = '';
+        } else {
+          removeBtn.disabled = false;
+          let totalLines = 0;
+          checks.forEach(c => totalLines += c.dataset.uuids.split(',').length);
+          info.textContent = `เลือก ${checks.length.toLocaleString()} บิล (${totalLines.toLocaleString()} รายการ)`;
+        }
+      };
+      
+      document.querySelectorAll('.sub-detail-check').forEach(c => {
+        c.addEventListener('change', updateRemoveBtn);
+      });
+      
+      // Remove button
+      document.getElementById('sub-detail-remove').addEventListener('click', async () => {
+        const checks = document.querySelectorAll('.sub-detail-check:checked');
+        if (checks.length === 0) return;
+        const uuidsToRemove = [];
+        checks.forEach(c => {
+          c.dataset.uuids.split(',').forEach(u => uuidsToRemove.push(u));
+        });
+        if (!confirm(`เอาบิล ${checks.length} ใบออกจากใบส่ง?\n\n(บิลจะกลับมาเป็น pending — สามารถส่งใหม่ได้)`)) return;
+        
+        try {
+          toast(`⏳ กำลังเอาออก...`, 'info');
+          const r = await api('removeFromPcSubmission', {
+            submission_id: subId,
+            uuids: uuidsToRemove,
+          });
+          if (r.success !== false) {
+            toast(`✅ เอาออก ${(r.data.removed || uuidsToRemove.length).toLocaleString()} รายการ`, 'success');
+            closeModal();
+            await loadAndRender();
+          } else {
+            toast(`❌ Error: ${r.error}`, 'error');
+          }
+        } catch(e) {
+          toast(`❌ Error: ${e.message}`, 'error');
+        }
+      });
+    } catch (err) {
+      console.error('[Sub Detail]', err);
+      document.getElementById('modal-body').innerHTML = `<div style="padding:30px;color:var(--danger)">❌ ${err.message || err}</div>`;
+    }
+  }
+  
+  // ────────────────────────────────────────────────────────────────
+  // Add to existing submission — open auto-select modal scoped to this brand+source
+  // ────────────────────────────────────────────────────────────────
+  function _pcOpenAddToSubmission(subId, brand, year, month, source) {
+    // Switch state to that source first → reload → open auto-select with brand pre-selected
+    if (state.source !== source) {
+      state.source = source;
+      _pcSaveState(state);
+    }
+    
+    // Filter year/month → original month range (เก่ากว่าเดือนปลายทาง)
+    // ถ้า brand จะถูก pre-select ใน auto-select modal
+    const targetLabel = `${PC_MONTH_LABELS[month-1]} ${year}`;
+    
+    // เปิด auto-select modal โดย bypass UI rebuild — ส่งผ่าน hint
+    state._addToSubmission = { subId, brand, year, month, source };
+    _pcSaveState(state);
+    
+    renderShell();
+    loadAndRender().then(() => {
+      // Open auto-select with pre-fill
+      _pcOpenAutoSelectModal({
+        prefillBrand: brand,
+        prefillTargetYear: year,
+        prefillTargetMonth: month,
+        addingToSubmission: subId,
+        sourceLabel: source === 'invoice' ? 'Invoice' : 'Front',
+        targetLabel: targetLabel,
+      });
+    });
+  }
+  
+  // ────────────────────────────────────────────────────────────────
+  // Excel/PDF export per-submission
+  // ────────────────────────────────────────────────────────────────
+  async function _pcSubExportExcel(subId) {
+    try {
+      toast('⏳ กำลังโหลดข้อมูล...', 'info');
+      const res = await api('getPcSubmissionDetail', { submission_id: subId });
+      if (!res.success) { toast(`❌ ${res.error}`, 'error'); return; }
+      
+      const sub = res.data.submission;
+      const items = res.data.lineitems || [];
+      if (items.length === 0) { toast('❌ ไม่มีข้อมูล', 'error'); return; }
+      if (typeof XLSX === 'undefined') { toast('❌ XLSX library ไม่พร้อม', 'error'); return; }
+      
+      const monthLbl = PC_MONTH_LABELS[sub.target_month - 1];
+      const sorted = items.slice().sort((a, b) => {
+        if (a.source !== b.source) return (a.source||'front').localeCompare(b.source||'front');
+        const c2 = String(a.bill_no || '').localeCompare(String(b.bill_no || ''));
+        return c2;
+      });
+      
+      const headers = ['Source','วันที่','เลขที่บิล','Prefix','คลาส','สถานี','รหัสสินค้า','ชื่อสินค้า','ลูกค้า','แบรนด์','หมวด','จำนวน','ราคา','ยอดรวม'];
+      const data = [headers];
+      sorted.forEach(r => {
+        data.push([
+          (r.source||'front') === 'invoice' ? '🧾 Invoice' : '📦 Front',
+          r.original_date || '',
+          r.bill_no || '',
+          r.bill_prefix || '',
+          r.vat_class === 'VAT' ? 'ใบสั่งขาย' : (r.vat_class === 'NOVAT' ? 'ใบกำกับภาษี' : ''),
+          r.station || '',
+          r.product_code || '',
+          r.product_name || '',
+          r.customer || '',
+          r.brand || '',
+          r.group_name || '',
+          Number(r.qty) || 0,
+          Number(r.price) || 0,
+          Number(r.total) || 0,
+        ]);
+      });
+      data.push([]);
+      const sumRow = new Array(headers.length).fill('');
+      sumRow[0] = 'รวม';
+      sumRow[11] = items.reduce((s,r) => s + (Number(r.qty)||0), 0);
+      sumRow[13] = Number(sub.total_amount);
+      data.push(sumRow);
+      
+      const ws = XLSX.utils.aoa_to_sheet(data);
+      ws['!cols'] = [{wch:12},{wch:12},{wch:18},{wch:8},{wch:14},{wch:10},{wch:18},{wch:30},{wch:25},{wch:12},{wch:10},{wch:10},{wch:12},{wch:14}];
+      
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, `${sub.brand}_${monthLbl}`.substring(0, 31));
+      const filename = `PC_Submission_${sub.brand}_${monthLbl}_${sub.target_year}.xlsx`;
+      XLSX.writeFile(wb, filename);
+      toast(`✅ Export: ${filename}`, 'success');
+    } catch (err) {
+      console.error(err);
+      toast(`❌ ${err.message}`, 'error');
+    }
+  }
+  
+  async function _pcSubExportPDF(subId) {
+    try {
+      const res = await api('getPcSubmissionDetail', { submission_id: subId });
+      if (!res.success) { toast(`❌ ${res.error}`, 'error'); return; }
+      const sub = res.data.submission;
+      const items = res.data.lineitems || [];
+      if (items.length === 0) { toast('❌ ไม่มีข้อมูล', 'error'); return; }
+      
+      const fmt = (n) => Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      const fmtInt = (n) => Number(n || 0).toLocaleString('en-US', { maximumFractionDigits: 0 });
+      const monthLbl = PC_MONTH_LABELS[sub.target_month - 1];
+      const brand = PC_BRANDS.find(b => b.id === sub.brand);
+      const brandColor = brand?.color || '#5b7cfa';
+      
+      // Group by source → bills
+      const byBill = {};
+      items.forEach(r => {
+        const src = r.source || 'front';
+        const k = src + '::' + (r.bill_no || '');
+        if (!byBill[k]) byBill[k] = { source: src, bill_no: r.bill_no, date: r.original_date, total: 0, lines: [] };
+        byBill[k].total += Number(r.total) || 0;
+        byBill[k].lines.push(r);
+      });
+      const allBills = Object.values(byBill).sort((a,b) => {
+        if (a.source !== b.source) return a.source === 'front' ? -1 : 1;
+        return String(a.bill_no).localeCompare(String(b.bill_no));
+      });
+      
+      const frontBills = allBills.filter(b => b.source === 'front');
+      const invoiceBills = allBills.filter(b => b.source === 'invoice');
+      
+      const billRowsHtml = (bills) => bills.map(b => {
+        const isNeg = b.total < 0;
+        return `<tr style="${isNeg?'color:#d33':''}">
+          <td>${b.date || ''}</td>
+          <td>${b.bill_no || ''}</td>
+          <td style="text-align:right">${b.lines.length}</td>
+          <td style="text-align:right">${fmt(b.total)}</td>
+        </tr>`;
+      }).join('');
+      
+      const w = window.open('', '_blank', 'width=1000,height=800');
+      if (!w) { toast('❌ Pop-up ถูกบล็อค', 'error'); return; }
+      
+      w.document.write(`<!DOCTYPE html><html><head>
+<meta charset="utf-8"><title>PC ${sub.brand} ${monthLbl} ${sub.target_year}</title>
+<style>
+  body { font-family: 'Sarabun','Tahoma',sans-serif; padding: 20px; color: #1f2937; }
+  h1 { font-size: 18px; margin-bottom: 4px; }
+  .subtitle { color: #6b7280; font-size: 11px; margin-bottom: 10px; }
+  .summary { background: #f9fafb; padding: 10px 14px; border-radius: 6px; margin-bottom: 14px; border-left: 4px solid ${brandColor}; }
+  .source-section { margin-bottom: 18px; page-break-inside: avoid; }
+  .source-header { background: #f3f4f6; padding: 6px 10px; font-weight: 700; font-size: 11px; }
+  table { width: 100%; border-collapse: collapse; font-size: 10px; }
+  th, td { padding: 4px 6px; border: 1px solid #e5e7eb; text-align: left; }
+  thead { background: #f3f4f6; }
+  @media print { body { padding: 10px; } @page { size: A4 portrait; margin: 12mm; } }
+</style></head><body>
+  <h1>📤 ใบส่ง PC — ${sub.brand}</h1>
+  <div class="subtitle">เดือนส่ง: ${monthLbl} ${sub.target_year} · ID: ${sub.submission_id} · พิมพ์: ${new Date().toLocaleString('th-TH')}</div>
+  <div class="summary">
+    <strong>ยอดรวม: ฿${fmt(sub.total_amount)}</strong>
+    · ${fmtInt(sub.total_bills)} บิล · ${fmtInt(sub.total_lines)} รายการ<br>
+    📦 Front: ฿${fmt(sub.front_amount)} (${fmtInt(sub.front_lines)})  ·
+    🧾 Invoice: ฿${fmt(sub.invoice_amount)} (${fmtInt(sub.invoice_lines)})
+  </div>
+  ${frontBills.length > 0 ? `
+  <div class="source-section">
+    <div class="source-header">📦 Front — ${frontBills.length} บิล · ฿${fmt(sub.front_amount)}</div>
+    <table>
+      <thead><tr><th>วันที่</th><th>เลขที่บิล</th><th style="text-align:right">รายการ</th><th style="text-align:right">ยอด</th></tr></thead>
+      <tbody>${billRowsHtml(frontBills)}</tbody>
+    </table>
+  </div>
+  ` : ''}
+  ${invoiceBills.length > 0 ? `
+  <div class="source-section">
+    <div class="source-header">🧾 Invoice — ${invoiceBills.length} บิล · ฿${fmt(sub.invoice_amount)}</div>
+    <table>
+      <thead><tr><th>วันที่</th><th>เลขที่บิล</th><th style="text-align:right">รายการ</th><th style="text-align:right">ยอด</th></tr></thead>
+      <tbody>${billRowsHtml(invoiceBills)}</tbody>
+    </table>
+  </div>
+  ` : ''}
+  <script>window.addEventListener('load', () => setTimeout(() => window.print(), 300));<\/script>
+</body></html>`);
+      w.document.close();
+      toast(`✅ เปิด print preview`, 'success');
+    } catch (err) {
+      console.error(err);
+      toast(`❌ ${err.message}`, 'error');
+    }
+  }
+  
+  // ────────────────────────────────────────────────────────────────
+  // Delete entire submission
+  // ────────────────────────────────────────────────────────────────
+  async function _pcSubDelete(subId) {
+    if (!confirm(`ลบใบส่ง ${subId}?\n\nบิลทั้งหมดในใบจะกลับเป็น pending — สามารถส่งใหม่ได้`)) return;
+    try {
+      toast('⏳ กำลังลบ...', 'info');
+      const res = await api('deletePcSubmission', { submission_id: subId });
+      if (res.success !== false) {
+        toast(`✅ ลบใบส่ง · คืน pending ${(res.data.reset_lineitems || 0).toLocaleString()} รายการ`, 'success');
+        await loadAndRender();
+      } else {
+        toast(`❌ ${res.error}`, 'error');
+      }
+    } catch (err) {
+      toast(`❌ ${err.message}`, 'error');
+    }
+  }
+  
   // ────────────────────────────────────────────────────────────────
   // Bind checkbox events (row + select-all)
   // ────────────────────────────────────────────────────────────────
@@ -31520,9 +32113,11 @@ async function renderPcSales(el) {
   //   4. Greedy add บิลทีละใบ จน sum >= target → STOP
   //   5. Return: list ของ pc_uuid ทั้งหมดของบิลที่เลือก
   // ────────────────────────────────────────────────────────────────
-  function _pcOpenAutoSelectModal() {
+  function _pcOpenAutoSelectModal(opts) {
+    opts = opts || {};
     const isInvoice = state.source === 'invoice';
-    const sourceLabel = isInvoice ? 'Invoice' : 'Front';
+    const sourceLabel = opts.sourceLabel || (isInvoice ? 'Invoice' : 'Front');
+    const isAddingTo = !!opts.addingToSubmission;
     
     // Pending rows ของ source ปัจจุบัน
     const allRows = (cachedRows || []).filter(r => 
@@ -31542,14 +32137,24 @@ async function renderPcSales(el) {
       return;
     }
     
-    openModal(`🎯 เลือกบิล PC ${sourceLabel} ตามยอดเป้า`, `
+    const defY = opts.prefillTargetYear || new Date().getFullYear();
+    const defM = opts.prefillTargetMonth || (new Date().getMonth() + 1);
+    
+    openModal(`🎯 ${isAddingTo ? 'เพิ่มบิลเข้าใบส่ง' : 'เลือกบิล'} PC ${sourceLabel} ตามยอดเป้า`, `
       <div style="padding:18px;max-width:680px">
+        
+        ${isAddingTo ? `
+        <div style="background:rgba(34,197,94,.08);padding:10px 12px;border-radius:8px;border-left:3px solid var(--success);font-size:.78rem;color:var(--text2);margin-bottom:14px">
+          📤 <b>กำลังเพิ่มบิลเข้าใบส่ง:</b> ${opts.prefillBrand} · ${opts.targetLabel}<br>
+          <span style="font-size:.72rem;color:var(--text-muted)">บิลที่เลือกจะ append เข้าใบเดิม (ไม่สร้างใบใหม่)</span>
+        </div>
+        ` : ''}
         
         <!-- Inputs -->
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:16px">
           <div>
             <label style="display:block;font-size:.78rem;color:var(--text2);margin-bottom:5px;font-weight:600">แบรนด์</label>
-            <select id="auto-brand" class="input" style="padding:8px 10px;width:100%">${brandOpts}</select>
+            <select id="auto-brand" class="input" style="padding:8px 10px;width:100%" ${isAddingTo?'disabled':''}>${brandOpts}</select>
           </div>
           <div>
             <label style="display:block;font-size:.78rem;color:var(--text2);margin-bottom:5px;font-weight:600">ยอดเป้าหมาย (฿)</label>
@@ -31561,15 +32166,15 @@ async function renderPcSales(el) {
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:16px">
           <div>
             <label style="display:block;font-size:.78rem;color:var(--text2);margin-bottom:5px;font-weight:600">ปีที่ส่ง</label>
-            <select id="auto-submit-year" class="input" style="padding:8px 10px;width:100%">
-              ${years.map(y => `<option value="${y}" ${y===new Date().getFullYear()?'selected':''}>${y}</option>`).join('')}
+            <select id="auto-submit-year" class="input" style="padding:8px 10px;width:100%" ${isAddingTo?'disabled':''}>
+              ${years.map(y => `<option value="${y}" ${y===defY?'selected':''}>${y}</option>`).join('')}
             </select>
           </div>
           <div>
             <label style="display:block;font-size:.78rem;color:var(--text2);margin-bottom:5px;font-weight:600">เดือนที่ส่ง</label>
-            <select id="auto-submit-month" class="input" style="padding:8px 10px;width:100%">
+            <select id="auto-submit-month" class="input" style="padding:8px 10px;width:100%" ${isAddingTo?'disabled':''}>
               ${PC_MONTH_LABELS.map((label, i) => 
-                `<option value="${i+1}" ${(i+1)===new Date().getMonth()+1?'selected':''}>${label}</option>`
+                `<option value="${i+1}" ${(i+1)===defM?'selected':''}>${label}</option>`
               ).join('')}
             </select>
           </div>
@@ -31601,6 +32206,12 @@ async function renderPcSales(el) {
     let lastResult = null;  // {selectedUuids, totalAmount, billCount, lineCount}
     
     document.getElementById('btn-auto-cancel').addEventListener('click', closeModal);
+    
+    // Pre-select brand if specified
+    if (opts.prefillBrand) {
+      const brandSel = document.getElementById('auto-brand');
+      if (brandSel) brandSel.value = opts.prefillBrand;
+    }
     
     // Calculate button
     const recalc = () => {
@@ -31910,6 +32521,73 @@ async function renderPcSales(el) {
     
     const stLabel = (status === 'submitted') ? 'ส่งแล้ว' :
                     (status === 'excluded')  ? 'ไม่นำส่ง' : 'pending';
+    
+    // For 'submitted' → must group by brand → create/add to submission per brand
+    if (status === 'submitted') {
+      if (!submitYear || !submitMonth) {
+        toast('❌ ต้องระบุเดือนปลายทางสำหรับการส่ง', 'error');
+        return;
+      }
+      
+      // Group selected uuids by brand
+      const byBrand = {};
+      (cachedRows || []).forEach(r => {
+        if (!selectedUuids.has(r.pc_uuid)) return;
+        const b = r.brand || '';
+        if (!byBrand[b]) byBrand[b] = [];
+        byBrand[b].push(r.pc_uuid);
+      });
+      
+      const brands = Object.keys(byBrand);
+      if (brands.length === 0) return;
+      
+      toast(`⏳ กำลังส่ง ${uuids.length.toLocaleString()} รายการ ใน ${brands.length} แบรนด์...`, 'info');
+      
+      let totalUpdated = 0;
+      const errors = [];
+      const submissions = [];
+      
+      for (const brand of brands) {
+        try {
+          const res = await api('createOrAddPcSubmission', {
+            brand: brand,
+            target_year: submitYear,
+            target_month: submitMonth,
+            uuids: byBrand[brand],
+          });
+          if (res && res.success !== false && res.data) {
+            totalUpdated += Number(res.data.updated_lines) || 0;
+            submissions.push({
+              brand: brand,
+              created: res.data.created,
+              submission_id: res.data.submission_id,
+              lines: res.data.updated_lines,
+            });
+          } else {
+            errors.push(`${brand}: ${(res && res.error) || 'unknown'}`);
+          }
+        } catch (err) {
+          errors.push(`${brand}: ${err.message}`);
+        }
+      }
+      
+      if (errors.length > 0) {
+        toast(`⚠ บันทึกบางส่วนล้มเหลว: ${errors.join(', ')}`, 'error');
+      } else {
+        const newCount = submissions.filter(s => s.created).length;
+        const existingCount = submissions.length - newCount;
+        const parts = [`✅ ส่ง ${totalUpdated.toLocaleString()} รายการ → ส่งแล้ว`];
+        if (newCount > 0)      parts.push(`สร้างใบใหม่ ${newCount}`);
+        if (existingCount > 0) parts.push(`เพิ่มเข้าใบเดิม ${existingCount}`);
+        toast(parts.join(' · '), 'success');
+      }
+      
+      selectedUuids.clear();
+      await loadAndRender();
+      return;
+    }
+    
+    // For 'pending'/'excluded' — use direct status update
     toast(`⏳ กำลังอัปเดต ${uuids.length.toLocaleString()} รายการ → ${stLabel}...`, 'info');
     
     try {
@@ -31917,8 +32595,6 @@ async function renderPcSales(el) {
         uuids: uuids,
         newStatus: status,
       };
-      if (submitYear)  params.submitYear = submitYear;
-      if (submitMonth) params.submitMonth = submitMonth;
       
       const res = await api('updatePcStatus', params);
       if (res && res.success !== false) {
