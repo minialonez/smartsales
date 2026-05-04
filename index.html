@@ -17637,7 +17637,7 @@ const NAV_ITEMS = [
   { id:'reports',   icon:'file',    label:'รายงานบัญชี' },
   { id:'tax_export',icon:'file',    label:'📋 Export สรรพากร' },
   { id:'monthly',   icon:'file',    label:'📅 รายงานรายเดือน' },
-  { id:'pc_sales',  icon:'file',    label:'📊 ยอดขาย PC' },
+  { id:'pc_sales',  icon:'file',    label:'📊 ยอด PC' },
   { id:'users',     icon:'users',   label:'จัดการผู้ใช้' },
 ];
 
@@ -30555,10 +30555,10 @@ function _pcLoadState() {
         return {
           year: Number(s.year) || new Date().getFullYear(),
           months: Array.isArray(s.months) ? s.months.filter(m => m >= 1 && m <= 12) : [],
-          source: (s.source === 'invoice') ? 'invoice' : 'front',  // tab ('front' | 'invoice')
+          source: (s.source === 'submissions') ? 'submissions' : 'all',  // tab: 'all' | 'submissions'
+          sourceFilter: ['all','front','invoice'].indexOf(s.sourceFilter) >= 0 ? s.sourceFilter : 'all',
           station: s.station || 'all',
           vatClass: s.vatClass || 'all',
-          billPrefix: s.billPrefix || 'all',
           brand: s.brand || 'all',
           status: s.status || 'all',
         };
@@ -30569,10 +30569,10 @@ function _pcLoadState() {
   return {
     year: now.getFullYear(),
     months: [now.getMonth() + 1],
-    source: 'front',
+    source: 'all',
+    sourceFilter: 'all',
     station: 'all',
     vatClass: 'all',
-    billPrefix: 'all',
     brand: 'all',
     status: 'all',
   };
@@ -30608,16 +30608,15 @@ async function renderPcSales(el) {
   years.sort((a, b) => b - a);
   
   function renderShell() {
-    const isInvoice = state.source === 'invoice';
-    const sourceLabel = isInvoice ? 'Invoice Raw' : 'Front Raw';
-    const sourceColor = isInvoice ? 'var(--warn)' : 'var(--primary)';
+    const isAll = state.source === 'all';
+    const isSubmissions = state.source === 'submissions';
     
     el.innerHTML = `
       <div class="flex justify-between items-center mb-3">
-        <div class="page-title">📊 ยอดขาย PC</div>
+        <div class="page-title">📊 ยอด PC</div>
         <div class="flex" style="gap:8px">
-          <button class="btn btn-primary btn-sm" id="btn-pc-upload">📂 อัปโหลด ${sourceLabel}</button>
-          <button class="btn btn-ghost btn-sm" id="btn-pc-auto-select" title="เลือกบิลตามยอดเป้า">🎯 เลือกตามยอด</button>
+          ${!isSubmissions ? `<button class="btn btn-primary btn-sm" id="btn-pc-upload">📂 อัปโหลด</button>` : ''}
+          ${!isSubmissions ? `<button class="btn btn-ghost btn-sm" id="btn-pc-auto-select" title="เลือกบิลตามยอดเป้า">🎯 เลือกตามยอด</button>` : ''}
           <button class="btn btn-ghost btn-sm" id="btn-pc-excel">📊 Excel</button>
           <button class="btn btn-ghost btn-sm" id="btn-pc-pdf">🖨 PDF</button>
         </div>
@@ -30626,12 +30625,11 @@ async function renderPcSales(el) {
       <!-- Combined summary card (Front + Invoice รวมกัน) — populated by loadAndRender -->
       <div id="pc-combined-summary" class="mb-3"></div>
       
-      <!-- Source tabs: Front | Invoice | Submissions -->
+      <!-- Source tabs: ยอด PC | Sell out -->
       <div class="card-flat mb-2" style="padding:6px;display:inline-flex;gap:4px;border-radius:10px;background:var(--surface2)">
         ${[
-          { id: 'front',        label: '📦 Front',         color: 'var(--primary)' },
-          { id: 'invoice',      label: '🧾 Invoice',       color: 'var(--warn)' },
-          { id: 'submissions',  label: '📤 ใบส่ง',         color: 'var(--success)' },
+          { id: 'all',          label: '📊 ยอด PC',  color: 'var(--primary)' },
+          { id: 'submissions',  label: '📤 Sell out', color: 'var(--success)' },
         ].map(t => {
           const active = state.source === t.id;
           const style = active
@@ -30664,12 +30662,63 @@ async function renderPcSales(el) {
         </div>
       </div>
       
-      <!-- Filter row 2: Station + Brand + Status (Monthly-style states) -->
+      <!-- Filter row 2: Source + Station/VAT + Brand + Status (Monthly-style states) -->
       <!-- States: active (solid) / dimmed (other selected) / default (outlined) -->
       <div class="card-flat mb-3" style="padding:12px">
         <div class="flex items-center" style="gap:14px;flex-wrap:wrap">
-          ${isInvoice ? `
-          <!-- Invoice: VAT class filter -->
+          
+          <!-- Source filter (Front | Invoice | ทั้งหมด) -->
+          <div class="flex items-center" style="gap:6px;flex-wrap:wrap">
+            <span style="font-size:.78rem;color:var(--text2);margin-right:4px">ที่มา:</span>
+            ${(() => {
+              const isAllActive = (state.sourceFilter || 'all') === 'all';
+              const allBtnStyle = isAllActive
+                ? 'background:var(--primary);border:1px solid var(--primary);color:#fff'
+                : 'background:transparent;border:1px solid var(--border);color:var(--text2)';
+              return `<button data-sourcefilter="all" style="${allBtnStyle};padding:4px 10px;font-size:.74rem;border-radius:20px;cursor:pointer;font-weight:${isAllActive?600:500};transition:all .2s">ทั้งหมด</button>`;
+            })()}
+            ${[
+              { id: 'front',   label: '📦 Front',   color: 'var(--primary)' },
+              { id: 'invoice', label: '🧾 Invoice', color: 'var(--warn)' },
+            ].map(s => {
+              const isMe = (state.sourceFilter || 'all') === s.id;
+              const isAll = (state.sourceFilter || 'all') === 'all';
+              let style;
+              if (isMe)        style = `background:${s.color};border:1px solid ${s.color};color:#fff;font-weight:600`;
+              else if (isAll)  style = `background:transparent;border:1px solid ${s.color};color:${s.color};font-weight:500`;
+              else             style = `background:transparent;border:1px dashed var(--border);color:var(--text-muted);opacity:.5;font-weight:500`;
+              return `<button data-sourcefilter="${s.id}" style="${style};padding:4px 10px;font-size:.74rem;border-radius:20px;cursor:pointer;transition:all .2s">${s.label}</button>`;
+            }).join('')}
+          </div>
+          
+          <span style="color:var(--text-muted)">|</span>
+          
+          <!-- Station filter (Front-relevant) -->
+          <div class="flex items-center" style="gap:6px;flex-wrap:wrap">
+            <span style="font-size:.78rem;color:var(--text2);margin-right:4px">สถานี:</span>
+            ${(() => {
+              const isAllActive = state.station === 'all';
+              const allBtnStyle = isAllActive
+                ? 'background:var(--primary);border:1px solid var(--primary);color:#fff'
+                : 'background:transparent;border:1px solid var(--border);color:var(--text2)';
+              return `<button data-station="all" style="${allBtnStyle};padding:4px 10px;font-size:.74rem;border-radius:20px;cursor:pointer;font-weight:${isAllActive?600:500};transition:all .2s">ทั้งหมด</button>`;
+            })()}
+            ${PC_STATIONS.map(s => {
+              const isMe = state.station === s;
+              const isAll = state.station === 'all';
+              const stnColorMap = { 'FRONT1': 'var(--primary)', 'FRONT2': 'var(--success)', 'FRONT3': 'var(--warn)', 'FRONT4': 'var(--purple)' };
+              const stnColor = stnColorMap[s] || 'var(--primary)';
+              let style;
+              if (isMe)        style = `background:${stnColor};border:1px solid ${stnColor};color:#fff;font-weight:600`;
+              else if (isAll)  style = `background:transparent;border:1px solid ${stnColor};color:${stnColor};font-weight:500`;
+              else             style = `background:transparent;border:1px dashed var(--border);color:var(--text-muted);opacity:.5;font-weight:500`;
+              return `<button data-station="${s}" style="${style};padding:4px 10px;font-size:.74rem;border-radius:20px;cursor:pointer;transition:all .2s">${s}</button>`;
+            }).join('')}
+          </div>
+          
+          <span style="color:var(--text-muted)">|</span>
+          
+          <!-- VAT class (Invoice-relevant) -->
           <div class="flex items-center" style="gap:6px;flex-wrap:wrap">
             <span style="font-size:.78rem;color:var(--text2);margin-right:4px">คลาส:</span>
             ${(() => {
@@ -30692,55 +30741,6 @@ async function renderPcSales(el) {
               return `<button data-vatclass="${v.id}" style="${style};padding:4px 10px;font-size:.74rem;border-radius:20px;cursor:pointer;transition:all .2s">${v.label}</button>`;
             }).join('')}
           </div>
-          
-          <span style="color:var(--text-muted)">|</span>
-          
-          <!-- Invoice: Bill prefix filter -->
-          <div class="flex items-center" style="gap:6px;flex-wrap:wrap">
-            <span style="font-size:.78rem;color:var(--text2);margin-right:4px">Prefix:</span>
-            ${(() => {
-              const isAllActive = state.billPrefix === 'all';
-              const allBtnStyle = isAllActive
-                ? 'background:var(--primary);border:1px solid var(--primary);color:#fff'
-                : 'background:transparent;border:1px solid var(--border);color:var(--text2)';
-              return `<button data-prefix="all" style="${allBtnStyle};padding:4px 10px;font-size:.74rem;border-radius:20px;cursor:pointer;font-weight:${isAllActive?600:500};transition:all .2s">ทั้งหมด</button>`;
-            })()}
-            ${['SR','SS','SC','OR','OS','JR'].map(p => {
-              const isMe = state.billPrefix === p;
-              const isAll = state.billPrefix === 'all';
-              const isVat = ['SR','SS','SC'].indexOf(p) >= 0;
-              const c = isVat ? 'var(--warn)' : 'var(--purple)';
-              let style;
-              if (isMe)        style = `background:${c};border:1px solid ${c};color:#fff;font-weight:600`;
-              else if (isAll)  style = `background:transparent;border:1px solid ${c};color:${c};font-weight:500`;
-              else             style = `background:transparent;border:1px dashed var(--border);color:var(--text-muted);opacity:.5;font-weight:500`;
-              return `<button data-prefix="${p}" style="${style};padding:4px 10px;font-size:.72rem;border-radius:20px;cursor:pointer;transition:all .2s">${p}</button>`;
-            }).join('')}
-          </div>
-          ` : `
-          <!-- Front: Station filter -->
-          <div class="flex items-center" style="gap:6px;flex-wrap:wrap">
-            <span style="font-size:.78rem;color:var(--text2);margin-right:4px">สถานี:</span>
-            ${(() => {
-              const isAllActive = state.station === 'all';
-              const allBtnStyle = isAllActive
-                ? 'background:var(--primary);border:1px solid var(--primary);color:#fff'
-                : 'background:transparent;border:1px solid var(--border);color:var(--text2)';
-              return `<button data-station="all" style="${allBtnStyle};padding:4px 10px;font-size:.74rem;border-radius:20px;cursor:pointer;font-weight:${isAllActive?600:500};transition:all .2s">ทั้งหมด</button>`;
-            })()}
-            ${PC_STATIONS.map(s => {
-              const isMe = state.station === s;
-              const isAll = state.station === 'all';
-              const stnColorMap = { 'FRONT1': 'var(--primary)', 'FRONT2': 'var(--success)', 'FRONT3': 'var(--warn)', 'FRONT4': 'var(--purple)' };
-              const stnColor = stnColorMap[s] || 'var(--primary)';
-              let style;
-              if (isMe)        style = `background:${stnColor};border:1px solid ${stnColor};color:#fff;font-weight:600`;
-              else if (isAll)  style = `background:transparent;border:1px solid ${stnColor};color:${stnColor};font-weight:500`;
-              else             style = `background:transparent;border:1px dashed var(--border);color:var(--text-muted);opacity:.5;font-weight:500`;
-              return `<button data-station="${s}" style="${style};padding:4px 10px;font-size:.74rem;border-radius:20px;cursor:pointer;transition:all .2s">${s}</button>`;
-            }).join('')}
-          </div>
-          `}
           
           <span style="color:var(--text-muted)">|</span>
           
@@ -30851,20 +30851,23 @@ async function renderPcSales(el) {
         const newSource = btn.dataset.source;
         if (state.source === newSource) return;
         state.source = newSource;
-        // Reset source-specific filters when switching
-        if (newSource === 'invoice') {
-          state.station = 'all';
-        } else {
-          state.vatClass = 'all';
-          state.billPrefix = 'all';
-        }
         _pcSaveState(state);
         renderShell();
         await loadAndRender();
       });
     });
     
-    // Station/Brand/Status filter buttons
+    // Source filter (within "ยอด PC" tab) — Front/Invoice/All
+    el.querySelectorAll('[data-sourcefilter]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        state.sourceFilter = btn.dataset.sourcefilter;
+        _pcSaveState(state);
+        renderShell();
+        await loadAndRender();
+      });
+    });
+    
+    // Station/VAT/Brand/Status filter buttons
     el.querySelectorAll('[data-station]').forEach(btn => {
       btn.addEventListener('click', async () => {
         state.station = btn.dataset.station;
@@ -30876,19 +30879,6 @@ async function renderPcSales(el) {
     el.querySelectorAll('[data-vatclass]').forEach(btn => {
       btn.addEventListener('click', async () => {
         state.vatClass = btn.dataset.vatclass;
-        // If user picks specific VAT class, reset bill_prefix to 'all'
-        // (because prefix filter is sub-category of vat_class)
-        if (state.vatClass !== 'all') state.billPrefix = 'all';
-        _pcSaveState(state);
-        renderShell();
-        await loadAndRender();
-      });
-    });
-    el.querySelectorAll('[data-prefix]').forEach(btn => {
-      btn.addEventListener('click', async () => {
-        state.billPrefix = btn.dataset.prefix;
-        // If user picks specific prefix, reset vat_class to 'all' to avoid contradictions
-        if (state.billPrefix !== 'all') state.vatClass = 'all';
         _pcSaveState(state);
         renderShell();
         await loadAndRender();
@@ -31013,21 +31003,18 @@ async function renderPcSales(el) {
       // Render combined summary card (Front + Invoice รวมกัน — applies to ALL rows, not filtered)
       _renderCombinedSummary(rows);
       
-      // Source filter (front | invoice) — primary tab
-      filtered = filtered.filter(r => (r.source || 'front') === state.source);
+      // Source filter (within "ยอด PC" tab) — Front/Invoice/All
+      const sf = state.sourceFilter || 'all';
+      if (sf !== 'all') {
+        filtered = filtered.filter(r => (r.source || 'front') === sf);
+      }
       
-      // Source-specific filter
-      if (state.source === 'invoice') {
-        if (state.vatClass !== 'all') {
-          filtered = filtered.filter(r => r.vat_class === state.vatClass);
-        }
-        if (state.billPrefix !== 'all') {
-          filtered = filtered.filter(r => r.bill_prefix === state.billPrefix);
-        }
-      } else {
-        if (state.station !== 'all') {
-          filtered = filtered.filter(r => r.station === state.station);
-        }
+      // Station/VAT filters apply only to relevant source
+      if (state.station !== 'all') {
+        filtered = filtered.filter(r => (r.source || 'front') !== 'front' || r.station === state.station);
+      }
+      if (state.vatClass !== 'all') {
+        filtered = filtered.filter(r => (r.source || 'front') !== 'invoice' || r.vat_class === state.vatClass);
       }
       
       if (state.brand !== 'all') {
@@ -31038,16 +31025,10 @@ async function renderPcSales(el) {
       if (summaryEl) {
         const monthsLabel = state.months.length === 12 ? 'ทั้งปี' :
                             state.months.map(m => PC_MONTH_LABELS[m-1]).join(', ');
-        const sourceLabel = state.source === 'invoice' ? 'Invoice' : 'Front';
-        const filterParts = [`${sourceLabel} · ${monthsLabel} ${state.year}`];
-        if (state.source === 'invoice') {
-          if (state.vatClass !== 'all') {
-            filterParts.push(state.vatClass === 'VAT' ? 'ใบสั่งขาย' : 'ใบกำกับภาษี');
-          }
-          if (state.billPrefix !== 'all') filterParts.push(`Prefix ${state.billPrefix}`);
-        } else {
-          if (state.station !== 'all') filterParts.push(`สถานี ${state.station}`);
-        }
+        const sfLabel = sf === 'all' ? 'ทั้งหมด' : (sf === 'invoice' ? 'Invoice' : 'Front');
+        const filterParts = [`${sfLabel} · ${monthsLabel} ${state.year}`];
+        if (state.station !== 'all') filterParts.push(`สถานี ${state.station}`);
+        if (state.vatClass !== 'all') filterParts.push(state.vatClass === 'VAT' ? 'ใบสั่งขาย' : 'ใบกำกับภาษี');
         if (state.brand !== 'all') filterParts.push(`แบรนด์ ${state.brand}`);
         if (state.status !== 'all') {
           const stLbl = PC_STATUSES.find(s => s.id === state.status)?.label || state.status;
@@ -31057,19 +31038,16 @@ async function renderPcSales(el) {
       }
       
       if (filtered.length === 0) {
-        const sourceLabel = state.source === 'invoice' ? 'Invoice Raw' : 'Front Raw';
         root.innerHTML = `<div class="card text-center" style="padding:50px;color:var(--text-muted)">
           <div style="font-size:1.5rem;margin-bottom:8px">📭</div>
-          <div>ไม่มีข้อมูล ${sourceLabel} ตรงกับ filter ที่เลือก</div>
+          <div>ไม่มีข้อมูลตรงกับ filter ที่เลือก</div>
           <div style="font-size:.75rem;margin-top:6px;color:var(--text-muted)">
-            ${rows.length === 0 ? `อัปโหลด ${sourceLabel} เพื่อเริ่มต้น` : `กรองแล้ว 0 จาก ${rows.length} แถว`}
+            ${rows.length === 0 ? `อัปโหลดไฟล์ Front Raw หรือ Invoice Raw เพื่อเริ่มต้น` : `กรองแล้ว 0 จาก ${rows.length} แถว`}
           </div>
         </div>`;
         return;
       }
       
-      // Step 2A.2: simple preview table
-      // Step 2A.5 จะเปลี่ยนเป็น grouped view + bulk select
       _renderPcPreviewTable(root, filtered);
     } catch(err) {
       console.error('[PC] Load failed:', err);
@@ -31169,9 +31147,10 @@ async function renderPcSales(el) {
   }
   
   function _renderPcPreviewTable(root, rows) {
-    const isInvoice = state.source === 'invoice';
-    const sourceColor = isInvoice ? 'var(--warn)' : 'var(--primary)';
-    const sourceBg = isInvoice ? 'rgba(245,158,66,.08)' : 'var(--primary-bg)';
+    const sf = state.sourceFilter || 'all';
+    const isInvoice = sf === 'invoice';  // ใช้สำหรับ visual color เท่านั้น
+    const sourceColor = sf === 'invoice' ? 'var(--warn)' : sf === 'front' ? 'var(--primary)' : 'var(--success)';
+    const sourceBg = sf === 'invoice' ? 'rgba(245,158,66,.08)' : sf === 'front' ? 'var(--primary-bg)' : 'rgba(34,197,94,.06)';
     
     // Compute totals
     let totalQty = 0, totalAmount = 0;
@@ -31223,25 +31202,13 @@ async function renderPcSales(el) {
     const selectAllAttr = allSelected ? 'checked' : '';
     const selectAllIndet = someSelected ? 'data-indet="1"' : '';
     
-    const tableHeaders = isInvoice ? `
+    // Unified table headers (รวม Front + Invoice — ตัด customer ออก)
+    const tableHeaders = `
       <th style="width:30px"><input type="checkbox" id="pc-select-all" ${selectAllAttr} ${selectAllIndet}></th>
       <th>วันที่</th>
+      <th>ที่มา</th>
       <th>เลขที่บิล</th>
-      <th>คลาส</th>
-      <th>รหัสสินค้า</th>
-      <th>ชื่อสินค้า</th>
-      <th>ลูกค้า</th>
-      <th>แบรนด์</th>
-      <th>หมวด</th>
-      <th style="text-align:right">จำนวน</th>
-      <th style="text-align:right">ราคา</th>
-      <th style="text-align:right">ยอดรวม</th>
-      <th>สถานะ</th>
-    ` : `
-      <th style="width:30px"><input type="checkbox" id="pc-select-all" ${selectAllAttr} ${selectAllIndet}></th>
-      <th>วันที่</th>
-      <th>เลขที่บิล</th>
-      <th>สถานี</th>
+      <th>สถานี/Prefix</th>
       <th>รหัสสินค้า</th>
       <th>ชื่อสินค้า</th>
       <th>แบรนด์</th>
@@ -31257,7 +31224,7 @@ async function renderPcSales(el) {
       <div class="card-flat mb-3" style="padding:18px 20px;background:linear-gradient(135deg, ${sourceBg} 0%, transparent 100%);border:1px solid ${sourceColor};border-left:5px solid ${sourceColor}">
         <div class="flex justify-between items-center" style="flex-wrap:wrap;gap:14px;margin-bottom:14px">
           <div>
-            <div style="font-size:.7rem;color:var(--text2);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px">ยอดรวม PC ${isInvoice ? '(Invoice)' : '(Front)'}</div>
+            <div style="font-size:.7rem;color:var(--text2);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px">ยอด PC ${(state.sourceFilter||'all')==='all' ? '(ทั้งหมด)' : (state.sourceFilter==='invoice'?'(Invoice)':'(Front)')}</div>
             <div style="font-size:1.6rem;font-weight:800;color:${sourceColor};font-variant-numeric:tabular-nums">฿${fmt(totalAmount)}</div>
             <div style="font-size:.78rem;color:var(--text-muted);margin-top:2px">${rows.length.toLocaleString()} รายการ · ${fmtInt(totalQty)} ชิ้น</div>
           </div>
@@ -31266,7 +31233,7 @@ async function renderPcSales(el) {
       </div>
       
       ${truncated ? `<div class="card-flat mb-2" style="padding:10px;background:rgba(245,158,66,.06);border:1px solid var(--warn);font-size:.78rem;color:var(--warn)">
-        ⚠ แสดง ${MAX} แถวแรก จากทั้งหมด ${sorted.length} — Group view + bulk actions จะมาใน Step 2A.5
+        ⚠ แสดง ${MAX} แถวแรก จากทั้งหมด ${sorted.length}
       </div>` : ''}
       
       <!-- Line items table -->
@@ -31284,20 +31251,18 @@ async function renderPcSales(el) {
                 const stLabel = status?.label || r.status || '';
                 const isNegative = r.bill_type === 'return' || r.bill_type === 'credit_note';
                 const isSelected = selectedUuids.has(r.pc_uuid);
+                const rowSource = (r.source || 'front').toLowerCase();
+                const isInvoiceRow = rowSource === 'invoice';
                 
-                // Source-specific middle columns
-                const middleCols = isInvoice ? `
-                  <td style="font-size:.74rem">
-                    <span style="display:inline-block;padding:1px 6px;border-radius:4px;background:${r.vat_class==='VAT'?'var(--warn)':'var(--purple)'};color:#fff;font-size:.65rem;font-weight:700;margin-right:3px">${r.bill_prefix||''}</span>
-                  </td>
-                  <td style="font-family:var(--mono);font-size:.74rem;color:var(--text2)">${r.product_code || ''}</td>
-                  <td style="font-size:.78rem;max-width:240px" title="${(r.product_name || '').replace(/"/g,'&quot;')}">${r.product_name || ''}</td>
-                  <td style="font-size:.72rem;max-width:180px;color:var(--text2)" title="${(r.customer || '').replace(/"/g,'&quot;')}">${(r.customer || '').replace(/^\([^)]+\)\s*/,'')}</td>
-                ` : `
-                  <td style="font-size:.78rem">${r.station || ''}</td>
-                  <td style="font-family:var(--mono);font-size:.74rem;color:var(--text2)">${r.product_code || ''}</td>
-                  <td style="font-size:.78rem;max-width:280px" title="${(r.product_name || '').replace(/"/g,'&quot;')}">${r.product_name || ''}</td>
-                `;
+                // Source badge
+                const srcBadge = isInvoiceRow
+                  ? `<span style="display:inline-block;padding:2px 6px;border-radius:4px;background:var(--warn);color:#fff;font-size:.65rem;font-weight:700">🧾 Inv</span>`
+                  : `<span style="display:inline-block;padding:2px 6px;border-radius:4px;background:var(--primary);color:#fff;font-size:.65rem;font-weight:700">📦 Fr</span>`;
+                
+                // Station/Prefix column (depends on source)
+                const stnPrefixCell = isInvoiceRow
+                  ? `<span style="display:inline-block;padding:1px 6px;border-radius:4px;background:${r.vat_class==='VAT'?'var(--warn)':'var(--purple)'};color:#fff;font-size:.65rem;font-weight:700">${r.bill_prefix||''}</span>`
+                  : `<span style="font-size:.78rem">${r.station || ''}</span>`;
                 
                 // Split indicator
                 const isSplit = !!r.parent_pc_uuid;
@@ -31309,8 +31274,11 @@ async function renderPcSales(el) {
                 return `<tr data-uuid="${r.pc_uuid}" data-status="${r.status||'pending'}" style="${isNegative?'background:rgba(239,68,68,.04);':''}${isSelected?'background:rgba(91,124,250,.08);':''}">
                   <td><input type="checkbox" class="pc-row-check" data-uuid="${r.pc_uuid}" ${isSelected?'checked':''}></td>
                   <td style="font-family:var(--mono);font-size:.78rem">${r.original_date || ''}</td>
+                  <td>${srcBadge}</td>
                   <td style="font-family:var(--mono);font-size:.76rem">${r.bill_no || ''}${splitBadge}</td>
-                  ${middleCols}
+                  <td style="font-size:.74rem">${stnPrefixCell}</td>
+                  <td style="font-family:var(--mono);font-size:.74rem;color:var(--text2)">${r.product_code || ''}</td>
+                  <td style="font-size:.78rem;max-width:280px" title="${(r.product_name || '').replace(/"/g,'&quot;')}">${r.product_name || ''}</td>
                   <td><span style="display:inline-block;padding:2px 8px;border-radius:6px;background:${brandColor}1f;color:${brandColor};font-size:.7rem;font-weight:600">${r.brand || ''}</span></td>
                   <td style="font-size:.74rem;color:var(--text-muted)">${r.group_name || ''}</td>
                   <td style="text-align:right;font-family:var(--mono)">${fmtInt(r.qty)}</td>
@@ -31337,14 +31305,15 @@ async function renderPcSales(el) {
   // ────────────────────────────────────────────────────────────────
   function _pcGetFilteredRows() {
     let rows = (cachedRows || []).slice();
-    rows = rows.filter(r => (r.source || 'front') === state.source);
-    if (state.source === 'invoice') {
-      if (state.vatClass !== 'all')   rows = rows.filter(r => r.vat_class === state.vatClass);
-      if (state.billPrefix !== 'all') rows = rows.filter(r => r.bill_prefix === state.billPrefix);
-    } else {
-      if (state.station !== 'all') rows = rows.filter(r => r.station === state.station);
+    // sourceFilter: 'all' = ทั้ง front + invoice, 'front'/'invoice' = filter
+    const sf = state.sourceFilter || 'all';
+    if (sf !== 'all') {
+      rows = rows.filter(r => (r.source || 'front') === sf);
     }
-    if (state.brand !== 'all') rows = rows.filter(r => r.brand === state.brand);
+    // Station + VAT filters apply to relevant source only
+    if (state.station !== 'all')  rows = rows.filter(r => (r.source || 'front') !== 'front' || r.station === state.station);
+    if (state.vatClass !== 'all') rows = rows.filter(r => (r.source || 'front') !== 'invoice' || r.vat_class === state.vatClass);
+    if (state.brand !== 'all')    rows = rows.filter(r => r.brand === state.brand);
     return rows;
   }
   
@@ -31359,8 +31328,8 @@ async function renderPcSales(el) {
       return;
     }
     
-    const isInvoice = state.source === 'invoice';
-    const sourceLabel = isInvoice ? 'Invoice' : 'Front';
+    const sf = state.sourceFilter || 'all';
+    const sourceLabel = sf === 'all' ? 'ทั้งหมด' : (sf === 'invoice' ? 'Invoice' : 'Front');
     const monthsLabel = state.months.length === 12 ? 'ทั้งปี' :
                         state.months.map(m => PC_MONTH_LABELS[m-1]).join('-');
     
@@ -31370,30 +31339,31 @@ async function renderPcSales(el) {
       return String(a.bill_no || '').localeCompare(String(b.bill_no || ''));
     });
     
-    const headers = isInvoice
-      ? ['วันที่','เลขที่บิล','Prefix','คลาส','รหัสสินค้า','ชื่อสินค้า','ลูกค้า','พนักงานขาย','แบรนด์','หมวด','จำนวน','ราคา','ยอดรวม','สถานะ','เดือนส่ง']
-      : ['วันที่','เลขที่บิล','สถานี','รหัสสินค้า','ชื่อสินค้า','แบรนด์','หมวด','จำนวน','ราคา','ยอดรวม','สถานะ','เดือนส่ง'];
+    // Unified columns (รวม Front + Invoice — ตัด customer + salesperson)
+    const headers = ['วันที่','ที่มา','เลขที่บิล','สถานี/Prefix','คลาส','รหัสสินค้า','ชื่อสินค้า','แบรนด์','หมวด','จำนวน','ราคา','ยอดรวม','สถานะ','เดือนส่ง'];
     
     const data = [headers];
     sorted.forEach(r => {
       const submitInfo = r.status === 'submitted' && r.submit_year && r.submit_month
         ? `${PC_MONTH_LABELS[r.submit_month-1]} ${r.submit_year}` : '';
       const stLabel = (PC_STATUSES.find(s => s.id === r.status) || {}).label || r.status || '';
-      const row = isInvoice ? [
-        r.original_date || '', r.bill_no || '', r.bill_prefix || '',
-        r.vat_class === 'VAT' ? 'ใบสั่งขาย' : (r.vat_class === 'NOVAT' ? 'ใบกำกับภาษี' : ''),
-        r.product_code || '', r.product_name || '', r.customer || '', r.salesperson || '',
-        r.brand || '', r.group_name || '',
-        Number(r.qty) || 0, Number(r.price) || 0, Number(r.total) || 0,
-        stLabel, submitInfo,
-      ] : [
-        r.original_date || '', r.bill_no || '', r.station || '',
-        r.product_code || '', r.product_name || '',
-        r.brand || '', r.group_name || '',
-        Number(r.qty) || 0, Number(r.price) || 0, Number(r.total) || 0,
-        stLabel, submitInfo,
-      ];
-      data.push(row);
+      const isInvoiceRow = (r.source || 'front') === 'invoice';
+      data.push([
+        r.original_date || '',
+        isInvoiceRow ? '🧾 Invoice' : '📦 Front',
+        r.bill_no || '',
+        isInvoiceRow ? (r.bill_prefix || '') : (r.station || ''),
+        isInvoiceRow ? (r.vat_class === 'VAT' ? 'ใบสั่งขาย' : (r.vat_class === 'NOVAT' ? 'ใบกำกับภาษี' : '')) : '',
+        r.product_code || '',
+        r.product_name || '',
+        r.brand || '',
+        r.group_name || '',
+        Number(r.qty) || 0,
+        Number(r.price) || 0,
+        Number(r.total) || 0,
+        stLabel,
+        submitInfo,
+      ]);
     });
     
     const totalAmount = sorted.reduce((s, r) => s + (Number(r.total) || 0), 0);
@@ -31401,16 +31371,12 @@ async function renderPcSales(el) {
     data.push([]);
     const sumRow = new Array(headers.length).fill('');
     sumRow[0] = 'รวม';
-    if (isInvoice) { sumRow[10] = totalQty; sumRow[12] = totalAmount; }
-    else           { sumRow[7]  = totalQty; sumRow[9]  = totalAmount; }
+    sumRow[9] = totalQty;
+    sumRow[11] = totalAmount;
     data.push(sumRow);
     
     const ws = XLSX.utils.aoa_to_sheet(data);
-    if (isInvoice) {
-      ws['!cols'] = [{wch:12},{wch:18},{wch:8},{wch:14},{wch:18},{wch:30},{wch:28},{wch:18},{wch:12},{wch:10},{wch:10},{wch:12},{wch:14},{wch:12},{wch:14}];
-    } else {
-      ws['!cols'] = [{wch:12},{wch:22},{wch:10},{wch:18},{wch:35},{wch:12},{wch:10},{wch:10},{wch:12},{wch:14},{wch:12},{wch:14}];
-    }
+    ws['!cols'] = [{wch:12},{wch:12},{wch:22},{wch:14},{wch:14},{wch:18},{wch:30},{wch:12},{wch:10},{wch:10},{wch:12},{wch:14},{wch:12},{wch:14}];
     
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, `PC ${sourceLabel}`.substring(0, 31));
@@ -31429,8 +31395,8 @@ async function renderPcSales(el) {
     const fmt = (n) => Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
     const fmtInt = (n) => Number(n || 0).toLocaleString('en-US', { maximumFractionDigits: 0 });
     
-    const isInvoice = state.source === 'invoice';
-    const sourceLabel = isInvoice ? 'Invoice' : 'Front';
+    const sf = state.sourceFilter || 'all';
+    const sourceLabel = sf === 'all' ? 'ทั้งหมด' : (sf === 'invoice' ? 'Invoice' : 'Front');
     const monthsLabel = state.months.length === 12 ? 'ทั้งปี' :
                         state.months.map(m => PC_MONTH_LABELS[m-1]).join(', ');
     
@@ -31461,15 +31427,13 @@ async function renderPcSales(el) {
       const rowsHtml = brandRows.map(r => {
         const isNeg = r.bill_type === 'return' || r.bill_type === 'credit_note';
         const stLbl = (PC_STATUSES.find(s => s.id === r.status) || {}).label || r.status || '';
-        const middleCol = isInvoice 
-          ? `<td>${r.bill_prefix || ''}</td><td>${(r.customer||'').replace(/^\([^)]+\)\s*/,'').slice(0,30)}</td>`
-          : `<td>${r.station || ''}</td>`;
-        return `<tr style="${isNeg?'color:#d33':''}"><td>${r.original_date || ''}</td><td>${r.bill_no || ''}</td>${middleCol}<td>${r.product_code || ''}</td><td>${(r.product_name || '').slice(0, 40)}</td><td style="text-align:right">${fmtInt(r.qty)}</td><td style="text-align:right">${fmt(r.total)}</td><td>${stLbl}</td></tr>`;
+        const isInvoiceRow = (r.source || 'front') === 'invoice';
+        const srcCell = isInvoiceRow ? '🧾' : '📦';
+        const stnPrefixCell = isInvoiceRow ? (r.bill_prefix || '') : (r.station || '');
+        return `<tr style="${isNeg?'color:#d33':''}"><td>${r.original_date || ''}</td><td>${srcCell}</td><td>${r.bill_no || ''}</td><td>${stnPrefixCell}</td><td>${r.product_code || ''}</td><td>${(r.product_name || '').slice(0, 40)}</td><td style="text-align:right">${fmtInt(r.qty)}</td><td style="text-align:right">${fmt(r.total)}</td><td>${stLbl}</td></tr>`;
       }).join('');
       
-      const headerCols = isInvoice
-        ? '<th>วันที่</th><th>บิล</th><th>Pref</th><th>ลูกค้า</th><th>รหัส</th><th>ชื่อสินค้า</th><th style="text-align:right">จำนวน</th><th style="text-align:right">รวม</th><th>สถานะ</th>'
-        : '<th>วันที่</th><th>บิล</th><th>สถานี</th><th>รหัส</th><th>ชื่อสินค้า</th><th style="text-align:right">จำนวน</th><th style="text-align:right">รวม</th><th>สถานะ</th>';
+      const headerCols = '<th>วันที่</th><th>ที่มา</th><th>บิล</th><th>สถานี/Pref</th><th>รหัส</th><th>ชื่อสินค้า</th><th style="text-align:right">จำนวน</th><th style="text-align:right">รวม</th><th>สถานะ</th>';
       
       return `<div class="brand-section" style="margin-bottom:24px;page-break-inside:avoid">
         <div style="background:${brandDef.color};color:#fff;padding:6px 12px;border-radius:4px;display:inline-block;margin-bottom:6px;font-weight:700;font-size:12px">
@@ -31500,7 +31464,7 @@ async function renderPcSales(el) {
   @media print { body { padding: 10px; } @page { size: A4 landscape; margin: 10mm; } }
 </style>
 </head><body>
-  <h1>📊 รายงานยอดขาย PC (${sourceLabel})</h1>
+  <h1>📊 รายงาน ยอด PC (${sourceLabel})</h1>
   <div class="subtitle">${monthsLabel} ${state.year}  ·  สถานะ: ${state.status === 'all' ? 'ทุกสถานะ' : ((PC_STATUSES.find(s=>s.id===state.status)||{}).label||state.status)}  ·  พิมพ์: ${new Date().toLocaleString('th-TH')}</div>
   <div class="summary">
     <strong>รวมทั้งหมด:</strong> ${sorted.length.toLocaleString()} รายการ · ${fmtInt(totalQty)} ชิ้น · <strong>฿${fmt(totalAmount)}</strong>
@@ -31513,12 +31477,12 @@ async function renderPcSales(el) {
   }
   
   // ════════════════════════════════════════════════════════════════
-  // SUBMISSIONS VIEW — list ใบส่ง PC ทั้งหมด
+  // SUBMISSIONS VIEW — list Sell out PC ทั้งหมด
   // ════════════════════════════════════════════════════════════════
   async function _pcRenderSubmissionsView(root, summaryEl) {
     root.innerHTML = `<div class="card text-center" style="padding:40px;color:var(--text-muted)">
       <div style="font-size:1.4rem;margin-bottom:8px">⏳</div>
-      <div>กำลังโหลดใบส่ง...</div>
+      <div>กำลังโหลด Sell out...</div>
     </div>`;
     if (summaryEl) summaryEl.textContent = '';
     
@@ -31541,7 +31505,7 @@ async function renderPcSales(el) {
         const monthsLbl = state.months.length === 1 ? PC_MONTH_LABELS[state.months[0]-1] :
                           state.months.length === 12 ? 'ทั้งปี' :
                           `${state.months.length} เดือน`;
-        let label = `📤 ใบส่ง PC ${state.year}`;
+        let label = `📤 Sell out PC ${state.year}`;
         if (state.months.length === 1) label += ` · ${monthsLbl}`;
         if (state.brand !== 'all') label += ` · ${state.brand}`;
         summaryEl.textContent = `${label} — ${submissions.length.toLocaleString()} ใบ`;
@@ -31550,9 +31514,9 @@ async function renderPcSales(el) {
       if (submissions.length === 0) {
         root.innerHTML = `<div class="card text-center" style="padding:50px;color:var(--text-muted)">
           <div style="font-size:1.5rem;margin-bottom:8px">📭</div>
-          <div>ยังไม่มีใบส่ง PC</div>
+          <div>ยังไม่มี Sell out PC</div>
           <div style="font-size:.78rem;margin-top:8px;color:var(--text-muted)">
-            ไปแท็บ Front/Invoice → เลือกบิล → กดส่ง → จะสร้างใบส่งให้อัตโนมัติ
+            ไปแท็บ Front/Invoice → เลือกบิล → กดส่ง → จะสร้าง Sell out ให้อัตโนมัติ
           </div>
         </div>`;
         return;
@@ -31579,7 +31543,7 @@ async function renderPcSales(el) {
       
       const grandHtml = `
         <div class="card-flat mb-3" style="padding:16px 20px;background:linear-gradient(135deg, rgba(34,197,94,.1), transparent);border:1px solid var(--success);border-left:5px solid var(--success)">
-          <div style="font-size:.7rem;color:var(--text2);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px">📤 ใบส่ง PC ทั้งหมด</div>
+          <div style="font-size:.7rem;color:var(--text2);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px">📤 Sell out PC ทั้งหมด</div>
           <div style="font-size:1.5rem;font-weight:800;color:var(--success);font-variant-numeric:tabular-nums">฿${fmt(grandTotal)}</div>
           <div style="font-size:.78rem;color:var(--text-muted);margin-top:2px">
             ${submissions.length.toLocaleString()} ใบ · ${fmtInt(grandBills)} บิล · ${fmtInt(grandLines)} รายการ
@@ -31686,7 +31650,7 @@ async function renderPcSales(el) {
   // Submission detail modal — show all bills in a submission
   // ────────────────────────────────────────────────────────────────
   async function _pcOpenSubmissionDetail(subId) {
-    openModal('📤 รายละเอียดใบส่ง', `
+    openModal('📤 รายละเอียด Sell out', `
       <div style="padding:30px;text-align:center;color:var(--text-muted)">⏳ กำลังโหลด...</div>
     `);
     
@@ -31862,7 +31826,7 @@ async function renderPcSales(el) {
         checks.forEach(c => {
           c.dataset.uuids.split(',').forEach(u => uuidsToRemove.push(u));
         });
-        if (!confirm(`เอาบิล ${checks.length} ใบออกจากใบส่ง?\n\n(บิลจะกลับมาเป็น pending — สามารถส่งใหม่ได้)`)) return;
+        if (!confirm(`เอาบิล ${checks.length} ใบออกจาก Sell out?\n\n(บิลจะกลับมาเป็น pending — สามารถส่งใหม่ได้)`)) return;
         
         try {
           toast(`⏳ กำลังเอาออก...`, 'info');
@@ -31940,7 +31904,7 @@ async function renderPcSales(el) {
         return c2;
       });
       
-      const headers = ['Source','วันที่','เลขที่บิล','Prefix','คลาส','สถานี','รหัสสินค้า','ชื่อสินค้า','ลูกค้า','แบรนด์','หมวด','จำนวน','ราคา','ยอดรวม'];
+      const headers = ['Source','วันที่','เลขที่บิล','Prefix','คลาส','สถานี','รหัสสินค้า','ชื่อสินค้า','แบรนด์','หมวด','จำนวน','ราคา','ยอดรวม'];
       const data = [headers];
       sorted.forEach(r => {
         data.push([
@@ -31952,7 +31916,6 @@ async function renderPcSales(el) {
           r.station || '',
           r.product_code || '',
           r.product_name || '',
-          r.customer || '',
           r.brand || '',
           r.group_name || '',
           Number(r.qty) || 0,
@@ -31963,12 +31926,12 @@ async function renderPcSales(el) {
       data.push([]);
       const sumRow = new Array(headers.length).fill('');
       sumRow[0] = 'รวม';
-      sumRow[11] = items.reduce((s,r) => s + (Number(r.qty)||0), 0);
-      sumRow[13] = Number(sub.total_amount);
+      sumRow[10] = items.reduce((s,r) => s + (Number(r.qty)||0), 0);
+      sumRow[12] = Number(sub.total_amount);
       data.push(sumRow);
       
       const ws = XLSX.utils.aoa_to_sheet(data);
-      ws['!cols'] = [{wch:12},{wch:12},{wch:18},{wch:8},{wch:14},{wch:10},{wch:18},{wch:30},{wch:25},{wch:12},{wch:10},{wch:10},{wch:12},{wch:14}];
+      ws['!cols'] = [{wch:12},{wch:12},{wch:18},{wch:8},{wch:14},{wch:10},{wch:18},{wch:30},{wch:12},{wch:10},{wch:10},{wch:12},{wch:14}];
       
       const wb = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(wb, ws, `${sub.brand}_${monthLbl}`.substring(0, 31));
@@ -32039,7 +32002,7 @@ async function renderPcSales(el) {
   thead { background: #f3f4f6; }
   @media print { body { padding: 10px; } @page { size: A4 portrait; margin: 12mm; } }
 </style></head><body>
-  <h1>📤 ใบส่ง PC — ${sub.brand}</h1>
+  <h1>📤 Sell out PC — ${sub.brand}</h1>
   <div class="subtitle">เดือนส่ง: ${monthLbl} ${sub.target_year} · ID: ${sub.submission_id} · พิมพ์: ${new Date().toLocaleString('th-TH')}</div>
   <div class="summary">
     <strong>ยอดรวม: ฿${fmt(sub.total_amount)}</strong>
@@ -32079,12 +32042,12 @@ async function renderPcSales(el) {
   // Delete entire submission
   // ────────────────────────────────────────────────────────────────
   async function _pcSubDelete(subId) {
-    if (!confirm(`ลบใบส่ง ${subId}?\n\nบิลทั้งหมดในใบจะกลับเป็น pending — สามารถส่งใหม่ได้`)) return;
+    if (!confirm(`ลบ Sell out ${subId}?\n\nบิลทั้งหมดใน Sell out จะกลับเป็น pending — สามารถส่งใหม่ได้`)) return;
     try {
       toast('⏳ กำลังลบ...', 'info');
       const res = await api('deletePcSubmission', { submission_id: subId });
       if (res.success !== false) {
-        toast(`✅ ลบใบส่ง · คืน pending ${(res.data.reset_lineitems || 0).toLocaleString()} รายการ`, 'success');
+        toast(`✅ ลบ Sell out · คืน pending ${(res.data.reset_lineitems || 0).toLocaleString()} รายการ`, 'success');
         await loadAndRender();
       } else {
         toast(`❌ ${res.error}`, 'error');
@@ -32169,13 +32132,11 @@ async function renderPcSales(el) {
   // ────────────────────────────────────────────────────────────────
   function _pcOpenAutoSelectModal(opts) {
     opts = opts || {};
-    const isInvoice = state.source === 'invoice';
-    const sourceLabel = opts.sourceLabel || (isInvoice ? 'Invoice' : 'Front');
+    const sourceLabel = opts.sourceLabel || 'ยอด PC';
     const isAddingTo = !!opts.addingToSubmission;
     
-    // Pending rows ของ source ปัจจุบัน
+    // Pending rows ของทุก source — รวม Front + Invoice
     const allRows = (cachedRows || []).filter(r => 
-      (r.source || 'front') === state.source && 
       (r.status || 'pending') === 'pending'
     );
     
@@ -32187,19 +32148,19 @@ async function renderPcSales(el) {
       .map(b => `<option value="${b.id}" data-color="${b.color}">${b.label}</option>`).join('');
     
     if (!brandOpts) {
-      toast(`❌ ไม่มีรายการค้างส่งใน ${sourceLabel}`, 'error');
+      toast(`❌ ไม่มีรายการค้างส่ง`, 'error');
       return;
     }
     
     const defY = opts.prefillTargetYear || new Date().getFullYear();
     const defM = opts.prefillTargetMonth || (new Date().getMonth() + 1);
     
-    openModal(`🎯 ${isAddingTo ? 'เพิ่มบิลเข้าใบส่ง' : 'เลือกบิล'} PC ${sourceLabel} ตามยอดเป้า`, `
+    openModal(`🎯 ${isAddingTo ? 'เพิ่มบิลเข้า Sell out' : 'เลือกบิล'} PC ${sourceLabel} ตามยอดเป้า`, `
       <div style="padding:18px;max-width:680px">
         
         ${isAddingTo ? `
         <div style="background:rgba(34,197,94,.08);padding:10px 12px;border-radius:8px;border-left:3px solid var(--success);font-size:.78rem;color:var(--text2);margin-bottom:14px">
-          📤 <b>กำลังเพิ่มบิลเข้าใบส่ง:</b> ${opts.prefillBrand} · ${opts.targetLabel}<br>
+          📤 <b>กำลังเพิ่มบิลเข้า Sell out:</b> ${opts.prefillBrand} · ${opts.targetLabel}<br>
           <span style="font-size:.72rem;color:var(--text-muted)">บิลที่เลือกจะ append เข้าใบเดิม (ไม่สร้างใบใหม่)</span>
         </div>
         ` : ''}
