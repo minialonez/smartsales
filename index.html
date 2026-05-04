@@ -773,14 +773,76 @@ function applyFlatpickrAll() {
     return;
   }
   window._fpLoadRetry = 0;
+
+  // 🔧 Custom parseDate — บังคับ parse แบบ deterministic ทุก browser/locale
+  // แก้ปัญหา Edge en-US locale ตี yyyy-mm-dd เป็น yyyy-dd-mm
+  const customParseDate = function(datestr, format) {
+    if (!datestr) return null;
+    if (datestr instanceof Date) return isNaN(datestr) ? null : datestr;
+    const s = String(datestr).trim();
+
+    // Pattern 1: yyyy-mm-dd (ISO — มาจาก backend หรือ value attribute)
+    const isoMatch = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+    if (isoMatch) {
+      const y = +isoMatch[1], m = +isoMatch[2], d = +isoMatch[3];
+      if (m < 1 || m > 12 || d < 1 || d > 31) return null;
+      return new Date(y, m - 1, d);
+    }
+
+    // Pattern 2: dd/mm/yyyy (Thai display format — altInput)
+    const dmyMatch = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+    if (dmyMatch) {
+      let d = +dmyMatch[1], m = +dmyMatch[2], y = +dmyMatch[3];
+      // Auto-detect en-US m/d/y: ถ้า day > 12 และ month <= 12 → swap
+      if (d > 12 && m <= 12) { /* dd/mm — keep as is */ }
+      else if (m > 12 && d <= 12) { [d, m] = [m, d]; } // swap from m/d/y
+      // Buddhist year support
+      if (y > 2400) y -= 543;
+      if (m < 1 || m > 12 || d < 1 || d > 31) return null;
+      return new Date(y, m - 1, d);
+    }
+
+    // Pattern 3: dd-mm-yyyy (with dashes)
+    const dashMatch = s.match(/^(\d{1,2})-(\d{1,2})-(\d{4})$/);
+    if (dashMatch) {
+      let d = +dashMatch[1], m = +dashMatch[2], y = +dashMatch[3];
+      if (m > 12 && d <= 12) { [d, m] = [m, d]; }
+      if (y > 2400) y -= 543;
+      if (m < 1 || m > 12 || d < 1 || d > 31) return null;
+      return new Date(y, m - 1, d);
+    }
+
+    // Fallback: ใช้ flatpickr default (เผื่อ format อื่นๆ เช่น Excel epoch)
+    try {
+      const fallback = flatpickr.parseDate(s, format);
+      if (fallback && !isNaN(fallback)) return fallback;
+    } catch (e) {}
+
+    return null;
+  };
+
+  // 🔧 Custom formatDate — บังคับ format แบบ deterministic
+  const customFormatDate = function(date, format) {
+    if (!date || !(date instanceof Date) || isNaN(date)) return '';
+    const y = date.getFullYear();
+    const m = String(date.getMonth() + 1).padStart(2, '0');
+    const d = String(date.getDate()).padStart(2, '0');
+    if (format === 'Y-m-d') return `${y}-${m}-${d}`;
+    if (format === 'd/m/Y') return `${d}/${m}/${y}`;
+    // Fallback ใช้ flatpickr default สำหรับ format อื่น
+    try { return flatpickr.formatDate(date, format); } catch (e) { return ''; }
+  };
+
   document.querySelectorAll('input[type="date"]').forEach(inp => {
     if (inp._flatpickr) return; // already applied
     try {
       flatpickr(inp, {
-        dateFormat: 'Y-m-d',        // value ที่ส่งออก = yyyy-mm-dd (เหมือนเดิม)
-        altFormat: 'd/m/Y',         // ที่แสดงในช่อง = 17/04/2026
-        altInput: true,             // สร้างช่องแสดงใหม่ซ้อนทับ
+        dateFormat: 'Y-m-d',     // value ที่ส่งออก = yyyy-mm-dd (เหมือนเดิม)
+        altFormat: 'd/m/Y',       // ที่แสดงในช่อง = 17/04/2026 (เหมือนเดิม)
+        altInput: true,
         allowInput: true,
+        parseDate: customParseDate,   // 🔧 ใหม่ — กัน browser locale interpretation
+        formatDate: customFormatDate, // 🔧 ใหม่ — บังคับ output แบบ deterministic
       });
     } catch(e) {}
   });
