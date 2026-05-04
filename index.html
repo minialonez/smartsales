@@ -415,6 +415,7 @@ async function api(action, params = {}) {
       'upsertMonthlyFront', 'upsertMonthlyInvoice',
       'upsertPcBatch', 'updatePcStatus',
       'createOrAddPcSubmission', 'removeFromPcSubmission', 'deletePcSubmission',
+      'splitPcLineitem', 'unsplitPcLineitems',
     ];
     const forcePost = FORCE_POST_ACTIONS.indexOf(action) !== -1;
     
@@ -30157,14 +30158,20 @@ async function _pcShowPreviewModal(filename, sheetName, source, records, groups,
   const checks = await Promise.all(periods.map(async (key) => {
     const [y, m] = key.split('-').map(Number);
     try {
-      const res = await api('checkPcPeriod', { year: y, month: m, source: source });
-      const d = (res && res.data) || {};
+      const [periodRes, splitRes] = await Promise.all([
+        api('checkPcPeriod', { year: y, month: m, source: source }),
+        api('countPcSplitsByPeriod', { year: y, month: m, source: source }),
+      ]);
+      const d = (periodRes && periodRes.data) || {};
+      const s = (splitRes && splitRes.data) || {};
       return {
         year: y, month: m,
         pending: d.pending || 0,
         submitted: d.submitted || 0,
         excluded: d.excluded || 0,
         total: d.total || 0,
+        split_count: s.count || 0,
+        split_bills: s.bills_affected || 0,
       };
     } catch(e) {
       return { year: y, month: m, error: e.message };
@@ -30320,13 +30327,25 @@ async function _pcShowPreviewModal(filename, sheetName, source, records, groups,
       warningText = parts.join(' · ');
     }
     
+    // Split warning (records ที่ user ได้ split ไว้แล้ว)
+    let splitWarn = '';
+    if (check.split_count > 0) {
+      splitWarn = `<div style="margin-top:4px;font-size:.7rem;color:var(--purple);font-weight:600">
+        ⚠️ พบ split records: ${fmtInt(check.split_count)} ส่วน (${fmtInt(check.split_bills)} บิล) — re-upload จะลบ split ทิ้ง!
+      </div>`;
+    }
+    
     return `
       <tr>
-        <td>${hasExisting ? '⚠️' : '✨'} ${monthLbl(m)} ${y}</td>
-        <td>${warningText}</td>
+        <td style="vertical-align:top">${hasExisting ? '⚠️' : '✨'} ${monthLbl(m)} ${y}</td>
+        <td>${warningText}${splitWarn}</td>
       </tr>
     `;
   }).join('');
+  
+  // Total split count across all periods
+  const totalSplits = checks.reduce((s, c) => s + (c.split_count || 0), 0);
+  const totalSplitBills = checks.reduce((s, c) => s + (c.split_bills || 0), 0);
   
   // Sample preview (5 sale + 3 return/credit_note rows)
   const positiveRecs = records.filter(r => r.bill_type === 'sale').slice(0, 5);
@@ -30418,10 +30437,29 @@ async function _pcShowPreviewModal(filename, sheetName, source, records, groups,
         </table>
       </div>
       
+      ${totalSplits > 0 ? `
+      <!-- Split confirmation checkbox -->
+      <div class="card-flat mb-3" style="padding:14px 16px;background:rgba(168,85,247,.08);border:2px solid var(--purple)">
+        <div style="font-weight:700;color:var(--purple);margin-bottom:6px">
+          ⚠️ พบ Split records ในเดือนเหล่านี้
+        </div>
+        <div style="font-size:.8rem;color:var(--text);margin-bottom:10px">
+          คุณได้ split บิลเอง ${fmtInt(totalSplits)} ส่วน (จาก ${fmtInt(totalSplitBills)} บิล) ใน period นี้<br>
+          การ re-upload <b style="color:var(--purple)">จะลบ split records ทั้งหมดทิ้ง</b> และแทนที่ด้วยบิลปกติจากไฟล์ใหม่
+        </div>
+        <label style="display:flex;align-items:center;gap:10px;cursor:pointer;padding:8px;border-radius:6px;background:var(--surface)">
+          <input type="checkbox" id="confirm-overwrite-splits">
+          <span style="font-size:.85rem;color:var(--text);font-weight:600">
+            ฉันรับทราบว่า split records ${fmtInt(totalSplits)} ส่วนจะถูกลบทิ้ง
+          </span>
+        </label>
+      </div>
+      ` : ''}
+      
       <!-- Action buttons -->
       <div class="flex justify-end" style="gap:10px;margin-top:16px">
         <button class="btn btn-ghost" id="btn-pc-cancel">❌ ยกเลิก</button>
-        <button class="btn btn-primary" id="btn-pc-confirm">✅ ยืนยันบันทึก</button>
+        <button class="btn btn-primary" id="btn-pc-confirm" ${totalSplits > 0 ? 'disabled style="opacity:.5"' : ''}>✅ ยืนยันบันทึก</button>
       </div>
     </div>
   `;
@@ -30429,6 +30467,15 @@ async function _pcShowPreviewModal(filename, sheetName, source, records, groups,
   document.getElementById('modal-body').innerHTML = bodyHtml;
   
   document.getElementById('btn-pc-cancel').addEventListener('click', () => closeModal());
+  
+  // Enable/disable confirm based on checkbox
+  if (totalSplits > 0) {
+    document.getElementById('confirm-overwrite-splits').addEventListener('change', (e) => {
+      const btn = document.getElementById('btn-pc-confirm');
+      btn.disabled = !e.target.checked;
+      btn.style.opacity = e.target.checked ? '1' : '.5';
+    });
+  }
   
   document.getElementById('btn-pc-confirm').addEventListener('click', async () => {
     await _pcSaveBatch(records, groups, source, onSaveSuccess);
@@ -31252,10 +31299,17 @@ async function renderPcSales(el) {
                   <td style="font-size:.78rem;max-width:280px" title="${(r.product_name || '').replace(/"/g,'&quot;')}">${r.product_name || ''}</td>
                 `;
                 
+                // Split indicator
+                const isSplit = !!r.parent_pc_uuid;
+                const splitIdx = r.split_index;
+                const splitBadge = isSplit 
+                  ? `<span style="display:inline-block;padding:0 5px;border-radius:3px;background:var(--purple);color:#fff;font-size:.6rem;font-weight:700;margin-left:4px;vertical-align:1px" title="Split — ส่วนที่ ${splitIdx}">✂${splitIdx}</span>` 
+                  : '';
+                
                 return `<tr data-uuid="${r.pc_uuid}" data-status="${r.status||'pending'}" style="${isNegative?'background:rgba(239,68,68,.04);':''}${isSelected?'background:rgba(91,124,250,.08);':''}">
                   <td><input type="checkbox" class="pc-row-check" data-uuid="${r.pc_uuid}" ${isSelected?'checked':''}></td>
                   <td style="font-family:var(--mono);font-size:.78rem">${r.original_date || ''}</td>
-                  <td style="font-family:var(--mono);font-size:.76rem">${r.bill_no || ''}</td>
+                  <td style="font-family:var(--mono);font-size:.76rem">${r.bill_no || ''}${splitBadge}</td>
                   ${middleCols}
                   <td><span style="display:inline-block;padding:2px 8px;border-radius:6px;background:${brandColor}1f;color:${brandColor};font-size:.7rem;font-weight:600">${r.brand || ''}</span></td>
                   <td style="font-size:.74rem;color:var(--text-muted)">${r.group_name || ''}</td>
@@ -32428,6 +32482,14 @@ async function renderPcSales(el) {
       if (statusCounts[st] !== undefined) statusCounts[st]++;
     });
     
+    // Detect: can split? (เลือก 1 row, status=pending, ไม่ใช่ split อยู่แล้ว)
+    const canSplit = selectedRows.length === 1 && 
+                     (selectedRows[0].status||'pending') === 'pending' &&
+                     !selectedRows[0].parent_pc_uuid;
+    // Detect: can unsplit? (เลือก 1 row, มี parent_pc_uuid)
+    const canUnsplit = selectedRows.length === 1 && 
+                       !!selectedRows[0].parent_pc_uuid;
+    
     bar.style.display = 'block';
     bar.innerHTML = `
       <div class="card-flat" style="padding:12px 16px;background:linear-gradient(90deg, rgba(91,124,250,.1), rgba(91,124,250,.04));border:1px solid var(--primary);border-left:4px solid var(--primary);display:flex;align-items:center;gap:14px;flex-wrap:wrap">
@@ -32439,6 +32501,8 @@ async function renderPcSales(el) {
           ${statusCounts.pending} ค้างส่ง / ${statusCounts.submitted} ส่งแล้ว / ${statusCounts.excluded} ไม่ส่ง
         </div>
         <div style="flex:1"></div>
+        ${canSplit ? `<button class="btn btn-ghost btn-sm" id="btn-bulk-split" style="color:var(--purple)" title="แบ่งบิลเป็นหลายส่วน">✂️ Split</button>` : ''}
+        ${canUnsplit ? `<button class="btn btn-ghost btn-sm" id="btn-bulk-unsplit" style="color:var(--purple)" title="ยกเลิก split">↶ Unsplit</button>` : ''}
         <button class="btn btn-primary btn-sm" id="btn-bulk-submit" title="ส่งเดือนนี้/เดือนอื่น">📤 ส่ง / ย้ายเดือน</button>
         <button class="btn btn-ghost btn-sm" id="btn-bulk-unsubmit" title="คืนกลับเป็น pending">⏪ คืน pending</button>
         <button class="btn btn-ghost btn-sm" id="btn-bulk-exclude" style="color:var(--warn)" title="ทำเครื่องหมายไม่นำส่ง">🚫 ไม่นำส่ง</button>
@@ -32460,6 +32524,186 @@ async function renderPcSales(el) {
       if (!confirm(`ทำเครื่องหมายไม่นำส่ง ${count.toLocaleString()} รายการ?\n\n(สามารถคืนเป็น pending ได้ทีหลัง)`)) return;
       await _bulkUpdateStatus('excluded', null, null);
     });
+    if (canSplit) {
+      document.getElementById('btn-bulk-split').addEventListener('click', () => {
+        _openSplitModal(selectedRows[0]);
+      });
+    }
+    if (canUnsplit) {
+      document.getElementById('btn-bulk-unsplit').addEventListener('click', async () => {
+        await _doUnsplit(selectedRows[0]);
+      });
+    }
+  }
+  
+  // ════════════════════════════════════════════════════════════════
+  // SPLIT — แบ่งบิลเป็นหลายส่วน (manual)
+  // ════════════════════════════════════════════════════════════════
+  function _openSplitModal(row) {
+    const fmt = (n) => Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const origQty = Number(row.qty) || 0;
+    const origTotal = Number(row.total) || 0;
+    const origPrice = origQty !== 0 ? (origTotal / origQty) : (Number(row.price) || 0);
+    const isReturn = origQty < 0;
+    
+    if (origQty === 0) {
+      toast('❌ ไม่สามารถ split — qty = 0', 'error');
+      return;
+    }
+    
+    // Initial state: 2 parts, แบ่งครึ่ง (or 50/50 floor)
+    const halfA = Math.floor(Math.abs(origQty) / 2) * (isReturn ? -1 : 1);
+    const halfB = origQty - halfA;
+    let splitState = [
+      { qty: halfA },
+      { qty: halfB },
+    ];
+    
+    const renderModal = () => {
+      const totalSplitQty = splitState.reduce((s, p) => s + (Number(p.qty) || 0), 0);
+      const isValid = Math.abs(totalSplitQty - origQty) < 0.001;
+      const totalSplitAmount = splitState.reduce((s, p) => s + ((Number(p.qty) || 0) * origPrice), 0);
+      
+      const partsHtml = splitState.map((part, i) => {
+        const partAmount = (Number(part.qty) || 0) * origPrice;
+        const canRemove = splitState.length > 2;
+        return `
+          <div style="display:flex;align-items:center;gap:10px;padding:10px;background:var(--surface2);border-radius:8px;margin-bottom:8px">
+            <div style="font-weight:600;color:var(--text2);min-width:80px">ส่วนที่ ${i+1}:</div>
+            <input type="number" class="input split-qty" data-idx="${i}" value="${part.qty}" 
+                   style="width:100px;padding:6px 8px;font-family:var(--mono);text-align:right" 
+                   step="${isReturn ? -1 : 1}">
+            <div style="color:var(--text-muted);font-size:.85rem">ชิ้น</div>
+            <div style="flex:1;text-align:right;font-family:var(--mono);font-size:.9rem;color:var(--text)">
+              ฿${fmt(partAmount)}
+            </div>
+            ${canRemove ? `<button class="btn btn-ghost btn-sm split-remove" data-idx="${i}" style="padding:2px 8px;color:var(--danger)">✕</button>` : '<div style="width:30px"></div>'}
+          </div>
+        `;
+      }).join('');
+      
+      const validationHtml = isValid 
+        ? `<div style="color:var(--success);font-weight:600">✓ รวม: ${totalSplitQty} / ${origQty} ชิ้น · ฿${fmt(totalSplitAmount)}</div>`
+        : `<div style="color:var(--danger);font-weight:600">⚠ รวม: ${totalSplitQty} / ${origQty} ชิ้น (ต่าง ${(origQty - totalSplitQty)})</div>`;
+      
+      openModal(`✂️ แบ่งบิล (Split)`, `
+        <div style="padding:18px;max-width:580px">
+          <!-- Original -->
+          <div style="background:var(--surface2);padding:12px 14px;border-radius:8px;margin-bottom:14px;border-left:4px solid var(--primary)">
+            <div style="font-size:.78rem;color:var(--text-muted);margin-bottom:4px">เดิม</div>
+            <div style="font-family:var(--mono);font-size:.78rem;color:var(--text2);margin-bottom:4px">${row.bill_no || ''}</div>
+            <div style="font-size:.85rem;color:var(--text);margin-bottom:6px">${row.product_code || ''} — ${row.product_name || ''}</div>
+            <div style="display:flex;gap:14px;font-size:.82rem">
+              <span><b>${origQty}</b> ชิ้น</span>
+              <span style="color:var(--text-muted)">×</span>
+              <span>฿${fmt(origPrice)}/ชิ้น</span>
+              <span style="color:var(--text-muted)">=</span>
+              <span style="font-weight:700">฿${fmt(origTotal)}</span>
+            </div>
+          </div>
+          
+          <!-- Splits -->
+          <div style="margin-bottom:12px">
+            <div style="font-weight:600;margin-bottom:8px;color:var(--text)">แบ่งเป็น:</div>
+            <div id="split-parts-container">${partsHtml}</div>
+            <button class="btn btn-ghost btn-sm" id="btn-split-add" style="margin-top:4px">➕ เพิ่มส่วนใหม่</button>
+          </div>
+          
+          <!-- Validation -->
+          <div style="padding:10px 12px;background:${isValid ? 'rgba(34,197,94,.08)' : 'rgba(239,68,68,.08)'};border-radius:8px;margin-bottom:14px;font-size:.85rem">
+            ${validationHtml}
+          </div>
+          
+          <!-- Actions -->
+          <div class="flex justify-end" style="gap:10px">
+            <button class="btn btn-ghost" id="btn-split-cancel">ยกเลิก</button>
+            <button class="btn btn-primary" id="btn-split-confirm" ${isValid?'':'disabled style="opacity:.5"'}>✂️ ยืนยัน Split</button>
+          </div>
+        </div>
+      `);
+      
+      // Bind events
+      document.getElementById('btn-split-cancel').addEventListener('click', closeModal);
+      
+      document.querySelectorAll('.split-qty').forEach(inp => {
+        inp.addEventListener('input', (e) => {
+          const i = parseInt(e.target.dataset.idx, 10);
+          splitState[i].qty = Number(e.target.value) || 0;
+          renderModal();
+        });
+      });
+      
+      document.querySelectorAll('.split-remove').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const i = parseInt(btn.dataset.idx, 10);
+          splitState.splice(i, 1);
+          renderModal();
+        });
+      });
+      
+      document.getElementById('btn-split-add').addEventListener('click', () => {
+        // Add new part with qty=0 (user fills in)
+        splitState.push({ qty: 0 });
+        renderModal();
+      });
+      
+      document.getElementById('btn-split-confirm').addEventListener('click', async () => {
+        if (!isValid) return;
+        await _doSplit(row, splitState);
+      });
+    };
+    
+    renderModal();
+  }
+  
+  async function _doSplit(row, splits) {
+    try {
+      toast(`⏳ กำลัง split...`, 'info');
+      const res = await api('splitPcLineitem', {
+        pc_uuid: row.pc_uuid,
+        splits: splits,
+      });
+      if (res && res.success !== false && res.data) {
+        toast(`✅ Split สำเร็จ — แบ่งเป็น ${res.data.splits} ส่วน`, 'success');
+        closeModal();
+        selectedUuids.clear();
+        await loadAndRender();
+      } else {
+        toast(`❌ ${(res && res.error) || 'unknown'}`, 'error');
+      }
+    } catch (err) {
+      console.error('[PC Split]', err);
+      toast(`❌ ${err.message}`, 'error');
+    }
+  }
+  
+  async function _doUnsplit(row) {
+    if (!row.parent_pc_uuid) {
+      toast('❌ Record นี้ไม่ใช่ split', 'error');
+      return;
+    }
+    
+    // Find siblings count for confirm message
+    const siblings = (cachedRows || []).filter(r => 
+      String(r.parent_pc_uuid || '').trim() === String(row.parent_pc_uuid).trim()
+    );
+    
+    if (!confirm(`ยกเลิก split ${siblings.length} ส่วน → รวมกลับเป็นบิลเดียว?\n\n(${row.bill_no} · ${row.product_code})`)) return;
+    
+    try {
+      toast(`⏳ กำลัง unsplit...`, 'info');
+      const res = await api('unsplitPcLineitems', { pc_uuid: row.pc_uuid });
+      if (res && res.success !== false && res.data) {
+        toast(`✅ Unsplit สำเร็จ — รวม ${res.data.removed_count} ส่วน → 1 record (${res.data.total_qty} ชิ้น)`, 'success');
+        selectedUuids.clear();
+        await loadAndRender();
+      } else {
+        toast(`❌ ${(res && res.error) || 'unknown'}`, 'error');
+      }
+    } catch (err) {
+      console.error('[PC Unsplit]', err);
+      toast(`❌ ${err.message}`, 'error');
+    }
   }
   
   // ────────────────────────────────────────────────────────────────
