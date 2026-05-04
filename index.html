@@ -18377,27 +18377,9 @@ async function loadAllFromCloud(opts) {
       }
     }
     
-    // ⭐ HEAL bill ↔ stmt links (4/5/26)
-    //    Reason: legacy bills ที่ paid แต่ matched_stmt_uuid ว่าง 
-    //    → unmatch หาบิลผิดเมื่อ bill_no ซ้ำ (split payment)
-    //    Conservative: link เฉพาะที่มั่นใจ (unique ref หรือ matched_bills tie-break)
-    if (swapBills && swapStmts && typeof window.healBillStmtLinks === 'function') {
-      const allStmts = getAllStatements();
-      const r = window.healBillStmtLinks(billList, allStmts);
-      if (r.total > 0) {
-        console.log(`[loadAllFromCloud] heal links: ${r.healed}/${r.total} bills → linked uuid (ambiguous=${r.ambiguous}, notFound=${r.notFound})`);
-        // ถ้า heal ได้ → mark dirty เพื่อ sync ขึ้น cloud
-        if (r.healed > 0 && window.syncManager?.markDirty) {
-          billList.forEach(b => {
-            if (b.matched_stmt_uuid && b.bill_uuid) {
-              // เพิ่ม dirty (จะ push ตอน save ถัดไป — ไม่ auto-push เอง)
-              window.syncManager.markDirty('bills', b.bill_uuid);
-            }
-          });
-          console.log(`[loadAllFromCloud] marked ${r.healed} healed bills dirty — push ครั้งถัดไปจะ sync ขึ้น cloud`);
-        }
-      }
-    }
+    // ⚠️ NOTE: Auto-heal bill ↔ stmt links DISABLED (4/5/26)
+    //   User เลือก match เอง เพื่อ guarantee 100% accuracy
+    //   helper window.healBillStmtLinks() ยังเรียก manual ผ่าน console ได้
     
     window._lastCloudLoad = Date.now();
     const elapsed = Math.round((Date.now() - t0) / 1000);
