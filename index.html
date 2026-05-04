@@ -17917,9 +17917,11 @@ async function loadAllFromCloud(opts) {
   const reason = opts.reason || 'manual';
   const silent = !!opts.silent;
   const currentYear = new Date().getFullYear();
+  // ⭐ Default: ปีปัจจุบันเท่านั้น (ลด time จาก 94s → ~10s)
+  //    ถ้าต้องการปีก่อน → opts.years = ['2026','2025']
   const years = Array.isArray(opts.years) && opts.years.length 
     ? opts.years 
-    : [String(currentYear), String(currentYear - 1)];
+    : [String(currentYear)];
   
   // ⭐ Concurrency guard — ห้าม load ซ้อน
   if (window._loadingFromCloud) {
@@ -17959,135 +17961,150 @@ async function loadAllFromCloud(opts) {
   };
   
   try {
-    // ── PARALLEL FETCH (group 1: independent collections) ──
-    const [resPayments, resSpTemps, resCashflow, resSuppliers, resSupplierPays] = await Promise.all([
-      api('getPayments').catch(e => ({ success: false, error: e.message })),
-      api('getSpTemps').catch(e => ({ success: false, error: e.message })),
-      api('getCashflow').catch(e => ({ success: false, error: e.message })),
-      api('getSuppliers').catch(e => ({ success: false, error: e.message })),
-      api('getSupplierPayments').catch(e => ({ success: false, error: e.message })),
-    ]);
+    // ── Capture "before" count สำหรับ threshold validation ──
+    const beforeStmtsCount = (typeof getAllStatements === 'function') ? getAllStatements().length : 0;
+    const beforeBillsCount = Array.isArray(billList) ? billList.length : 0;
     
-    // Process payments
+    // ══════════════════════════════════════════════════════════════
+    // ⭐ MEGA-PARALLEL FETCH (4/5/26)
+    // ══════════════════════════════════════════════════════════════
+    // เดิม: sequential year + per-bank loop = ~94s
+    // ใหม่: ทุกอย่าง parallel = ~10s
+    //
+    // - Group 1 (collections): 5 requests
+    // - Per year × N years × (1 bills + 1 meta + 5 banks) = 7 requests/year
+    // - Default 1 year → 12 requests รวม → run พร้อมกัน
+    // ══════════════════════════════════════════════════════════════
+    
+    const BANKS = ['KTB', 'KBANK', 'BBL_NW', 'BBL', 'TTB'];
+    const fetchPromises = [];
+    const fetchLabels = [];
+    
+    // Group 1: independent collections
+    fetchPromises.push(api('getPayments').catch(e => ({ _err: e.message })));        fetchLabels.push('SP');
+    fetchPromises.push(api('getSpTemps').catch(e => ({ _err: e.message })));         fetchLabels.push('SP-TEMP');
+    fetchPromises.push(api('getCashflow').catch(e => ({ _err: e.message })));        fetchLabels.push('Cashflow');
+    fetchPromises.push(api('getSuppliers').catch(e => ({ _err: e.message })));       fetchLabels.push('Suppliers');
+    fetchPromises.push(api('getSupplierPayments').catch(e => ({ _err: e.message }))); fetchLabels.push('Supplier Payments');
+    
+    // Per year: bills + meta + 5 banks
+    const yearPromiseStart = {};
+    years.forEach(y => {
+      yearPromiseStart[y] = fetchPromises.length;
+      fetchPromises.push(api('getBillsWithUuid', { year: y }).catch(e => ({ _err: e.message })));  fetchLabels.push(`Bills ${y}`);
+      fetchPromises.push(api('getMetaWithUuid', { year: y }).catch(e => ({ _err: e.message })));   fetchLabels.push(`Meta ${y}`);
+      BANKS.forEach(bank => {
+        fetchPromises.push(api('v2_getStatementsByBank', { bank, year: y }).catch(e => ({ _err: e.message })));
+        fetchLabels.push(`Stmts ${y} ${bank}`);
+      });
+    });
+    
+    console.log(`[loadAllFromCloud] firing ${fetchPromises.length} parallel requests...`);
+    const tFetch = Date.now();
+    const results = await Promise.all(fetchPromises);
+    console.log(`[loadAllFromCloud] all responses received in ${Math.round((Date.now() - tFetch)/1000)}s`);
+    
+    // ── Process Group 1 ──
+    // SP (idx 0)
     try {
-      const items = (resPayments?.data?.data) || (Array.isArray(resPayments?.data) ? resPayments.data : []) || [];
+      const r = results[0];
+      if (r?._err) throw new Error(r._err);
+      const items = (r?.data?.data) || (Array.isArray(r?.data) ? r.data : []) || [];
       items.forEach(p => tempPayments.push(p));
       _log('SP', items.length);
     } catch (e) { _log('SP', 0, e); }
     
-    // Process sp_temps
+    // SP-TEMP (idx 1)
     try {
-      const flatRows = (resSpTemps?.data?.data) || (Array.isArray(resSpTemps?.data) ? resSpTemps.data : []) || [];
+      const r = results[1];
+      if (r?._err) throw new Error(r._err);
+      const flatRows = (r?.data?.data) || (Array.isArray(r?.data) ? r.data : []) || [];
       const grouped = (typeof spTempGroupFlat === 'function') ? spTempGroupFlat(flatRows) : flatRows;
       grouped.forEach(t => tempSpTemps.push(t));
       _log('SP-TEMP', grouped.length);
     } catch (e) { _log('SP-TEMP', 0, e); }
     
-    // Process cashflow
+    // Cashflow (idx 2)
     try {
-      const items = (resCashflow?.data?.data) || (Array.isArray(resCashflow?.data) ? resCashflow.data : []) || [];
+      const r = results[2];
+      if (r?._err) throw new Error(r._err);
+      const items = (r?.data?.data) || (Array.isArray(r?.data) ? r.data : []) || [];
       items.forEach(c => tempCashflow.push(c));
       _log('Cashflow', items.length);
     } catch (e) { _log('Cashflow', 0, e); }
     
-    // Process suppliers
+    // Suppliers (idx 3)
     try {
-      const items = (resSuppliers?.data?.data) || (Array.isArray(resSuppliers?.data) ? resSuppliers.data : []) || [];
+      const r = results[3];
+      if (r?._err) throw new Error(r._err);
+      const items = (r?.data?.data) || (Array.isArray(r?.data) ? r.data : []) || [];
       items.forEach(s => tempSuppliers.push(s));
       _log('Suppliers', items.length);
     } catch (e) { _log('Suppliers', 0, e); }
     
-    // Process supplier payments
+    // Supplier Payments (idx 4)
     try {
-      const items = (resSupplierPays?.data?.data) || (Array.isArray(resSupplierPays?.data) ? resSupplierPays.data : []) || [];
+      const r = results[4];
+      if (r?._err) throw new Error(r._err);
+      const items = (r?.data?.data) || (Array.isArray(r?.data) ? r.data : []) || [];
       items.forEach(p => tempSupplierPayments.push(p));
       _log('Supplier Payments', items.length);
     } catch (e) { _log('Supplier Payments', 0, e); }
     
-    // ── PARALLEL FETCH (group 2: per-year bills + stmts + meta) ──
-    // ── Capture "before" count สำหรับ threshold validation ──
-    const beforeStmtsCount = (typeof getAllStatements === 'function') ? getAllStatements().length : 0;
-    const beforeBillsCount = Array.isArray(billList) ? billList.length : 0;
-    
+    // ── Process per-year results ──
     for (const y of years) {
-      // Bills + Meta — parallel (2 requests, OK)
-      const [resBills, resMeta] = await Promise.all([
-        api('getBillsWithUuid', { year: y }).catch(e => ({ success: false, error: e.message })),
-        api('getMetaWithUuid', { year: y }).catch(e => ({ success: false, error: e.message })),
-      ]);
+      const startIdx = yearPromiseStart[y];
       
-      // Bills
+      // Bills (idx +0)
       try {
-        if (resBills?.success && Array.isArray(resBills.data?.rows)) {
-          resBills.data.rows.forEach(b => tempBills.push(b));
-          _log(`Bills ${y}`, resBills.data.rows.length);
-        } else if (resBills?.success === false) {
-          _log(`Bills ${y}`, 0, new Error(resBills.error || 'unknown'));
+        const r = results[startIdx];
+        if (r?._err) throw new Error(r._err);
+        if (r?.success && Array.isArray(r.data?.rows)) {
+          r.data.rows.forEach(b => tempBills.push(b));
+          _log(`Bills ${y}`, r.data.rows.length);
+        } else if (r?.success === false) {
+          _log(`Bills ${y}`, 0, new Error(r.error || 'unknown'));
         }
       } catch (e) { _log(`Bills ${y}`, 0, e); }
       
-      // ── Stmts: per-bank fetch (sequential, แต่ละ bank แยก request) ──
-      // เปลี่ยนจาก v2_getAllStatementsByYear (1 request × 5 banks) → v2_getStatementsByBank (5 requests)
-      // เหตุผล: 1 request × 5 banks = อาจ Apps Script timeout 30s → fail ทั้งปี
-      //          แยก request = ถ้า bank ใด timeout, อื่น ๆ ยังได้
-      const BANKS = ['KTB', 'KBANK', 'BBL_NW', 'BBL', 'TTB'];
-      for (const bank of BANKS) {
-        const displayBank = (bank === 'BBL_NW') ? 'BBL NW' : bank;
-        let attempt = 0;
-        let success = false;
-        while (attempt < 2 && !success) {
-          attempt++;
-          try {
-            const r = await api('v2_getStatementsByBank', { bank, year: y });
-            if (r?.success && Array.isArray(r.data?.rows)) {
-              if (!tempStmts[displayBank]) tempStmts[displayBank] = [];
-              r.data.rows.forEach(s => {
-                s.bank = displayBank;
-                tempStmts[displayBank].push(s);
-              });
-              _log(`Stmts ${y} ${displayBank}`, r.data.rows.length);
-              success = true;
-            } else if (r?.success === false) {
-              if (attempt >= 2) {
-                _log(`Stmts ${y} ${displayBank}`, 0, new Error(r.error || 'unknown'));
-              } else {
-                console.warn(`[loadAllFromCloud] Stmts ${y} ${displayBank} attempt ${attempt} failed, retrying...`);
-                await new Promise(r => setTimeout(r, 1000));
-              }
-            } else {
-              success = true; // No error, no rows — empty bank, OK
-              _log(`Stmts ${y} ${displayBank}`, 0);
-            }
-          } catch (e) {
-            if (attempt >= 2) {
-              _log(`Stmts ${y} ${displayBank}`, 0, e);
-            } else {
-              console.warn(`[loadAllFromCloud] Stmts ${y} ${displayBank} attempt ${attempt} exception, retrying...`);
-              await new Promise(r => setTimeout(r, 1000));
-            }
-          }
-        }
-      }
-      
-      // Meta
+      // Meta (idx +1)
       try {
-        if (resMeta?.success && Array.isArray(resMeta.data?.rows) && resMeta.data.rows.length > 0) {
+        const r = results[startIdx + 1];
+        if (r?._err) throw new Error(r._err);
+        if (r?.success && Array.isArray(r.data?.rows) && r.data.rows.length > 0) {
           if (typeof window.parseCompactMetaRows === 'function') {
-            const parsed = window.parseCompactMetaRows(resMeta.data.rows, {});
+            const parsed = window.parseCompactMetaRows(r.data.rows, {});
             if (parsed.summary?.__byDate) {
-              Object.entries(parsed.summary.__byDate).forEach(([d, v]) => {
-                tempSummary.__byDate[d] = v;
-              });
+              Object.entries(parsed.summary.__byDate).forEach(([d, v]) => { tempSummary.__byDate[d] = v; });
             }
             if (parsed.cashCount?.__byDate) {
-              Object.entries(parsed.cashCount.__byDate).forEach(([d, v]) => {
-                tempCashCount.__byDate[d] = v;
-              });
+              Object.entries(parsed.cashCount.__byDate).forEach(([d, v]) => { tempCashCount.__byDate[d] = v; });
             }
-            _log(`Meta ${y}`, resMeta.data.rows.length);
+            _log(`Meta ${y}`, r.data.rows.length);
           }
         }
       } catch (e) { _log(`Meta ${y}`, 0, e); }
+      
+      // Stmts per bank (idx +2 onwards)
+      BANKS.forEach((bank, bi) => {
+        const displayBank = (bank === 'BBL_NW') ? 'BBL NW' : bank;
+        try {
+          const r = results[startIdx + 2 + bi];
+          if (r?._err) throw new Error(r._err);
+          if (r?.success && Array.isArray(r.data?.rows)) {
+            if (!tempStmts[displayBank]) tempStmts[displayBank] = [];
+            r.data.rows.forEach(s => {
+              s.bank = displayBank;
+              tempStmts[displayBank].push(s);
+            });
+            _log(`Stmts ${y} ${displayBank}`, r.data.rows.length);
+          } else if (r?.success === false) {
+            _log(`Stmts ${y} ${displayBank}`, 0, new Error(r.error || 'unknown'));
+          } else {
+            _log(`Stmts ${y} ${displayBank}`, 0);
+          }
+        } catch (e) { _log(`Stmts ${y} ${displayBank}`, 0, e); }
+      });
     }
     
     // ══════════════════════════════════════════════════════════════
