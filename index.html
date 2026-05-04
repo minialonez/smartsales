@@ -2411,6 +2411,57 @@ function healBillStmtLinks(bills, stmts) {
 }
 window.healBillStmtLinks = healBillStmtLinks;
 
+// ══════════════════════════════════════════════════════════════
+// FIND BILLS LINKED TO STMT — split-payment safe (4/5/26)
+// ══════════════════════════════════════════════════════════════
+// Single source of truth สำหรับการหา bills ที่ผูกกับ stmt ตัวหนึ่ง
+// ใช้ในทุก operation ที่ต้อง resolve "stmt → bills":
+//   - deleteStmtFlow (Data page)
+//   - matching unmatch (Matching page)
+//   - Match Integrity Scan (Data page)
+//   - Auto-match validation
+//
+// ใช้ได้กับทุก bank (KTB, KBANK, BBL NW, BBL, TTB) — ไม่มีการแยก bank
+//
+// Algorithm:
+//   1. ถ้า bill มี matched_stmt_uuid → ใช้ uuid PK (split-payment safe)
+//   2. ถ้าไม่มี (legacy) → ใช้ matched_stmt_ref + bill_no ที่อยู่ใน matched_bills array
+//      (ต้องตรงทั้ง ref + bill_no — ป้องกัน bill_no ซ้ำผูก stmt อื่น)
+// ══════════════════════════════════════════════════════════════
+function findBillsLinkedToStmt(bills, stmt) {
+  if (!stmt || !Array.isArray(bills)) return [];
+  const stmtUuid = stmt.stmt_uuid || '';
+  const stmtRef = stmt.ref_no ? String(stmt.ref_no).trim() : '';
+  const matchedBillNos = (Array.isArray(stmt.matched_bills) && stmt.matched_bills.length)
+    ? stmt.matched_bills.map(x => String(x).trim()).filter(Boolean)
+    : (stmt.match_bill 
+        ? String(stmt.match_bill).split(' + ').map(s => s.split(' (')[0].trim()).filter(Boolean)
+        : []);
+  
+  return bills.filter(b => {
+    if (!b) return false;
+    
+    // Path 1: bill has uuid link → use uuid (split-payment safe)
+    if (b.matched_stmt_uuid) {
+      return b.matched_stmt_uuid === stmtUuid;
+    }
+    
+    // Path 2: legacy bill (no matched_stmt_uuid) → use ref + bill_no
+    if (!stmtRef) return false;
+    if (b.matched_stmt_ref !== stmtRef) return false;
+    
+    // ถ้า stmt มี matched_bills list → bill_no ต้องอยู่ใน list
+    if (matchedBillNos.length > 0) {
+      const billNo = String(b.bill_no || '').trim();
+      return billNo && matchedBillNos.includes(billNo);
+    }
+    
+    // ไม่มี matched_bills list — match ที่ ref อย่างเดียว (rare legacy case)
+    return true;
+  });
+}
+window.findBillsLinkedToStmt = findBillsLinkedToStmt;
+
 const syncManager = {
   enabled: true,            // toggle ผ่าน localStorage['sf_sync_enabled']
   pushDelayMs: 5000,        // debounce 5s หลัง mutation สุดท้าย
@@ -21652,20 +21703,9 @@ async function renderMatching(el) {
       
       let unmatchedBillCount = 0;
       if (isMatched) {
-        billList.forEach(b => {
-          // ⭐ Bug fix (4/5/26): Split-payment bill_no duplicates
-          //    เดิม: (matched_stmt_uuid===stmtUuid) || (matchedBillsArr.includes(bill_no))
-          //    ปัญหา: bill_no ซ้ำ (split payment) + bill อื่นไม่ใช่ของ stmt นี้ → unmatch ผิด
-          //    Fix: prefer uuid; fallback ใช้ bill_no + matched_stmt_ref ตรงกันด้วย
-          let linked;
-          if (b.matched_stmt_uuid) {
-            linked = (b.matched_stmt_uuid === stmtUuid);
-          } else {
-            // Legacy bill (ไม่มี matched_stmt_uuid) — ใช้ matched_stmt_ref + bill_no
-            linked = (b.matched_stmt_ref === stmt.ref_no) 
-                  && matchedBillsArr.includes(String(b.bill_no||'').trim());
-          }
-          if (!linked) return;
+        // ⭐ Use single source of truth helper (4/5/26 — split-payment safe)
+        const linkedBills = findBillsLinkedToStmt(billList, stmt);
+        linkedBills.forEach(b => {
           b.match_status = 'unpaid';
           b.confirmation = '';
           b.pay_date = '';
@@ -22383,17 +22423,11 @@ async function renderMatching(el) {
               ? String(stmt.match_bill).split(' + ').map(s => s.split(' (')[0].trim()).filter(Boolean)
               : []);
         
-        // ⭐ Find bills LINKED TO THIS STMT first — กัน case bill_no ซ้ำ + ref_no ซ้ำ
-        //    Priority: matched_stmt_uuid (PK) > matched_stmt_ref (string)
-        //    (ราชการใช้ ref เดียวทั้งวัน — uuid กัน mismatch ได้)
-        const linkedBills = billList.filter(b => {
-          if (b.match_status !== 'paid' && b.match_status !== 'matched') return false;
-          if (stmt.stmt_uuid && b.matched_stmt_uuid) {
-            return b.matched_stmt_uuid === stmt.stmt_uuid;
-          }
-          // Fallback: ref_no match (legacy bills ที่ยังไม่มี matched_stmt_uuid)
-          return b.matched_stmt_ref === stmt.ref_no;
-        });
+        // ⭐ Find bills LINKED TO THIS STMT — split-payment safe (4/5/26)
+        //    ใช้ helper เดียวกันใน operation อื่น (deleteStmtFlow, integrity scan)
+        //    Filter: เฉพาะ paid/matched (ไม่เอา bills ที่ unmatch แล้ว)
+        const linkedBills = findBillsLinkedToStmt(billList, stmt)
+          .filter(b => b.match_status === 'paid' || b.match_status === 'matched');
         
         billNumbersToUnmatch.forEach(bn => {
           // ⚡ SP-TEMP partial — new format: SP-TEMP-XXXX|sb_no|partial_uuid (3-part, sb-level)
@@ -24447,10 +24481,8 @@ function renderData(el) {
         if (s.match_station === 'SP-TEMP') return;
         if (s.match_station === 'TL-VAT' || s.match_station === 'TL-NOVAT') return;
         
-        const linkedBills = billList.filter(b => 
-          (b.matched_stmt_uuid && b.matched_stmt_uuid === s.stmt_uuid) ||
-          billNos.includes(String(b.bill_no || '').trim())
-        );
+        // ⭐ Use single source of truth helper (split-payment safe, 4/5/26)
+        const linkedBills = findBillsLinkedToStmt(billList, s);
         
         linkedBills.forEach(b => {
           if (b.match_status !== 'paid') {
