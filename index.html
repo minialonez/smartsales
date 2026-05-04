@@ -31248,11 +31248,27 @@ async function renderPcSales(el) {
                 const brandColor = brand?.color || 'var(--text2)';
                 const stColor = status?.color || 'var(--text2)';
                 const stBg = status?.bg || 'var(--surface2)';
-                const stLabel = status?.label || r.status || '';
                 const isNegative = r.bill_type === 'return' || r.bill_type === 'credit_note';
                 const isSelected = selectedUuids.has(r.pc_uuid);
                 const rowSource = (r.source || 'front').toLowerCase();
                 const isInvoiceRow = rowSource === 'invoice';
+                
+                // Status cell display:
+                //   pending  = ว่าง (ไม่แสดงอะไร)
+                //   submitted = แสดงเดือนปลายทาง เช่น "ก.พ. 2026"
+                //   excluded  = "ไม่นำส่ง" (เหมือนเดิม)
+                let statusCell = '';
+                if (r.status === 'submitted') {
+                  const sm = Number(r.submit_month);
+                  const sy = Number(r.submit_year);
+                  const submitLbl = (sm >= 1 && sm <= 12 && sy)
+                    ? `${PC_MONTH_LABELS[sm-1]} ${sy}`
+                    : 'ส่งแล้ว';
+                  statusCell = `<span style="display:inline-block;padding:2px 8px;border-radius:6px;background:${stBg};color:${stColor};font-size:.7rem;font-weight:600">${submitLbl}</span>`;
+                } else if (r.status === 'excluded') {
+                  statusCell = `<span style="display:inline-block;padding:2px 8px;border-radius:6px;background:${stBg};color:${stColor};font-size:.7rem;font-weight:600">ไม่นำส่ง</span>`;
+                }
+                // pending → statusCell stays empty
                 
                 // Source badge
                 const srcBadge = isInvoiceRow
@@ -31284,7 +31300,7 @@ async function renderPcSales(el) {
                   <td style="text-align:right;font-family:var(--mono)">${fmtInt(r.qty)}</td>
                   <td style="text-align:right;font-family:var(--mono)">${fmt(r.price)}</td>
                   <td style="text-align:right;font-family:var(--mono);${isNegative?'color:var(--danger);font-weight:600':''}">${fmt(r.total)}</td>
-                  <td><span style="display:inline-block;padding:2px 8px;border-radius:6px;background:${stBg};color:${stColor};font-size:.7rem;font-weight:600">${stLabel}</span></td>
+                  <td>${statusCell}</td>
                 </tr>`;
               }).join('')}
             </tbody>
