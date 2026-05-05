@@ -21233,10 +21233,10 @@ async function openReceivePaymentModal() {
     <div id="rp-modal" style="display:flex;flex-direction:column;gap:12px;max-height:78vh;overflow:hidden">
       
       <!-- STEP 1: ลูกค้า -->
-      <div class="input-group">
+      <div class="input-group" style="position:relative">
         <label>🔍 ค้นหาลูกค้า (รหัส / ชื่อ)</label>
         <input class="input" id="rp-cust-search" placeholder="เช่น BE-00789 หรือ XYZ" autocomplete="off">
-        <div id="rp-cust-dropdown" style="display:none;position:absolute;background:var(--bg);border:1px solid var(--border);border-radius:6px;max-height:200px;overflow-y:auto;width:100%;z-index:1000;box-shadow:0 4px 12px rgba(0,0,0,0.15)"></div>
+        <div id="rp-cust-dropdown" style="display:none;position:absolute;top:100%;left:0;right:0;background:var(--bg);border:1px solid var(--border);border-radius:6px;max-height:280px;overflow-y:auto;z-index:99999;box-shadow:0 4px 16px rgba(0,0,0,0.25);margin-top:2px"></div>
       </div>
       
       <!-- เครดิตค้าง -->
@@ -21268,8 +21268,8 @@ async function openReceivePaymentModal() {
             <input class="input" id="rp-bank" placeholder="KBANK / SCB ...">
           </div>
           <div class="input-group">
-            <label>Conf / เลขเช็ค</label>
-            <input class="input" id="rp-conf" placeholder="reference">
+            <label id="rp-conf-label">Conf / Reference</label>
+            <input class="input" id="rp-conf" placeholder="เลขอ้างอิง">
           </div>
         </div>
         <div id="rp-cheque-due-row" style="display:none;margin-bottom:8px">
@@ -21381,16 +21381,25 @@ function wireReceivePaymentModal(state) {
       $dropdown.style.display = 'block';
       return;
     }
-    const matches = customerList.filter(c => {
-      const id = String(c.cust_id || c.cust_code || '').toLowerCase();
-      const name = String(c.cust_name || '').toLowerCase();
-      return id.includes(q) || name.includes(q);
-    }).slice(0, 20);
     
-    if (matches.length === 0) {
+    // ⭐ Dedup by cust_code (ลูกค้าอาจซ้ำใน customers sheet)
+    const seen = new Set();
+    const matches = [];
+    customerList.forEach(c => {
+      const code = String(c.cust_id || c.cust_code || '').trim().toUpperCase();
+      const id = code.toLowerCase();
+      const name = String(c.cust_name || '').toLowerCase();
+      if (!id.includes(q) && !name.includes(q)) return;
+      if (!code || seen.has(code)) return;  // skip duplicate cust_code
+      seen.add(code);
+      matches.push(c);
+    });
+    const top = matches.slice(0, 20);
+    
+    if (top.length === 0) {
       $dropdown.innerHTML = '<div style="padding:8px;color:var(--muted)">ไม่พบลูกค้า</div>';
     } else {
-      $dropdown.innerHTML = matches.map(c => {
+      $dropdown.innerHTML = top.map(c => {
         const code = c.cust_id || c.cust_code || '';
         const name = c.cust_name || '';
         return `<div class="rp-cust-item" data-code="${code}" data-name="${name}" 
@@ -21400,6 +21409,15 @@ function wireReceivePaymentModal(state) {
                 <strong>${code}</strong> ${name}
               </div>`;
       }).join('');
+      // ⭐ Show count if dedup happened
+      const totalMatched = customerList.filter(c => {
+        const id = String(c.cust_id || c.cust_code || '').toLowerCase();
+        const name = String(c.cust_name || '').toLowerCase();
+        return id.includes(q) || name.includes(q);
+      }).length;
+      if (totalMatched > top.length) {
+        $dropdown.innerHTML += `<div style="padding:6px;color:var(--muted);font-size:.75rem;text-align:center;background:var(--bg-elev)">แสดง ${top.length} จาก ${matches.length} ราย (ลบซ้ำ ${totalMatched - matches.length} ใบ)</div>`;
+      }
       $dropdown.querySelectorAll('.rp-cust-item').forEach(item => {
         item.onclick = () => {
           state.cust_code = item.dataset.code;
@@ -21574,6 +21592,25 @@ function wireReceivePaymentModal(state) {
     $chequeDueRow.style.display = isCheque ? 'block' : 'none';
     $cfRow.style.display = isCard ? 'flex' : 'none';
     $tfRow.style.display = (isCheque || $type.value === 'Transfer') ? 'flex' : 'none';
+    
+    // ⭐ Update Conf label ตาม type
+    const $confLabel = document.getElementById('rp-conf-label');
+    const $confInput = document.getElementById('rp-conf');
+    if ($confLabel && $confInput) {
+      if (isCheque) {
+        $confLabel.textContent = 'เลขที่เช็ค *';
+        $confInput.placeholder = 'เลขเช็ค (จำเป็น)';
+      } else if (t === 'Transfer') {
+        $confLabel.textContent = 'Confirmation';
+        $confInput.placeholder = 'รหัสโอน / ref';
+      } else if (isCard) {
+        $confLabel.textContent = 'เลขสลิปบัตร';
+        $confInput.placeholder = 'slip number';
+      } else {
+        $confLabel.textContent = 'หมายเหตุ';
+        $confInput.placeholder = '(ไม่จำเป็น)';
+      }
+    }
     
     if (isCard) {
       $tf.value = '0';
