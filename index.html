@@ -19958,10 +19958,8 @@ async function renderBilling(el) {
     if (activeTab === 'payments') wirePaymentsTab();
   }
 
-  // ══════════════════════════════════════════════════════════════
-  // TAB 1: LIST
-  // ══════════════════════════════════════════════════════════════
-  function renderListTab() {
+  // ⭐ Helper (4/5/26): สร้างเฉพาะ rows part — ใช้ใน renderListRowsOnly เพื่อ update โดยไม่แตะ search input
+  function renderListRows() {
     const q = listFilter.search.toLowerCase().trim();
     let rows = billingNotes.slice();
     if (listFilter.status !== 'ALL') rows = rows.filter(n => n.status === listFilter.status);
@@ -19981,7 +19979,70 @@ async function renderBilling(el) {
       );
     }
     rows.sort((a, b) => String(b.billing_no||'').localeCompare(String(a.billing_no||'')));
+    
+    return rows.length === 0 ? `
+      <div style="text-align:center;padding:60px;color:var(--muted);background:var(--bg-elev);border-radius:8px">
+        <div style="font-size:48px;margin-bottom:12px">📭</div>
+        <div>ไม่พบใบวางบิลที่ตรงกับเงื่อนไข</div>
+      </div>
+    ` : `
+      <div style="overflow-x:auto;border:1px solid var(--border);border-radius:8px">
+      <table class="table" style="width:100%;font-size:13px">
+        <thead>
+          <tr style="background:var(--bg-elev)">
+            <th>เลขที่</th>
+            <th>วันที่ออก</th>
+            <th>ครบกำหนด</th>
+            <th>ลูกค้า</th>
+            <th style="text-align:center">บิล</th>
+            <th style="text-align:right">ยอดรวม</th>
+            <th style="text-align:right">ชำระแล้ว</th>
+            <th style="text-align:right">คงเหลือ</th>
+            <th style="text-align:center">สถานะ</th>
+            <th style="text-align:center">จัดการ</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows.map(n => {
+            const s = STATUS_INFO[n.status] || { label: n.status, color:'#888', emoji:'?' };
+            const overdue = (n.status === 'pending' || n.status === 'partial') && n.due_date && n.due_date < todayISO();
+            const billCount = Array.isArray(n.bills_snapshot) ? n.bills_snapshot.length : 0;
+            return `
+              <tr style="border-top:1px solid var(--border);${overdue?'background:rgba(239,68,68,0.06)':''}">
+                <td><strong>${n.billing_no||'-'}</strong></td>
+                <td>${fmtThaiDate(n.billing_date)}</td>
+                <td style="${overdue?'color:#ef4444;font-weight:600':''}">${fmtThaiDate(n.due_date)}${overdue?' ⚠️':''}</td>
+                <td>
+                  <div style="font-weight:500">${n.cust_name||'-'}</div>
+                  ${n.cust_code?`<div style="font-size:11px;color:var(--muted)">${n.cust_code}</div>`:''}
+                </td>
+                <td style="text-align:center">${billCount}</td>
+                <td style="text-align:right">฿${fmtNum(n.total_amount)}</td>
+                <td style="text-align:right;color:${n.paid_amount>0?'#16a34a':'var(--muted)'}">${n.paid_amount>0?'฿'+fmtNum(n.paid_amount):'-'}</td>
+                <td style="text-align:right;font-weight:600;color:${n.outstanding>0?'#ef4444':'#16a34a'}">${n.outstanding>0?'฿'+fmtNum(n.outstanding):'-'}</td>
+                <td style="text-align:center"><span style="color:${s.color};font-weight:500">${s.emoji} ${s.label}</span></td>
+                <td style="text-align:center;white-space:nowrap">
+                  <button class="btn btn-outline btn-sm bn-view" data-uuid="${n.billing_uuid}" title="ดู">👁</button>
+                  <button class="btn btn-outline btn-sm bn-print" data-uuid="${n.billing_uuid}" title="พิมพ์">🖨</button>
+                  ${n.status !== 'paid' && n.status !== 'cancelled' ? `<button class="btn btn-primary btn-sm bn-pay" data-uuid="${n.billing_uuid}" title="รับชำระ">💵</button>` : ''}
+                  ${n.paid_amount === 0 && n.status !== 'cancelled' ? `<button class="btn btn-outline btn-sm bn-edit" data-uuid="${n.billing_uuid}" title="แก้ไข">✏</button>` : ''}
+                  ${n.status !== 'cancelled' ? `<button class="btn btn-outline btn-sm bn-cancel" data-uuid="${n.billing_uuid}" title="ยกเลิก" style="color:#ef4444">✖</button>` : ''}
+                  ${n.paid_amount === 0 && n.status === 'cancelled' ? `<button class="btn btn-outline btn-sm bn-delete" data-uuid="${n.billing_uuid}" title="ลบ" style="color:#ef4444">🗑</button>` : ''}
+                </td>
+              </tr>
+            `;
+          }).join('')}
+        </tbody>
+      </table>
+      </div>
+      <div style="margin-top:8px;font-size:13px;color:var(--muted)">รวม ${rows.length} ใบ</div>
+    `;
+  }
 
+  // ══════════════════════════════════════════════════════════════
+  // TAB 1: LIST
+  // ══════════════════════════════════════════════════════════════
+  function renderListTab() {
     return `
       <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;align-items:center">
         <input class="input" id="bn-list-search" placeholder="🔍 ค้นหา (เลขใบ / ชื่อลูกค้า / เลขบิล)" value="${listFilter.search}" style="flex:1;min-width:240px">
@@ -19994,76 +20055,51 @@ async function renderBilling(el) {
         </select>
         <input class="input" id="bn-list-cust" placeholder="ลูกค้า" value="${listFilter.cust}" style="width:180px">
       </div>
-
-      ${rows.length === 0 ? `
-        <div style="text-align:center;padding:60px;color:var(--muted);background:var(--bg-elev);border-radius:8px">
-          <div style="font-size:48px;margin-bottom:12px">📭</div>
-          <div>ยังไม่มีใบวางบิล</div>
-          <button class="btn btn-primary" style="margin-top:16px" onclick="document.querySelector('[data-tab=create]').click()">➕ สร้างใบวางบิลใหม่</button>
-        </div>
-      ` : `
-        <div style="overflow-x:auto;border:1px solid var(--border);border-radius:8px">
-        <table class="table" style="width:100%;font-size:13px">
-          <thead>
-            <tr style="background:var(--bg-elev)">
-              <th>เลขที่</th>
-              <th>วันที่ออก</th>
-              <th>ครบกำหนด</th>
-              <th>ลูกค้า</th>
-              <th style="text-align:center">บิล</th>
-              <th style="text-align:right">ยอดรวม</th>
-              <th style="text-align:right">ชำระแล้ว</th>
-              <th style="text-align:right">คงเหลือ</th>
-              <th style="text-align:center">สถานะ</th>
-              <th style="text-align:center">จัดการ</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${rows.map(n => {
-              const s = STATUS_INFO[n.status] || { label: n.status, color:'#888', emoji:'?' };
-              const overdue = (n.status === 'pending' || n.status === 'partial') && n.due_date && n.due_date < todayISO();
-              const billCount = Array.isArray(n.bills_snapshot) ? n.bills_snapshot.length : 0;
-              return `
-                <tr style="border-top:1px solid var(--border);${overdue?'background:rgba(239,68,68,0.06)':''}">
-                  <td><strong>${n.billing_no||'-'}</strong></td>
-                  <td>${fmtThaiDate(n.billing_date)}</td>
-                  <td style="${overdue?'color:#ef4444;font-weight:600':''}">${fmtThaiDate(n.due_date)}${overdue?' ⚠️':''}</td>
-                  <td>
-                    <div style="font-weight:500">${n.cust_name||'-'}</div>
-                    ${n.cust_code?`<div style="font-size:11px;color:var(--muted)">${n.cust_code}</div>`:''}
-                  </td>
-                  <td style="text-align:center">${billCount}</td>
-                  <td style="text-align:right">฿${fmtNum(n.total_amount)}</td>
-                  <td style="text-align:right;color:${n.paid_amount>0?'#16a34a':'var(--muted)'}">${n.paid_amount>0?'฿'+fmtNum(n.paid_amount):'-'}</td>
-                  <td style="text-align:right;font-weight:600;color:${n.outstanding>0?'#ef4444':'#16a34a'}">${n.outstanding>0?'฿'+fmtNum(n.outstanding):'-'}</td>
-                  <td style="text-align:center"><span style="color:${s.color};font-weight:500">${s.emoji} ${s.label}</span></td>
-                  <td style="text-align:center;white-space:nowrap">
-                    <button class="btn btn-outline btn-sm bn-view" data-uuid="${n.billing_uuid}" title="ดู">👁</button>
-                    <button class="btn btn-outline btn-sm bn-print" data-uuid="${n.billing_uuid}" title="พิมพ์">🖨</button>
-                    ${n.status !== 'paid' && n.status !== 'cancelled' ? `<button class="btn btn-primary btn-sm bn-pay" data-uuid="${n.billing_uuid}" title="รับชำระ">💵</button>` : ''}
-                    ${n.paid_amount === 0 && n.status !== 'cancelled' ? `<button class="btn btn-outline btn-sm bn-edit" data-uuid="${n.billing_uuid}" title="แก้ไข">✏</button>` : ''}
-                    ${n.status !== 'cancelled' ? `<button class="btn btn-outline btn-sm bn-cancel" data-uuid="${n.billing_uuid}" title="ยกเลิก" style="color:#ef4444">✖</button>` : ''}
-                    ${n.paid_amount === 0 && n.status === 'cancelled' ? `<button class="btn btn-outline btn-sm bn-delete" data-uuid="${n.billing_uuid}" title="ลบ" style="color:#ef4444">🗑</button>` : ''}
-                  </td>
-                </tr>
-              `;
-            }).join('')}
-          </tbody>
-        </table>
-        </div>
-        <div style="margin-top:8px;font-size:13px;color:var(--muted)">รวม ${rows.length} ใบ</div>
-      `}
+      <div id="bn-list-rows-container">
+        ${renderListRows()}
+      </div>
     `;
   }
 
   function wireListTab() {
     const s = document.getElementById('bn-list-search');
-    if (s) s.oninput = e => { listFilter.search = e.target.value; render(); wireListTab(); s.focus(); s.setSelectionRange(s.value.length, s.value.length); };
+    if (s) {
+      // ⭐ Bug fix (4/5/26): ไม่ re-render ทั้ง tab ตอนพิมพ์ — แค่ update list section
+      //    เดิม: render() + wireListTab() ทำให้ input detach → focus หลุด → keystroke หาย
+      //    ใหม่: debounced filter — re-render เฉพาะ list rows ไม่แตะ input
+      s.oninput = e => {
+        listFilter.search = e.target.value;
+        renderListRowsOnly();
+      };
+    }
     const st = document.getElementById('bn-list-status');
-    if (st) st.onchange = e => { listFilter.status = e.target.value; render(); };
+    if (st) st.onchange = e => { listFilter.status = e.target.value; renderListRowsOnly(); };
     const c = document.getElementById('bn-list-cust');
-    if (c) c.oninput = e => { listFilter.cust = e.target.value; render(); wireListTab(); c.focus(); c.setSelectionRange(c.value.length, c.value.length); };
+    if (c) {
+      c.oninput = e => {
+        listFilter.cust = e.target.value;
+        renderListRowsOnly();
+      };
+    }
 
+    document.querySelectorAll('.bn-view').forEach(b => b.onclick = () => openViewModal(b.dataset.uuid));
+    document.querySelectorAll('.bn-print').forEach(b => b.onclick = () => openPrintWindow(b.dataset.uuid));
+    document.querySelectorAll('.bn-pay').forEach(b => b.onclick = () => openPayModal(b.dataset.uuid));
+    document.querySelectorAll('.bn-edit').forEach(b => b.onclick = () => openEditModal(b.dataset.uuid));
+    document.querySelectorAll('.bn-cancel').forEach(b => b.onclick = () => doCancel(b.dataset.uuid));
+    document.querySelectorAll('.bn-delete').forEach(b => b.onclick = () => doDelete(b.dataset.uuid));
+  }
+  
+  // ⭐ Re-render เฉพาะ list rows section (ไม่แตะ search input → focus คงอยู่)
+  function renderListRowsOnly() {
+    const container = document.getElementById('bn-list-rows-container');
+    if (!container) {
+      // fallback: ถ้าหา container ไม่เจอ → re-render full
+      render();
+      return;
+    }
+    container.innerHTML = renderListRows();
+    // wire row buttons เท่านั้น (ไม่แตะ input handlers)
     document.querySelectorAll('.bn-view').forEach(b => b.onclick = () => openViewModal(b.dataset.uuid));
     document.querySelectorAll('.bn-print').forEach(b => b.onclick = () => openPrintWindow(b.dataset.uuid));
     document.querySelectorAll('.bn-pay').forEach(b => b.onclick = () => openPayModal(b.dataset.uuid));
