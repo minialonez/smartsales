@@ -2571,6 +2571,8 @@ const syncManager = {
       NO_ARG_TYPES.forEach(t => this.dirty.add(t));
     }
     this._schedulePush();
+    // ⭐ Bug fix (4/5/26): emit listeners เพื่อให้ saveBtn badge update ทันที
+    this._emit();
   },
   
   _schedulePush() {
@@ -2946,6 +2948,8 @@ const syncManager = {
             if (this.dirtyUuids?.bills) this.dirtyUuids.bills.clear();
             // ⭐ เคลียร์ dirty type flag ด้วย — กัน stale flag (dirty=true แต่ no uuids to push)
             this.dirty.delete('bills');
+            // ⭐ Emit ทันที — saveBtn badge update ตามจริง
+            this._emit();
             if (totalBatches > 0) {
               console.log(`[push bills] ✓ ${okBatches}/${totalBatches} batches ok`);
             }
@@ -3095,6 +3099,7 @@ const syncManager = {
             this._fpCache.stmts = fp;
             if (this.dirtyUuids?.stmts) this.dirtyUuids.stmts.clear();
             this.dirty.delete('stmts');
+            this._emit();
             if (stmtTotalBatches > 0) {
               console.log(`[push stmts] ✓ ${stmtOkBatches}/${stmtTotalBatches} batches ok`);
             }
@@ -3107,6 +3112,7 @@ const syncManager = {
           if (r?.success === false) throw new Error(r.error || 'API error');
           this._fpCache.payments = fp;
           this.dirty.delete('payments');
+          this._emit();
         } else if (type === 'sp_temps') {
           // ⭐ Flat schema — flatten nested state ก่อนส่ง backend
           //    1 row = 1 (bill × partial event)
@@ -3154,6 +3160,7 @@ const syncManager = {
           }
           this._fpCache.sp_temps = fp;
           this.dirty.delete('sp_temps');
+          this._emit();
         } else if (type === 'cashflow') {
           if (cashflowList.length === 0) continue;
           const fp = this._fp({n: cashflowList.length, first: cashflowList[0]?.id, last: cashflowList[cashflowList.length-1]?.id});
@@ -3162,6 +3169,7 @@ const syncManager = {
           if (r?.success === false) throw new Error(r.error || 'API error');
           this._fpCache.cashflow = fp;
           this.dirty.delete('cashflow');
+          this._emit();
         } else if (type === 'suppliers') {
           const fp = this._fp({sup: supplierList.length, pay: supplierPayments.length});
           if (fp === this._fpCache.suppliers) { results.skipped++; continue; }
@@ -3175,6 +3183,7 @@ const syncManager = {
           }
           this._fpCache.suppliers = fp;
           this.dirty.delete('suppliers');
+          this._emit();
         } else if (type === 'meta') {
           // Meta สำคัญมาก — ใช้ full JSON fingerprint (หนักแต่คุ้ม กันบวม sheet)
           // ⭐ Include __lockedDates ใน fp — เปลี่ยน lock = trigger push
@@ -3317,6 +3326,7 @@ const syncManager = {
           // ⭐ Clear dirty dates + user-modified fields หลัง push สำเร็จ
           if (this.dirtyUuids?.meta) this.dirtyUuids.meta.clear();
           if (window._userModifiedMetaFields) window._userModifiedMetaFields.clear();
+          this._emit();
           console.log('[meta push] DONE — cleared dirtyUuids.meta + _userModifiedMetaFields');
         }
         results.ok++;
@@ -8967,7 +8977,19 @@ async function renderMain(el) {
       }
     }
     updateDirtyDot();
-    setInterval(updateDirtyDot, 2000);
+    // ⭐ Bug fix (4/5/26): subscribe syncManager.onChange → update badge ทันที
+    //    เดิม: poll ทุก 2s → user save แล้ว badge ลดช้า + ดูเหมือน desync
+    //    ใหม่: react to dirty changes immediately + fallback poll 1s (กัน edge case)
+    if (window.syncManager?.onChange && !window._dirtyBadgeWired) {
+      window._dirtyBadgeWired = true;
+      window.syncManager.onChange(() => {
+        try { updateDirtyDot(); } catch(_){}
+      });
+    }
+    // Fallback polling (เร็วขึ้น 2s → 1s + smooth animation)
+    if (!window._dirtyBadgeInterval) {
+      window._dirtyBadgeInterval = setInterval(updateDirtyDot, 1000);
+    }
     
     document.getElementById('btn-save-main')?.addEventListener('click', async () => {
       // ── Pre-save validation ──
