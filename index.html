@@ -21243,15 +21243,15 @@ async function openReceivePaymentModal() {
       <div id="rp-credit-section" style="display:none;background:rgba(245,158,11,.08);border:1px solid var(--warn);border-radius:6px;padding:10px"></div>
       
       <!-- STEP 2: บิลค้างชำระ -->
-      <div id="rp-bills-section" style="display:none;flex:1;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:10px;background:var(--bg-elev);min-height:200px;max-height:300px">
+      <div id="rp-bills-section" style="display:none;flex:1;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:12px;background:var(--bg-elev);min-height:280px;max-height:420px">
         <div id="rp-bills-content"></div>
       </div>
       
       <!-- STEP 3: ข้อมูลรับชำระ -->
-      <div id="rp-payment-section" style="display:none;background:var(--bg-elev);border:1px solid var(--border);border-radius:6px;padding:12px">
-        <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px;margin-bottom:8px">
-          <div class="input-group">
-            <label>Type</label>
+      <div id="rp-payment-section" style="display:none;background:var(--bg-elev);border:1px solid var(--border);border-radius:6px;padding:14px">
+        <div id="rp-payment-fields-row" style="display:grid;grid-template-columns:130px 145px 145px 145px 1fr;gap:10px;margin-bottom:10px">
+          <div class="input-group" style="margin:0">
+            <label style="font-size:.78rem">Type</label>
             <select class="select" id="rp-type">
               <option value="Cash">Cash</option>
               <option value="Transfer" selected>Transfer</option>
@@ -21259,70 +21259,68 @@ async function openReceivePaymentModal() {
               <option value="Card">Card</option>
             </select>
           </div>
-          <div class="input-group">
-            <label>วันที่</label>
+          <div class="input-group" style="margin:0">
+            <label style="font-size:.78rem" id="rp-pay-date-label">วันที่</label>
             <input type="date" class="input" id="rp-pay-date" value="${todayISO()}">
           </div>
-          <div class="input-group" id="rp-bank-group">
-            <label>ธนาคาร</label>
+          <div class="input-group" id="rp-cheque-due-group" style="margin:0;display:none">
+            <label style="font-size:.78rem">วันขึ้นเช็ค *</label>
+            <input type="date" class="input" id="rp-due-date">
+          </div>
+          <div class="input-group" id="rp-bank-group" style="margin:0">
+            <label style="font-size:.78rem">ธนาคาร</label>
             <input class="input" id="rp-bank" placeholder="KBANK / SCB ...">
           </div>
-          <div class="input-group">
-            <label id="rp-conf-label">Conf / Reference</label>
-            <input class="input" id="rp-conf" placeholder="เลขอ้างอิง">
-          </div>
-        </div>
-        <div id="rp-cheque-due-row" style="display:none;margin-bottom:8px">
-          <div class="input-group">
-            <label>วันขึ้นเช็ค (due_date)</label>
-            <input type="date" class="input" id="rp-due-date">
+          <div class="input-group" style="margin:0">
+            <label style="font-size:.78rem" id="rp-conf-label">Confirmation</label>
+            <input class="input" id="rp-conf" placeholder="รหัสโอน / ref">
           </div>
         </div>
         
         <!-- ยอดบิลที่เลือก + WHT/fee -->
-        <div style="border-top:1px solid var(--border);padding-top:8px;margin-top:4px">
-          <div style="display:flex;justify-content:space-between;font-size:.85rem;margin-bottom:4px">
-            <span>ยอดบิลที่เลือก:</span>
-            <span id="rp-sum-selected" style="font-weight:600">฿0.00</span>
+        <div style="border-top:1px solid var(--border);padding-top:10px;margin-top:4px">
+          <div style="display:flex;justify-content:space-between;font-size:.9rem;margin-bottom:6px">
+            <span style="color:var(--muted)">ยอดบิลที่เลือก:</span>
+            <span id="rp-sum-selected" style="font-weight:700;font-size:1rem">฿0.00</span>
           </div>
           <div id="rp-fee-rows" style="display:none">
-            <div style="display:flex;align-items:center;gap:8px;margin:4px 0">
-              <input type="checkbox" id="rp-wht-enable" style="margin:0">
-              <label for="rp-wht-enable" style="font-size:.85rem;cursor:pointer">หัก ณ ที่จ่าย 1%</label>
+            <div style="display:flex;align-items:center;gap:8px;margin:6px 0">
+              <input type="checkbox" id="rp-wht-enable" style="margin:0;width:18px;height:18px;cursor:pointer">
+              <label for="rp-wht-enable" style="font-size:.85rem;cursor:pointer;flex:1">หัก ณ ที่จ่าย 1%</label>
               <input type="number" class="input" id="rp-wht" step="0.01" placeholder="0.00" 
-                     style="width:100px;font-size:.85rem;color:var(--purple)" disabled>
+                     style="width:120px;font-size:.85rem;color:var(--purple);text-align:right" disabled>
             </div>
-            <div style="display:flex;align-items:center;gap:8px;margin:4px 0" id="rp-tf-row">
+            <div style="display:flex;align-items:center;gap:8px;margin:6px 0" id="rp-tf-row">
               <label style="font-size:.85rem;flex:1">ค่าธรรมเนียมโอน/เช็ค</label>
               <input type="number" class="input" id="rp-tf" step="0.01" placeholder="0.00" value="12" 
-                     style="width:100px;font-size:.85rem">
+                     style="width:120px;font-size:.85rem;text-align:right">
             </div>
-            <div style="display:flex;align-items:center;gap:8px;margin:4px 0;display:none" id="rp-cf-row">
+            <div style="align-items:center;gap:8px;margin:6px 0;display:none" id="rp-cf-row">
               <label style="font-size:.85rem;flex:1">ค่าธรรมเนียมบัตร</label>
               <input type="number" class="input" id="rp-cf" step="0.01" placeholder="0.00" 
-                     style="width:100px;font-size:.85rem">
+                     style="width:120px;font-size:.85rem;text-align:right">
             </div>
           </div>
-          <div style="display:flex;justify-content:space-between;font-size:.85rem;margin-top:6px;padding-top:6px;border-top:1px dashed var(--border)">
-            <span>สุทธิเข้าบัญชี (net):</span>
-            <span id="rp-net" style="font-weight:600;color:var(--success)">฿0.00</span>
+          <div style="display:flex;justify-content:space-between;font-size:.9rem;margin-top:8px;padding-top:8px;border-top:1px dashed var(--border)">
+            <span style="color:var(--muted)">สุทธิเข้าบัญชี (net):</span>
+            <span id="rp-net" style="font-weight:700;color:var(--success);font-size:1rem">฿0.00</span>
           </div>
-          <div style="display:flex;justify-content:space-between;font-size:.85rem;margin-top:4px">
-            <span>ยอดที่ลูกค้าจ่ายจริง:</span>
+          <div style="display:flex;justify-content:space-between;align-items:center;font-size:.95rem;margin-top:8px;padding:8px 10px;background:var(--bg);border-radius:6px;border:1px solid var(--border)">
+            <span style="font-weight:600">💰 ยอดที่ลูกค้าจ่ายจริง:</span>
             <input type="number" class="input" id="rp-amount-paid" step="0.01" placeholder="0.00" 
-                   style="width:140px;text-align:right;font-weight:600">
+                   style="width:160px;text-align:right;font-weight:700;font-size:1rem">
           </div>
-          <div id="rp-overflow-row" style="display:none;color:var(--warn);font-size:.85rem;margin-top:4px;text-align:right"></div>
+          <div id="rp-overflow-row" style="display:none;color:var(--warn);font-size:.85rem;margin-top:6px;text-align:right;padding:6px 10px;background:rgba(245,158,11,.08);border-radius:4px"></div>
         </div>
       </div>
       
       <!-- Submit -->
-      <div style="display:flex;gap:8px;justify-content:flex-end;border-top:1px solid var(--border);padding-top:8px">
+      <div style="display:flex;gap:10px;justify-content:flex-end;border-top:1px solid var(--border);padding-top:12px">
         <button class="btn btn-ghost" onclick="closeModal()">ยกเลิก</button>
-        <button class="btn btn-primary" id="rp-submit" disabled>💾 บันทึกการรับชำระ</button>
+        <button class="btn btn-primary" id="rp-submit" disabled style="font-size:.95rem;padding:10px 20px">💾 บันทึกการรับชำระ</button>
       </div>
     </div>
-  `, { width: '720px', maxWidth: '95vw' });
+  `, { width: '960px', maxWidth: '96vw' });
 
   // Wire modal
   wireReceivePaymentModal(state);
@@ -21340,7 +21338,7 @@ function wireReceivePaymentModal(state) {
   const $bank = document.getElementById('rp-bank');
   const $conf = document.getElementById('rp-conf');
   const $dueDate = document.getElementById('rp-due-date');
-  const $chequeDueRow = document.getElementById('rp-cheque-due-row');
+  const $chequeDueRow = document.getElementById('rp-cheque-due-group');
   const $bankGroup = document.getElementById('rp-bank-group');
   const $sumSelected = document.getElementById('rp-sum-selected');
   const $feeRows = document.getElementById('rp-fee-rows');
@@ -21592,6 +21590,20 @@ function wireReceivePaymentModal(state) {
     $chequeDueRow.style.display = isCheque ? 'block' : 'none';
     $cfRow.style.display = isCard ? 'flex' : 'none';
     $tfRow.style.display = (isCheque || $type.value === 'Transfer') ? 'flex' : 'none';
+    
+    // ⭐ Adjust grid columns when Cheque (5 cols visible) vs others (4 cols + 1 hidden = visually 4)
+    const $fieldsRow = document.getElementById('rp-payment-fields-row');
+    if ($fieldsRow) {
+      $fieldsRow.style.gridTemplateColumns = isCheque
+        ? '120px 130px 130px 130px 1fr'   // Cheque: type / pay_date / due_date / bank / conf
+        : isCash
+          ? '130px 145px 1fr'             // Cash: type / pay_date / conf (no bank/due)
+          : '130px 145px 145px 1fr';      // Transfer/Card: type / pay_date / bank / conf
+    }
+    
+    // Pay date label change for Cheque
+    const $payDateLabel = document.getElementById('rp-pay-date-label');
+    if ($payDateLabel) $payDateLabel.textContent = isCheque ? 'วันรับเช็ค' : 'วันที่';
     
     // ⭐ Update Conf label ตาม type
     const $confLabel = document.getElementById('rp-conf-label');
