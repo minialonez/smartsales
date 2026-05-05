@@ -20024,6 +20024,7 @@ async function renderBilling(el) {
                 <td style="text-align:center;white-space:nowrap">
                   <button class="btn btn-outline btn-sm bn-view" data-uuid="${n.billing_uuid}" title="ดู">👁</button>
                   <button class="btn btn-outline btn-sm bn-print" data-uuid="${n.billing_uuid}" title="พิมพ์">🖨</button>
+                  ${n.status !== 'cancelled' ? `<button class="btn btn-outline btn-sm bn-refresh" data-uuid="${n.billing_uuid}" data-cust="${n.cust_code||''}" data-y="${n.cycle_year||''}" data-m="${n.cycle_month||''}" title="🔄 Refresh ยอดจากบิลปัจจุบัน — กรณียอดบิลผิด/แก้บิลย้อนหลัง" style="color:var(--warn)">🔄</button>` : ''}
                   ${n.status !== 'paid' && n.status !== 'cancelled' ? `<button class="btn btn-primary btn-sm bn-pay" data-uuid="${n.billing_uuid}" title="รับชำระ">💵</button>` : ''}
                   ${n.paid_amount === 0 && n.status !== 'cancelled' ? `<button class="btn btn-outline btn-sm bn-edit" data-uuid="${n.billing_uuid}" title="แก้ไข">✏</button>` : ''}
                   ${n.status !== 'cancelled' ? `<button class="btn btn-outline btn-sm bn-cancel" data-uuid="${n.billing_uuid}" title="ยกเลิก" style="color:#ef4444">✖</button>` : ''}
@@ -20088,6 +20089,7 @@ async function renderBilling(el) {
     document.querySelectorAll('.bn-edit').forEach(b => b.onclick = () => openEditModal(b.dataset.uuid));
     document.querySelectorAll('.bn-cancel').forEach(b => b.onclick = () => doCancel(b.dataset.uuid));
     document.querySelectorAll('.bn-delete').forEach(b => b.onclick = () => doDelete(b.dataset.uuid));
+    document.querySelectorAll('.bn-refresh').forEach(b => b.onclick = () => doRefreshSb(b.dataset.uuid, b.dataset.cust, b.dataset.y, b.dataset.m));
   }
   
   // ⭐ Re-render เฉพาะ list rows section (ไม่แตะ search input → focus คงอยู่)
@@ -20106,6 +20108,37 @@ async function renderBilling(el) {
     document.querySelectorAll('.bn-edit').forEach(b => b.onclick = () => openEditModal(b.dataset.uuid));
     document.querySelectorAll('.bn-cancel').forEach(b => b.onclick = () => doCancel(b.dataset.uuid));
     document.querySelectorAll('.bn-delete').forEach(b => b.onclick = () => doDelete(b.dataset.uuid));
+    document.querySelectorAll('.bn-refresh').forEach(b => b.onclick = () => doRefreshSb(b.dataset.uuid, b.dataset.cust, b.dataset.y, b.dataset.m));
+  }
+  
+  // ⭐ Refresh ยอด SB ตัวเดียว (4/5/26): re-aggregate เฉพาะ cust_code+year+month
+  //    ใช้กรณี:
+  //    - แก้ยอดบิลใน Sheet ตรงๆ → ยอดเก่าใน SB ค้าง
+  //    - เพิ่มบิลย้อนหลัง → ยังไม่อยู่ใน SB
+  //    - แก้ match_status (paid/unpaid) → paid_amount ไม่ตรง
+  async function doRefreshSb(uuid, custCode, year, month) {
+    if (!custCode || !year || !month) {
+      toast('SB นี้ไม่มี cust_code/year/month — ใช้ "Re-aggregate" ในหน้า Data แทน', 'warn');
+      return;
+    }
+    if (!confirm(`Refresh ยอด SB นี้?\n\n• ลูกค้า: ${custCode}\n• เดือน: ${month}/${year}\n\nระบบจะ recalculate ยอดจากบิลปัจจุบันใน Sheet bills_${year}\nเหมาะสำหรับกรณี:\n• แก้ยอดบิล\n• เพิ่มบิลย้อนหลัง\n• แก้ match_status`)) return;
+    
+    try {
+      const r = await api('aggregateSB', { year: Number(year), month: Number(month), cust_code: custCode });
+      if (r?.success && r.data) {
+        const s = r.data;
+        toast(`✅ Refresh สำเร็จ — ${s.updated > 0 ? 'updated' : (s.no_change > 0 ? 'no change' : 'no data')}`, 'success', 4000);
+        // Reload billing notes + re-render
+        await loadNotes();
+        render();
+        wireListTab();
+      } else {
+        toast(`❌ Refresh ล้มเหลว: ${r?.error || 'unknown'}`, 'error', 5000);
+      }
+    } catch (err) {
+      console.error('[bn-refresh] error:', err);
+      toast(`❌ Refresh error: ${err.message}`, 'error', 5000);
+    }
   }
 
   // ══════════════════════════════════════════════════════════════
