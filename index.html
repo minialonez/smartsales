@@ -7261,6 +7261,7 @@ async function renderMain(el) {
           <input type="date" class="input" id="filter-date-to" value="${filterDateTo}" placeholder="ถึง" title="วันที่สิ้นสุด" style="width:140px;font-size:.8rem">
           ${filterDateFrom||filterDateTo?'<button class="btn btn-ghost btn-sm" id="btn-clear-date">✕ ล้างวันที่</button>':''}
           <button class="btn btn-primary btn-sm" id="btn-add-bill">${ICONS.plus} เพิ่มบิล</button>
+          <button class="btn btn-sm" id="btn-receive-payment" style="background:var(--success);color:#fff" title="รับชำระลูกค้า + ตัดจ่าย SB">💵 รับชำระลูกค้า</button>
           <button class="btn btn-outline btn-sm" id="btn-bulk-date">📅 Bulk</button>
           <button class="btn btn-outline btn-sm" id="btn-auto-duedate">⚡ Auto Due</button>
           <button class="btn btn-sm" id="btn-delete-selected" style="background:var(--danger);color:#fff;display:none">🗑 ลบที่เลือก (<span id="del-count">0</span>)</button>
@@ -8511,6 +8512,12 @@ async function renderMain(el) {
     document.getElementById('btn-clear-bill-search')?.addEventListener('click', () => {
       filterBillSearch = '';
       render();
+    });
+
+    // ⭐ Phase 3 (5/5/26) — รับชำระลูกค้า + ตัดจ่าย SB
+    document.getElementById('btn-receive-payment')?.addEventListener('click', () => {
+      if (blockIfLocked(selectedDate, 'รับชำระ')) return;
+      openReceivePaymentModal();
     });
 
     // ── เพิ่มบิลเอง ──
@@ -21194,6 +21201,517 @@ ${n.remarks?`<div style="margin-top:12px;padding:8px;border-left:3px solid #888;
   // ══════════════════════════════════════════════════════════════
   await refresh();
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// Phase 3 (5/5/26) — รับชำระลูกค้า + ตัดจ่าย SB (Modal)
+// ═══════════════════════════════════════════════════════════════════
+async function openReceivePaymentModal() {
+  // State
+  const state = {
+    cust_code: '',
+    cust_name: '',
+    outstanding_sbs: [],     // SBs ค้างของลูกค้า
+    credit_pending: [],      // SP-PENDING credit ค้าง
+    selected_bills: new Map(), // bill_uuid → { bill_uuid, bill_no, billing_uuid, billing_no, amount }
+    credit_used: new Map(),    // bill_uuid → { bill_uuid, amount }
+    type: 'Transfer',
+    pay_date: todayISO(),
+    due_date: '',
+    bank: '',
+    confirmation: '',
+    wht_enabled: false,
+    wht_amount: 0,
+    transfer_fee: 0,
+    card_fee: 0,
+    amount_paid: 0,           // ยอดที่ลูกค้าจ่าย (ก่อน WHT/fee)
+    wht_manually_edited: false,
+    loading: false,
+  };
+
+  // Modal HTML
+  openModal('💵 รับชำระลูกค้า', `
+    <div id="rp-modal" style="display:flex;flex-direction:column;gap:12px;max-height:78vh;overflow:hidden">
+      
+      <!-- STEP 1: ลูกค้า -->
+      <div class="input-group">
+        <label>🔍 ค้นหาลูกค้า (รหัส / ชื่อ)</label>
+        <input class="input" id="rp-cust-search" placeholder="เช่น BE-00789 หรือ XYZ" autocomplete="off">
+        <div id="rp-cust-dropdown" style="display:none;position:absolute;background:var(--bg);border:1px solid var(--border);border-radius:6px;max-height:200px;overflow-y:auto;width:100%;z-index:1000;box-shadow:0 4px 12px rgba(0,0,0,0.15)"></div>
+      </div>
+      
+      <!-- เครดิตค้าง -->
+      <div id="rp-credit-section" style="display:none;background:rgba(245,158,11,.08);border:1px solid var(--warn);border-radius:6px;padding:10px"></div>
+      
+      <!-- STEP 2: บิลค้างชำระ -->
+      <div id="rp-bills-section" style="display:none;flex:1;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:10px;background:var(--bg-elev);min-height:200px;max-height:300px">
+        <div id="rp-bills-content"></div>
+      </div>
+      
+      <!-- STEP 3: ข้อมูลรับชำระ -->
+      <div id="rp-payment-section" style="display:none;background:var(--bg-elev);border:1px solid var(--border);border-radius:6px;padding:12px">
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px;margin-bottom:8px">
+          <div class="input-group">
+            <label>Type</label>
+            <select class="select" id="rp-type">
+              <option value="Cash">Cash</option>
+              <option value="Transfer" selected>Transfer</option>
+              <option value="Cheque">Cheque</option>
+              <option value="Card">Card</option>
+            </select>
+          </div>
+          <div class="input-group">
+            <label>วันที่</label>
+            <input type="date" class="input" id="rp-pay-date" value="${todayISO()}">
+          </div>
+          <div class="input-group" id="rp-bank-group">
+            <label>ธนาคาร</label>
+            <input class="input" id="rp-bank" placeholder="KBANK / SCB ...">
+          </div>
+          <div class="input-group">
+            <label>Conf / เลขเช็ค</label>
+            <input class="input" id="rp-conf" placeholder="reference">
+          </div>
+        </div>
+        <div id="rp-cheque-due-row" style="display:none;margin-bottom:8px">
+          <div class="input-group">
+            <label>วันขึ้นเช็ค (due_date)</label>
+            <input type="date" class="input" id="rp-due-date">
+          </div>
+        </div>
+        
+        <!-- ยอดบิลที่เลือก + WHT/fee -->
+        <div style="border-top:1px solid var(--border);padding-top:8px;margin-top:4px">
+          <div style="display:flex;justify-content:space-between;font-size:.85rem;margin-bottom:4px">
+            <span>ยอดบิลที่เลือก:</span>
+            <span id="rp-sum-selected" style="font-weight:600">฿0.00</span>
+          </div>
+          <div id="rp-fee-rows" style="display:none">
+            <div style="display:flex;align-items:center;gap:8px;margin:4px 0">
+              <input type="checkbox" id="rp-wht-enable" style="margin:0">
+              <label for="rp-wht-enable" style="font-size:.85rem;cursor:pointer">หัก ณ ที่จ่าย 1%</label>
+              <input type="number" class="input" id="rp-wht" step="0.01" placeholder="0.00" 
+                     style="width:100px;font-size:.85rem;color:var(--purple)" disabled>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px;margin:4px 0" id="rp-tf-row">
+              <label style="font-size:.85rem;flex:1">ค่าธรรมเนียมโอน/เช็ค</label>
+              <input type="number" class="input" id="rp-tf" step="0.01" placeholder="0.00" value="12" 
+                     style="width:100px;font-size:.85rem">
+            </div>
+            <div style="display:flex;align-items:center;gap:8px;margin:4px 0;display:none" id="rp-cf-row">
+              <label style="font-size:.85rem;flex:1">ค่าธรรมเนียมบัตร</label>
+              <input type="number" class="input" id="rp-cf" step="0.01" placeholder="0.00" 
+                     style="width:100px;font-size:.85rem">
+            </div>
+          </div>
+          <div style="display:flex;justify-content:space-between;font-size:.85rem;margin-top:6px;padding-top:6px;border-top:1px dashed var(--border)">
+            <span>สุทธิเข้าบัญชี (net):</span>
+            <span id="rp-net" style="font-weight:600;color:var(--success)">฿0.00</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;font-size:.85rem;margin-top:4px">
+            <span>ยอดที่ลูกค้าจ่ายจริง:</span>
+            <input type="number" class="input" id="rp-amount-paid" step="0.01" placeholder="0.00" 
+                   style="width:140px;text-align:right;font-weight:600">
+          </div>
+          <div id="rp-overflow-row" style="display:none;color:var(--warn);font-size:.85rem;margin-top:4px;text-align:right"></div>
+        </div>
+      </div>
+      
+      <!-- Submit -->
+      <div style="display:flex;gap:8px;justify-content:flex-end;border-top:1px solid var(--border);padding-top:8px">
+        <button class="btn btn-ghost" onclick="closeModal()">ยกเลิก</button>
+        <button class="btn btn-primary" id="rp-submit" disabled>💾 บันทึกการรับชำระ</button>
+      </div>
+    </div>
+  `, { width: '720px', maxWidth: '95vw' });
+
+  // Wire modal
+  wireReceivePaymentModal(state);
+}
+
+function wireReceivePaymentModal(state) {
+  const $search = document.getElementById('rp-cust-search');
+  const $dropdown = document.getElementById('rp-cust-dropdown');
+  const $billsSection = document.getElementById('rp-bills-section');
+  const $billsContent = document.getElementById('rp-bills-content');
+  const $paymentSection = document.getElementById('rp-payment-section');
+  const $creditSection = document.getElementById('rp-credit-section');
+  const $type = document.getElementById('rp-type');
+  const $payDate = document.getElementById('rp-pay-date');
+  const $bank = document.getElementById('rp-bank');
+  const $conf = document.getElementById('rp-conf');
+  const $dueDate = document.getElementById('rp-due-date');
+  const $chequeDueRow = document.getElementById('rp-cheque-due-row');
+  const $bankGroup = document.getElementById('rp-bank-group');
+  const $sumSelected = document.getElementById('rp-sum-selected');
+  const $feeRows = document.getElementById('rp-fee-rows');
+  const $whtEnable = document.getElementById('rp-wht-enable');
+  const $wht = document.getElementById('rp-wht');
+  const $tf = document.getElementById('rp-tf');
+  const $tfRow = document.getElementById('rp-tf-row');
+  const $cf = document.getElementById('rp-cf');
+  const $cfRow = document.getElementById('rp-cf-row');
+  const $net = document.getElementById('rp-net');
+  const $amountPaid = document.getElementById('rp-amount-paid');
+  const $overflowRow = document.getElementById('rp-overflow-row');
+  const $submit = document.getElementById('rp-submit');
+
+  // ── Customer search autocomplete ──
+  let searchTimer = null;
+  $search?.addEventListener('input', () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => doCustSearch($search.value), 200);
+  });
+  $search?.addEventListener('focus', () => {
+    if ($dropdown.children.length > 0) $dropdown.style.display = 'block';
+  });
+  document.addEventListener('click', (e) => {
+    if (!$search.contains(e.target) && !$dropdown.contains(e.target)) {
+      $dropdown.style.display = 'none';
+    }
+  });
+
+  function doCustSearch(query) {
+    const q = query.trim().toLowerCase();
+    if (!q || q.length < 2) {
+      $dropdown.style.display = 'none';
+      return;
+    }
+    if (!Array.isArray(customerList)) {
+      $dropdown.innerHTML = '<div style="padding:8px;color:var(--muted)">ยังไม่มีข้อมูลลูกค้า</div>';
+      $dropdown.style.display = 'block';
+      return;
+    }
+    const matches = customerList.filter(c => {
+      const id = String(c.cust_id || c.cust_code || '').toLowerCase();
+      const name = String(c.cust_name || '').toLowerCase();
+      return id.includes(q) || name.includes(q);
+    }).slice(0, 20);
+    
+    if (matches.length === 0) {
+      $dropdown.innerHTML = '<div style="padding:8px;color:var(--muted)">ไม่พบลูกค้า</div>';
+    } else {
+      $dropdown.innerHTML = matches.map(c => {
+        const code = c.cust_id || c.cust_code || '';
+        const name = c.cust_name || '';
+        return `<div class="rp-cust-item" data-code="${code}" data-name="${name}" 
+                style="padding:8px 10px;cursor:pointer;border-bottom:1px solid var(--border);font-size:.85rem"
+                onmouseover="this.style.background='var(--surface2)'" 
+                onmouseout="this.style.background='var(--bg)'">
+                <strong>${code}</strong> ${name}
+              </div>`;
+      }).join('');
+      $dropdown.querySelectorAll('.rp-cust-item').forEach(item => {
+        item.onclick = () => {
+          state.cust_code = item.dataset.code;
+          state.cust_name = item.dataset.name;
+          $search.value = state.cust_code + ' ' + state.cust_name;
+          $dropdown.style.display = 'none';
+          loadCustomerData();
+        };
+      });
+    }
+    $dropdown.style.display = 'block';
+  }
+
+  // ── Load customer SBs + credit ──
+  async function loadCustomerData() {
+    state.selected_bills.clear();
+    state.credit_used.clear();
+    $billsContent.innerHTML = '<div style="text-align:center;padding:20px;color:var(--muted)">กำลังโหลด...</div>';
+    $billsSection.style.display = 'block';
+    $paymentSection.style.display = 'block';
+    
+    try {
+      const [sbsR, creditR] = await Promise.all([
+        api('getOutstandingSBsByCust', { cust_code: state.cust_code }),
+        api('getCreditPending', { cust_code: state.cust_code }),
+      ]);
+      state.outstanding_sbs = (sbsR && sbsR.success) ? (sbsR.data || []) : [];
+      state.credit_pending = (creditR && creditR.success) ? (creditR.data || []) : [];
+      
+      renderCreditSection();
+      renderBillsList();
+      updateSummary();
+    } catch (e) {
+      console.error('[receive payment] load error:', e);
+      $billsContent.innerHTML = '<div style="text-align:center;padding:20px;color:var(--danger)">❌ โหลดข้อมูลไม่สำเร็จ</div>';
+    }
+  }
+
+  function renderCreditSection() {
+    if (state.credit_pending.length === 0) {
+      $creditSection.style.display = 'none';
+      return;
+    }
+    const total = state.credit_pending.reduce((s, c) => s + Number(c.amount || 0), 0);
+    $creditSection.style.display = 'block';
+    $creditSection.innerHTML = `
+      <div style="font-size:.85rem;font-weight:600;color:var(--warn);margin-bottom:6px">
+        ⚠️ ${state.cust_code} มีเครดิตค้าง ${state.credit_pending.length} ใบ รวม ฿${fmtNum(total)}
+      </div>
+      <div style="display:flex;flex-direction:column;gap:4px;max-height:120px;overflow-y:auto">
+        ${state.credit_pending.map(c => {
+          const used = state.credit_used.has(c.bill_uuid);
+          return `
+            <label style="display:flex;align-items:center;gap:8px;padding:4px;background:var(--bg);border-radius:4px;cursor:pointer;font-size:.8rem">
+              <input type="checkbox" class="rp-credit-cb" data-uuid="${c.bill_uuid}" data-amount="${c.amount}" ${used ? 'checked' : ''}>
+              <span style="font-family:var(--mono);font-size:.75rem">${c.bill_no}</span>
+              <span style="color:var(--muted);font-size:.75rem">${fmtDate(c.date)}</span>
+              <span style="margin-left:auto;font-weight:600">฿${fmtNum(c.amount)}</span>
+            </label>
+          `;
+        }).join('')}
+      </div>
+    `;
+    $creditSection.querySelectorAll('.rp-credit-cb').forEach(cb => {
+      cb.onchange = () => {
+        const uuid = cb.dataset.uuid;
+        const amt = Number(cb.dataset.amount);
+        if (cb.checked) {
+          state.credit_used.set(uuid, { bill_uuid: uuid, amount: amt });
+        } else {
+          state.credit_used.delete(uuid);
+        }
+        updateSummary();
+      };
+    });
+  }
+
+  function renderBillsList() {
+    if (state.outstanding_sbs.length === 0) {
+      $billsContent.innerHTML = '<div style="text-align:center;padding:20px;color:var(--muted)">✅ ลูกค้านี้ไม่มี SB ค้างชำระ</div>';
+      return;
+    }
+    
+    const monthNames = ['','ม.ค.','ก.พ.','มี.ค.','เม.ย.','พ.ค.','มิ.ย.','ก.ค.','ส.ค.','ก.ย.','ต.ค.','พ.ย.','ธ.ค.'];
+    
+    $billsContent.innerHTML = state.outstanding_sbs.map(sb => {
+      const cycleLabel = `${monthNames[sb.cycle_month] || sb.cycle_month}/${(sb.cycle_year % 100).toString().padStart(2,'0')}`;
+      const billsHtml = (sb.bills_snapshot || []).map(b => {
+        const billUuid = b.bill_uuid || '';
+        const isPaid = b.match_status === 'paid' || b.paid_by_sp;
+        const checked = state.selected_bills.has(billUuid);
+        return `
+          <label style="display:grid;grid-template-columns:24px 110px 80px 1fr 100px;gap:6px;align-items:center;padding:4px 6px;font-size:.78rem;cursor:${isPaid?'not-allowed':'pointer'};border-radius:4px;background:${isPaid?'rgba(34,197,94,.05)':checked?'rgba(59,130,246,.1)':'var(--bg)'};${isPaid?'opacity:0.55':''}"
+                 onmouseover="this.style.background='${isPaid?'rgba(34,197,94,.05)':'var(--surface2)'}'" 
+                 onmouseout="this.style.background='${isPaid?'rgba(34,197,94,.05)':checked?'rgba(59,130,246,.1)':'var(--bg)'}'">
+            <input type="checkbox" class="rp-bill-cb" data-uuid="${billUuid}" 
+                   data-bill-no="${b.bill_no||''}" data-billing-uuid="${sb.billing_uuid}" 
+                   data-billing-no="${sb.billing_no||''}" data-amount="${b.amount||0}" 
+                   ${checked?'checked':''} ${isPaid?'disabled':''}>
+            <span style="font-family:var(--mono);font-size:.72rem">${b.bill_no || '(no bill_no)'}</span>
+            <span style="color:var(--muted);font-size:.72rem">${fmtDate(b.date)}</span>
+            <span style="font-size:.72rem;color:${isPaid?'var(--success)':'inherit'}">${isPaid?'✅ จ่ายแล้ว':''}</span>
+            <span style="text-align:right;font-weight:500">฿${fmtNum(b.amount)}</span>
+          </label>
+        `;
+      }).join('');
+      
+      return `
+        <details open style="margin-bottom:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg)">
+          <summary style="cursor:pointer;padding:8px 10px;font-size:.85rem;font-weight:600;background:var(--bg-elev);border-radius:6px 6px 0 0;display:flex;justify-content:space-between;align-items:center">
+            <div>
+              <span>${sb.billing_no} — ${cycleLabel}</span>
+              <span style="font-weight:400;color:var(--muted);margin-left:8px;font-size:.78rem">${(sb.bills_snapshot||[]).length} บิล</span>
+            </div>
+            <span style="color:var(--danger)">ค้าง ฿${fmtNum(sb.outstanding)}</span>
+          </summary>
+          <div style="padding:6px 8px;display:flex;flex-direction:column;gap:2px">
+            <div style="padding:4px 6px;font-size:.75rem;color:var(--muted);border-bottom:1px solid var(--border)">
+              <a href="javascript:void(0)" class="rp-select-all" data-billing-uuid="${sb.billing_uuid}">✓ เลือกทั้งหมดที่ยังไม่จ่าย</a>
+            </div>
+            ${billsHtml}
+          </div>
+        </details>
+      `;
+    }).join('');
+    
+    // Wire bill checkboxes
+    $billsContent.querySelectorAll('.rp-bill-cb').forEach(cb => {
+      cb.onchange = () => {
+        const uuid = cb.dataset.uuid;
+        if (cb.checked) {
+          state.selected_bills.set(uuid, {
+            bill_uuid: uuid,
+            bill_no: cb.dataset.billNo,
+            billing_uuid: cb.dataset.billingUuid,
+            billing_no: cb.dataset.billingNo,
+            amount: Number(cb.dataset.amount),
+          });
+        } else {
+          state.selected_bills.delete(uuid);
+        }
+        updateSummary();
+        // Update row background
+        const label = cb.closest('label');
+        if (label) label.style.background = cb.checked ? 'rgba(59,130,246,.1)' : 'var(--bg)';
+      };
+    });
+    // Select all per SB
+    $billsContent.querySelectorAll('.rp-select-all').forEach(link => {
+      link.onclick = () => {
+        const sbUuid = link.dataset.billingUuid;
+        $billsContent.querySelectorAll(`.rp-bill-cb[data-billing-uuid="${sbUuid}"]`).forEach(cb => {
+          if (!cb.disabled && !cb.checked) {
+            cb.checked = true;
+            cb.dispatchEvent(new Event('change'));
+          }
+        });
+      };
+    });
+  }
+
+  // ── Type/WHT/fee logic ──
+  function updateTypeUI() {
+    const t = $type.value;
+    const isCash = t === 'Cash';
+    const isCheque = t === 'Cheque';
+    const isCard = t === 'Card';
+    const hasFee = !isCash;  // Cash ไม่มี WHT/fee
+    
+    $feeRows.style.display = hasFee ? 'block' : 'none';
+    $bankGroup.style.display = isCash ? 'none' : 'block';
+    $chequeDueRow.style.display = isCheque ? 'block' : 'none';
+    $cfRow.style.display = isCard ? 'flex' : 'none';
+    $tfRow.style.display = (isCheque || $type.value === 'Transfer') ? 'flex' : 'none';
+    
+    if (isCard) {
+      $tf.value = '0';
+    } else if (isCheque || t === 'Transfer') {
+      if ($tf.value === '' || Number($tf.value) === 0) $tf.value = '12';
+    }
+    
+    updateSummary();
+  }
+
+  function updateWHT() {
+    if (state.wht_manually_edited) return;
+    const sumSel = Array.from(state.selected_bills.values()).reduce((s, b) => s + b.amount, 0);
+    if ($whtEnable.checked && sumSel > 0) {
+      // ROUND(amount/1.07 × 0.01, 2)
+      const wht = Math.round((sumSel / 1.07) * 0.01 * 100) / 100;
+      $wht.value = wht.toFixed(2);
+    } else {
+      $wht.value = '';
+    }
+  }
+
+  function updateSummary() {
+    const sumSel = Array.from(state.selected_bills.values()).reduce((s, b) => s + b.amount, 0);
+    const sumCredit = Array.from(state.credit_used.values()).reduce((s, c) => s + c.amount, 0);
+    
+    $sumSelected.textContent = '฿' + fmtNum(sumSel);
+    
+    const t = $type.value;
+    const whtOn = $whtEnable.checked && (t === 'Transfer' || t === 'Cheque');
+    
+    $wht.disabled = !whtOn;
+    if (whtOn && !state.wht_manually_edited) updateWHT();
+    if (!whtOn) $wht.value = '';
+    
+    const wht = Number($wht.value) || 0;
+    const tf = (t !== 'Cash' && t !== 'Card') ? (Number($tf.value) || 0) : 0;
+    const cf = (t === 'Card') ? (Number($cf.value) || 0) : 0;
+    const net = sumSel - wht - tf - cf;
+    $net.textContent = '฿' + fmtNum(net);
+    
+    // Auto-set amount_paid = sumSel (default จ่ายครบ)
+    if (!$amountPaid.value || Number($amountPaid.value) === 0) {
+      $amountPaid.value = sumSel.toFixed(2);
+    }
+    
+    const amountPaid = Number($amountPaid.value) || 0;
+    const totalCovered = amountPaid + sumCredit;
+    const overflow = totalCovered - sumSel;
+    
+    if (overflow > 0.01) {
+      $overflowRow.style.display = 'block';
+      $overflowRow.textContent = `ส่วนเกิน ฿${fmtNum(overflow)} → จะสร้างเป็น SP-PENDING credit ค้าง`;
+    } else if (overflow < -0.01) {
+      $overflowRow.style.display = 'block';
+      $overflowRow.style.color = 'var(--danger)';
+      $overflowRow.textContent = `❌ ยอดที่จ่ายน้อยกว่ายอดบิล ฿${fmtNum(Math.abs(overflow))}`;
+    } else {
+      $overflowRow.style.display = 'none';
+    }
+    
+    // Submit enable: amount_paid >= sumSel - sumCredit (เลือกบิลแล้วต้องจ่ายพอ)
+    const canSubmit = (sumSel > 0 || amountPaid > 0) && totalCovered >= sumSel - 0.01;
+    $submit.disabled = !canSubmit;
+  }
+
+  // Wire fee inputs
+  $type?.addEventListener('change', updateTypeUI);
+  $whtEnable?.addEventListener('change', () => {
+    state.wht_manually_edited = false;
+    updateSummary();
+  });
+  $wht?.addEventListener('input', () => {
+    state.wht_manually_edited = true;
+    updateSummary();
+  });
+  $tf?.addEventListener('input', updateSummary);
+  $cf?.addEventListener('input', updateSummary);
+  $amountPaid?.addEventListener('input', updateSummary);
+  
+  // Init UI
+  updateTypeUI();
+
+  // ── Submit ──
+  $submit.onclick = async () => {
+    if ($submit.disabled) return;
+    $submit.disabled = true;
+    $submit.textContent = 'กำลังบันทึก...';
+    
+    try {
+      const sumSel = Array.from(state.selected_bills.values()).reduce((s, b) => s + b.amount, 0);
+      const t = $type.value;
+      const wht = ($whtEnable.checked && (t === 'Transfer' || t === 'Cheque')) ? (Number($wht.value) || 0) : 0;
+      const tf = (t !== 'Cash' && t !== 'Card') ? (Number($tf.value) || 0) : 0;
+      const cf = (t === 'Card') ? (Number($cf.value) || 0) : 0;
+      
+      const req = {
+        cust_code: state.cust_code,
+        cust_name: state.cust_name,
+        amount: Number($amountPaid.value) || sumSel,
+        wht_amount: wht,
+        transfer_fee: tf,
+        card_fee: cf,
+        type: t,
+        pay_date: $payDate.value,
+        due_date: t === 'Cheque' ? $dueDate.value : '',
+        bank: $bank.value,
+        confirmation: $conf.value,
+        selected_bills: Array.from(state.selected_bills.values()),
+        credit_used: Array.from(state.credit_used.values()),
+        action_by: (window.currentUser?.display_name) || 'Admin',
+      };
+      
+      const r = await api('recordSBPayment', req);
+      
+      if (r?.success && r.data) {
+        toast('✅ บันทึกการรับชำระสำเร็จ', 'success', 3000);
+        // Reload data + refresh main page
+        if (typeof loadAllFromCloud === 'function') {
+          await loadAllFromCloud({ years: [Number(req.pay_date.substring(0,4))], mode: 'force' });
+        }
+        if (typeof render === 'function') render();
+        closeModal();
+      } else {
+        toast('❌ ' + (r?.error || 'บันทึกไม่สำเร็จ'), 'error', 5000);
+        $submit.disabled = false;
+        $submit.textContent = '💾 บันทึกการรับชำระ';
+      }
+    } catch (e) {
+      console.error('[receive payment] submit error:', e);
+      toast('❌ Error: ' + e.message, 'error', 5000);
+      $submit.disabled = false;
+      $submit.textContent = '💾 บันทึกการรับชำระ';
+    }
+  };
+}
+
+window.openReceivePaymentModal = openReceivePaymentModal;
 
 // ── Sales ───────────────────────────────────────────────────
 async function renderSales(el) {
