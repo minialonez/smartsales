@@ -4203,11 +4203,18 @@ function findDuplicateBills() {
   //   SS00126-000002 | Cash     | 3      ← ✓ เก็บได้
   //   SS00126-000002 | Transfer | 5515   ← ✓ เก็บได้ (ไม่ถือว่าซ้ำ)
   // แต่ถ้า bill_no + type + amount ตรงกัน = ซ้ำจริง
+  // 
+  // ⭐ ยกเว้น (4/5/26): SP-prefix อนุญาตให้ซ้ำได้
+  //    เพราะลูกค้าอาจจ่าย SP เดียวกันหลายครั้ง (split installment)
+  //    หรือ SP เลขเดียวกันใช้คุ้ม bills คนละชุด
   const byKey = {};
   billList.forEach((b, i) => {
     if (b.match_status === 'void') return;
     const no = (b.bill_no || '').trim();
     if (!no || no.startsWith('MANUAL-')) return;
+    // ⭐ Skip SP-prefix (อนุญาตซ้ำ)
+    const prefix = no.substring(0, 2).toUpperCase();
+    if (prefix === 'SP') return;
     // Composite key
     const key = `${no}|${(b.type || '').trim()}|${Number(b.amount) || 0}`;
     if (!byKey[key]) byKey[key] = [];
@@ -9104,6 +9111,45 @@ async function renderMain(el) {
           toast(`⚠️ บันทึก ${pushed} ประเภท แต่มี error ${errors} (ดู console)`, 'warn', 6000);
         } else {
           toast(`✅ บันทึกสำเร็จ — push ${pushed} ประเภท${skipped > 0 ? ` (skip ${skipped})` : ''}`, 'success', 4000);
+          
+          // ⭐ Phase 2 (4/5/26): Trigger SB auto-aggregate หลัง save bills สำเร็จ
+          //    Run in background — ไม่ block UI, ไม่กระทบ flow ปกติถ้า fail
+          //    Aggregate เดือนปัจจุบัน + เดือนของ selectedDate (ถ้าต่างกัน)
+          try {
+            const today = new Date();
+            const cy = today.getFullYear();
+            const cm = today.getMonth() + 1;
+            
+            // เดือนของ selectedDate (อาจเป็นเดือนก่อน — เช่นแก้ย้อนหลัง)
+            let selY = cy, selM = cm;
+            if (typeof selectedDate === 'string' && /^\d{4}-\d{2}/.test(selectedDate)) {
+              selY = Number(selectedDate.substring(0, 4));
+              selM = Number(selectedDate.substring(5, 7));
+            }
+            
+            // Aggregate (async — ไม่รอ result)
+            const months = (selY === cy && selM === cm) 
+              ? [{ year: cy, month: cm }] 
+              : [{ year: cy, month: cm }, { year: selY, month: selM }];
+            
+            (async () => {
+              for (const m of months) {
+                try {
+                  const r = await api('aggregateSB', { year: m.year, month: m.month });
+                  if (r?.success && r.data) {
+                    const s = r.data;
+                    if (s.created > 0 || s.updated > 0) {
+                      console.log(`[SB aggregate] ${m.year}-${String(m.month).padStart(2,'0')}: created=${s.created} updated=${s.updated} no_change=${s.no_change} skipped_no_cust=${s.skipped_no_cust}`);
+                    }
+                  }
+                } catch(e) {
+                  console.warn(`[SB aggregate] ${m.year}-${m.month} failed:`, e?.message || e);
+                }
+              }
+            })();
+          } catch(e) {
+            console.warn('[SB aggregate] init error:', e?.message || e);
+          }
         }
       } catch (err) {
         console.error('Save error:', err);
@@ -11489,8 +11535,11 @@ function validateBillForCustomer(bill) {
   }
   
   // ── Check 2: vat_status ──
+  // ⭐ BOTH = ลูกค้าออกได้ทั้ง VAT และ NO_VAT — ไม่ warning
   const vatStatus = String(customer.vat_status || '').toUpperCase();
-  if (vatStatus === 'VAT' && category === 'NO_VAT_CREDIT') {
+  if (vatStatus === 'BOTH') {
+    // ✅ accept ทุก type ของบิลเครดิต
+  } else if (vatStatus === 'VAT' && category === 'NO_VAT_CREDIT') {
     result.warnings.push(`⚠️ บิล ${billNo}: ลูกค้า ${customer.cust_name} เป็น "VAT" แต่เปิดบิล ${billNo.substring(0,2)} (NO_VAT) — ควรใช้ SR/SC`);
   } else if (vatStatus === 'NO_VAT' && category === 'VAT_CREDIT') {
     result.warnings.push(`⚠️ บิล ${billNo}: ลูกค้า ${customer.cust_name} เป็น "NO_VAT" แต่เปิดบิล ${billNo.substring(0,2)} (VAT) — ควรใช้ OR/JR`);
@@ -23421,6 +23470,37 @@ function renderData(el) {
         </p>
       </div>
       
+      <!-- ⭐ SB Auto-Aggregate Section (Phase 2 — 4/5/26) -->
+      <div class="card mb-3" style="border:1.5px solid var(--warn);background:rgba(245,158,11,.04)">
+        <div class="flex justify-between items-center mb-3">
+          <div>
+            <div class="font-semi" style="color:var(--warn)">📋 SB Auto-Aggregate (รวบบิลเป็นใบวางบิล)</div>
+            <div class="text-xs text-muted mt-1">
+              รวมบิล SR/SC/OR/JR ของแต่ละลูกค้า/เดือน → สร้าง/อัปเดต SB อัตโนมัติ<br>
+              ทำงานอัตโนมัติทุกครั้งที่กด "บันทึก" หน้า Main แต่ใช้ปุ่มนี้สำหรับ <strong>full re-aggregate</strong> ได้
+            </div>
+          </div>
+          <div class="flex gap-2 items-center">
+            <select class="select select-sm" id="sb-aggregate-month" style="font-size:.8rem">
+              <option value="">เดือนปัจจุบัน</option>
+              <option value="1">มกราคม</option><option value="2">กุมภาพันธ์</option>
+              <option value="3">มีนาคม</option><option value="4">เมษายน</option>
+              <option value="5">พฤษภาคม</option><option value="6">มิถุนายน</option>
+              <option value="7">กรกฎาคม</option><option value="8">สิงหาคม</option>
+              <option value="9">กันยายน</option><option value="10">ตุลาคม</option>
+              <option value="11">พฤศจิกายน</option><option value="12">ธันวาคม</option>
+            </select>
+            <button class="btn btn-outline btn-sm" id="btn-sb-aggregate" style="border-color:var(--warn);color:var(--warn)">🔄 Re-aggregate</button>
+          </div>
+        </div>
+        <p class="text-xs text-dim" style="padding:10px;background:rgba(245,158,11,.08);border-radius:6px;border-left:3px solid var(--warn)">
+          📋 <strong>Composite key:</strong> 1 SB / 1 ลูกค้า / 1 เดือน — รวมทุก type (SR+SC+OR+JR)<br>
+          🔴 <strong>VAT bills (SR+SC):</strong> เก็บแยก total_vat / paid_vat / outstanding_vat<br>
+          🔵 <strong>NO_VAT bills (OR+JR):</strong> เก็บแยก total_novat / paid_novat / outstanding_novat<br>
+          ⚠️ ลูกค้าที่ไม่มี cust_code ใน remarks1 → จะถูก skip (รายงานใน console log)
+        </p>
+      </div>
+      
       <!-- Meta Reset Section -->
       <div class="card mb-3" style="border:1.5px solid var(--purple);background:rgba(165,134,255,.04)">
         <div class="flex justify-between items-center mb-3">
@@ -24606,6 +24686,45 @@ function renderData(el) {
       } catch(e) {
         console.error('[backfill]', e);
         toast('Backfill ล้มเหลว: ' + e.message, 'error', 6000);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = orig;
+      }
+    });
+    
+    // ⭐ SB Aggregate manual button (Phase 2 — 4/5/26)
+    document.getElementById('btn-sb-aggregate')?.addEventListener('click', async (e) => {
+      const btn = e.currentTarget;
+      const monthSel = document.getElementById('sb-aggregate-month');
+      const monthVal = monthSel?.value || '';
+      const today = new Date();
+      const year = today.getFullYear();
+      const month = monthVal ? Number(monthVal) : (today.getMonth() + 1);
+      
+      if (!confirm(`รวบบิลของเดือน ${month}/${year} เป็น SB?\n\nระบบจะ:\n• ดึงบิล SR/SC/OR/JR ของเดือนนี้\n• Group by ลูกค้า\n• สร้าง/อัปเดต SB row (1 ลูกค้า/เดือน = 1 SB)\n• แยก totals: VAT (SR+SC) vs NOVAT (OR+JR)`)) return;
+      
+      const orig = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = '⏳ กำลังรวบ...';
+      try {
+        const r = await api('aggregateSB', { year, month });
+        if (r?.success && r.data) {
+          const s = r.data;
+          alert(
+            `✅ Aggregate ${month}/${year} สำเร็จ\n\n` +
+            `• สร้างใหม่: ${s.created} SB\n` +
+            `• อัปเดต: ${s.updated} SB\n` +
+            `• ไม่เปลี่ยน: ${s.no_change || 0} SB\n` +
+            `• ข้าม (ไม่มี cust_code): ${s.skipped_no_cust || 0} บิล\n\n` +
+            (s.errors?.length ? `⚠️ Errors:\n${s.errors.join('\n')}` : 'ไม่มี error')
+          );
+          toast(`✅ SB aggregate: created ${s.created}, updated ${s.updated}`, 'success', 5000);
+        } else {
+          alert(`❌ Aggregate ล้มเหลว: ${r?.error || 'unknown'}`);
+        }
+      } catch (err) {
+        alert(`❌ Aggregate error: ${err.message}`);
+        console.error('[SB aggregate] error:', err);
       } finally {
         btn.disabled = false;
         btn.textContent = orig;
