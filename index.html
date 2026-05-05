@@ -9772,20 +9772,64 @@ async function renderMain(el) {
           renderKeepScroll();
         });
         
-        document.getElementById('eb-delete')?.addEventListener('click', () => {
+        document.getElementById('eb-delete')?.addEventListener('click', async () => {
           if (!confirm(`ลบบิล ${b.bill_no||'(ไม่มีเลข)'}?\n${b.type} · ฿${fmtNum(b.amount)} · ${fmtDate(b.date)}\n\nลบแล้วกู้คืนไม่ได้`)) return;
-          // ใช้ reference (b) แทน idx — กัน idx shift ถ้ามี mutation อื่น
+          
+          // ⭐ Phase 3: ถ้าเป็น SP-PENDING → cascade revert ผ่าน backend ก่อน
+          const isSPPending = String(b.bill_no || '').startsWith('SP-PENDING-');
+          if (isSPPending) {
+            const confirmCascade = confirm(
+              `⚠️ บิลนี้เป็น SP-PENDING (รับชำระลูกค้า)\n\n` +
+              `การลบจะ:\n` +
+              `• ลบ payments ที่ผูกกับบิลนี้ทั้งหมด\n` +
+              `• คืน paid_amount + status ของ SB ที่เกี่ยวข้อง\n` +
+              `• ลบ SP-PENDING ใบนี้\n\n` +
+              `ดำเนินการต่อ?`
+            );
+            if (!confirmCascade) return;
+            
+            try {
+              const r = await api('revertSPPendingManual', { reference: b.bill_uuid });
+              if (!r?.success) {
+                toast('❌ Revert ผิดพลาด: ' + (r?.error || 'unknown'), 'error', 5000);
+                return;
+              }
+              const stats = r.data || {};
+              toast(`✓ Revert สำเร็จ — SB ${stats.sb_reverted||0} ใบ + payments ${stats.payments_deleted||0} records`, 'success', 4000);
+              // Reload from cloud (SB + payments อาจ stale)
+              if (typeof loadAllFromCloud === 'function') {
+                await loadAllFromCloud({ years: [Number(String(b.date).substring(0,4)) || new Date().getFullYear()], mode: 'force' });
+              }
+            } catch (e) {
+              console.error('[delete SP-PENDING] cascade error:', e);
+              toast('❌ Cascade error: ' + e.message, 'error', 5000);
+              return;
+            }
+          }
+          
+          // Normal bill delete
           const realIdx = billList.indexOf(b);
-          if (realIdx < 0) { toast('บิลไม่อยู่ในระบบแล้ว', 'warn'); closeModal(); return; }
+          if (realIdx < 0) { 
+            // อาจถูก reload จาก cloud แล้ว — หาใหม่จาก uuid
+            const idxByUuid = billList.findIndex(x => x.bill_uuid === b.bill_uuid);
+            if (idxByUuid < 0) { 
+              if (!isSPPending) { toast('บิลไม่อยู่ในระบบแล้ว', 'warn'); }
+              closeModal(); 
+              renderKeepScroll();
+              return; 
+            }
+            billList.splice(idxByUuid, 1);
+          } else {
+            billList.splice(realIdx, 1);
+          }
           // ⭐ Track uuid เพื่อ push delete ไป cloud
           if (b.bill_uuid && typeof syncManager !== 'undefined') {
             syncManager.markDeleted('bills', b.bill_uuid);
           }
-          billList.splice(realIdx, 1);
           persistMainState();
           invalidateBillsCache();    // สำคัญ: ล้าง cache ให้ Sum refresh
           closeModal();
-          toast('ลบบิลแล้ว', 'success');
+          if (!isSPPending) toast('ลบบิลแล้ว', 'success');
           renderKeepScroll();
         });
       });
@@ -21225,6 +21269,7 @@ async function openReceivePaymentModal() {
     card_fee: 0,
     amount_paid: 0,           // ยอดที่ลูกค้าจ่าย (ก่อน WHT/fee)
     wht_manually_edited: false,
+    amount_manually_edited: false,
     loading: false,
   };
 
@@ -21305,6 +21350,17 @@ async function openReceivePaymentModal() {
             <span style="color:var(--muted)">สุทธิเข้าบัญชี (net):</span>
             <span id="rp-net" style="font-weight:700;color:var(--success);font-size:1rem">฿0.00</span>
           </div>
+          
+          <!-- ⭐ Breakdown — ใช้เครดิต + ต้องจ่ายเพิ่ม -->
+          <div id="rp-credit-deduct-row" style="display:none;justify-content:space-between;font-size:.85rem;margin-top:4px;color:var(--warn)">
+            <span>ใช้ partial ที่ค้างไว้:</span>
+            <span id="rp-credit-deduct">−฿0.00</span>
+          </div>
+          <div id="rp-need-pay-row" style="display:flex;justify-content:space-between;align-items:center;font-size:1rem;margin-top:8px;padding:10px 12px;background:rgba(245,158,11,.1);border:2px solid var(--warn);border-radius:6px">
+            <span style="font-weight:700">💸 ต้องจ่ายเพิ่ม:</span>
+            <span id="rp-need-pay" style="font-weight:800;color:var(--warn);font-size:1.1rem">฿0.00</span>
+          </div>
+          
           <div style="display:flex;justify-content:space-between;align-items:center;font-size:.95rem;margin-top:8px;padding:8px 10px;background:var(--bg);border-radius:6px;border:1px solid var(--border)">
             <span style="font-weight:600">💰 ยอดที่ลูกค้าจ่ายจริง:</span>
             <input type="number" class="input" id="rp-amount-paid" step="0.01" placeholder="0.00" 
@@ -21462,18 +21518,19 @@ function wireReceivePaymentModal(state) {
     const total = state.credit_pending.reduce((s, c) => s + Number(c.amount || 0), 0);
     $creditSection.style.display = 'block';
     $creditSection.innerHTML = `
-      <div style="font-size:.85rem;font-weight:600;color:var(--warn);margin-bottom:6px">
-        ⚠️ ${state.cust_code} มีเครดิตค้าง ${state.credit_pending.length} ใบ รวม ฿${fmtNum(total)}
+      <div style="font-size:.9rem;font-weight:600;color:var(--warn);margin-bottom:8px">
+        💰 ${state.cust_code} มี <span style="background:var(--warn);color:#fff;padding:2px 8px;border-radius:4px">partial</span> ค้างจ่าย ${state.credit_pending.length} ใบ รวม ฿${fmtNum(total)}
       </div>
-      <div style="display:flex;flex-direction:column;gap:4px;max-height:120px;overflow-y:auto">
+      <div style="font-size:.78rem;color:var(--muted);margin-bottom:6px">เลือกใบที่ต้องการนำมาตัดจ่ายในรอบนี้:</div>
+      <div style="display:flex;flex-direction:column;gap:4px;max-height:140px;overflow-y:auto">
         ${state.credit_pending.map(c => {
           const used = state.credit_used.has(c.bill_uuid);
           return `
-            <label style="display:flex;align-items:center;gap:8px;padding:4px;background:var(--bg);border-radius:4px;cursor:pointer;font-size:.8rem">
-              <input type="checkbox" class="rp-credit-cb" data-uuid="${c.bill_uuid}" data-amount="${c.amount}" ${used ? 'checked' : ''}>
+            <label style="display:flex;align-items:center;gap:8px;padding:6px 8px;background:var(--bg);border-radius:4px;cursor:pointer;font-size:.82rem;border:1px solid ${used?'var(--warn)':'transparent'}">
+              <input type="checkbox" class="rp-credit-cb" data-uuid="${c.bill_uuid}" data-amount="${c.amount}" ${used ? 'checked' : ''} style="width:16px;height:16px;cursor:pointer">
               <span style="font-family:var(--mono);font-size:.75rem">${c.bill_no}</span>
               <span style="color:var(--muted);font-size:.75rem">${fmtDate(c.date)}</span>
-              <span style="margin-left:auto;font-weight:600">฿${fmtNum(c.amount)}</span>
+              <span style="margin-left:auto;font-weight:600;color:var(--warn)">฿${fmtNum(c.amount)}</span>
             </label>
           `;
         }).join('')}
@@ -21488,6 +21545,7 @@ function wireReceivePaymentModal(state) {
         } else {
           state.credit_used.delete(uuid);
         }
+        renderCreditSection();  // re-render to update border style
         updateSummary();
       };
     });
@@ -21664,9 +21722,31 @@ function wireReceivePaymentModal(state) {
     const net = sumSel - wht - tf - cf;
     $net.textContent = '฿' + fmtNum(net);
     
-    // Auto-set amount_paid = sumSel (default จ่ายครบ)
-    if (!$amountPaid.value || Number($amountPaid.value) === 0) {
-      $amountPaid.value = sumSel.toFixed(2);
+    // ⭐ "ต้องจ่ายเพิ่ม" = ยอดบิลที่เลือก − partial ที่ใช้
+    const $creditDeductRow = document.getElementById('rp-credit-deduct-row');
+    const $creditDeduct = document.getElementById('rp-credit-deduct');
+    const $needPay = document.getElementById('rp-need-pay');
+    const $needPayRow = document.getElementById('rp-need-pay-row');
+    
+    if (sumCredit > 0) {
+      if ($creditDeductRow) $creditDeductRow.style.display = 'flex';
+      if ($creditDeduct) $creditDeduct.textContent = '−฿' + fmtNum(sumCredit);
+    } else {
+      if ($creditDeductRow) $creditDeductRow.style.display = 'none';
+    }
+    
+    const needPay = Math.max(0, sumSel - sumCredit);
+    if ($needPay) $needPay.textContent = '฿' + fmtNum(needPay);
+    
+    // ซ่อน "ต้องจ่ายเพิ่ม" ถ้า sumSel = 0 และ sumCredit = 0 (ยังไม่เลือกอะไร)
+    if ($needPayRow) {
+      $needPayRow.style.display = (sumSel > 0 || sumCredit > 0) ? 'flex' : 'none';
+    }
+    
+    // ⭐ Auto-set amount_paid = needPay (default จ่ายเฉพาะส่วนที่ต้องจ่ายเพิ่ม)
+    // ถ้า user แก้แล้ว (state.amount_manually_edited) ไม่ override
+    if (!state.amount_manually_edited) {
+      $amountPaid.value = needPay.toFixed(2);
     }
     
     const amountPaid = Number($amountPaid.value) || 0;
@@ -21675,16 +21755,18 @@ function wireReceivePaymentModal(state) {
     
     if (overflow > 0.01) {
       $overflowRow.style.display = 'block';
-      $overflowRow.textContent = `ส่วนเกิน ฿${fmtNum(overflow)} → จะสร้างเป็น SP-PENDING credit ค้าง`;
+      $overflowRow.style.color = 'var(--warn)';
+      $overflowRow.textContent = `ส่วนเกิน ฿${fmtNum(overflow)} → จะเก็บเป็น partial รอตัดจ่ายภายหลัง`;
     } else if (overflow < -0.01) {
       $overflowRow.style.display = 'block';
       $overflowRow.style.color = 'var(--danger)';
-      $overflowRow.textContent = `❌ ยอดที่จ่ายน้อยกว่ายอดบิล ฿${fmtNum(Math.abs(overflow))}`;
+      $overflowRow.textContent = `❌ ยังขาดอีก ฿${fmtNum(Math.abs(overflow))}`;
     } else {
       $overflowRow.style.display = 'none';
     }
     
-    // Submit enable: amount_paid >= sumSel - sumCredit (เลือกบิลแล้วต้องจ่ายพอ)
+    // Submit enable: ต้องมียอดอย่างใดอย่างหนึ่ง (sel หรือ amount_paid > 0)
+    // และ amountPaid + creditUsed ≥ sumSel (ครอบบิลที่เลือก)
     const canSubmit = (sumSel > 0 || amountPaid > 0) && totalCovered >= sumSel - 0.01;
     $submit.disabled = !canSubmit;
   }
@@ -21701,7 +21783,13 @@ function wireReceivePaymentModal(state) {
   });
   $tf?.addEventListener('input', updateSummary);
   $cf?.addEventListener('input', updateSummary);
-  $amountPaid?.addEventListener('input', updateSummary);
+  $amountPaid?.addEventListener('input', () => {
+    state.amount_manually_edited = true;
+    updateSummary();
+  });
+  $amountPaid?.addEventListener('focus', () => {
+    state.amount_manually_edited = true;
+  });
   
   // Init UI
   updateTypeUI();
