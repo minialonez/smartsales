@@ -24779,15 +24779,25 @@ function renderData(el) {
         const r = await api('aggregateSB', { year, month });
         if (r?.success && r.data) {
           const s = r.data;
+          const diag = s.diagnostic || {};
           alert(
             `✅ Aggregate ${month}/${year} สำเร็จ\n\n` +
-            `• สร้างใหม่: ${s.created} SB\n` +
-            `• อัปเดต: ${s.updated} SB\n` +
-            `• ไม่เปลี่ยน: ${s.no_change || 0} SB\n` +
-            `• ข้าม (ไม่มี cust_code): ${s.skipped_no_cust || 0} บิล\n\n` +
+            `📊 ผลลัพธ์:\n` +
+            `  • สร้างใหม่: ${s.created} SB\n` +
+            `  • อัปเดต: ${s.updated} SB\n` +
+            `  • ไม่เปลี่ยน: ${s.no_change || 0} SB\n\n` +
+            `🔍 Diagnostic (Bills filter):\n` +
+            `  • Total ใน sheet: ${diag.total_bills_in_sheet || 0}\n` +
+            `  • ผ่าน date filter: ${diag.passed_date_filter || 0}\n` +
+            `  • ผ่าน type filter (SR/SC/OR/JR): ${diag.passed_type_filter || 0}\n` +
+            `  • ข้าม - no date: ${diag.skipped_no_date || 0}\n` +
+            `  • ข้าม - คนละเดือน: ${diag.skipped_wrong_month || 0}\n` +
+            `  • ข้าม - ไม่ใช่ SR/SC/OR/JR: ${diag.skipped_other_type || 0}\n` +
+            `  • ข้าม - ไม่มี cust_code: ${diag.skipped_no_cust || 0}\n\n` +
             (s.errors?.length ? `⚠️ Errors:\n${s.errors.join('\n')}` : 'ไม่มี error')
           );
           toast(`✅ SB aggregate: created ${s.created}, updated ${s.updated}`, 'success', 5000);
+          console.log('[SB aggregate] diagnostic:', diag);
         } else {
           alert(`❌ Aggregate ล้มเหลว: ${r?.error || 'unknown'}`);
         }
