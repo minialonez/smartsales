@@ -4393,6 +4393,25 @@ function validateAll() {
     });
   }
   
+  // ── ⭐ Customer-bill mismatch (4/5/26 — Phase 1 SB foundation) ──
+  //    เตือน: ลูกค้า cash_only แต่เปิด SR/SC/OR/JR
+  //    เตือน: ลูกค้า VAT แต่เปิด OR/JR (ควรใช้ SR/SC) — และในทาง opposite
+  if (typeof validateAllBillsForCustomers === 'function' && customerList.length > 0) {
+    const cv = validateAllBillsForCustomers(billList);
+    // Group warnings by customer (ลด noise — ลูกค้าเดียวมีหลายบิลผิด → 1 warning)
+    Object.values(cv.byCustomer).forEach(({ customer, warnings: w }) => {
+      if (w.length > 0) {
+        const sample = w.slice(0, 2).join(' / ');
+        const more = w.length > 2 ? ` (+${w.length - 2} เพิ่มเติม)` : '';
+        warnings.push({
+          level: 'warn',
+          category: 'customer_validate',
+          msg: `${sample}${more}`,
+        });
+      }
+    });
+  }
+  
   // ── Business Rules Violations ──
   cashflowList.forEach((c, i) => {
     if (!c.bank || !c.vat) return;
@@ -11403,6 +11422,107 @@ function extractCustCode(s) {
   return m ? m[1] : '';
 }
 window.extractCustCode = extractCustCode;
+
+// ══════════════════════════════════════════════════════════════
+// CUSTOMER VALIDATION (4/5/26 — Phase 1 SB foundation)
+// ══════════════════════════════════════════════════════════════
+// Helpers สำหรับ validate bill ก่อน save:
+//   - หา customer จาก remarks1 (ที่เก็บ "(CODE) name" หรือ "CODE name")
+//   - ตรวจ credit_status: ถ้า cash_only แต่เปิดบิล credit type → warning
+//   - ตรวจ vat_status: ถ้า VAT ลูกค้าแต่เปิด OR/JR (NO_VAT type) → warning
+// ══════════════════════════════════════════════════════════════
+
+// Bill type → category (เครดิต / VAT)
+//   SR/SC = ขาย VAT (ออกบิล + ใบกำกับภาษี)
+//   OR/JR = ขาย NO_VAT (ออกบิลเปล่า)
+//   อื่นๆ = ไม่ใช่ขายเครดิต (Cash, Card, Transfer, etc.)
+function getBillCreditCategory(billNo) {
+  const prefix = String(billNo || '').trim().substring(0, 2).toUpperCase();
+  if (prefix === 'SR' || prefix === 'SC') return 'VAT_CREDIT';
+  if (prefix === 'OR' || prefix === 'JR') return 'NO_VAT_CREDIT';
+  return 'OTHER';
+}
+window.getBillCreditCategory = getBillCreditCategory;
+
+// หา customer จาก customer string (เช่น "BE-00002 อันวาแอนด์โค")
+function findCustomerByString(customerStr) {
+  const code = extractCustCode(customerStr);
+  if (!code) return null;
+  if (!Array.isArray(customerList) || customerList.length === 0) return null;
+  return customerList.find(c => 
+    String(c.cust_code || c.cust_id || '').trim().toUpperCase() === code.toUpperCase()
+  ) || null;
+}
+window.findCustomerByString = findCustomerByString;
+
+// ⭐ Validate bill against customer master
+// returns: { warnings: [], errors: [], customer: object|null }
+function validateBillForCustomer(bill) {
+  const result = { warnings: [], errors: [], customer: null };
+  if (!bill) return result;
+  
+  const billNo = bill.bill_no || '';
+  const remarks1 = bill.remarks1 || '';
+  const category = getBillCreditCategory(billNo);
+  
+  // ถ้าไม่ใช่บิลเครดิต → skip validation
+  if (category === 'OTHER') return result;
+  
+  // หา customer จาก remarks1
+  const customer = findCustomerByString(remarks1);
+  result.customer = customer;
+  
+  if (!customer) {
+    // ไม่เจอลูกค้า — อาจกรอกชื่อเอง ไม่ได้เลือกจาก master
+    if (remarks1.trim()) {
+      result.warnings.push(`บิล ${billNo}: ไม่พบลูกค้า "${extractCustCode(remarks1) || remarks1}" ใน customer master — ไม่สามารถ validate VAT/credit`);
+    }
+    return result;
+  }
+  
+  // ── Check 1: credit_status ──
+  const creditStatus = String(customer.credit_status || '').toLowerCase();
+  if (creditStatus === 'cash_only') {
+    result.warnings.push(`⚠️ บิล ${billNo}: ลูกค้า ${customer.cust_name} เป็น "เงินสดเท่านั้น" (cash_only) แต่เปิดบิลเครดิต ${category === 'VAT_CREDIT' ? 'SR/SC' : 'OR/JR'} — ออกผิด type?`);
+  } else if (creditStatus === 'suspended') {
+    result.warnings.push(`⚠️ บิล ${billNo}: ลูกค้า ${customer.cust_name} ถูก suspend — ไม่ควรเปิดบิลเครดิต`);
+  }
+  
+  // ── Check 2: vat_status ──
+  const vatStatus = String(customer.vat_status || '').toUpperCase();
+  if (vatStatus === 'VAT' && category === 'NO_VAT_CREDIT') {
+    result.warnings.push(`⚠️ บิล ${billNo}: ลูกค้า ${customer.cust_name} เป็น "VAT" แต่เปิดบิล ${billNo.substring(0,2)} (NO_VAT) — ควรใช้ SR/SC`);
+  } else if (vatStatus === 'NO_VAT' && category === 'VAT_CREDIT') {
+    result.warnings.push(`⚠️ บิล ${billNo}: ลูกค้า ${customer.cust_name} เป็น "NO_VAT" แต่เปิดบิล ${billNo.substring(0,2)} (VAT) — ควรใช้ OR/JR`);
+  } else if (!vatStatus) {
+    result.warnings.push(`บิล ${billNo}: ลูกค้า ${customer.cust_name} ยังไม่กำหนด vat_status ใน customer master`);
+  }
+  
+  return result;
+}
+window.validateBillForCustomer = validateBillForCustomer;
+
+// ⭐ Batch validation — ทุกบิลของวัน
+function validateAllBillsForCustomers(bills) {
+  if (!Array.isArray(bills)) return { warnings: [], errors: [], byCustomer: {} };
+  const allWarnings = [];
+  const allErrors = [];
+  const byCustomer = {};
+  
+  bills.forEach(b => {
+    const r = validateBillForCustomer(b);
+    if (r.warnings.length > 0) {
+      allWarnings.push(...r.warnings);
+      const key = r.customer?.cust_code || r.customer?.cust_id || 'unknown';
+      if (!byCustomer[key]) byCustomer[key] = { customer: r.customer, warnings: [] };
+      byCustomer[key].warnings.push(...r.warnings);
+    }
+    if (r.errors.length > 0) allErrors.push(...r.errors);
+  });
+  
+  return { warnings: allWarnings, errors: allErrors, byCustomer };
+}
+window.validateAllBillsForCustomers = validateAllBillsForCustomers;
 
 // ── General customer autocomplete: wire ให้ input ใดๆ ──
 //   ใช้ใน Add Bill / Edit Bill / inline edit remarks1
