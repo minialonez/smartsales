@@ -3467,7 +3467,21 @@ const syncManager = {
               if (monthScope && !_inMonthScope(toISODate(b.date))) return;
               const uuid = b.bill_uuid;
               // ⭐ Skip uuids ที่ local ลบไปแล้ว แต่ cloud ยังไม่ได้ลบตาม (push ค้าง)
-              if (uuid && this.deletedBillUuids.has(uuid)) return;
+              // 🔥 BUG FIX (4/5/26): เช็คว่า bill นี้อยู่ใน billList ปัจจุบันมั้ย
+              //    ถ้าอยู่ → user เคยลบ + เพิ่มกลับมา (อาจ uuid collision หรือ re-create) → KEEP
+              //    ถ้าไม่อยู่ + tracked deleted → SKIP ตามเดิม
+              if (uuid && this.deletedBillUuids.has(uuid)) {
+                const stillInLocal = billList.some(x => x.bill_uuid === uuid);
+                if (stillInLocal) {
+                  // bill นี้ user เพิ่มกลับมาแล้ว — clear from deletedSet
+                  console.warn(`[sync] Bill ${uuid} เคย mark deleted แต่ยังอยู่ใน local → ลบออกจาก deletedSet (อาจเป็น re-create)`);
+                  this.deletedBillUuids.delete(uuid);
+                  try { localStorage.setItem('sf_deleted_bill_uuids', JSON.stringify([...this.deletedBillUuids])); } catch(_){}
+                  // ไม่ skip — process ต่อปกติ
+                } else {
+                  return;
+                }
+              }
               if (uuid) {
                 // UUID-based dedup (stable)
                 if (!seenBillUuids.has(uuid)) {
@@ -11385,9 +11399,24 @@ function wireRemarks1Autocomplete(input) {
   
   function positionDrop() {
     const r = input.getBoundingClientRect();
+    const dropHeight = 240; // max-height
+    const viewportH = window.innerHeight;
+    const spaceBelow = viewportH - r.bottom;
+    const spaceAbove = r.top;
+    
     drop.style.left = (r.left + window.scrollX) + 'px';
-    drop.style.top = (r.bottom + window.scrollY + 2) + 'px';
     drop.style.width = Math.max(r.width, 240) + 'px';
+    
+    // ⭐ Smart flip (4/5/26): ถ้าด้านล่างไม่พอ + ด้านบนมีที่มากกว่า → flip up
+    //    Bug fix: dropdown ใน modal เพิ่มบิล/แก้บิล เคยทับปุ่มบันทึก
+    if (spaceBelow < dropHeight && spaceAbove > spaceBelow) {
+      // วางเหนือ input
+      drop.style.top = (r.top + window.scrollY - Math.min(dropHeight, spaceAbove - 8) - 2) + 'px';
+      drop.style.maxHeight = Math.min(dropHeight, spaceAbove - 8) + 'px';
+    } else {
+      drop.style.top = (r.bottom + window.scrollY + 2) + 'px';
+      drop.style.maxHeight = Math.min(dropHeight, spaceBelow - 8) + 'px';
+    }
   }
   
   function doSearch(q) {
@@ -18290,8 +18319,33 @@ async function loadAllFromCloud(opts) {
         const r = results[startIdx];
         if (r?._err) throw new Error(r._err);
         if (r?.success && Array.isArray(r.data?.rows)) {
-          r.data.rows.forEach(b => tempBills.push(b));
-          _log(`Bills ${y}`, r.data.rows.length);
+          // 🔥 BUG FIX (4/5/26): respect deletedBillUuids ใน Pattern B reload เหมือน sync
+          //    แต่ถ้า bill อยู่ใน billList ปัจจุบัน → user re-add แล้ว → ห้าม skip
+          const deletedSet = (window.syncManager?.deletedBillUuids) || new Set();
+          let skippedCount = 0;
+          let resurrectedCount = 0;
+          r.data.rows.forEach(b => {
+            const uuid = b.bill_uuid;
+            if (uuid && deletedSet.has(uuid)) {
+              // เช็คว่ายังอยู่ใน billList มั้ย (user re-add แล้ว)
+              const stillInLocal = billList.some(x => x.bill_uuid === uuid);
+              if (stillInLocal) {
+                deletedSet.delete(uuid);
+                resurrectedCount++;
+                tempBills.push(b);
+              } else {
+                skippedCount++;
+              }
+              return;
+            }
+            tempBills.push(b);
+          });
+          if (skippedCount > 0) console.warn(`[loadAllFromCloud] Bills ${y}: skipped ${skippedCount} uuids (in deletedSet)`);
+          if (resurrectedCount > 0) {
+            console.warn(`[loadAllFromCloud] Bills ${y}: resurrected ${resurrectedCount} uuids (re-add by user)`);
+            try { localStorage.setItem('sf_deleted_bill_uuids', JSON.stringify([...deletedSet])); } catch(_){}
+          }
+          _log(`Bills ${y}`, r.data.rows.length - skippedCount);
         } else if (r?.success === false) {
           _log(`Bills ${y}`, 0, new Error(r.error || 'unknown'));
         }
