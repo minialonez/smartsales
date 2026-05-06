@@ -21405,111 +21405,122 @@ async function openReceivePaymentModal() {
 
   // Modal HTML
   openModal('💵 รับชำระลูกค้า', `
-    <div id="rp-modal" style="display:flex;flex-direction:column;gap:12px;max-height:78vh;overflow:hidden">
+    <div id="rp-modal" style="display:flex;flex-direction:column;gap:12px;max-height:88vh;overflow:hidden">
       
-      <!-- STEP 1: ลูกค้า -->
-      <div class="input-group" style="position:relative">
+      <!-- STEP 1: ลูกค้า (full width) -->
+      <div class="input-group" style="position:relative;margin:0">
         <label>🔍 ค้นหาลูกค้า (รหัส / ชื่อ)</label>
         <input class="input" id="rp-cust-search" placeholder="เช่น BE-00789 หรือ XYZ" autocomplete="off">
         <div id="rp-cust-dropdown" style="display:none;position:absolute;top:100%;left:0;right:0;background:var(--bg);border:1px solid var(--border);border-radius:6px;max-height:280px;overflow-y:auto;z-index:99999;box-shadow:0 4px 16px rgba(0,0,0,0.25);margin-top:2px"></div>
       </div>
       
-      <!-- เครดิตค้าง -->
+      <!-- เครดิตค้าง (full width) -->
       <div id="rp-credit-section" style="display:none;background:rgba(245,158,11,.08);border:1px solid var(--warn);border-radius:6px;padding:10px"></div>
       
-      <!-- STEP 2: บิลค้างชำระ -->
-      <div id="rp-bills-section" style="display:none;flex:1;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:12px;background:var(--bg-elev);min-height:280px;max-height:420px">
-        <div id="rp-bills-content"></div>
-      </div>
-      
-      <!-- STEP 3: ข้อมูลรับชำระ -->
-      <div id="rp-payment-section" style="display:none;background:var(--bg-elev);border:1px solid var(--border);border-radius:6px;padding:14px">
-        <div id="rp-payment-fields-row" style="display:grid;grid-template-columns:130px 145px 145px 145px 1fr;gap:10px;margin-bottom:10px">
-          <div class="input-group" style="margin:0">
-            <label style="font-size:.78rem">Type</label>
-            <select class="select" id="rp-type">
-              <option value="Cash">Cash</option>
-              <option value="Transfer" selected>Transfer</option>
-              <option value="Cheque">Cheque</option>
-              <option value="Card">Card</option>
-            </select>
-          </div>
-          <div class="input-group" style="margin:0">
-            <label style="font-size:.78rem" id="rp-pay-date-label">วันที่</label>
-            <input type="date" class="input" id="rp-pay-date" value="${todayISO()}">
-          </div>
-          <div class="input-group" id="rp-cheque-due-group" style="margin:0;display:none">
-            <label style="font-size:.78rem">วันขึ้นเช็ค *</label>
-            <input type="date" class="input" id="rp-due-date">
-          </div>
-          <div class="input-group" id="rp-bank-group" style="margin:0">
-            <label style="font-size:.78rem">ธนาคาร</label>
-            <input class="input" id="rp-bank" placeholder="KBANK / SCB ...">
-          </div>
-          <div class="input-group" style="margin:0">
-            <label style="font-size:.78rem" id="rp-conf-label">Confirmation</label>
-            <input class="input" id="rp-conf" placeholder="รหัสโอน / ref">
-          </div>
+      <!-- ⭐ 2-col layout: Step 2 (bills) ซ้าย | Step 3 (payment) ขวา -->
+      <div id="rp-2col-grid" style="display:grid;grid-template-columns:1.4fr 1fr;gap:14px;flex:1;min-height:0;overflow:hidden">
+        
+        <!-- STEP 2: บิลค้างชำระ -->
+        <div id="rp-bills-section" style="display:none;flex-direction:column;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:12px;background:var(--bg-elev);min-height:340px;max-height:65vh">
+          <div id="rp-bills-content"></div>
         </div>
         
-        <!-- ⭐ Phase 4 (5/5/26) — Match-first SB Payment Info Box -->
-        <div id="rp-phase4-info" style="display:none;margin:6px 0 10px;padding:8px 12px;border-radius:6px;font-size:.82rem;line-height:1.45;border:1px solid"></div>
-        
-        <!-- ยอดบิลที่เลือก + WHT/fee -->
-        <div style="border-top:1px solid var(--border);padding-top:10px;margin-top:4px">
-          <div style="display:flex;justify-content:space-between;font-size:.9rem;margin-bottom:6px">
-            <span style="color:var(--muted)">ยอดบิลที่เลือก:</span>
-            <span id="rp-sum-selected" style="font-weight:700;font-size:1rem">฿0.00</span>
-          </div>
-          <div id="rp-fee-rows" style="display:none">
-            <div style="display:flex;align-items:center;gap:8px;margin:6px 0">
-              <input type="checkbox" id="rp-wht-enable" style="margin:0;width:18px;height:18px;cursor:pointer">
-              <label for="rp-wht-enable" style="font-size:.85rem;cursor:pointer;flex:1">หัก ณ ที่จ่าย 1%</label>
-              <input type="number" class="input" id="rp-wht" step="0.01" placeholder="0.00" 
-                     style="width:120px;font-size:.85rem;color:var(--purple);text-align:right" disabled>
+        <!-- STEP 3: ข้อมูลรับชำระ -->
+        <div id="rp-payment-section" style="display:none;flex-direction:column;overflow-y:auto;background:var(--bg-elev);border:1px solid var(--border);border-radius:6px;padding:14px;min-height:340px;max-height:65vh">
+          <div id="rp-payment-fields-row" style="display:grid;grid-template-columns:110px 130px 1fr;gap:8px;margin-bottom:10px">
+            <div class="input-group" style="margin:0">
+              <label style="font-size:.78rem">Type</label>
+              <select class="select" id="rp-type">
+                <option value="Cash">Cash</option>
+                <option value="Transfer" selected>Transfer</option>
+                <option value="Cheque">Cheque</option>
+                <option value="Card">Card</option>
+              </select>
             </div>
-            <div style="display:flex;align-items:center;gap:8px;margin:6px 0" id="rp-tf-row">
-              <label style="font-size:.85rem;flex:1">ค่าธรรมเนียมโอน/เช็ค</label>
-              <input type="number" class="input" id="rp-tf" step="0.01" placeholder="0.00" value="12" 
-                     style="width:120px;font-size:.85rem;text-align:right">
+            <div class="input-group" style="margin:0">
+              <label style="font-size:.78rem" id="rp-pay-date-label">วันที่</label>
+              <input type="date" class="input" id="rp-pay-date" value="${todayISO()}">
             </div>
-            <div style="align-items:center;gap:8px;margin:6px 0;display:none" id="rp-cf-row">
-              <label style="font-size:.85rem;flex:1">ค่าธรรมเนียมบัตร</label>
-              <input type="number" class="input" id="rp-cf" step="0.01" placeholder="0.00" 
-                     style="width:120px;font-size:.85rem;text-align:right">
+            <div class="input-group" id="rp-cheque-due-group" style="margin:0;display:none">
+              <label style="font-size:.78rem">วันขึ้นเช็ค *</label>
+              <input type="date" class="input" id="rp-due-date">
             </div>
-          </div>
-          <div style="display:flex;justify-content:space-between;font-size:.9rem;margin-top:8px;padding-top:8px;border-top:1px dashed var(--border)">
-            <span style="color:var(--muted)">สุทธิเข้าบัญชี (net):</span>
-            <span id="rp-net" style="font-weight:700;color:var(--success);font-size:1rem">฿0.00</span>
+            <div class="input-group" id="rp-bank-group" style="margin:0">
+              <label style="font-size:.78rem">ธนาคาร</label>
+              <input class="input" id="rp-bank" placeholder="KBANK / SCB ...">
+            </div>
+            <div class="input-group" style="margin:0;grid-column:1 / -1">
+              <label style="font-size:.78rem" id="rp-conf-label">Confirmation</label>
+              <input class="input" id="rp-conf" placeholder="รหัสโอน / ref">
+            </div>
           </div>
           
-          <!-- ⭐ Breakdown — ใช้เครดิต + ต้องจ่ายเพิ่ม -->
-          <div id="rp-credit-deduct-row" style="display:none;justify-content:space-between;font-size:.85rem;margin-top:4px;color:var(--warn)">
-            <span>ใช้ partial ที่ค้างไว้:</span>
-            <span id="rp-credit-deduct">−฿0.00</span>
-          </div>
-          <div id="rp-need-pay-row" style="display:flex;justify-content:space-between;align-items:center;font-size:1rem;margin-top:8px;padding:10px 12px;background:rgba(245,158,11,.1);border:2px solid var(--warn);border-radius:6px">
-            <span style="font-weight:700">💸 ต้องจ่ายเพิ่ม:</span>
-            <span id="rp-need-pay" style="font-weight:800;color:var(--warn);font-size:1.1rem">฿0.00</span>
-          </div>
+          <!-- ⭐ Phase 4 (5/5/26) — Match-first SB Payment Info Box -->
+          <div id="rp-phase4-info" style="display:none;margin:6px 0 10px;padding:8px 12px;border-radius:6px;font-size:.82rem;line-height:1.45;border:1px solid"></div>
           
-          <div style="display:flex;justify-content:space-between;align-items:center;font-size:.95rem;margin-top:8px;padding:8px 10px;background:var(--bg);border-radius:6px;border:1px solid var(--border)">
-            <span style="font-weight:600">💰 ยอดที่ลูกค้าจ่ายจริง:</span>
-            <input type="number" class="input" id="rp-amount-paid" step="0.01" placeholder="0.00" 
-                   style="width:160px;text-align:right;font-weight:700;font-size:1rem">
+          <!-- ยอดบิลที่เลือก + WHT/fee -->
+          <div style="border-top:1px solid var(--border);padding-top:10px;margin-top:4px">
+            <div style="display:flex;justify-content:space-between;font-size:.9rem;margin-bottom:6px">
+              <span style="color:var(--muted)">ยอดบิลที่เลือก:</span>
+              <span id="rp-sum-selected" style="font-weight:700;font-size:1rem">฿0.00</span>
+            </div>
+            <div id="rp-fee-rows" style="display:none">
+              <div style="display:flex;align-items:center;gap:8px;margin:6px 0">
+                <input type="checkbox" id="rp-wht-enable" style="margin:0;width:18px;height:18px;cursor:pointer">
+                <label for="rp-wht-enable" style="font-size:.85rem;cursor:pointer;flex:1">หัก ณ ที่จ่าย 1%</label>
+                <input type="number" class="input" id="rp-wht" step="0.01" placeholder="0.00" 
+                       style="width:120px;font-size:.85rem;color:var(--purple);text-align:right" disabled>
+              </div>
+              <div style="display:flex;align-items:center;gap:8px;margin:6px 0" id="rp-tf-row">
+                <label style="font-size:.85rem;flex:1">ค่าธรรมเนียมโอน/เช็ค</label>
+                <input type="number" class="input" id="rp-tf" step="0.01" placeholder="0.00" value="12" 
+                       style="width:120px;font-size:.85rem;text-align:right">
+              </div>
+              <div style="align-items:center;gap:8px;margin:6px 0;display:none" id="rp-cf-row">
+                <label style="font-size:.85rem;flex:1">ค่าธรรมเนียมบัตร</label>
+                <input type="number" class="input" id="rp-cf" step="0.01" placeholder="0.00" 
+                       style="width:120px;font-size:.85rem;text-align:right">
+              </div>
+            </div>
+            <div style="display:flex;justify-content:space-between;font-size:.9rem;margin-top:8px;padding-top:8px;border-top:1px dashed var(--border)">
+              <span style="color:var(--muted)">สุทธิเข้าบัญชี (net):</span>
+              <span id="rp-net" style="font-weight:700;color:var(--success);font-size:1rem">฿0.00</span>
+            </div>
+            
+            <!-- ⭐ Breakdown — ใช้เครดิต + ต้องจ่ายเพิ่ม -->
+            <div id="rp-credit-deduct-row" style="display:none;justify-content:space-between;font-size:.85rem;margin-top:4px;color:var(--warn)">
+              <span>ใช้ partial ที่ค้างไว้:</span>
+              <span id="rp-credit-deduct">−฿0.00</span>
+            </div>
+            <div id="rp-need-pay-row" style="display:flex;justify-content:space-between;align-items:center;font-size:1rem;margin-top:8px;padding:10px 12px;background:rgba(245,158,11,.1);border:2px solid var(--warn);border-radius:6px">
+              <span style="font-weight:700">💸 ต้องจ่ายเพิ่ม:</span>
+              <span id="rp-need-pay" style="font-weight:800;color:var(--warn);font-size:1.1rem">฿0.00</span>
+            </div>
+            
+            <div style="display:flex;justify-content:space-between;align-items:center;font-size:.95rem;margin-top:8px;padding:8px 10px;background:var(--bg);border-radius:6px;border:1px solid var(--border)">
+              <span style="font-weight:600">💰 ยอดที่ลูกค้าจ่ายจริง:</span>
+              <input type="number" class="input" id="rp-amount-paid" step="0.01" placeholder="0.00" 
+                     style="width:160px;text-align:right;font-weight:700;font-size:1rem">
+            </div>
+            <div id="rp-overflow-row" style="display:none;color:var(--warn);font-size:.85rem;margin-top:6px;text-align:right;padding:6px 10px;background:rgba(245,158,11,.08);border-radius:4px"></div>
           </div>
-          <div id="rp-overflow-row" style="display:none;color:var(--warn);font-size:.85rem;margin-top:6px;text-align:right;padding:6px 10px;background:rgba(245,158,11,.08);border-radius:4px"></div>
         </div>
       </div>
       
-      <!-- Submit -->
+      <!-- Submit (full width) -->
       <div style="display:flex;gap:10px;justify-content:flex-end;border-top:1px solid var(--border);padding-top:12px">
-        <button class="btn btn-ghost" onclick="closeModal()">ยกเลิก</button>
-        <button class="btn btn-primary" id="rp-submit" disabled style="font-size:.95rem;padding:10px 20px">💾 บันทึกการรับชำระ</button>
+        <button class="btn btn-ghost" id="rp-cancel">ยกเลิก</button>
+        <button class="btn btn-primary" id="rp-submit" disabled style="font-size:.95rem;padding:10px 24px">💾 บันทึกการรับชำระ</button>
       </div>
     </div>
-  `, { width: '960px', maxWidth: '96vw' });
+    <style>
+      /* ⭐ Phase 4 — responsive: < 900px → กลับ stacked (มือถือ/tablet) */
+      @media (max-width: 900px) {
+        #rp-2col-grid { grid-template-columns: 1fr !important; }
+        #rp-bills-section, #rp-payment-section { max-height: 50vh !important; }
+      }
+    </style>
+  `, { width: '1280px', maxWidth: '96vw' });
 
   // Wire modal
   wireReceivePaymentModal(state);
@@ -21541,6 +21552,15 @@ function wireReceivePaymentModal(state) {
   const $amountPaid = document.getElementById('rp-amount-paid');
   const $overflowRow = document.getElementById('rp-overflow-row');
   const $submit = document.getElementById('rp-submit');
+  const $cancel = document.getElementById('rp-cancel');
+  
+  // ⭐ Cancel button — wire ผ่าน addEventListener (กัน scope issue ของ inline onclick)
+  $cancel?.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (typeof closeModal === 'function') closeModal();
+    else if (typeof window.closeModal === 'function') window.closeModal();
+  });
 
   // ── Customer search autocomplete ──
   let searchTimer = null;
@@ -21623,8 +21643,8 @@ function wireReceivePaymentModal(state) {
     state.selected_bills.clear();
     state.credit_used.clear();
     $billsContent.innerHTML = '<div style="text-align:center;padding:20px;color:var(--muted)">กำลังโหลด...</div>';
-    $billsSection.style.display = 'block';
-    $paymentSection.style.display = 'block';
+    $billsSection.style.display = 'flex';
+    $paymentSection.style.display = 'flex';
     
     try {
       const [sbsR, creditR] = await Promise.all([
