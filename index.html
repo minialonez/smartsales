@@ -20908,7 +20908,6 @@ ${bodyHtml}
             <td style="text-align:center">${i+1}</td>
             <td>${b.bill_no||'-'}</td>
             <td>${_formatThaiDate(b.date)}</td>
-            <td>${b.station||'-'}</td>
             <td class="num">฿${fmtNum(amt)}</td>
           </tr>
         `;
@@ -20916,7 +20915,7 @@ ${bodyHtml}
     } else {
       // Fallback: ถ้าไม่มี bills_snapshot ใช้ summary
       billRowsHtml = `
-        <tr><td colspan="4">รวมยอดตามใบวางบิล</td><td class="num">฿${fmtNum(sb.total_amount)}</td></tr>
+        <tr><td colspan="3">รวมยอดตามใบวางบิล</td><td class="num">฿${fmtNum(sb.total_amount)}</td></tr>
       `;
       runningTotal = Number(sb.total_amount) || 0;
     }
@@ -20954,26 +20953,25 @@ ${bodyHtml}
       <table>
         <thead>
           <tr>
-            <th style="width:36px">#</th>
+            <th style="width:50px">#</th>
             <th>เลขที่บิล</th>
-            <th style="width:110px">วันที่</th>
-            <th style="width:120px">สถานี</th>
-            <th class="num" style="width:120px">จำนวนเงิน</th>
+            <th style="width:140px">วันที่</th>
+            <th class="num" style="width:160px">จำนวนเงิน</th>
           </tr>
         </thead>
         <tbody>
           ${billRowsHtml}
           <tr class="total-row">
-            <td colspan="4" class="num">รวมยอดทั้งสิ้น</td>
+            <td colspan="3" class="num">รวมยอดทั้งสิ้น</td>
             <td class="num">฿${fmtNum(runningTotal)}</td>
           </tr>
           ${paid > 0 ? `
           <tr>
-            <td colspan="4" class="num" style="color:#16a34a">หัก ชำระแล้ว</td>
+            <td colspan="3" class="num" style="color:#16a34a">หัก ชำระแล้ว</td>
             <td class="num" style="color:#16a34a">฿${fmtNum(paid)}</td>
           </tr>
           <tr class="total-row">
-            <td colspan="4" class="num" style="color:#ef4444">ค้างชำระ</td>
+            <td colspan="3" class="num" style="color:#ef4444">ค้างชำระ</td>
             <td class="num" style="color:#ef4444">฿${fmtNum(outstanding)}</td>
           </tr>
           ` : ''}
