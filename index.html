@@ -13765,22 +13765,6 @@ function getAllowedBanks(vat, direction) {
 // - OS/OR โอนเข้า KTB/KBANK/BBL → wrong (NOVAT → VAT bank)
 // - ระบบไม่บล็อก แต่จะ flag ให้ผู้ใช้เห็น
 // ══════════════════════════════════════════════════════════════
-function detectMisroutedPayment(billNo, bank) {
-  if (!billNo || !bank) return null;
-  const prefix = String(billNo).substring(0, 2).toUpperCase();
-  const bankDef = BANK_ACCOUNTS[bank];
-  if (!bankDef) return null;
-  
-  // VAT docs (SS, SR) — should go to VAT banks
-  if (['SS', 'SR'].includes(prefix) && bankDef.vat !== 'VAT') {
-    return { type:'vat_to_novat', msg:`บิล ${prefix} (VAT) โอนเข้า ${bank} (NOVAT) — ผิดบัญชี` };
-  }
-  // NOVAT docs (OS, OR) — should go to BBL NW
-  if (['OS', 'OR'].includes(prefix) && bankDef.vat !== 'NOVAT') {
-    return { type:'novat_to_vat', msg:`บิล ${prefix} (NOVAT) โอนเข้า ${bank} (VAT) — ผิดบัญชี` };
-  }
-  return null; // ok
-}
 
 // ══════════════════════════════════════════════════════════════
 // Render Cashflow Page (เงินเข้าออก: Deposit, Supplier, Transfer)
