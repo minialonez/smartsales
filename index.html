@@ -19882,7 +19882,7 @@ async function renderBilling(el) {
   let loading = false;
 
   // List tab filters
-  let listFilter = { status: 'ALL', search: '', cust: '' };
+  let listFilter = { status: 'ALL', search: '', cust: '', creditOnly: false };
 
   // Create tab state
   let createState = {
@@ -19994,10 +19994,11 @@ async function renderBilling(el) {
     render();
     try {
       await loadNotes();
+      // ⭐ Load customerList ทุกครั้ง (สำหรับ credit warning ใน list/aging tabs)
+      await loadCustomerListIfNeeded();
       if (activeTab === 'payments') await loadPayments();
       if (activeTab === 'aging') await loadAging();
       if (activeTab === 'create') {
-        await loadCustomerListIfNeeded();
         await loadNextNo();
       }
     } catch (e) {
@@ -20034,6 +20035,25 @@ async function renderBilling(el) {
     const totalOutstanding = billingNotes
       .filter(n => n.status === 'pending' || n.status === 'partial')
       .reduce((s, n) => s + (Number(n.outstanding)||0), 0);
+    
+    // ⭐ Credit Warning stats — นับจำนวน "ลูกค้า" (unique cust_code) ที่ใกล้เต็มวงเงิน
+    const creditWarnedCusts = new Set();
+    const creditCriticalCusts = new Set();
+    if (Array.isArray(customerList) && customerList.length > 0) {
+      // Reset cache before recalculating
+      _custOutstandingCache = null;
+      // Iterate unique cust_codes from billingNotes
+      const seenCodes = new Set();
+      billingNotes.forEach(n => {
+        const code = String(n.cust_code || '').trim().toUpperCase();
+        if (!code || seenCodes.has(code)) return;
+        seenCodes.add(code);
+        const u = getCreditUsage(code);
+        if (u.level === 'critical') creditCriticalCusts.add(code);
+        else if (u.level === 'warn') creditWarnedCusts.add(code);
+      });
+    }
+    const creditWarnTotal = creditWarnedCusts.size + creditCriticalCusts.size;
 
     el.innerHTML = `
       <div class="page-header">
@@ -20058,6 +20078,15 @@ async function renderBilling(el) {
           <div class="stat-label">หนี้คงค้างทั้งหมด</div>
           <div class="stat-value" style="color:#ef4444">฿${fmtNum(totalOutstanding)}</div>
         </div>
+        <div class="stat-card" style="border-left:4px solid ${creditCriticalCusts.size>0?'#ef4444':(creditWarnedCusts.size>0?'#f59e0b':'#6b7280')};${creditWarnTotal>0?'cursor:pointer':''}" 
+             id="stat-credit-warn" 
+             title="${creditWarnTotal>0?'คลิกเพื่อแสดงเฉพาะลูกค้าใกล้เต็มวงเงิน':'ไม่มีลูกค้าใกล้เต็มวงเงิน'}">
+          <div class="stat-label">⚠️ ใกล้เต็มวงเงิน (≥70%)</div>
+          <div class="stat-value" style="color:${creditCriticalCusts.size>0?'#ef4444':(creditWarnedCusts.size>0?'#f59e0b':'var(--muted)')}">
+            ${creditWarnTotal} <span style="font-size:13px;color:var(--muted)">ราย</span>
+          </div>
+          ${creditCriticalCusts.size>0?`<div style="font-size:11px;color:#ef4444;margin-top:2px">🚨 ${creditCriticalCusts.size} ราย ≥90%</div>`:''}
+        </div>
       </div>
 
       <div class="tab-nav" style="display:flex;gap:4px;border-bottom:1px solid var(--border);margin-bottom:16px;overflow-x:auto">
@@ -20076,6 +20105,30 @@ async function renderBilling(el) {
     document.querySelectorAll('.bn-tab').forEach(b => {
       b.onclick = () => { activeTab = b.dataset.tab; refresh(); };
     });
+    
+    // ⭐ Credit warn stat card → toggle filter
+    const $statCredit = document.getElementById('stat-credit-warn');
+    if ($statCredit && creditWarnTotal > 0) {
+      $statCredit.onclick = () => {
+        listFilter.creditOnly = !listFilter.creditOnly;
+        // เมื่อ filter on → ไป list tab เสมอ
+        if (listFilter.creditOnly && activeTab !== 'list') {
+          activeTab = 'list';
+        }
+        refresh();
+        if (listFilter.creditOnly) {
+          toast('🔍 กรองเฉพาะลูกค้าใกล้เต็มวงเงิน — กดอีกครั้งเพื่อยกเลิก', 'info', 4000);
+        } else {
+          toast('แสดงทั้งหมด', 'info', 2000);
+        }
+      };
+      // Visual: ถ้า filter active → highlight
+      if (listFilter.creditOnly) {
+        $statCredit.style.outline = '2px solid var(--accent)';
+        $statCredit.style.outlineOffset = '2px';
+      }
+    }
+    
     wireTabHandlers();
   }
 
@@ -20133,6 +20186,85 @@ async function renderBilling(el) {
     return result;
   }
 
+  // ⭐ Credit Warning (5/5/26) — Helper: หา credit usage ของลูกค้าจาก customerList + billingNotes
+  //   threshold: 70% ของ credit_limit ใน customers sheet
+  //   Returns { limit, outstanding, ratio, level } where level ∈ 'safe' | 'warn' | 'critical' | 'no_limit'
+  const CREDIT_WARN_THRESHOLD = 0.70;     // 70% — main alert
+  const CREDIT_CRITICAL_THRESHOLD = 0.90; // 90% — critical (เกือบเต็ม)
+  
+  // Cache outstanding sum per cust_code (recompute when billingNotes changes)
+  let _custOutstandingCache = null;
+  let _custOutstandingCacheKey = '';
+  
+  function _buildCustOutstandingMap() {
+    const key = String(billingNotes.length) + ':' + (billingNotes[0]?.updated_at || '');
+    if (_custOutstandingCache && _custOutstandingCacheKey === key) return _custOutstandingCache;
+    const map = {};
+    for (let i = 0; i < billingNotes.length; i++) {
+      const n = billingNotes[i];
+      // นับเฉพาะ SB ที่ยังค้าง (pending + partial); paid/cancelled ไม่นับ
+      if (n.status !== 'pending' && n.status !== 'partial') continue;
+      const code = String(n.cust_code || '').trim().toUpperCase();
+      if (!code) continue;
+      map[code] = (map[code] || 0) + (Number(n.outstanding) || 0);
+    }
+    _custOutstandingCache = map;
+    _custOutstandingCacheKey = key;
+    return map;
+  }
+  
+  function getCreditUsage(custCode) {
+    if (!custCode) return { limit: 0, outstanding: 0, ratio: 0, level: 'no_limit' };
+    const code = String(custCode).trim().toUpperCase();
+    
+    // Find customer
+    let limit = 0;
+    if (Array.isArray(customerList)) {
+      const cust = customerList.find(c => 
+        String(c.cust_id || c.cust_code || '').trim().toUpperCase() === code
+      );
+      if (cust) limit = Number(cust.credit_limit) || 0;
+    }
+    
+    const map = _buildCustOutstandingMap();
+    const outstanding = map[code] || 0;
+    
+    if (limit <= 0) return { limit: 0, outstanding, ratio: 0, level: 'no_limit' };
+    
+    const ratio = outstanding / limit;
+    let level;
+    if (ratio >= CREDIT_CRITICAL_THRESHOLD) level = 'critical';
+    else if (ratio >= CREDIT_WARN_THRESHOLD) level = 'warn';
+    else level = 'safe';
+    
+    return { limit, outstanding, ratio, level };
+  }
+  
+  // ⭐ Render progress bar HTML (compact — สำหรับ row ใน table)
+  function renderCreditBar(usage) {
+    if (usage.level === 'no_limit') return '';
+    const pct = Math.min(100, Math.round(usage.ratio * 100));
+    let barColor, textColor, label;
+    if (usage.level === 'critical') {
+      barColor = '#ef4444'; textColor = '#ef4444'; label = '🚨 เกือบเต็มวงเงิน';
+    } else if (usage.level === 'warn') {
+      barColor = '#f59e0b'; textColor = '#f59e0b'; label = '⚠️ ใกล้เต็มวงเงิน';
+    } else {
+      barColor = '#16a34a'; textColor = 'var(--muted)'; label = '';
+    }
+    return `
+      <div style="margin-top:4px">
+        <div style="display:flex;justify-content:space-between;font-size:10.5px;line-height:1.2">
+          <span style="color:${textColor}">${label || 'เครดิต'} ${pct}%</span>
+          <span style="color:var(--muted)">฿${fmtNum(usage.outstanding)} / ฿${fmtNum(usage.limit)}</span>
+        </div>
+        <div style="height:4px;background:var(--border);border-radius:2px;overflow:hidden;margin-top:2px">
+          <div style="height:100%;width:${pct}%;background:${barColor};transition:width .3s"></div>
+        </div>
+      </div>
+    `;
+  }
+
   // ⭐ Helper (4/5/26): สร้างเฉพาะ rows part — ใช้ใน renderListRowsOnly เพื่อ update โดยไม่แตะ search input
   function renderListRows() {
     const q = listFilter.search.toLowerCase().trim();
@@ -20153,7 +20285,28 @@ async function renderBilling(el) {
         (Array.isArray(n.bills_snapshot) && n.bills_snapshot.some(b => String(b.bill_no||'').toLowerCase().includes(q)))
       );
     }
-    rows.sort((a, b) => String(b.billing_no||'').localeCompare(String(a.billing_no||'')));
+    
+    // ⭐ Credit-warning filter (toggle จาก stat card)
+    if (listFilter.creditOnly) {
+      rows = rows.filter(n => {
+        const u = getCreditUsage(n.cust_code);
+        return u.level === 'critical' || u.level === 'warn';
+      });
+    }
+    // ⭐ Credit Warning sort (5/5/26):
+    //   1. Critical (≥90%) → top, sorted by ratio desc
+    //   2. Warn (≥70%) → next, sorted by ratio desc
+    //   3. Safe / no_limit → ปกติ (sort by billing_no desc)
+    rows.sort((a, b) => {
+      const ua = getCreditUsage(a.cust_code);
+      const ub = getCreditUsage(b.cust_code);
+      const aRank = ua.level === 'critical' ? 0 : (ua.level === 'warn' ? 1 : 2);
+      const bRank = ub.level === 'critical' ? 0 : (ub.level === 'warn' ? 1 : 2);
+      if (aRank !== bRank) return aRank - bRank;
+      // Same rank: critical/warn sort by ratio desc; safe by billing_no desc
+      if (aRank < 2) return ub.ratio - ua.ratio;
+      return String(b.billing_no||'').localeCompare(String(a.billing_no||''));
+    });
     
     return rows.length === 0 ? `
       <div style="text-align:center;padding:60px;color:var(--muted);background:var(--bg-elev);border-radius:8px">
@@ -20168,7 +20321,7 @@ async function renderBilling(el) {
             <th>เลขที่</th>
             <th>วันที่ออก</th>
             <th>ครบกำหนด</th>
-            <th>ลูกค้า</th>
+            <th style="min-width:220px">ลูกค้า / เครดิต</th>
             <th style="text-align:center">บิล</th>
             <th style="text-align:right">ยอดรวม</th>
             <th style="text-align:right">ชำระแล้ว</th>
@@ -20188,14 +20341,27 @@ async function renderBilling(el) {
             const inFlightPill = inFlight.length > 0 
               ? `<div style="font-size:10.5px;color:var(--warn);margin-top:2px" title="SP-PENDING รอ match: ${inFlight.map(x=>x.bill_no+' ฿'+fmtNum(x.amount)).join(', ')}">⏳ รอ match: ${inFlight.length} ใบ ฿${fmtNum(inFlightAmt)}</div>`
               : '';
+            // ⭐ Credit Warning bar — แสดงใน column ลูกค้า
+            const usage = getCreditUsage(n.cust_code);
+            const creditBar = renderCreditBar(usage);
+            // ⭐ Row highlight ตาม credit level
+            let rowBg = '';
+            if (usage.level === 'critical') rowBg = 'background:rgba(239,68,68,0.10)';
+            else if (usage.level === 'warn') rowBg = 'background:rgba(245,158,11,0.08)';
+            else if (overdue) rowBg = 'background:rgba(239,68,68,0.06)';
+            // ⭐ Border indicator (ซ้าย) สำหรับ warn/critical
+            let leftBorder = '';
+            if (usage.level === 'critical') leftBorder = 'box-shadow:inset 4px 0 0 #ef4444';
+            else if (usage.level === 'warn') leftBorder = 'box-shadow:inset 4px 0 0 #f59e0b';
             return `
-              <tr style="border-top:1px solid var(--border);${overdue?'background:rgba(239,68,68,0.06)':''}">
+              <tr style="border-top:1px solid var(--border);${rowBg};${leftBorder}">
                 <td><strong>${n.billing_no||'-'}</strong></td>
                 <td>${fmtThaiDate(n.billing_date)}</td>
                 <td style="${overdue?'color:#ef4444;font-weight:600':''}">${fmtThaiDate(n.due_date)}${overdue?' ⚠️':''}</td>
                 <td>
                   <div style="font-weight:500">${n.cust_name||'-'}</div>
                   ${n.cust_code?`<div style="font-size:11px;color:var(--muted)">${n.cust_code}</div>`:''}
+                  ${creditBar}
                 </td>
                 <td style="text-align:center">${billCount}</td>
                 <td style="text-align:right">฿${fmtNum(n.total_amount)}</td>
