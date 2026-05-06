@@ -491,7 +491,72 @@ async function pushMatchDelta(bill, stmt) {
     if (bill) window.syncManager.markDirty('bills', bill.bill_uuid);
     if (stmt) window.syncManager.markDirty('stmts', stmt.stmt_uuid);
   }
-  return; // no immediate API call
+  
+  // ⭐ Phase 4 (5/5/26) — SP-PENDING auto-apply / revert
+  // เมื่อ SP-PENDING bill ถูก match → call applySPPendingMatch (apply SB payments)
+  // เมื่อ SP-PENDING bill ถูก unmatch → call revertSPPendingUnmatch (revert SB payments)
+  // 
+  // Cash type: apply ทันทีตอน recordSBPayment (skip ที่นี่)
+  // Transfer/Cheque/Card: รอจน match → trigger ที่นี่
+  // 
+  // Idempotent: backend เช็ค billing_payments.reference == bill_uuid → ถ้ามีแล้ว skip
+  if (bill && bill.bill_uuid && String(bill.bill_no || '').startsWith('SP-PENDING-')) {
+    const isMatched = bill.match_status === 'paid' || bill.match_status === 'matched';
+    const isUnmatched = bill.match_status === 'pending' || bill.match_status === '';
+    
+    // Cash bills: apply already done in recordSBPayment → skip
+    if (bill.type === 'Cash') return;
+    
+    try {
+      if (isMatched) {
+        // ── Apply ──
+        const r = await api('applySPPendingMatch', { 
+          bill_uuid: bill.bill_uuid,
+          action_by: (typeof currentUser !== 'undefined' && currentUser?.display_name) || 'Admin'
+        });
+        if (r?.success) {
+          const stats = r.data || {};
+          const sbCount = (stats.sb_updated || []).length;
+          const payCount = stats.payments_inserted || 0;
+          if (payCount > 0) {
+            toast(`✓ Apply SP — SB ${sbCount} ใบ + payments ${payCount} records`, 'success', 4000);
+            // SB sheet เปลี่ยนแล้ว → trigger reload billing notes ถ้าเปิดหน้านั้นอยู่
+            if (typeof window._reloadBillingNotesIfOpen === 'function') {
+              window._reloadBillingNotesIfOpen();
+            }
+          }
+        } else {
+          console.error('[pushMatchDelta] applySPPendingMatch failed:', r?.error);
+          toast('⚠️ Apply SP-PENDING ผิดพลาด: ' + (r?.error || 'unknown'), 'warn', 5000);
+        }
+      } else if (isUnmatched) {
+        // ── Revert ──
+        const r = await api('revertSPPendingUnmatch', { 
+          bill_uuid: bill.bill_uuid,
+          action_by: (typeof currentUser !== 'undefined' && currentUser?.display_name) || 'Admin'
+        });
+        if (r?.success) {
+          const stats = r.data || {};
+          const sbCount = (stats.sb_updated || []).length;
+          const payDel = stats.payments_deleted || 0;
+          if (payDel > 0) {
+            toast(`↩ Revert SP — SB ${sbCount} ใบคืนค้าง (${payDel} payments)`, 'info', 4000);
+            if (typeof window._reloadBillingNotesIfOpen === 'function') {
+              window._reloadBillingNotesIfOpen();
+            }
+          }
+        } else {
+          console.error('[pushMatchDelta] revertSPPendingUnmatch failed:', r?.error);
+          toast('⚠️ Revert SP-PENDING ผิดพลาด: ' + (r?.error || 'unknown'), 'warn', 5000);
+        }
+      }
+    } catch (e) {
+      console.error('[pushMatchDelta SP-PENDING]', e);
+      toast('⚠️ SP-PENDING hook error: ' + e.message, 'warn', 5000);
+    }
+  }
+  
+  return;
 }
 
 // ── Date Helpers (dd/mm/yyyy เสมอ) ──
@@ -6623,6 +6688,15 @@ async function renderMain(el) {
       const st = (b.station || '').trim();
       const ty = (b.type || '').trim();
       if (st !== station || ty !== type) return false;
+      // ⭐ Phase 4 (5/5/26) — SP-PENDING ที่ยัง unmatched ไม่นับ ใน Daily "ยอดโอน/เช็ค/บัตร"
+      //    เพราะเงินยังไม่เข้าจริง (รอ match stmt) — paid_by_sp = JSON allocation (truthy)
+      //    แต่นี่เป็น "ตั้งใจรับชำระ" ยังไม่ใช่ "เงินเข้าจริง"
+      const billNo = String(b.bill_no || '');
+      const isSPPending = billNo.indexOf('SP-PENDING-') === 0;
+      if (isSPPending) {
+        // SP-PENDING: นับเฉพาะเมื่อ match แล้ว (ไม่สนใจ paid_by_sp)
+        return b.match_status === 'paid' || b.match_status === 'matched';
+      }
       // Filter: เฉพาะบิลที่ match แล้ว (matched, paid, paid_by_sp)
       const isMatched = b.match_status === 'paid' || b.paid_by_sp;
       return isMatched;
@@ -19932,6 +20006,22 @@ async function renderBilling(el) {
     loading = false;
     render();
   }
+  
+  // ⭐ Phase 4 (5/5/26) — Expose reload helper สำหรับ pushMatchDelta hook
+  //    เมื่อ SP-PENDING ถูก match/unmatch → SB sheet เปลี่ยน → reload silent (ไม่ set loading=true)
+  window._reloadBillingNotesIfOpen = async function() {
+    // Reload เฉพาะถ้าหน้า billing_notes/debt เปิดอยู่
+    if (typeof currentPage !== 'undefined' && (currentPage === 'debt' || currentPage === 'billing')) {
+      try {
+        await loadNotes();
+        if (activeTab === 'payments') await loadPayments();
+        if (activeTab === 'aging') await loadAging();
+        render();
+      } catch (e) {
+        console.warn('[_reloadBillingNotesIfOpen] failed:', e?.message || e);
+      }
+    }
+  };
 
   // ══════════════════════════════════════════════════════════════
   // MAIN RENDER
@@ -20009,6 +20099,40 @@ async function renderBilling(el) {
     if (activeTab === 'payments') wirePaymentsTab();
   }
 
+  // ⭐ Phase 4 (5/5/26) — Helper: หา SP-PENDING bills ที่ "รอ match" (in-flight) สำหรับ SB ใบหนึ่ง
+  //   = SP-PENDING bill ที่ paid_by_sp.allocations มี billing_uuid ตรง + match_status ยังไม่ใช่ paid/matched
+  //   ใช้ใน list/aging tab เพื่อแสดง pill "⏳ +N รอ match"
+  function getInFlightSP(billingUuid) {
+    if (!billingUuid || typeof billList === 'undefined' || !Array.isArray(billList)) return [];
+    const result = [];
+    for (let i = 0; i < billList.length; i++) {
+      const b = billList[i];
+      const bn = String(b.bill_no || '');
+      if (bn.indexOf('SP-PENDING-') !== 0) continue;
+      // Skip if already applied (matched/paid)
+      const isApplied = b.match_status === 'paid' || b.match_status === 'matched';
+      if (isApplied) continue;
+      // Skip Cash (already applied at recordSBPayment time)
+      if (b.type === 'Cash') continue;
+      if (!b.paid_by_sp) continue;
+      try {
+        const data = typeof b.paid_by_sp === 'string' ? JSON.parse(b.paid_by_sp) : b.paid_by_sp;
+        if (!data || !Array.isArray(data.allocations)) continue;
+        const alloc = data.allocations.find(a => a.billing_uuid === billingUuid);
+        if (alloc) {
+          result.push({
+            bill_uuid: b.bill_uuid,
+            bill_no: bn,
+            type: b.type,
+            amount: Number(alloc.amount) || 0,
+            pay_date: b.pay_date || b.date
+          });
+        }
+      } catch (_) { /* skip malformed JSON */ }
+    }
+    return result;
+  }
+
   // ⭐ Helper (4/5/26): สร้างเฉพาะ rows part — ใช้ใน renderListRowsOnly เพื่อ update โดยไม่แตะ search input
   function renderListRows() {
     const q = listFilter.search.toLowerCase().trim();
@@ -20058,6 +20182,12 @@ async function renderBilling(el) {
             const s = STATUS_INFO[n.status] || { label: n.status, color:'#888', emoji:'?' };
             const overdue = (n.status === 'pending' || n.status === 'partial') && n.due_date && n.due_date < todayISO();
             const billCount = Array.isArray(n.bills_snapshot) ? n.bills_snapshot.length : 0;
+            // ⭐ Phase 4 — SP-PENDING in-flight (รอ match)
+            const inFlight = getInFlightSP(n.billing_uuid);
+            const inFlightAmt = inFlight.reduce((s2, x) => s2 + x.amount, 0);
+            const inFlightPill = inFlight.length > 0 
+              ? `<div style="font-size:10.5px;color:var(--warn);margin-top:2px" title="SP-PENDING รอ match: ${inFlight.map(x=>x.bill_no+' ฿'+fmtNum(x.amount)).join(', ')}">⏳ รอ match: ${inFlight.length} ใบ ฿${fmtNum(inFlightAmt)}</div>`
+              : '';
             return `
               <tr style="border-top:1px solid var(--border);${overdue?'background:rgba(239,68,68,0.06)':''}">
                 <td><strong>${n.billing_no||'-'}</strong></td>
@@ -20069,7 +20199,7 @@ async function renderBilling(el) {
                 </td>
                 <td style="text-align:center">${billCount}</td>
                 <td style="text-align:right">฿${fmtNum(n.total_amount)}</td>
-                <td style="text-align:right;color:${n.paid_amount>0?'#16a34a':'var(--muted)'}">${n.paid_amount>0?'฿'+fmtNum(n.paid_amount):'-'}</td>
+                <td style="text-align:right;color:${n.paid_amount>0?'#16a34a':'var(--muted)'}">${n.paid_amount>0?'฿'+fmtNum(n.paid_amount):'-'}${inFlightPill}</td>
                 <td style="text-align:right;font-weight:600;color:${n.outstanding>0?'#ef4444':'#16a34a'}">${n.outstanding>0?'฿'+fmtNum(n.outstanding):'-'}</td>
                 <td style="text-align:center"><span style="color:${s.color};font-weight:500">${s.emoji} ${s.label}</span></td>
                 <td style="text-align:center;white-space:nowrap">
@@ -21322,6 +21452,9 @@ async function openReceivePaymentModal() {
           </div>
         </div>
         
+        <!-- ⭐ Phase 4 (5/5/26) — Match-first SB Payment Info Box -->
+        <div id="rp-phase4-info" style="display:none;margin:6px 0 10px;padding:8px 12px;border-radius:6px;font-size:.82rem;line-height:1.45;border:1px solid"></div>
+        
         <!-- ยอดบิลที่เลือก + WHT/fee -->
         <div style="border-top:1px solid var(--border);padding-top:10px;margin-top:4px">
           <div style="display:flex;justify-content:space-between;font-size:.9rem;margin-bottom:6px">
@@ -21648,6 +21781,26 @@ function wireReceivePaymentModal(state) {
     $chequeDueRow.style.display = isCheque ? 'block' : 'none';
     $cfRow.style.display = isCard ? 'flex' : 'none';
     $tfRow.style.display = (isCheque || $type.value === 'Transfer') ? 'flex' : 'none';
+    
+    // ⭐ Phase 4 — Match-first info box
+    const $info = document.getElementById('rp-phase4-info');
+    if ($info) {
+      if (isCash) {
+        $info.style.display = 'block';
+        $info.style.background = 'rgba(34,197,94,.08)';
+        $info.style.borderColor = 'var(--success)';
+        $info.style.color = 'var(--fg)';
+        $info.innerHTML = '<strong style="color:var(--success)">✓ Cash</strong> — ระบบจะตัดยอด SB ทันทีหลังบันทึก';
+      } else {
+        $info.style.display = 'block';
+        $info.style.background = 'rgba(245,158,11,.08)';
+        $info.style.borderColor = 'var(--warn)';
+        $info.style.color = 'var(--fg)';
+        const tName = isCheque ? 'Cheque' : (isCard ? 'Card' : 'Transfer');
+        $info.innerHTML = '<strong style="color:var(--warn)">⏳ ' + tName + '</strong> — สร้าง SP-PENDING เพื่อรอ <strong>match กับ statement</strong> ก่อน · ' +
+                          'SB ยังคง <strong>ค้าง</strong> จนกว่าจะ match (ตัดยอดอัตโนมัติ)';
+      }
+    }
     
     // ⭐ Adjust grid columns when Cheque (5 cols visible) vs others (4 cols + 1 hidden = visually 4)
     const $fieldsRow = document.getElementById('rp-payment-fields-row');
@@ -24225,6 +24378,29 @@ function renderData(el) {
         </p>
       </div>
       
+      <!-- ⭐ Phase 4 Migration Section (5/5/26) -->
+      <div class="card mb-3" style="border:1.5px solid var(--accent);background:rgba(91,124,250,.04)">
+        <div class="flex justify-between items-center mb-3">
+          <div>
+            <div class="font-semi" style="color:var(--accent)">🔄 Phase 4 Migration — SP-PENDING (Match-first SB Payment)</div>
+            <div class="text-xs text-muted mt-1">
+              สำหรับ SP-PENDING <strong>เก่า</strong> (สร้างก่อน Phase 4 deploy) ที่ยังเป็น Transfer/Cheque/Card<br>
+              <strong>Revert</strong> SP-PENDING ที่ <strong>unmatched</strong> → คืน SB ค้าง — รับชำระใหม่ตาม Phase 4 flow
+            </div>
+          </div>
+          <div class="flex gap-2">
+            <button class="btn btn-outline btn-sm" id="btn-migrate-phase4-dry" style="border-color:var(--info);color:var(--info)" title="Dry-run: scan + report เท่านั้น ไม่เปลี่ยนข้อมูล">🔍 Scan (Dry-run)</button>
+            <button class="btn btn-sm" id="btn-migrate-phase4-apply" style="background:var(--accent);color:#fff;border:none;font-weight:700" title="Apply: revert SP-PENDING ที่ unmatched">⚡ Apply Migration</button>
+          </div>
+        </div>
+        <p class="text-xs text-dim" style="padding:10px;background:rgba(91,124,250,.08);border-radius:6px;border-left:3px solid var(--accent)">
+          ✅ <strong>Scan-only ก่อน</strong> เสมอ — รายงานก่อน apply เพื่อยืนยัน<br>
+          🔧 Migration จะ <strong>revert</strong> เฉพาะ SP-PENDING <strong>unmatched (Transfer/Cheque/Card)</strong> → SB คืนค้าง + ลบ payments<br>
+          ✅ ไม่แตะ: Cash SP-PENDING (apply แล้ว), SP-PENDING ที่ matched แล้ว (apply แล้ว)<br>
+          ☁️ หลัง apply ต้อง <strong>refresh from cloud</strong> เพื่อ reload SB list (เพราะ backend แก้ตรง Sheet)
+        </p>
+      </div>
+      
       <!-- Meta Reset Section -->
       <div class="card mb-3" style="border:1.5px solid var(--purple);background:rgba(165,134,255,.04)">
         <div class="flex justify-between items-center mb-3">
@@ -25723,6 +25899,144 @@ function renderData(el) {
         if (!confirm(`✓ ยืนยัน Sync ไป paid ทั้งคู่ทุกรายการ?\n\nสำหรับ ${issues.billPaidStmtUnpaid.length + issues.billUnpaidStmtPaid.length} รายการที่ "ฝั่งหนึ่ง paid อีกฝั่ง unpaid" — จะตั้งให้ทั้งสองฝั่ง = paid\n\nสำหรับ ${issues.billPaidStmtMissing.length + issues.stmtPaidNoBills.length} รายการที่ขาด counterpart — ไม่ทำอะไร (ใช้ Unlink แทน)\n\nหลังจากนั้นกด "บันทึก" เพื่อ push ขึ้น cloud`)) return;
         doRepair('sync_paid');
       });
+    });
+    
+    // ── ⭐ Phase 4 Migration (5/5/26) — Revert SP-PENDING unmatched (Transfer/Cheque/Card) ──
+    function fmtMigrateReport(data, isDryRun) {
+      const lines = [];
+      lines.push((isDryRun ? '🔍 SCAN REPORT' : '⚡ MIGRATION REPORT') + ' — Phase 4');
+      lines.push('═══════════════════════════');
+      lines.push('Scanned: ' + (data.scanned || 0) + ' SP-PENDING bills');
+      lines.push('No-op (apply ทันแล้ว / overflow / no allocation): ' + (data.noop || 0));
+      lines.push('');
+      lines.push((isDryRun ? '⏳ Will revert (unmatched + has payments)' : '✅ Reverted') + 
+                 ': ' + (data.reverted || 0));
+      lines.push((isDryRun ? '⏳ Will apply (matched + no payments yet)' : '✅ Applied') + 
+                 ': ' + (data.applied || 0));
+      lines.push('');
+      lines.push((data.errors || 0) > 0 ? '⚠️ Errors: ' + data.errors : '✓ ไม่มี errors');
+      
+      if (Array.isArray(data.details) && data.details.length > 0) {
+        const acts = data.details.filter(d => d.action !== 'noop');
+        if (acts.length > 0) {
+          lines.push('');
+          lines.push('Details (max 10):');
+          acts.slice(0, 10).forEach(d => {
+            const tag = d.action === 'revert' ? '↩' : (d.action === 'apply' ? '⚡' : '·');
+            lines.push('  ' + tag + ' ' + d.bill_no + ' [' + (d.match_status||'-') + ']' + 
+                       (d.error ? ' ❌ ' + d.error : ''));
+          });
+          if (acts.length > 10) lines.push('  ... และอีก ' + (acts.length - 10));
+        }
+      }
+      return lines.join('\n');
+    }
+    
+    document.getElementById('btn-migrate-phase4-dry')?.addEventListener('click', async () => {
+      const btn = document.getElementById('btn-migrate-phase4-dry');
+      const orig = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = '⏳ Scanning...';
+      try {
+        const r = await api('migrateSPPendingPhase4', { dry_run: true });
+        if (!r?.success) {
+          toast('❌ Scan ผิดพลาด: ' + (r?.error || 'unknown'), 'error', 5000);
+          console.error('[migrate dry-run]', r);
+          return;
+        }
+        const report = fmtMigrateReport(r.data || {}, true);
+        console.log(report);
+        alert(report);
+        const totalActions = ((r.data && r.data.reverted) || 0) + ((r.data && r.data.applied) || 0);
+        if (totalActions === 0) {
+          toast('✓ ไม่มี SP-PENDING ที่ต้อง migrate', 'success', 4000);
+        } else {
+          toast('🔍 Scan: ' + totalActions + ' บิลต้อง migrate — กด Apply ถ้าพร้อม', 'info', 5000);
+        }
+      } catch (e) {
+        console.error('[migrate dry-run]', e);
+        toast('❌ Scan error: ' + e.message, 'error', 5000);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = orig;
+      }
+    });
+    
+    document.getElementById('btn-migrate-phase4-apply')?.addEventListener('click', async () => {
+      // Step 1: dry-run ก่อนเพื่อให้ user เห็น scope
+      const btn = document.getElementById('btn-migrate-phase4-apply');
+      const orig = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = '⏳ Scanning...';
+      let scanData;
+      try {
+        const r = await api('migrateSPPendingPhase4', { dry_run: true });
+        if (!r?.success) {
+          toast('❌ Pre-scan ผิดพลาด: ' + (r?.error || 'unknown'), 'error', 5000);
+          btn.disabled = false;
+          btn.textContent = orig;
+          return;
+        }
+        scanData = r.data || {};
+      } catch (e) {
+        toast('❌ Pre-scan error: ' + e.message, 'error', 5000);
+        btn.disabled = false;
+        btn.textContent = orig;
+        return;
+      }
+      
+      const totalActions = (scanData.reverted || 0) + (scanData.applied || 0);
+      if (totalActions === 0) {
+        toast('✓ ไม่มี SP-PENDING ที่ต้อง migrate', 'success', 4000);
+        btn.disabled = false;
+        btn.textContent = orig;
+        return;
+      }
+      
+      // Step 2: Confirm 2x ก่อน apply
+      const summary = fmtMigrateReport(scanData, true);
+      const confirm1 = confirm(
+        summary + '\n\n' +
+        '═══════════════════════════\n' +
+        '⚠️ APPLY MIGRATION?\n\n' +
+        '• Revert: ' + (scanData.reverted || 0) + ' บิล (SB คืนค้าง)\n' +
+        '• Apply: ' + (scanData.applied || 0) + ' บิล (SB ตัดยอด)\n\n' +
+        'การกระทำนี้ <กลับไม่ได้>'
+      );
+      if (!confirm1) {
+        btn.disabled = false;
+        btn.textContent = orig;
+        return;
+      }
+      
+      const confirm2 = prompt('พิมพ์ "MIGRATE" (ตัวพิมพ์ใหญ่) เพื่อยืนยัน:');
+      if (confirm2 !== 'MIGRATE') {
+        toast('ยกเลิก migration', 'info');
+        btn.disabled = false;
+        btn.textContent = orig;
+        return;
+      }
+      
+      // Step 3: Apply
+      btn.textContent = '⏳ Applying...';
+      try {
+        const r = await api('migrateSPPendingPhase4', { dry_run: false });
+        if (!r?.success) {
+          toast('❌ Migration ผิดพลาด: ' + (r?.error || 'unknown'), 'error', 8000);
+          console.error('[migrate apply]', r);
+          return;
+        }
+        const report = fmtMigrateReport(r.data || {}, false);
+        console.log(report);
+        alert(report);
+        toast('✅ Migration เสร็จ — แนะนำกด 🔄 Refresh from Cloud เพื่อ reload', 'success', 6000);
+      } catch (e) {
+        console.error('[migrate apply]', e);
+        toast('❌ Migration error: ' + e.message, 'error', 8000);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = orig;
+      }
     });
     
     // ── ซ่อม Meta UUID Swap (day↔month swap from Apps Script coercion) ──
