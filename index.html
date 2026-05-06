@@ -30649,13 +30649,84 @@ async function renderSpRecon(el) {
   });
   
   document.getElementById('spv2-btn-merge')?.addEventListener('click', () => {
-    if (!confirm(`รวมข้อมูล 3 ไฟล์?\n\n• การชำระเงิน: ${spV2State.rawPayMain.length} SP\n• ตามประเภท: ${spV2State.rawPayType.length} SP\n• ภาษีขาย: ${spV2State.rawTaxSales.length} records\n\n⚠️ จะ reset counter ไหม?`)) return;
-    // Save counter if continuing, else reset
-    const resetCounter = confirm('Reset counter SP (เริ่ม 0001 ใหม่)?\n\nYes = Reset\nNo = ต่อจากของเดิม');
-    if (resetCounter) spV2State.nextCounter = 1;
-    spV2State.mainRows = spV2BuildRows(spV2State.rawPayMain, spV2State.rawPayType, spV2State.rawTaxSales);
+    const existingCount = spV2State.mainRows.length;
+    const existingHeaders = spV2State.mainRows.filter(r => r._is_header).length;
+    
+    // ⭐ Build new rows
+    const newRows = spV2BuildRows(spV2State.rawPayMain, spV2State.rawPayType, spV2State.rawTaxSales);
+    const newHeaders = newRows.filter(r => r._is_header).length;
+    
+    // ⭐ ถ้ามีข้อมูลเดิม → ถามว่าจะรวมหรือทับ
+    if (existingCount > 0) {
+      const action = prompt(
+        `📊 ตอนนี้มีข้อมูลเดิม: ${existingHeaders} SP\n` +
+        `กำลังจะเพิ่ม: ${newHeaders} SP จากไฟล์ใหม่\n\n` +
+        `เลือกวิธี:\n` +
+        `  พิมพ์ "รวม" — เพิ่มข้อมูลใหม่ (เก็บของเดิม)\n` +
+        `  พิมพ์ "ทับ" — ลบเก่า แล้วใส่ใหม่ทับ\n` +
+        `  ว่างหรือ Cancel — ยกเลิก`
+      );
+      
+      if (!action) {
+        toast('ยกเลิก', 'info');
+        return;
+      }
+      
+      if (action.trim() === 'รวม' || action.trim().toLowerCase() === 'append' || action.trim().toLowerCase() === 'merge') {
+        // APPEND: รวมข้อมูลใหม่กับของเดิม — แต่ต้องไม่ duplicate group_id
+        const existingGids = new Set(spV2State.mainRows.filter(r => r._is_header).map(r => r._group_id));
+        const dupes = newRows.filter(r => r._is_header && existingGids.has(r._group_id)).length;
+        
+        if (dupes > 0) {
+          if (!confirm(`พบ ${dupes} SP ที่ซ้ำกัน (มี group_id ตรงกัน)\n\nกด OK = ข้ามตัวที่ซ้ำ (ไม่เพิ่ม)\nกด Cancel = ยกเลิก`)) return;
+        }
+        
+        // Append non-duplicate rows
+        const newGids = new Set(newRows.filter(r => r._is_header).map(r => r._group_id));
+        const accepted = [];
+        let appendedHeaders = 0;
+        for (const r of newRows) {
+          if (existingGids.has(r._group_id)) continue; // skip duplicate
+          accepted.push(r);
+          if (r._is_header) appendedHeaders++;
+        }
+        spV2State.mainRows = spV2State.mainRows.concat(accepted);
+        persistSpV2();
+        toast(`✅ เพิ่ม ${appendedHeaders} SP (รวมเป็น ${existingHeaders + appendedHeaders} SP)`, 'success', 4000);
+        renderSpRecon(el);
+        return;
+      }
+      
+      if (action.trim() === 'ทับ' || action.trim().toLowerCase() === 'replace' || action.trim().toLowerCase() === 'overwrite') {
+        // REPLACE: ลบเก่าแล้วใส่ใหม่ — ถาม counter ด้วย
+        const resetChoice = prompt(
+          `🔢 SP counter (เลขลำดับ SP):\n\n` +
+          `  พิมพ์ "เริ่มใหม่" — เริ่ม 0001 ใหม่\n` +
+          `  พิมพ์ "ต่อ" — ต่อจาก ${spV2State.nextCounter}\n` +
+          `  ว่าง = ต่อจากของเดิม`
+        );
+        if (resetChoice && (resetChoice.trim() === 'เริ่มใหม่' || resetChoice.trim().toLowerCase() === 'reset')) {
+          spV2State.nextCounter = 1;
+          // Re-build with new counter
+          spV2State.mainRows = spV2BuildRows(spV2State.rawPayMain, spV2State.rawPayType, spV2State.rawTaxSales);
+        } else {
+          spV2State.mainRows = newRows;
+        }
+        persistSpV2();
+        toast(`✅ ทับข้อมูลใหม่ — ${spV2State.mainRows.filter(r=>r._is_header).length} SP`, 'success', 4000);
+        renderSpRecon(el);
+        return;
+      }
+      
+      // Unknown response
+      toast('⚠️ ไม่เข้าใจคำตอบ — พิมพ์ "รวม" หรือ "ทับ"', 'warn', 4000);
+      return;
+    }
+    
+    // ⭐ ครั้งแรก — ไม่มีข้อมูลเดิม → ใส่เลย
+    spV2State.mainRows = newRows;
     persistSpV2();
-    toast(`สร้าง Main — ${spV2State.mainRows.length} rows`, 'success');
+    toast(`✅ สร้าง Main — ${newHeaders} SP`, 'success', 4000);
     renderSpRecon(el);
   });
   
