@@ -30158,6 +30158,7 @@ let spV2State = {
   nextCounter: 1,        // SP counter (global, no reset)
   filterVat: 'ALL',      // ALL | Y | N
   filterPaid: 'ALL',     // ALL | paid | unpaid
+  filterMonths: new Set(), // ⭐ multi-select เดือน "YYYY-MM" — empty = ALL
   filterPrefixes: new Set(), // multi-select bill prefixes (SR/SS/SC/OR/OS/JR/JS) — empty = ALL
   view: 'main',          // main | report | sellbills
   groupByCustomer: false, // ← Sell Bills: group by customer
@@ -30340,9 +30341,28 @@ function spV2IsPaid(row) {
   return total > 0;
 }
 
+// Extract YYYY-MM from pay_date (ISO yyyy-mm-dd)
+function spV2GetMonth(row) {
+  const d = String(row.pay_date || '').trim();
+  if (d.length >= 7) return d.substring(0, 7); // 'yyyy-mm'
+  return '';
+}
+
+// Get list of distinct months in current data
+function spV2GetAvailableMonths() {
+  const months = new Set();
+  spV2State.mainRows.forEach(r => {
+    if (r._is_header) {
+      const m = spV2GetMonth(r);
+      if (m) months.add(m);
+    }
+  });
+  return Array.from(months).sort(); // ascending
+}
+
 // Filter rows by current filters
 function spV2FilterRows() {
-  const { filterVat, filterPaid } = spV2State;
+  const { filterVat, filterPaid, filterMonths } = spV2State;
   // First pass: collect group_ids that match
   const groupsMatch = new Set();
   const headerMap = {};
@@ -30356,6 +30376,11 @@ function spV2FilterRows() {
         if (filterPaid === 'paid' && !paid) keep = false;
         if (filterPaid === 'unpaid' && paid) keep = false;
       }
+      // ⭐ Month filter (5/6/26): empty Set = ALL
+      if (filterMonths && filterMonths.size > 0) {
+        const m = spV2GetMonth(r);
+        if (!filterMonths.has(m)) keep = false;
+      }
       if (keep) groupsMatch.add(r._group_id);
     }
   });
@@ -30368,16 +30393,32 @@ function spV2FilterRows() {
 async function renderSpRecon(el) {
   const rows = spV2State.mainRows.length > 0 ? spV2FilterRows() : [];
   
-  // Stats
-  const headers = spV2State.mainRows.filter(r => r._is_header);
-  const vatHeaders = headers.filter(r => r.vat_flag === 'Y');
-  const novatHeaders = headers.filter(r => r.vat_flag === 'N');
-  const paidCount = headers.filter(r => spV2IsPaid(r)).length;
-  const unpaidCount = headers.length - paidCount;
+  // ⭐ Stats — ใช้ filtered headers (ตาม month filter ด้วย)
+  const allHeaders = spV2State.mainRows.filter(r => r._is_header);
+  const filteredHeaders = rows.filter(r => r._is_header);
+  const vatHeaders = filteredHeaders.filter(r => r.vat_flag === 'Y');
+  const novatHeaders = filteredHeaders.filter(r => r.vat_flag === 'N');
+  const paidCount = filteredHeaders.filter(r => spV2IsPaid(r)).length;
+  const unpaidCount = filteredHeaders.length - paidCount;
   const vatTotal = vatHeaders.reduce((s,r) => s + (Number(r.pay_total)||0), 0);
   const novatTotal = novatHeaders.reduce((s,r) => s + (Number(r.pay_total)||0), 0);
+  const grandTotal = vatTotal + novatTotal;
+  const paidTotal = filteredHeaders.filter(r => spV2IsPaid(r))
+                                    .reduce((s,r) => s + (Number(r.pay_total)||0), 0);
+  const unpaidTotal = grandTotal - paidTotal;
   
-  const { filterVat, filterPaid, view } = spV2State;
+  // Available months (auto-detect)
+  const availableMonths = spV2GetAvailableMonths();
+  const TH_MONTHS = ['ม.ค.','ก.พ.','มี.ค.','เม.ย.','พ.ค.','มิ.ย.','ก.ค.','ส.ค.','ก.ย.','ต.ค.','พ.ย.','ธ.ค.'];
+  const monthLabel = (ym) => {
+    const [y, m] = ym.split('-');
+    const mn = Number(m);
+    return TH_MONTHS[mn-1] + ' ' + y;
+  };
+  
+  const { filterVat, filterPaid, filterMonths, view } = spV2State;
+  const filterScope = (filterMonths.size > 0 || filterVat !== 'ALL' || filterPaid !== 'ALL')
+                        ? `(กรอง ${filteredHeaders.length}/${allHeaders.length})` : '';
   
   el.innerHTML = `
     <div class="page-title">📥 ตรวจ SP (ลูกหนี้) — V2</div>
@@ -30418,31 +30459,66 @@ async function renderSpRecon(el) {
     </div>
     
     ${spV2State.mainRows.length > 0 ? `
-      <!-- Stats cards -->
-      <div class="flex gap-2 flex-wrap" style="margin-bottom:12px">
-        <div class="card" style="flex:1;min-width:150px;padding:12px">
-          <div class="text-xs text-dim">SP ทั้งหมด</div>
-          <div style="font-size:1.4rem;font-weight:700">${headers.length}</div>
+      <!-- ⭐ Hero Stats — ใหญ่ ชัด เน้น Total Amount (5/6/26) -->
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin-bottom:14px">
+        <div class="card" style="padding:18px;border-left:4px solid var(--info)">
+          <div style="font-size:.78rem;color:var(--text3);font-weight:600;text-transform:uppercase;letter-spacing:.5px">💰 ยอดรวมทั้งหมด</div>
+          <div style="font-size:2rem;font-weight:800;color:var(--fg);line-height:1.1;margin-top:6px">฿${fmtNum(grandTotal)}</div>
+          <div style="font-size:.85rem;color:var(--text3);margin-top:4px">${filteredHeaders.length} SP ${filterScope}</div>
         </div>
-        <div class="card" style="flex:1;min-width:150px;padding:12px">
-          <div class="text-xs text-dim">VAT</div>
-          <div style="font-size:1.4rem;font-weight:700;color:var(--info)">${vatHeaders.length}</div>
-          <div class="text-xs text-dim">${fmtNum(vatTotal)} บ.</div>
+        <div class="card" style="padding:18px;border-left:4px solid var(--success)">
+          <div style="font-size:.78rem;color:var(--text3);font-weight:600;text-transform:uppercase;letter-spacing:.5px">✅ ชำระแล้ว</div>
+          <div style="font-size:2rem;font-weight:800;color:var(--success);line-height:1.1;margin-top:6px">฿${fmtNum(paidTotal)}</div>
+          <div style="font-size:.85rem;color:var(--text3);margin-top:4px">${paidCount} SP · ${grandTotal>0?Math.round(paidTotal/grandTotal*100):0}%</div>
         </div>
-        <div class="card" style="flex:1;min-width:150px;padding:12px">
-          <div class="text-xs text-dim">NOVAT</div>
-          <div style="font-size:1.4rem;font-weight:700;color:var(--warn)">${novatHeaders.length}</div>
-          <div class="text-xs text-dim">${fmtNum(novatTotal)} บ.</div>
-        </div>
-        <div class="card" style="flex:1;min-width:150px;padding:12px">
-          <div class="text-xs text-dim">Paid</div>
-          <div style="font-size:1.4rem;font-weight:700;color:var(--success)">${paidCount}</div>
-        </div>
-        <div class="card" style="flex:1;min-width:150px;padding:12px">
-          <div class="text-xs text-dim">Unpaid</div>
-          <div style="font-size:1.4rem;font-weight:700;color:var(--danger)">${unpaidCount}</div>
+        <div class="card" style="padding:18px;border-left:4px solid var(--danger)">
+          <div style="font-size:.78rem;color:var(--text3);font-weight:600;text-transform:uppercase;letter-spacing:.5px">❌ ค้างชำระ</div>
+          <div style="font-size:2rem;font-weight:800;color:var(--danger);line-height:1.1;margin-top:6px">฿${fmtNum(unpaidTotal)}</div>
+          <div style="font-size:.85rem;color:var(--text3);margin-top:4px">${unpaidCount} SP · ${grandTotal>0?Math.round(unpaidTotal/grandTotal*100):0}%</div>
         </div>
       </div>
+      
+      <!-- Sub stats VAT/NOVAT split — เล็กกว่า main hero -->
+      <div class="flex gap-2 flex-wrap" style="margin-bottom:14px">
+        <div class="card" style="flex:1;min-width:160px;padding:10px 14px">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <span style="font-size:.78rem;color:var(--info);font-weight:600">VAT (SS/SR/SC)</span>
+            <span style="font-size:1rem;font-weight:700;color:var(--info)">${vatHeaders.length} SP</span>
+          </div>
+          <div style="font-size:1rem;color:var(--fg);margin-top:2px">฿${fmtNum(vatTotal)}</div>
+        </div>
+        <div class="card" style="flex:1;min-width:160px;padding:10px 14px">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <span style="font-size:.78rem;color:var(--warn);font-weight:600">NOVAT (OR/OS/JR/JS)</span>
+            <span style="font-size:1rem;font-weight:700;color:var(--warn)">${novatHeaders.length} SP</span>
+          </div>
+          <div style="font-size:1rem;color:var(--fg);margin-top:2px">฿${fmtNum(novatTotal)}</div>
+        </div>
+      </div>
+      
+      <!-- ⭐ Month filter (5/6/26) -->
+      ${availableMonths.length > 0 ? `
+      <div class="card" style="padding:10px 14px;margin-bottom:12px">
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <span style="font-size:.85rem;font-weight:600;color:var(--text3);min-width:60px">📅 เดือน:</span>
+          <button class="pill spv2-month-all" 
+            style="${filterMonths.size===0?'background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600':''}">ทั้งหมด</button>
+          ${availableMonths.map(ym => {
+            const sel = filterMonths.has(ym);
+            return `<button class="pill spv2-month-btn" data-month="${ym}" 
+              style="${sel?'background:var(--info);color:#fff;border-color:var(--info);font-weight:600':''}">${monthLabel(ym)}</button>`;
+          }).join('')}
+          ${filterMonths.size > 0 ? `
+            <button class="btn btn-ghost btn-sm spv2-month-clear" style="font-size:.75rem;padding:4px 10px;color:var(--danger);margin-left:auto">🗑 ล้าง</button>
+          ` : ''}
+        </div>
+        ${filterMonths.size > 0 ? `
+          <div style="font-size:.75rem;color:var(--info);margin-top:6px">
+            · เลือก ${filterMonths.size} เดือน
+          </div>
+        ` : ''}
+      </div>
+      ` : ''}
       
       <!-- View toggle + filters -->
       <div class="flex gap-2 flex-wrap items-center" style="margin-bottom:12px">
@@ -30643,6 +30719,22 @@ async function renderSpRecon(el) {
       if (spV2State.filterPrefixes.has(p)) spV2State.filterPrefixes.delete(p);
       else spV2State.filterPrefixes.add(p);
     }
+    renderSpRecon(el);
+  }));
+  
+  // ⭐ Month filter wire (5/6/26)
+  el.querySelectorAll('.spv2-month-btn').forEach(b => b.addEventListener('click', () => {
+    const m = b.dataset.month;
+    if (spV2State.filterMonths.has(m)) spV2State.filterMonths.delete(m);
+    else spV2State.filterMonths.add(m);
+    renderSpRecon(el);
+  }));
+  el.querySelectorAll('.spv2-month-all').forEach(b => b.addEventListener('click', () => {
+    spV2State.filterMonths.clear();
+    renderSpRecon(el);
+  }));
+  el.querySelectorAll('.spv2-month-clear').forEach(b => b.addEventListener('click', () => {
+    spV2State.filterMonths.clear();
     renderSpRecon(el);
   }));
   
@@ -31194,16 +31286,6 @@ function spV2RenderSellBillsView() {
   
   html += `
       </tbody>
-      <tfoot style="position:sticky;bottom:0;background:var(--card);z-index:1">
-        <tr style="background:var(--bg2);font-weight:700;border-top:2px solid var(--border)">
-          <td colspan="7" style="padding:8px;text-align:right">รวม:</td>
-          <td style="padding:8px;text-align:right">${fmtNum(totalValue)}</td>
-          <td style="padding:8px;text-align:right">${fmtNum(totalVat)}</td>
-          <td style="padding:8px;text-align:right">${fmtNum(totalNovat)}</td>
-          <td style="padding:8px;text-align:right;color:var(--info)">${fmtNum(totalAll)}</td>
-          <td colspan="3"></td>
-        </tr>
-      </tfoot>
     </table>
   </div>`;
   
