@@ -25596,6 +25596,20 @@ function renderData(el) {
           <button type="button" class="btn btn-sm" id="btn-hm-force" style="background:var(--danger);color:#fff;border:none;font-weight:700" title="Re-migrate ทับของเก่า — ลบ payments เก่า (ref MIGRATION:) แล้วใส่ใหม่">🔄 Re-migrate (force)</button>
         </div>
         <div id="hm-status" style="margin-top:10px;font-size:.85rem;color:var(--muted)"></div>
+        
+        <!-- ⭐ Cleanup orphan payment by ref (5/6/26) -->
+        <div style="margin-top:14px;padding-top:12px;border-top:1px dashed var(--border)">
+          <div style="font-weight:600;font-size:.85rem;margin-bottom:6px;color:var(--warn)">🔧 Cleanup orphan payment by reference</div>
+          <div class="text-xs text-muted" style="margin-bottom:8px;line-height:1.5">
+            ลบ payment records ใน <code>billing_payments</code> ที่ <code>reference</code> ตรงตามที่ระบุ + คืนยอด <code>paid_amount</code> ของ SB ที่กระทบ<br>
+            ใช้สำหรับลบ orphan payment รุ่นเก่าที่ทำให้ตัวเลข double count
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <input type="text" id="hm-orphan-ref" class="input" placeholder="reference (เช่น 5693346e-d202-4f5b-84dd-46cbf2fa3483)" style="flex:1;min-width:280px;font-family:monospace;font-size:.85rem">
+            <button type="button" class="btn btn-sm" id="btn-hm-cleanup-orphan" style="background:var(--warn);color:#000;border:none;font-weight:700">🔧 Cleanup orphan</button>
+          </div>
+          <div id="hm-orphan-status" style="margin-top:8px;font-size:.85rem;color:var(--muted)"></div>
+        </div>
       </div>
       
       <!-- ⭐ Phase 4 Migration Section (5/5/26) -->
@@ -27646,6 +27660,67 @@ function renderData(el) {
           } finally {
             $force.disabled = false;
             $force.textContent = orig;
+          }
+        };
+      }
+      
+      // ⭐ Cleanup orphan payment by reference (5/6/26)
+      const $cleanupOrphan = document.getElementById('btn-hm-cleanup-orphan');
+      const $orphanRef = document.getElementById('hm-orphan-ref');
+      const $orphanStatus = document.getElementById('hm-orphan-status');
+      const setOrphanStatus = (html, color) => {
+        if ($orphanStatus) {
+          $orphanStatus.style.color = color || 'var(--muted)';
+          $orphanStatus.innerHTML = html;
+        }
+      };
+      
+      if ($cleanupOrphan) {
+        $cleanupOrphan.onclick = async () => {
+          const ref = ($orphanRef?.value || '').trim();
+          if (!ref) {
+            toast('⚠️ ใส่ reference ก่อน', 'warn', 3000);
+            return;
+          }
+          
+          // Confirm
+          const c1 = confirm(`🔧 Cleanup orphan payment\n\n` +
+                             `Reference: ${ref}\n\n` +
+                             `จะ:\n` +
+                             `1. ลบ payment rows ทุก row ที่ reference ตรงตามนี้\n` +
+                             `2. คืน paid_amount ของ SBs ที่กระทบ (re-aggregate)\n\n` +
+                             `⚠️ ใช้กับ orphan payment รุ่นเก่าเท่านั้น\n` +
+                             `OK = ดำเนินการ · Cancel = ยกเลิก`);
+          if (!c1) return;
+          
+          $cleanupOrphan.disabled = true;
+          const orig = $cleanupOrphan.textContent;
+          $cleanupOrphan.textContent = '⏳ Cleaning...';
+          setOrphanStatus(`⏳ กำลัง cleanup ref ${ref}...`, 'var(--info)');
+          
+          try {
+            const r = await api('revertSPPendingManual', { reference: ref });
+            if (!r?.success) throw new Error(r?.error || 'API failed');
+            const d = r.data || {};
+            
+            const report = `🔧 CLEANUP ORPHAN — ${ref}\n` +
+                           `═══════════════════════════\n` +
+                           `Payments deleted: ${d.payments_deleted || 0}\n` +
+                           `SBs reverted: ${d.sb_reverted || 0}\n\n` +
+                           (d.details ? `Details:\n${JSON.stringify(d.details, null, 2)}` : '');
+            console.log(report);
+            alert(report);
+            
+            const okMsg = `✅ ลบ ${d.payments_deleted || 0} payments · revert ${d.sb_reverted || 0} SBs — แนะนำกด 🔄 Refresh from Cloud`;
+            setOrphanStatus(okMsg, 'var(--success)');
+            toast(`✅ Cleanup ref ${ref.substring(0, 8)}…`, 'success', 5000);
+          } catch (e) {
+            console.error('[cleanup-orphan]', e);
+            alert('❌ Cleanup error: ' + e.message);
+            setOrphanStatus('❌ ' + e.message, 'var(--danger)');
+          } finally {
+            $cleanupOrphan.disabled = false;
+            $cleanupOrphan.textContent = orig;
           }
         };
       }
