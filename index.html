@@ -18179,7 +18179,9 @@ function closeModal() {
 const _mem = {};
 const IDB_NAME = 'SmartFinanceDB';
 const IDB_STORE = 'data';
-const IDB_LARGE_KEYS = ['sf_billList','sf_statementsByBank','sf_mainSummary','sf_cashCount'];
+const IDB_LARGE_KEYS = ['sf_billList','sf_statementsByBank','sf_mainSummary','sf_cashCount',
+                        // ⭐ 5/6/26 — Monthly Report + PC cache (local-first ตาม Main pattern)
+                        'sf_monthly_front','sf_monthly_invoice','sf_pc_lineitems'];
 
 let _idb = null;
 function openIDB() {
@@ -18234,6 +18236,179 @@ const safeStorage = {
   },
   del(k) { try { localStorage.removeItem(k); } catch { delete _mem[k]; } },
 };
+
+// ════════════════════════════════════════════════════════════════════
+// ⭐ Local-first cache สำหรับ Monthly Report + PC (5/6/26)
+// ════════════════════════════════════════════════════════════════════
+// Pattern เหมือน Main page: load ครั้งแรก → cache ใน IndexedDB → 
+//   ครั้งถัดไป (ทุก session) ใช้ cache ทันที (instant) + background refresh
+// 
+// Storage shape: { rows: [...], updated_at: ISO, year: '2026' }
+// Key per dataset: sf_monthly_front, sf_monthly_invoice, sf_pc_lineitems
+// 
+// API:
+//   loadMonthlyCache(kind)              → memory + IDB → { rows, updated_at, fresh }
+//   refreshMonthlyCache(kind, opts)     → fetch backend → save IDB → return rows
+//   invalidateMonthlyCache(kind)        → clear cache (ใช้ตอน upload file ใหม่)
+//   filterMonthlyRows(rows, year, mons) → client-side filter
+// ════════════════════════════════════════════════════════════════════
+
+const _localCache = { 
+  monthly_front: null,    // { rows, updated_at }
+  monthly_invoice: null, 
+  pc_lineitems: null
+};
+
+const CACHE_KEY_MAP = {
+  monthly_front:   'sf_monthly_front',
+  monthly_invoice: 'sf_monthly_invoice',
+  pc_lineitems:    'sf_pc_lineitems',
+};
+
+const CACHE_API_MAP = {
+  monthly_front:   'getMonthlyFront',
+  monthly_invoice: 'getMonthlyInvoice',
+  pc_lineitems:    'getPcLineitems',
+};
+
+// อายุ cache ที่ยังถือว่า "สด" (ยังไม่ต้อง refresh)
+// Monthly + PC = data ที่นานๆ เปลี่ยน (อัปโหลดครั้งคราว) → 6 ชม
+const CACHE_FRESH_MS = 6 * 60 * 60 * 1000; // 6h
+
+async function loadMonthlyCacheFromIDB(kind) {
+  // 1. Memory cache
+  if (_localCache[kind]) return _localCache[kind];
+  // 2. IDB
+  const k = CACHE_KEY_MAP[kind];
+  if (!k) return null;
+  try {
+    const raw = await idbGet(k);
+    if (!raw) return null;
+    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (!parsed || !Array.isArray(parsed.rows)) return null;
+    _localCache[kind] = parsed;
+    return parsed;
+  } catch (e) {
+    console.warn('[cache] load fail', kind, e?.message);
+    return null;
+  }
+}
+
+async function saveMonthlyCacheToIDB(kind, rows) {
+  const k = CACHE_KEY_MAP[kind];
+  if (!k) return;
+  const obj = { rows: rows || [], updated_at: new Date().toISOString() };
+  _localCache[kind] = obj;
+  try {
+    await idbSet(k, JSON.stringify(obj));
+  } catch (e) {
+    console.warn('[cache] save fail', kind, e?.message);
+  }
+}
+
+async function refreshMonthlyCache(kind, opts) {
+  // Fetch from backend → save IDB
+  const action = CACHE_API_MAP[kind];
+  if (!action) throw new Error('Unknown cache kind: ' + kind);
+  
+  // Pull all years & months — ใช้ filter ใน frontend
+  const params = (kind === 'pc_lineitems')
+    ? { year: '', months: '[]', includeStatuses: JSON.stringify(['pending','submitted','excluded']) }
+    : { years: '[]', months: '[]' }; // empty = all
+  
+  console.log('[cache refresh]', kind, 'fetching...');
+  const t0 = Date.now();
+  const res = await api(action, params);
+  if (!res || res.success === false) {
+    throw new Error(res?.error || 'fetch failed');
+  }
+  const rows = (res.data && res.data.rows) || [];
+  console.log('[cache refresh]', kind, `done — ${rows.length} rows in ${Date.now()-t0}ms`);
+  
+  await saveMonthlyCacheToIDB(kind, rows);
+  return rows;
+}
+
+async function invalidateMonthlyCache(kind) {
+  const k = CACHE_KEY_MAP[kind];
+  if (k) {
+    _localCache[kind] = null;
+    try { await idbSet(k, null); } catch (e) {}
+  }
+}
+
+// Helper: cache age check
+function cacheAgeMs(cache) {
+  if (!cache || !cache.updated_at) return Infinity;
+  return Date.now() - new Date(cache.updated_at).getTime();
+}
+function cacheAgeLabel(cache) {
+  const ms = cacheAgeMs(cache);
+  if (!isFinite(ms)) return 'ยังไม่มี';
+  const sec = Math.round(ms/1000);
+  if (sec < 60)   return sec + ' วินาทีก่อน';
+  const min = Math.round(sec/60);
+  if (min < 60)   return min + ' นาทีก่อน';
+  const hr  = Math.round(min/60);
+  if (hr < 24)    return hr + ' ชม. ก่อน';
+  const d = Math.round(hr/24);
+  return d + ' วันก่อน';
+}
+
+// Filter helpers
+function filterMonthlyRows(rows, yearStr, monthsArr) {
+  if (!Array.isArray(rows)) return [];
+  const y = yearStr ? Number(yearStr) : null;
+  const mSet = (Array.isArray(monthsArr) && monthsArr.length > 0) 
+    ? new Set(monthsArr.map(Number)) 
+    : null;
+  return rows.filter(r => {
+    if (y && Number(r.year) !== y) return false;
+    if (mSet && !mSet.has(Number(r.month))) return false;
+    return true;
+  });
+}
+
+function filterPcRows(rows, yearStr, monthsArr, statuses) {
+  if (!Array.isArray(rows)) return [];
+  const y = yearStr ? Number(yearStr) : null;
+  const mSet = (Array.isArray(monthsArr) && monthsArr.length > 0) 
+    ? new Set(monthsArr.map(Number)) 
+    : null;
+  const statusSet = (Array.isArray(statuses) && statuses.length > 0)
+    ? new Set(statuses)
+    : null;
+  return rows.filter(r => {
+    const st = (r.status || 'pending').toLowerCase();
+    if (statusSet && !statusSet.has(st)) return false;
+    
+    // ⭐ Year/month logic ตาม backend (status-aware):
+    //   submitted → match submit_year/month
+    //   pending/excluded → match original_year/month
+    let matchYear, matchMonth;
+    if (st === 'submitted') {
+      matchYear = Number(r.submit_year);
+      matchMonth = Number(r.submit_month);
+    } else {
+      matchYear = Number(r.original_year);
+      matchMonth = Number(r.original_month);
+    }
+    
+    if (y !== null && matchYear !== y) return false;
+    if (mSet && !mSet.has(matchMonth)) return false;
+    return true;
+  });
+}
+
+// Expose globally
+window._localCache = _localCache;
+window.loadMonthlyCacheFromIDB = loadMonthlyCacheFromIDB;
+window.refreshMonthlyCache = refreshMonthlyCache;
+window.invalidateMonthlyCache = invalidateMonthlyCache;
+window.cacheAgeLabel = cacheAgeLabel;
+window.filterMonthlyRows = filterMonthlyRows;
+window.filterPcRows = filterPcRows;
+window.CACHE_FRESH_MS = CACHE_FRESH_MS;
 
 // ══════════════════════════════════════════════════════════════
 // AUTH
@@ -32005,7 +32180,10 @@ async function renderMonthly(el) {
     // Upload button — open file picker → parse → preview → confirm → save
     document.getElementById('btn-monthly-upload')?.addEventListener('click', () => {
       _monthlyOpenUpload(async () => {
-        // After successful save: reload data
+        // ⭐ 5/6/26 — Upload เปลี่ยน data แล้ว → invalidate cache ทั้ง front + invoice
+        await invalidateMonthlyCache('monthly_front');
+        await invalidateMonthlyCache('monthly_invoice');
+        // After successful save: reload data (force refresh)
         await loadAndRender();
       });
     });
@@ -32046,50 +32224,87 @@ async function renderMonthly(el) {
     
     const fetchKey = `${state.tab}-${state.year}-${state.months.join(',')}`;
     
-    // Loading
-    root.innerHTML = `<div class="card text-center" style="padding:50px;color:var(--text-muted)">
-      <div style="margin-bottom:8px">⏳</div>
-      <div>กำลังโหลด...</div>
-    </div>`;
+    // ⭐ Local-first cache (5/6/26): instant render จาก cache + background refresh
+    const cacheKind = state.tab === 'front' ? 'monthly_front' : 'monthly_invoice';
     
-    try {
-      const action = state.tab === 'front' ? 'getMonthlyFront' : 'getMonthlyInvoice';
-      const res = await api(action, {
-        years:  JSON.stringify([state.year]),
-        months: JSON.stringify(state.months),
-      });
-      
-      if (!res || res.success === false) {
-        root.innerHTML = `<div class="card" style="padding:20px;color:var(--danger)">
-          ❌ ดึงข้อมูลไม่สำเร็จ: ${(res && res.error) || 'unknown'}
-        </div>`;
-        return;
-      }
-      
-      const rows = (res.data && res.data.rows) || [];
-      cachedRows = rows;
+    const renderFromRows = (rows, cacheMeta) => {
+      // Filter ใน frontend
+      const filtered = filterMonthlyRows(rows, state.year, state.months);
+      cachedRows = filtered;
       lastFetchKey = fetchKey;
       
-      // Update summary line
       if (summaryEl) {
         const monthsLabel = state.months.length === 12 ? 'ทั้งปี' :
                             state.months.map(m => MONTHLY_MONTH_LABELS[m-1]).join(', ');
-        summaryEl.textContent = `แสดง: ${monthsLabel} ${state.year} — ${rows.length} แถว`;
+        const ageTxt = cacheMeta ? ' · cache ' + cacheAgeLabel(cacheMeta) : '';
+        summaryEl.innerHTML = `แสดง: ${monthsLabel} ${state.year} — ${filtered.length} แถว${ageTxt}` +
+                              ` <a href="#" id="monthly-refresh-now" style="margin-left:8px;color:var(--accent);text-decoration:none">🔄 ดึงข้อมูลใหม่</a>`;
+        const refreshLink = document.getElementById('monthly-refresh-now');
+        if (refreshLink) refreshLink.onclick = (e) => { 
+          e.preventDefault();
+          refreshNow();
+        };
       }
       
-      if (rows.length === 0) {
+      if (filtered.length === 0) {
         root.innerHTML = `<div class="card text-center" style="padding:50px;color:var(--text-muted)">
           <div style="font-size:1.5rem;margin-bottom:8px">📭</div>
           <div>ยังไม่มีข้อมูลสำหรับช่วงที่เลือก</div>
           <div style="font-size:.75rem;margin-top:6px;color:var(--text-muted)">
-            อัปโหลดไฟล์ raw เพื่อเริ่มต้น (เพิ่มใน Step 3)
+            อัปโหลดไฟล์ raw เพื่อเริ่มต้น (Step 3)
           </div>
         </div>`;
         return;
       }
+      renderGroupedView(root, filtered);
+    };
+    
+    const refreshNow = async () => {
+      root.innerHTML = `<div class="card text-center" style="padding:50px;color:var(--text-muted)">
+        <div style="margin-bottom:8px">⏳</div>
+        <div>กำลังดึงข้อมูลล่าสุด...</div>
+      </div>`;
+      try {
+        const rows = await refreshMonthlyCache(cacheKind);
+        const c = await loadMonthlyCacheFromIDB(cacheKind);
+        renderFromRows(rows, c);
+        toast('🔄 ดึงข้อมูลล่าสุดสำเร็จ — ' + rows.length + ' rows', 'success', 3000);
+      } catch (err) {
+        root.innerHTML = `<div class="card" style="padding:20px;color:var(--danger)">
+          ❌ Refresh ผิดพลาด: ${err.message || err}
+        </div>`;
+      }
+    };
+    
+    try {
+      // 1. Try cache first
+      const cached = await loadMonthlyCacheFromIDB(cacheKind);
+      if (cached && Array.isArray(cached.rows) && cached.rows.length > 0) {
+        // Instant render
+        renderFromRows(cached.rows, cached);
+        // Background refresh ถ้า cache เก่ามาก
+        const ageMs = cacheAgeMs(cached);
+        if (ageMs > CACHE_FRESH_MS) {
+          console.log('[Monthly] cache stale (' + Math.round(ageMs/60000) + 'm), refreshing in background');
+          refreshMonthlyCache(cacheKind).then(rows => {
+            // Re-render only ถ้า user ยังอยู่ tab เดิม
+            const stillCurrent = `${state.tab}-${state.year}-${state.months.join(',')}` === fetchKey;
+            if (stillCurrent) {
+              loadMonthlyCacheFromIDB(cacheKind).then(c => renderFromRows(rows, c));
+            }
+          }).catch(err => console.warn('[Monthly] bg refresh failed:', err.message));
+        }
+        return;
+      }
       
-      // Step 5: Grouped view with filter bar + sub-totals + grand total
-      renderGroupedView(root, rows);
+      // 2. No cache → fetch from backend (first-time only)
+      root.innerHTML = `<div class="card text-center" style="padding:50px;color:var(--text-muted)">
+        <div style="margin-bottom:8px">⏳</div>
+        <div>กำลังโหลดข้อมูลครั้งแรก... (จะ cache ไว้ครั้งถัดไป instant)</div>
+      </div>`;
+      const rows = await refreshMonthlyCache(cacheKind);
+      const c = await loadMonthlyCacheFromIDB(cacheKind);
+      renderFromRows(rows, c);
     } catch(err) {
       console.error('[Monthly] Load failed:', err);
       root.innerHTML = `<div class="card" style="padding:20px;color:var(--danger)">
@@ -33953,6 +34168,8 @@ async function renderPcSales(el) {
     // Upload button — open file picker → parse → preview → save
     document.getElementById('btn-pc-upload')?.addEventListener('click', () => {
       _pcOpenUpload(async () => {
+        // ⭐ 5/6/26 — Upload เปลี่ยน data → invalidate cache
+        await invalidateMonthlyCache('pc_lineitems');
         await loadAndRender();
       });
     });
@@ -34005,72 +34222,36 @@ async function renderPcSales(el) {
     
     const fetchKey = `${state.year}-${state.months.join(',')}-${state.status}`;
     
-    root.innerHTML = `<div class="card text-center" style="padding:50px;color:var(--text-muted)">
-      <div style="margin-bottom:8px">⏳</div>
-      <div>กำลังโหลด...</div>
-    </div>`;
+    // ⭐ Local-first cache (5/6/26): instant render จาก IDB cache + background refresh
     
-    try {
-      const res = await api('getPcLineitems', {
-        year: state.year,
-        months: JSON.stringify(state.months),
-        includeStatuses: JSON.stringify(statusesToFetch),
-      });
-      
-      if (!res || res.success === false) {
-        root.innerHTML = `<div class="card" style="padding:20px;color:var(--danger)">
-          ❌ ดึงข้อมูลไม่สำเร็จ: ${(res && res.error) || 'unknown'}
-        </div>`;
-        return;
-      }
-      
-      let rows = (res.data && res.data.rows) || [];
+    const renderFromAllRows = (allRows, cacheMeta) => {
+      // ── Filter ใน frontend (year/months/status) ──
+      let rows = filterPcRows(allRows, state.year, state.months, statusesToFetch);
       cachedRows = rows;
       lastFetchKey = fetchKey;
       
-      // Apply client-side filters
+      // ── Apply client-side filters (source/station/vatClass/brand) ──
       let filtered = rows.slice();
       
-      // Debug: store raw rows for inspection
       window._pcLastRows = rows;
-      console.log(`[PC] Loaded ${rows.length} rows from API`);
-      if (rows.length > 0) {
-        // Sample first row + station/source distribution
-        const stnDist = {};
-        const srcDist = {};
-        rows.forEach(r => {
-          const stn = r.station || '(empty)';
-          const src = r.source || '(empty)';
-          stnDist[stn] = (stnDist[stn] || 0) + 1;
-          srcDist[src] = (srcDist[src] || 0) + 1;
-        });
-        console.log('[PC] Source distribution:', srcDist);
-        console.log('[PC] Station distribution:', stnDist);
-        console.log('[PC] Sample row:', rows[0]);
-      }
+      console.log(`[PC] Loaded ${rows.length} rows from cache`);
       
-      // Render combined summary card (Front + Invoice รวมกัน — applies to ALL rows, not filtered)
       _renderCombinedSummary(rows);
       
-      // Source filter (within "ยอด PC" tab) — Front/Invoice/All
       const sf = state.sourceFilter || 'all';
       if (sf !== 'all') {
         filtered = filtered.filter(r => (r.source || 'front') === sf);
       }
-      
-      // Station/VAT filters apply only to relevant source
       if (state.station !== 'all') {
         filtered = filtered.filter(r => (r.source || 'front') !== 'front' || r.station === state.station);
       }
       if (state.vatClass !== 'all') {
         filtered = filtered.filter(r => (r.source || 'front') !== 'invoice' || r.vat_class === state.vatClass);
       }
-      
       if (state.brand !== 'all') {
         filtered = filtered.filter(r => r.brand === state.brand);
       }
       
-      // Update summary line
       if (summaryEl) {
         const monthsLabel = state.months.length === 12 ? 'ทั้งปี' :
                             state.months.map(m => PC_MONTH_LABELS[m-1]).join(', ');
@@ -34083,7 +34264,11 @@ async function renderPcSales(el) {
           const stLbl = PC_STATUSES.find(s => s.id === state.status)?.label || state.status;
           filterParts.push(`สถานะ ${stLbl}`);
         }
-        summaryEl.textContent = `${filterParts.join(' · ')} — ${filtered.length} รายการ (โหลด ${rows.length} แถว)`;
+        const ageTxt = cacheMeta ? ' · cache ' + cacheAgeLabel(cacheMeta) : '';
+        summaryEl.innerHTML = `${filterParts.join(' · ')} — ${filtered.length} รายการ (โหลด ${rows.length} แถว)${ageTxt}` +
+                              ` <a href="#" id="pc-refresh-now" style="margin-left:8px;color:var(--accent);text-decoration:none">🔄 ดึงข้อมูลใหม่</a>`;
+        const refreshLink = document.getElementById('pc-refresh-now');
+        if (refreshLink) refreshLink.onclick = (e) => { e.preventDefault(); refreshNow(); };
       }
       
       if (filtered.length === 0) {
@@ -34098,6 +34283,52 @@ async function renderPcSales(el) {
       }
       
       _renderPcPreviewTable(root, filtered);
+    };
+    
+    const refreshNow = async () => {
+      root.innerHTML = `<div class="card text-center" style="padding:50px;color:var(--text-muted)">
+        <div style="margin-bottom:8px">⏳</div>
+        <div>กำลังดึงข้อมูลล่าสุด...</div>
+      </div>`;
+      try {
+        const allRows = await refreshMonthlyCache('pc_lineitems');
+        const c = await loadMonthlyCacheFromIDB('pc_lineitems');
+        renderFromAllRows(allRows, c);
+        toast('🔄 ดึงข้อมูลล่าสุดสำเร็จ — ' + allRows.length + ' rows', 'success', 3000);
+      } catch (err) {
+        root.innerHTML = `<div class="card" style="padding:20px;color:var(--danger)">
+          ❌ Refresh ผิดพลาด: ${err.message || err}
+        </div>`;
+      }
+    };
+    
+    try {
+      // 1. Try cache first
+      const cached = await loadMonthlyCacheFromIDB('pc_lineitems');
+      if (cached && Array.isArray(cached.rows) && cached.rows.length > 0) {
+        renderFromAllRows(cached.rows, cached);
+        // Background refresh ถ้า cache เก่า
+        const ageMs = cacheAgeMs(cached);
+        if (ageMs > CACHE_FRESH_MS) {
+          console.log('[PC] cache stale, refreshing in background');
+          refreshMonthlyCache('pc_lineitems').then(allRows => {
+            const stillCurrent = `${state.year}-${state.months.join(',')}-${state.status}` === fetchKey;
+            if (stillCurrent) {
+              loadMonthlyCacheFromIDB('pc_lineitems').then(c => renderFromAllRows(allRows, c));
+            }
+          }).catch(err => console.warn('[PC] bg refresh failed:', err.message));
+        }
+        return;
+      }
+      
+      // 2. No cache → fetch from backend (first-time)
+      root.innerHTML = `<div class="card text-center" style="padding:50px;color:var(--text-muted)">
+        <div style="margin-bottom:8px">⏳</div>
+        <div>กำลังโหลดข้อมูลครั้งแรก... (จะ cache ไว้ครั้งถัดไป instant)</div>
+      </div>`;
+      const allRows = await refreshMonthlyCache('pc_lineitems');
+      const c = await loadMonthlyCacheFromIDB('pc_lineitems');
+      renderFromAllRows(allRows, c);
     } catch(err) {
       console.error('[PC] Load failed:', err);
       root.innerHTML = `<div class="card" style="padding:20px;color:var(--danger)">
@@ -34902,6 +35133,8 @@ async function renderPcSales(el) {
           if (r.success !== false) {
             toast(`✅ เอาออก ${(r.data.removed || uuidsToRemove.length).toLocaleString()} รายการ`, 'success');
             closeModal();
+            // ⭐ 5/6/26 — remove from submission → invalidate cache
+            try { await invalidateMonthlyCache('pc_lineitems'); } catch(_){}
             await loadAndRender();
           } else {
             toast(`❌ Error: ${r.error}`, 'error');
@@ -35113,6 +35346,8 @@ async function renderPcSales(el) {
       const res = await api('deletePcSubmission', { submission_id: subId });
       if (res.success !== false) {
         toast(`✅ ลบ Sell out · คืน pending ${(res.data.reset_lineitems || 0).toLocaleString()} รายการ`, 'success');
+        // ⭐ 5/6/26 — delete submission → invalidate cache
+        try { await invalidateMonthlyCache('pc_lineitems'); } catch(_){}
         await loadAndRender();
       } else {
         toast(`❌ ${res.error}`, 'error');
@@ -35853,6 +36088,8 @@ async function renderPcSales(el) {
       }
       
       selectedUuids.clear();
+      // ⭐ 5/6/26 — submission เปลี่ยน status ของ lineitems → invalidate cache
+      try { await invalidateMonthlyCache('pc_lineitems'); } catch(_){}
       await loadAndRender();
       return;
     }
@@ -35871,6 +36108,8 @@ async function renderPcSales(el) {
         const updated = (res.data && res.data.updated) || uuids.length;
         toast(`✅ อัปเดตสำเร็จ ${updated.toLocaleString()} รายการ → ${stLabel}`, 'success');
         selectedUuids.clear();
+        // ⭐ 5/6/26 — status update → invalidate cache
+        try { await invalidateMonthlyCache('pc_lineitems'); } catch(_){}
         await loadAndRender();
       } else {
         toast(`❌ Error: ${(res && res.error) || 'unknown'}`, 'error');
