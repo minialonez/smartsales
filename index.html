@@ -27347,9 +27347,9 @@ function renderData(el) {
         return lines.join('\n');
       };
       
-      // Batched call (50 SBs per batch — avoid timeout)
+      // Batched call (smaller batch to avoid Apps Script timeout)
       const callBulkMigrate = async (data, dryRun) => {
-        const BATCH = 50;
+        const BATCH = 20;  // ⭐ ลดจาก 50 → 20 — แต่ละ batch ต้องอ่าน sheet ใหม่
         const aggregated = {
           input_groups: 0, sb_matched: 0, sb_not_found: 0, 
           sb_skipped_already_paid: 0, sb_updated: 0, 
@@ -27357,12 +27357,32 @@ function renderData(el) {
         };
         for (let i = 0; i < data.length; i += BATCH) {
           const batch = data.slice(i, i + BATCH);
-          setStatus(`⏳ ${dryRun ? 'Scanning' : 'Migrating'}: ${i+batch.length}/${data.length} (${Math.round((i+batch.length)/data.length*100)}%)`, 'var(--info)');
-          const r = await api('bulkMigrateHistoricPayments', {
-            payload: JSON.stringify(batch),
-            dry_run: dryRun,
-          });
-          if (!r?.success) throw new Error(r?.error || 'API failed');
+          const pct = Math.round((i+batch.length)/data.length*100);
+          setStatus(`⏳ ${dryRun ? 'Scanning' : 'Migrating'}: ${i+batch.length}/${data.length} (${pct}%) · batch ${Math.floor(i/BATCH)+1}/${Math.ceil(data.length/BATCH)}`, 'var(--info)');
+          
+          // ⭐ Retry logic — max 2 retries per batch
+          let r = null;
+          let attempts = 0;
+          while (attempts < 3) {
+            attempts++;
+            try {
+              r = await Promise.race([
+                api('bulkMigrateHistoricPayments', {
+                  payload: JSON.stringify(batch),
+                  dry_run: dryRun,
+                }),
+                new Promise((_, rej) => setTimeout(() => rej(new Error('Client timeout 90s')), 90000))
+              ]);
+              break;
+            } catch (err) {
+              console.warn(`[bulk-migrate] batch ${i} attempt ${attempts} failed:`, err.message);
+              if (attempts >= 3) throw err;
+              setStatus(`⚠️ Retry ${attempts}/3 · batch ${i}-${i+batch.length}...`, 'var(--warn)');
+              await new Promise(res => setTimeout(res, 2000));  // backoff 2s
+            }
+          }
+          
+          if (!r?.success) throw new Error(r?.error || 'API failed at batch ' + i);
           const d = r.data || {};
           aggregated.input_groups += d.input_groups || 0;
           aggregated.sb_matched += d.sb_matched || 0;
