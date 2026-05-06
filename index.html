@@ -25496,6 +25496,23 @@ function renderData(el) {
         </p>
       </div>
       
+      <!-- ⭐ Bulk Historic Payment Migration (5/6/26) -->
+      <div class="card mb-3" style="border:1.5px solid var(--purple);background:rgba(168,85,247,.04)">
+        <div class="font-semi mb-2" style="color:var(--purple)">📥 Bulk Historic Payment Migration</div>
+        <div class="text-xs text-muted" style="line-height:1.6">
+          Import ข้อมูลตัดจ่ายย้อนหลังจากไฟล์ JSON (สำหรับ migrate ข้อมูล Smart software เก่า)<br>
+          → Update <strong>billing_notes</strong>: paid_amount + outstanding + status<br>
+          → Insert <strong>billing_payments</strong>: 1 row ต่อ SP/method (audit trail)<br>
+          🛡 <strong>Safe:</strong> ข้าม SB ที่มี paid_amount > 0 (ป้องกัน double migration)
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;margin-top:10px;flex-wrap:wrap">
+          <input type="file" id="hm-file" accept=".json" style="flex:1;min-width:240px;padding:6px;border:1px solid var(--border);border-radius:6px">
+          <button type="button" class="btn btn-outline btn-sm" id="btn-hm-dry" style="border-color:var(--info);color:var(--info)">🔍 Scan (Dry-run)</button>
+          <button type="button" class="btn btn-sm" id="btn-hm-apply" style="background:var(--purple);color:#fff;border:none;font-weight:700">⚡ Apply Migration</button>
+        </div>
+        <div id="hm-status" style="margin-top:10px;font-size:.85rem;color:var(--muted)"></div>
+      </div>
+      
       <!-- ⭐ Phase 4 Migration Section (5/5/26) -->
       <div class="card mb-3" style="border:1.5px solid var(--accent);background:rgba(91,124,250,.04)">
         <div class="flex justify-between items-center mb-3">
@@ -27245,6 +27262,209 @@ function renderData(el) {
       };
     }
     console.log('[backfill wire]', !!$btnBackfill);
+    
+    // ⭐ Bulk Historic Payment Migration (5/6/26)
+    (function wireHistoricMigration() {
+      const $file = document.getElementById('hm-file');
+      const $dry = document.getElementById('btn-hm-dry');
+      const $apply = document.getElementById('btn-hm-apply');
+      const $status = document.getElementById('hm-status');
+      let loadedData = null;
+      
+      const setStatus = (html, color) => {
+        if ($status) {
+          $status.style.color = color || 'var(--muted)';
+          $status.innerHTML = html;
+        }
+      };
+      
+      // File parse
+      if ($file) {
+        $file.onchange = async (e) => {
+          const f = e.target.files[0];
+          if (!f) { loadedData = null; return; }
+          try {
+            const text = await f.text();
+            const data = JSON.parse(text);
+            if (!Array.isArray(data)) {
+              setStatus('❌ ไฟล์ต้องเป็น JSON array', 'var(--danger)');
+              loadedData = null;
+              return;
+            }
+            // Validate shape
+            const sample = data[0];
+            if (!sample || !sample.cust_code || !sample.cycle_year || !sample.cycle_month || sample.paid_amount === undefined) {
+              setStatus('❌ Format ไม่ถูกต้อง — ต้องมี cust_code, cycle_year, cycle_month, paid_amount', 'var(--danger)');
+              loadedData = null;
+              return;
+            }
+            loadedData = data;
+            const totalPaid = data.reduce((s, d) => s + (Number(d.paid_amount) || 0), 0);
+            setStatus(`✅ โหลดแล้ว: <strong>${data.length}</strong> SBs · รวม <strong>฿${data.reduce((s, d) => s + (Number(d.paid_amount) || 0), 0).toLocaleString('en', {minimumFractionDigits:2})}</strong>`, 'var(--success)');
+          } catch (err) {
+            setStatus('❌ Parse error: ' + err.message, 'var(--danger)');
+            loadedData = null;
+          }
+        };
+      }
+      
+      const fmtReport = (data, isDryRun) => {
+        const lines = [];
+        lines.push((isDryRun ? '🔍 SCAN REPORT' : '⚡ MIGRATION REPORT') + ' — Bulk Historic Payments');
+        lines.push('═══════════════════════════');
+        lines.push('Input groups: ' + (data.input_groups || 0));
+        lines.push('SB matched: ' + (data.sb_matched || 0));
+        lines.push('SB not found: ' + (data.sb_not_found || 0));
+        lines.push('SB skipped (already paid): ' + (data.sb_skipped_already_paid || 0));
+        lines.push('');
+        lines.push((isDryRun ? '⏳ Will update' : '✅ Updated') + ' SBs: ' + (data.sb_updated || 0));
+        lines.push((isDryRun ? '⏳ Will insert' : '✅ Inserted') + ' payments: ' + (data.payments_inserted || 0));
+        lines.push('');
+        if ((data.errors || []).length > 0) {
+          lines.push('⚠️ Errors: ' + data.errors.length);
+          data.errors.slice(0, 5).forEach(e => lines.push('  • ' + JSON.stringify(e).slice(0, 100)));
+        } else {
+          lines.push('✓ ไม่มี errors');
+        }
+        if (Array.isArray(data.details) && data.details.length > 0) {
+          const notFounds = data.details.filter(d => d.action === 'not_found');
+          const skips = data.details.filter(d => d.action === 'skip_already_paid');
+          if (notFounds.length > 0) {
+            lines.push('');
+            lines.push('Not found (max 5):');
+            notFounds.slice(0, 5).forEach(d => 
+              lines.push(`  • ${d.cust_code} ${d.cycle_year}-${String(d.cycle_month).padStart(2,'0')} · ฿${(d.paid_amount||0).toLocaleString()}`)
+            );
+          }
+          if (skips.length > 0) {
+            lines.push('');
+            lines.push('Skipped — already paid (max 5):');
+            skips.slice(0, 5).forEach(d => 
+              lines.push(`  • ${d.cust_code} ${d.cycle_year}-${String(d.cycle_month).padStart(2,'0')} · existing=฿${(d.existing_paid||0).toLocaleString()}`)
+            );
+          }
+        }
+        return lines.join('\n');
+      };
+      
+      // Batched call (50 SBs per batch — avoid timeout)
+      const callBulkMigrate = async (data, dryRun) => {
+        const BATCH = 50;
+        const aggregated = {
+          input_groups: 0, sb_matched: 0, sb_not_found: 0, 
+          sb_skipped_already_paid: 0, sb_updated: 0, 
+          payments_inserted: 0, errors: [], details: []
+        };
+        for (let i = 0; i < data.length; i += BATCH) {
+          const batch = data.slice(i, i + BATCH);
+          setStatus(`⏳ ${dryRun ? 'Scanning' : 'Migrating'}: ${i+batch.length}/${data.length} (${Math.round((i+batch.length)/data.length*100)}%)`, 'var(--info)');
+          const r = await api('bulkMigrateHistoricPayments', {
+            payload: JSON.stringify(batch),
+            dry_run: dryRun,
+          });
+          if (!r?.success) throw new Error(r?.error || 'API failed');
+          const d = r.data || {};
+          aggregated.input_groups += d.input_groups || 0;
+          aggregated.sb_matched += d.sb_matched || 0;
+          aggregated.sb_not_found += d.sb_not_found || 0;
+          aggregated.sb_skipped_already_paid += d.sb_skipped_already_paid || 0;
+          aggregated.sb_updated += d.sb_updated || 0;
+          aggregated.payments_inserted += d.payments_inserted || 0;
+          if (Array.isArray(d.errors)) aggregated.errors.push(...d.errors);
+          if (Array.isArray(d.details)) aggregated.details.push(...d.details);
+        }
+        return aggregated;
+      };
+      
+      if ($dry) {
+        $dry.onclick = async () => {
+          if (!loadedData) {
+            toast('⚠️ เลือกไฟล์ JSON ก่อน', 'warn', 3000);
+            return;
+          }
+          $dry.disabled = true;
+          const orig = $dry.textContent;
+          $dry.textContent = '⏳ Scanning...';
+          try {
+            const data = await callBulkMigrate(loadedData, true);
+            const report = fmtReport(data, true);
+            console.log(report);
+            alert(report);
+            setStatus(`🔍 Scan: matched ${data.sb_matched}, will update ${data.sb_updated}, insert ${data.payments_inserted} payments`, 'var(--info)');
+          } catch (e) {
+            console.error('[bulk-migrate dry]', e);
+            toast('❌ Scan error: ' + e.message, 'error', 5000);
+            setStatus('❌ ' + e.message, 'var(--danger)');
+          } finally {
+            $dry.disabled = false;
+            $dry.textContent = orig;
+          }
+        };
+      }
+      
+      if ($apply) {
+        $apply.onclick = async () => {
+          if (!loadedData) {
+            toast('⚠️ เลือกไฟล์ JSON ก่อน', 'warn', 3000);
+            return;
+          }
+          
+          // Pre-scan first
+          $apply.disabled = true;
+          const orig = $apply.textContent;
+          $apply.textContent = '⏳ Pre-scanning...';
+          let scanData;
+          try {
+            scanData = await callBulkMigrate(loadedData, true);
+          } catch (e) {
+            toast('❌ Pre-scan error: ' + e.message, 'error', 5000);
+            $apply.disabled = false;
+            $apply.textContent = orig;
+            return;
+          }
+          
+          if ((scanData.sb_updated || 0) === 0) {
+            alert('ℹ️ ไม่มี SB ที่ต้อง update\n\n' + fmtReport(scanData, true));
+            $apply.disabled = false;
+            $apply.textContent = orig;
+            return;
+          }
+          
+          // Confirm
+          const summary = fmtReport(scanData, true);
+          const c1 = confirm(summary + '\n\n═══════════════════════════\n⚠️ APPLY MIGRATION?\n\n' +
+                             `จะ update ${scanData.sb_updated} SBs + insert ${scanData.payments_inserted} payments\n` +
+                             `การกระทำนี้ <กลับไม่ได้ง่าย> (ต้อง manual revert)`);
+          if (!c1) { $apply.disabled = false; $apply.textContent = orig; return; }
+          
+          const c2 = prompt('พิมพ์ "MIGRATE" (ตัวพิมพ์ใหญ่) เพื่อยืนยัน:');
+          if (c2 !== 'MIGRATE') {
+            toast('ยกเลิก migration', 'info');
+            $apply.disabled = false;
+            $apply.textContent = orig;
+            return;
+          }
+          
+          // Apply
+          $apply.textContent = '⏳ Applying...';
+          try {
+            const result = await callBulkMigrate(loadedData, false);
+            const report = fmtReport(result, false);
+            console.log(report);
+            alert(report);
+            setStatus(`✅ Migration เสร็จ — updated ${result.sb_updated} SBs, inserted ${result.payments_inserted} payments. แนะนำกด 🔄 Refresh from Cloud`, 'var(--success)');
+            toast('✅ Migration เสร็จ ' + result.sb_updated + ' SBs', 'success', 6000);
+          } catch (e) {
+            console.error('[bulk-migrate apply]', e);
+            alert('❌ Migration error: ' + e.message);
+            setStatus('❌ ' + e.message, 'var(--danger)');
+          } finally {
+            $apply.disabled = false;
+            $apply.textContent = orig;
+          }
+        };
+      }
+    })();
     
     // ⭐ Company Info (5/6/26) — load + save
     (function wireCompanyInfo() {
