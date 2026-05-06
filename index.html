@@ -30749,12 +30749,12 @@ function _monthlyClassifyVAT(prefix) {
 }
 
 // Display label for VAT class (internal value stays 'VAT'/'NOVAT' — only UI label changes)
-//   VAT   → ใบสั่งขาย (sale order, no VAT included in price)
-//   NOVAT → ใบกำกับภาษี (tax invoice, VAT included)
-// NOTE: Naming follows business domain — confusing at first glance but matches user's terminology.
+//   VAT   (SR/SS/SC)     → ใบกำกับภาษี (tax invoice — มี VAT)
+//   NOVAT (OR/OS/JR/JS)  → ใบสั่งขาย   (sale order — ไม่มี VAT)
+// FIXED 5/6/26 — เดิม label สลับกัน
 function _monthlyVatClassLabel(cls) {
-  if (cls === 'VAT')   return 'ใบสั่งขาย';
-  if (cls === 'NOVAT') return 'ใบกำกับภาษี';
+  if (cls === 'VAT')   return 'ใบกำกับภาษี';
+  if (cls === 'NOVAT') return 'ใบสั่งขาย';
   return cls || '';
 }
 
@@ -32871,8 +32871,9 @@ function _pcParseFrontRaw(rows) {
 
 // ────────────────────────────────────────────────────────────────
 // Invoice bill_prefix → vat_class mapping (per Phase 1B)
-//   VAT (ใบสั่งขาย):     SR, SS, SC
-//   NOVAT (ใบกำกับภาษี): OR, OS, JR, JS
+//   VAT   (SR/SS/SC)     → ใบกำกับภาษี (tax invoice — มี VAT)
+//   NOVAT (OR/OS/JR/JS)  → ใบสั่งขาย   (sale order — ไม่มี VAT)
+// FIXED 5/6/26 — comment + labels เคยสลับ
 // ────────────────────────────────────────────────────────────────
 const PC_INVOICE_VAT_PREFIXES   = ['SR', 'SS', 'SC'];
 const PC_INVOICE_NOVAT_PREFIXES = ['OR', 'OS', 'JR', 'JS'];
@@ -33300,7 +33301,7 @@ async function _pcShowPreviewModal(filename, sheetName, source, records, groups,
       prefixTotals[p].total += Number(r.total) || 0;
     });
     
-    const vatLabel = (v) => v === 'VAT' ? 'ใบสั่งขาย' : v === 'NOVAT' ? 'ใบกำกับภาษี' : v;
+    const vatLabel = (v) => v === 'VAT' ? 'ใบกำกับภาษี' : v === 'NOVAT' ? 'ใบสั่งขาย' : v;
     const vatColor = (v) => v === 'VAT' ? 'var(--warn)' : v === 'NOVAT' ? 'var(--purple)' : 'var(--text2)';
     
     const vatRowsHtml = ['VAT', 'NOVAT'].map(v => {
@@ -33777,8 +33778,8 @@ async function renderPcSales(el) {
               return `<button data-vatclass="all" style="${allBtnStyle};padding:4px 10px;font-size:.74rem;border-radius:20px;cursor:pointer;font-weight:${isAllActive?600:500};transition:all .2s">ทั้งหมด</button>`;
             })()}
             ${[
-              { id: 'VAT',   label: 'ใบสั่งขาย',    color: 'var(--warn)' },
-              { id: 'NOVAT', label: 'ใบกำกับภาษี', color: 'var(--purple)' },
+              { id: 'VAT',   label: 'ใบกำกับภาษี', color: 'var(--warn)' },
+              { id: 'NOVAT', label: 'ใบสั่งขาย',    color: 'var(--purple)' },
             ].map(v => {
               const isMe = state.vatClass === v.id;
               const isAll = state.vatClass === 'all';
@@ -34076,7 +34077,7 @@ async function renderPcSales(el) {
         const sfLabel = sf === 'all' ? 'ทั้งหมด' : (sf === 'invoice' ? 'Invoice' : 'Front');
         const filterParts = [`${sfLabel} · ${monthsLabel} ${state.year}`];
         if (state.station !== 'all') filterParts.push(`สถานี ${state.station}`);
-        if (state.vatClass !== 'all') filterParts.push(state.vatClass === 'VAT' ? 'ใบสั่งขาย' : 'ใบกำกับภาษี');
+        if (state.vatClass !== 'all') filterParts.push(state.vatClass === 'VAT' ? 'ใบกำกับภาษี' : 'ใบสั่งขาย');
         if (state.brand !== 'all') filterParts.push(`แบรนด์ ${state.brand}`);
         if (state.status !== 'all') {
           const stLbl = PC_STATUSES.find(s => s.id === state.status)?.label || state.status;
@@ -34417,7 +34418,7 @@ async function renderPcSales(el) {
         isInvoiceRow ? '🧾 Invoice' : '📦 Front',
         r.bill_no || '',
         isInvoiceRow ? (r.bill_prefix || '') : (r.station || ''),
-        isInvoiceRow ? (r.vat_class === 'VAT' ? 'ใบสั่งขาย' : (r.vat_class === 'NOVAT' ? 'ใบกำกับภาษี' : '')) : '',
+        isInvoiceRow ? (r.vat_class === 'VAT' ? 'ใบกำกับภาษี' : (r.vat_class === 'NOVAT' ? 'ใบสั่งขาย' : '')) : '',
         r.product_code || '',
         r.product_name || '',
         r.brand || '',
@@ -34976,7 +34977,7 @@ async function renderPcSales(el) {
           r.original_date || '',
           r.bill_no || '',
           r.bill_prefix || '',
-          r.vat_class === 'VAT' ? 'ใบสั่งขาย' : (r.vat_class === 'NOVAT' ? 'ใบกำกับภาษี' : ''),
+          r.vat_class === 'VAT' ? 'ใบกำกับภาษี' : (r.vat_class === 'NOVAT' ? 'ใบสั่งขาย' : ''),
           r.station || '',
           r.product_code || '',
           r.product_name || '',
