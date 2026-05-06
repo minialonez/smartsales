@@ -5728,28 +5728,37 @@ function transformBill(billNo, amount, customer, date) {
   let station = '', type = '', stationOptions = null;
   let dueDate = '';
 
+  // ⭐ Type defaults — SR/OR = ขายเครดิต → 'Unknown' (รอ user เลือกตอนรับชำระ)
+  //    SS/OS = เงินสด → 'Cash' (auto-marked paid ทันที, ไม่ต้อง stmt)
+  //    SC/JS/JR = ใบลดหนี้ → 'Refund'
+  //    SP = ตัดชำระ → '' (ให้ user เลือกเอง)
   if (no.startsWith('SC')) {
     station = 'Invoice Credit';
     type = 'Refund';
     stationOptions = ['Invoice', 'Invoice Credit']; // SC เลือกได้ 2 อย่าง
   } else if (no.startsWith('SR')) {
     station = 'Invoice Credit';
-    type = 'Unknown';
-    // Auto Due Date = วันที่ 20 เดือนถัดไป
+    type = 'Unknown';  // ⭐ เครดิต — รอ user เลือก type ตอนรับชำระ
     dueDate = calcNextMonth20(date);
   } else if (no.startsWith('OR')) {
     station = 'Order Credit';
-    type = 'Unknown';
+    type = 'Unknown';  // ⭐ เครดิต — รอ user เลือก type ตอนรับชำระ
     dueDate = calcNextMonth20(date);
   } else if (no.startsWith('SS')) {
     station = 'Invoice';
-    type = ''; // ให้กรอกเอง
+    type = 'Cash';  // เงินสดทันที
   } else if (no.startsWith('OS')) {
     station = 'Order';
-    type = '';
+    type = 'Cash';  // เงินสดทันที
+  } else if (no.startsWith('JS')) {
+    station = 'Order';
+    type = 'Refund';  // ใบลดหนี้ของ OS
+  } else if (no.startsWith('JR')) {
+    station = 'Order Credit';
+    type = 'Refund';  // ใบลดหนี้ของ OR
   } else if (no.startsWith('SP')) {
     station = 'Payment';
-    type = '';
+    type = '';  // ตัดชำระ — user เลือกเอง
   } else {
     return null;
   }
@@ -5838,6 +5847,10 @@ function quickUnmatchBill(b) {
   
   if (!confirm(`ยกเลิก match บิล ${b.bill_no||'(ไม่มีเลข)'}?\n\n• Bill → pending, ล้าง confirmation/pay_date\n${stmtRef?`• Statement (${bank} · ref ${stmtRef}) → unmatched`:''}`)) return;
   
+  // ⭐ Diagnostic logging — track unmatch flow เพื่อ debug desync (bill ไม่ unmatch แต่ stmt unmatch)
+  console.group(`[unmatch] bill_no=${b.bill_no || '(none)'} uuid=${b.bill_uuid || '(none)'}`);
+  console.log('Before:', { match_status: b.match_status, confirmation: b.confirmation, pay_date: b.pay_date, matched_stmt_ref: b.matched_stmt_ref, matched_stmt_uuid: b.matched_stmt_uuid });
+  
   // 1) หา statement ที่ผูกอยู่ → unmatch
   let stmtCleared = false;
   let unmatchedStmt = null;  // ⭐ hoist out for delta push
@@ -5876,6 +5889,13 @@ function quickUnmatchBill(b) {
   try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(_){}
   persistMainState();
   invalidateBillsCache();
+  
+  // ⭐ Diagnostic — verify state mutation succeeded before push
+  console.log('After:', { match_status: b.match_status, confirmation: b.confirmation, pay_date: b.pay_date, matched_stmt_ref: b.matched_stmt_ref });
+  console.log('Stmt unmatched:', unmatchedStmt ? { uuid: unmatchedStmt.stmt_uuid, ref: unmatchedStmt.ref_no, status: unmatchedStmt.match_status } : 'none');
+  console.log('→ markDirty bills:', b.bill_uuid, '| stmts:', unmatchedStmt?.stmt_uuid || 'none');
+  console.log('⚠️ ต้องกดปุ่ม "บันทึก" เพื่อ push ขึ้น Sheet — auto-push DISABLED');
+  console.groupEnd();
   
   // ⭐ Delta push: push bill + stmt ที่เพิ่ง unmatch (fire-and-forget)
   pushMatchDelta(b, unmatchedStmt);
