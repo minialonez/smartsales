@@ -611,13 +611,6 @@ const TOISODATE_CACHE_LIMIT = 5000; // hard cap to prevent memory bloat
 
 // ⭐ Debounced stmts persist — ลด JSON.stringify(8000+ rows) ทุก match/unmatch
 let _stmtsPersistTimer = null;
-function persistStmtsDebounced() {
-  if (_stmtsPersistTimer) clearTimeout(_stmtsPersistTimer);
-  _stmtsPersistTimer = setTimeout(() => {
-    _stmtsPersistTimer = null;
-    try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(_) {}
-  }, 500);
-}
 function flushStmtsPersist() {
   if (_stmtsPersistTimer) {
     clearTimeout(_stmtsPersistTimer);
@@ -835,12 +828,6 @@ function sortToggleBtn(pageKey) {
 }
 
 // Generic date sorter (ASC)
-function sortByDateAsc(arr, getDate) {
-  return arr.sort((a, b) => (parseThaiDate(getDate(a)) || 0) - (parseThaiDate(getDate(b)) || 0));
-}
-function sortByDateDesc(arr, getDate) {
-  return arr.sort((a, b) => (parseThaiDate(getDate(b)) || 0) - (parseThaiDate(getDate(a)) || 0));
-}
 
 // ══════════════════════════════════════════════════════════
 // Flatpickr — บังคับ dd/mm/yyyy ทุกเบราว์เซอร์
@@ -10796,7 +10783,6 @@ function spTempSBStatus(t, sb_no) {
 
 // Backward compat — keep old name (legacy code may call it)
 function spTempBillsSum(t) { return spTempBillsTotal(t); }
-function spTempSBTotal(t, sb_no) { return spTempSBBills(t, sb_no); }
 
 // Generate partial_uuid (ใช้ผูก stmt match)
 function _genPartialUuid() {
@@ -11400,11 +11386,6 @@ window.renderSpTempBillsTabHtml = renderSpTempBillsTabHtml;
 window.renderSpTempPartialsTabHtml = renderSpTempPartialsTabHtml;
 window.wireSpTempV2Events = wireSpTempV2Events;
 
-function _genBillUuid() {
-  return (typeof crypto !== 'undefined' && crypto.randomUUID) 
-    ? crypto.randomUUID() 
-    : 'b-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
-}
 
 // Open Add/Edit bill modal for SP-TEMP — flat schema
 // billKey = 'sb_no|bill_no' (composite). Empty/null = new bill
@@ -15026,15 +15007,6 @@ function classifyVat(docNo) {
 }
 
 // Resolve PX ตาม sibling bills: ถ้า siblings เป็น V ก็ V, ถ้าเป็น N ก็ N
-function resolvePxVat(bills) {
-  if (!bills || bills.length === 0) return '';
-  const nonPx = bills.map(b => classifyVat(b.bill_no || b.doc_no || ''))
-                     .filter(v => v && v !== 'PX');
-  if (nonPx.length === 0) return ''; // all PX, can't determine
-  // ถ้ามีทั้ง V และ N → MIX
-  if (nonPx.includes('V') && nonPx.includes('N')) return 'MIX';
-  return nonPx[0];
-}
 
 // Parser 1: การชำระเงิน (Payment)
 // Format:
