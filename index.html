@@ -27368,7 +27368,7 @@ function renderData(el) {
             try {
               r = await Promise.race([
                 api('bulkMigrateHistoricPayments', {
-                  payload: JSON.stringify(batch),
+                  groups: JSON.stringify(batch),  // ⭐ ใช้ field 'groups' (เลี่ยง keyword 'payload' ที่ backend ลบทิ้ง)
                   dry_run: dryRun,
                 }),
                 new Promise((_, rej) => setTimeout(() => rej(new Error('Client timeout 90s')), 90000))
