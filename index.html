@@ -24061,6 +24061,19 @@ async function renderMatching(el) {
     // ══════════════════════════════════════════════════════════
     async function runAutoMatchRange(dateFrom, dateTo) {
       toast(`กำลัง Auto Match: ${fmtDate(dateFrom)} → ${fmtDate(dateTo)}...`, 'info');
+      
+      // ⭐ DEFENSIVE — snapshot ขนาดก่อน Auto Match (ใช้ post-check)
+      const _preBillCount = billList.length;
+      const _preStmtCount = uploadedStatements.length;
+      console.log(`[auto-match] PRE-CHECK billList=${_preBillCount} stmts=${_preStmtCount} range=${dateFrom}→${dateTo}`);
+      if (_preBillCount === 0) {
+        toast('❌ ไม่มี bills — กด Refresh หรือ import ข้อมูลก่อน', 'error', 5000);
+        return;
+      }
+      if (_preStmtCount === 0) {
+        toast('❌ ไม่มี statements — วาง Statement ก่อน', 'error', 5000);
+        return;
+      }
 
       // ── ยอดที่ใช้ match ตามกฎง่ายๆ: ──
       //   ถ้ามียอดสุทธิ (fee ใดๆ > 0) → match สุทธิ = amount − fees
@@ -24231,6 +24244,29 @@ async function renderMatching(el) {
       //         → "match แล้ว unmatch เองในหน้า matching" bug
       uploadedStatements = getAllStatements();
       
+      // ⭐ DEFENSIVE GUARD #1 — ตรวจว่า billList/stmts ไม่ลดลงผิดปกติ
+      //    ถ้าลด > 5% หลัง match → BUG: abort ก่อน persist เพื่อกัน save ของเสีย
+      const _postMatchBillCount = billList.length;
+      const _postMatchStmtCount = uploadedStatements.length;
+      if (_postMatchBillCount < _preBillCount * 0.95) {
+        const lostBills = _preBillCount - _postMatchBillCount;
+        console.error(`[auto-match] 🚨 BILLS LOST: pre=${_preBillCount} post=${_postMatchBillCount} (lost ${lostBills})`);
+        alert(`🛑 ABORT — Bills หาย ${lostBills} records ระหว่าง Auto Match\n\n` +
+              `ก่อน: ${_preBillCount}\nหลัง: ${_postMatchBillCount}\n\n` +
+              `⚠️ ห้าม Save / Refresh / ไปหน้าอื่น — กด F12 console ส่ง log ให้ admin\n\n` +
+              `วิธีกู้: refresh page (F5) → ดึงจาก cloud อีกครั้ง`);
+        return;
+      }
+      if (_postMatchStmtCount < _preStmtCount * 0.95) {
+        const lostStmts = _preStmtCount - _postMatchStmtCount;
+        console.error(`[auto-match] 🚨 STMTS LOST: pre=${_preStmtCount} post=${_postMatchStmtCount} (lost ${lostStmts})`);
+        alert(`🛑 ABORT — Statements หาย ${lostStmts} records ระหว่าง Auto Match\n\n` +
+              `ก่อน: ${_preStmtCount}\nหลัง: ${_postMatchStmtCount}\n\n` +
+              `⚠️ ห้าม Save / Refresh / ไปหน้าอื่น — กด F12 console ส่ง log ให้ admin`);
+        return;
+      }
+      console.log(`[auto-match] POST-MATCH OK billList=${_postMatchBillCount} stmts=${_postMatchStmtCount} matched_in=${matched} matched_out=${matchedExp}`);
+      
       // Sync to localStorage (immediate)
       try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(e) {}
       
@@ -24240,22 +24276,24 @@ async function renderMatching(el) {
       // Force flush ทันที (ไม่รอ debounce 1.5s)
       if (typeof flushPersistState === 'function') flushPersistState();
       
-      // ── Batch push delta — รวม bills + stmts ทุกตัวที่เพิ่ง match ──
-      // ใช้ uuid ตรวจ → ใช้ upsert API (สอดคล้องกับ pushMatchDelta)
+      // ── Batch push delta — ใช้ snapshot UUID จาก used set (RELIABLE) ──
+      // ⭐ FIX (5/6/26): เดิมใช้ matched_at filter (30s window) — มี race ถ้า system clock drift
+      //                  หรือ user เริ่ม Auto Match รอบ 2 ภายใน 30s → push ของเก่าซ้ำ
+      //                  ใหม่: ใช้ used set (uuid ที่ match ในรอบนี้แน่นอน)
       const matchedBills = [];
       const matchedStmts = [];
-      // Re-scan: หา bills/stmts ที่ match_method=auto_* ใน range
-      billList.forEach(b => {
-        if (!b.bill_uuid) return;
-        if (b.match_status !== 'paid') return;
-        const d = toISODate(b.date);
-        if (!d || d < dateFrom || d > dateTo) return;
-        // เก็บเฉพาะที่เพิ่ง match จาก auto run นี้ (matched_at ภายใน 30 วินาที)
-        const matchedAt = b.matched_at;
-        if (matchedAt && (Date.now() - new Date(matchedAt).getTime()) < 30000) {
+      const _matchedBillUuids = new Set();
+      const _matchedStmtUuids = new Set();
+      
+      // Re-scan: pull bills/stmts จาก used set ที่ match ในรอบนี้
+      for (const bi of used) {
+        const b = billList[bi];
+        if (b && b.bill_uuid && b.match_status === 'paid') {
           matchedBills.push({ ...b, date: toISODate(b.date) || b.date });
+          _matchedBillUuids.add(b.bill_uuid);
         }
-      });
+      }
+      // Stmts: ใช้ matched_at filter (เพราะ used เก็บแค่ bill index) แต่เพิ่ม guard
       uploadedStatements.forEach(s => {
         if (!s.stmt_uuid) return;
         if (s.match_status !== 'paid') return;
@@ -24264,8 +24302,23 @@ async function renderMatching(el) {
         const matchedAt = s.matched_at;
         if (matchedAt && (Date.now() - new Date(matchedAt).getTime()) < 30000) {
           matchedStmts.push({ ...s, date: toISODate(s.date) || s.date });
+          _matchedStmtUuids.add(s.stmt_uuid);
         }
       });
+      
+      // ⭐ DEFENSIVE GUARD #2 — sanity check จำนวน push
+      // ถ้า matchedBills > stmt count + 10 → bug — abort
+      const expectedMax = (matched + matchedExp) + 10;  // +10 buffer
+      if (matchedBills.length > expectedMax) {
+        console.error(`[auto-match] 🚨 PUSH COUNT ANOMALY: matchedBills=${matchedBills.length} expected≤${expectedMax}`);
+        alert(`🛑 ABORT — push count ผิดปกติ\n\n` +
+              `จะ push: ${matchedBills.length} bills\n` +
+              `แต่ match จริง: ${matched + matchedExp}\n\n` +
+              `กด F12 console ส่ง log ให้ admin`);
+        return;
+      }
+      
+      console.log(`[auto-match] PUSH SET — bills=${matchedBills.length}/${matched+matchedExp} stmts=${matchedStmts.length}`);
       
       // Group by year and push
       const pushPromises = [];
@@ -24336,6 +24389,19 @@ async function renderMatching(el) {
       }
       
       // Final UI update
+      // ⭐ DEFENSIVE GUARD #3 — final check ก่อน render
+      const _finalBillCount = billList.length;
+      const _finalStmtCount = uploadedStatements.length;
+      if (_finalBillCount < _preBillCount * 0.95) {
+        console.error(`[auto-match] 🚨 FINAL CHECK FAIL: pre=${_preBillCount} final=${_finalBillCount}`);
+        alert(`🛑 หลัง push เสร็จ — Bills หาย\n\n` +
+              `ก่อน Auto Match: ${_preBillCount}\n` +
+              `หลัง push: ${_finalBillCount}\n\n` +
+              `⚠️ กด F12 ส่ง console log ทันที\n` +
+              `วิธีกู้: refresh page → ดึงจาก cloud (อย่ากดบันทึก)`);
+      }
+      console.log(`[auto-match] FINAL OK billList=${_finalBillCount} stmts=${_finalStmtCount}`);
+      
       let msg = `✅ Auto Match ${fmtDate(dateFrom)} → ${fmtDate(dateTo)}\n\n`;
       msg += `💰 เงินเข้า match: ${matched}\n`;
       msg += `💸 เงินออก match: ${matchedExp}\n`;
