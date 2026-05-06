@@ -25593,6 +25593,7 @@ function renderData(el) {
           <input type="file" id="hm-file" accept=".json" style="flex:1;min-width:240px;padding:6px;border:1px solid var(--border);border-radius:6px">
           <button type="button" class="btn btn-outline btn-sm" id="btn-hm-dry" style="border-color:var(--info);color:var(--info)">🔍 Scan (Dry-run)</button>
           <button type="button" class="btn btn-sm" id="btn-hm-apply" style="background:var(--purple);color:#fff;border:none;font-weight:700">⚡ Apply Migration</button>
+          <button type="button" class="btn btn-sm" id="btn-hm-force" style="background:var(--danger);color:#fff;border:none;font-weight:700" title="Re-migrate ทับของเก่า — ลบ payments เก่า (ref MIGRATION:) แล้วใส่ใหม่">🔄 Re-migrate (force)</button>
         </div>
         <div id="hm-status" style="margin-top:10px;font-size:.85rem;color:var(--muted)"></div>
       </div>
@@ -27403,6 +27404,9 @@ function renderData(el) {
         lines.push('');
         lines.push((isDryRun ? '⏳ Will update' : '✅ Updated') + ' SBs: ' + (data.sb_updated || 0));
         lines.push((isDryRun ? '⏳ Will insert' : '✅ Inserted') + ' payments: ' + (data.payments_inserted || 0));
+        if ((data.payments_deleted || 0) > 0) {
+          lines.push('🗑 Deleted old MIGRATION: payments: ' + data.payments_deleted);
+        }
         lines.push('');
         if ((data.errors || []).length > 0) {
           lines.push('⚠️ Errors: ' + data.errors.length);
@@ -27432,17 +27436,19 @@ function renderData(el) {
       };
       
       // Batched call (smaller batch to avoid Apps Script timeout)
-      const callBulkMigrate = async (data, dryRun) => {
+      const callBulkMigrate = async (data, dryRun, force) => {
         const BATCH = 20;  // ⭐ ลดจาก 50 → 20 — แต่ละ batch ต้องอ่าน sheet ใหม่
         const aggregated = {
           input_groups: 0, sb_matched: 0, sb_not_found: 0, 
           sb_skipped_already_paid: 0, sb_updated: 0, 
-          payments_inserted: 0, errors: [], details: []
+          payments_inserted: 0, payments_deleted: 0,
+          errors: [], details: []
         };
         for (let i = 0; i < data.length; i += BATCH) {
           const batch = data.slice(i, i + BATCH);
           const pct = Math.round((i+batch.length)/data.length*100);
-          setStatus(`⏳ ${dryRun ? 'Scanning' : 'Migrating'}: ${i+batch.length}/${data.length} (${pct}%) · batch ${Math.floor(i/BATCH)+1}/${Math.ceil(data.length/BATCH)}`, 'var(--info)');
+          const action = dryRun ? 'Scanning' : (force ? 'Re-migrating' : 'Migrating');
+          setStatus(`⏳ ${action}: ${i+batch.length}/${data.length} (${pct}%) · batch ${Math.floor(i/BATCH)+1}/${Math.ceil(data.length/BATCH)}`, 'var(--info)');
           
           // ⭐ Retry logic — max 2 retries per batch
           let r = null;
@@ -27454,6 +27460,7 @@ function renderData(el) {
                 api('bulkMigrateHistoricPayments', {
                   groups: JSON.stringify(batch),  // ⭐ ใช้ field 'groups' (เลี่ยง keyword 'payload' ที่ backend ลบทิ้ง)
                   dry_run: dryRun,
+                  force: force ? 1 : 0,  // ⭐ 5/6/26 — force overwrite
                 }),
                 new Promise((_, rej) => setTimeout(() => rej(new Error('Client timeout 90s')), 90000))
               ]);
@@ -27474,6 +27481,7 @@ function renderData(el) {
           aggregated.sb_skipped_already_paid += d.sb_skipped_already_paid || 0;
           aggregated.sb_updated += d.sb_updated || 0;
           aggregated.payments_inserted += d.payments_inserted || 0;
+          aggregated.payments_deleted += d.payments_deleted || 0;
           if (Array.isArray(d.errors)) aggregated.errors.push(...d.errors);
           if (Array.isArray(d.details)) aggregated.details.push(...d.details);
         }
@@ -27490,7 +27498,7 @@ function renderData(el) {
           const orig = $dry.textContent;
           $dry.textContent = '⏳ Scanning...';
           try {
-            const data = await callBulkMigrate(loadedData, true);
+            const data = await callBulkMigrate(loadedData, true, false);
             const report = fmtReport(data, true);
             console.log(report);
             alert(report);
@@ -27519,7 +27527,7 @@ function renderData(el) {
           $apply.textContent = '⏳ Pre-scanning...';
           let scanData;
           try {
-            scanData = await callBulkMigrate(loadedData, true);
+            scanData = await callBulkMigrate(loadedData, true, false);
           } catch (e) {
             toast('❌ Pre-scan error: ' + e.message, 'error', 5000);
             $apply.disabled = false;
@@ -27552,7 +27560,7 @@ function renderData(el) {
           // Apply
           $apply.textContent = '⏳ Applying...';
           try {
-            const result = await callBulkMigrate(loadedData, false);
+            const result = await callBulkMigrate(loadedData, false, false);
             const report = fmtReport(result, false);
             console.log(report);
             alert(report);
@@ -27565,6 +27573,79 @@ function renderData(el) {
           } finally {
             $apply.disabled = false;
             $apply.textContent = orig;
+          }
+        };
+      }
+      
+      // ⭐ Force Re-migrate (5/6/26) — ทับของเก่า ลบ payments เก่า + insert ใหม่
+      const $force = document.getElementById('btn-hm-force');
+      if ($force) {
+        $force.onclick = async () => {
+          if (!loadedData) {
+            toast('⚠️ เลือกไฟล์ JSON ก่อน', 'warn', 3000);
+            return;
+          }
+          
+          // Pre-scan with force=true to see what will change
+          $force.disabled = true;
+          const orig = $force.textContent;
+          $force.textContent = '⏳ Pre-scanning (force)...';
+          let scanData;
+          try {
+            scanData = await callBulkMigrate(loadedData, true, true);
+          } catch (e) {
+            toast('❌ Pre-scan error: ' + e.message, 'error', 5000);
+            $force.disabled = false;
+            $force.textContent = orig;
+            return;
+          }
+          
+          // Force mode — sb_updated includes already-paid SBs (will be overwritten)
+          const totalToProcess = (scanData.sb_updated || 0);
+          if (totalToProcess === 0) {
+            alert('ℹ️ ไม่มี SB ที่ต้อง re-migrate\n\n' + fmtReport(scanData, true));
+            $force.disabled = false;
+            $force.textContent = orig;
+            return;
+          }
+          
+          // EXTRA strong confirmation
+          const summary = fmtReport(scanData, true);
+          const willOverwrite = (scanData.sb_skipped_already_paid || 0); // skipped in dry-run = will be overwritten in force
+          
+          const c1 = confirm(summary + '\n\n═══════════════════════════\n' +
+                             '🔄 RE-MIGRATE (FORCE OVERWRITE)?\n\n' +
+                             `📊 จะ update ${scanData.sb_updated} SBs (รวม SBs ที่เคย migrate แล้ว)\n` +
+                             `🗑 จะ ลบ payments เก่าที่มี ref "MIGRATION:" ของ SBs เหล่านี้\n` +
+                             `✅ จะ insert payments ใหม่ ${scanData.payments_inserted} records\n\n` +
+                             `⚠️ Manual payments (ที่ Toppy รับเองในแอพ) จะไม่กระทบ\n` +
+                             `⚠️ การกระทำนี้กลับไม่ได้ง่าย`);
+          if (!c1) { $force.disabled = false; $force.textContent = orig; return; }
+          
+          const c2 = prompt('🚨 Force Re-migrate — พิมพ์ "REMIGRATE" (ตัวพิมพ์ใหญ่):');
+          if (c2 !== 'REMIGRATE') {
+            toast('ยกเลิก re-migrate', 'info');
+            $force.disabled = false;
+            $force.textContent = orig;
+            return;
+          }
+          
+          // Apply with force
+          $force.textContent = '⏳ Re-migrating...';
+          try {
+            const result = await callBulkMigrate(loadedData, false, true);
+            const report = fmtReport(result, false);
+            console.log(report);
+            alert(report);
+            setStatus(`✅ Re-migrate เสร็จ — updated ${result.sb_updated} SBs · ลบเก่า ${result.payments_deleted} · ใส่ใหม่ ${result.payments_inserted}. แนะนำกด 🔄 Refresh from Cloud`, 'var(--success)');
+            toast('✅ Re-migrate เสร็จ ' + result.sb_updated + ' SBs', 'success', 6000);
+          } catch (e) {
+            console.error('[bulk-migrate force]', e);
+            alert('❌ Force migration error: ' + e.message);
+            setStatus('❌ ' + e.message, 'var(--danger)');
+          } finally {
+            $force.disabled = false;
+            $force.textContent = orig;
           }
         };
       }
