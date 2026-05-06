@@ -24641,8 +24641,9 @@ function renderData(el) {
             </div>
           </div>
           <div class="flex gap-2">
-            <button class="btn btn-outline btn-sm" id="btn-migrate-phase4-dry" style="border-color:var(--info);color:var(--info)" title="Dry-run: scan + report เท่านั้น ไม่เปลี่ยนข้อมูล">🔍 Scan (Dry-run)</button>
-            <button class="btn btn-sm" id="btn-migrate-phase4-apply" style="background:var(--accent);color:#fff;border:none;font-weight:700" title="Apply: revert SP-PENDING ที่ unmatched">⚡ Apply Migration</button>
+            <button type="button" class="btn btn-outline btn-sm" id="btn-backfill-paidby-dry" style="border-color:var(--purple);color:var(--purple)" title="Dry-run: scan + report paid_by_sp ที่ต้อง backfill">🔍 Backfill paid_by_sp</button>
+            <button type="button" class="btn btn-outline btn-sm" id="btn-migrate-phase4-dry" style="border-color:var(--info);color:var(--info)" title="Dry-run: scan + report เท่านั้น ไม่เปลี่ยนข้อมูล">🔍 Scan (Dry-run)</button>
+            <button type="button" class="btn btn-sm" id="btn-migrate-phase4-apply" style="background:var(--accent);color:#fff;border:none;font-weight:700" title="Apply: revert SP-PENDING ที่ unmatched">⚡ Apply Migration</button>
           </div>
         </div>
         <p class="text-xs text-dim" style="padding:10px;background:rgba(91,124,250,.08);border-radius:6px;border-left:3px solid var(--accent)">
@@ -26184,8 +26185,20 @@ function renderData(el) {
       return lines.join('\n');
     }
     
-    document.getElementById('btn-migrate-phase4-dry')?.addEventListener('click', async () => {
-      const btn = document.getElementById('btn-migrate-phase4-dry');
+    // ⭐ Defensive wire — direct reference + log if missing
+    const $btnMigDry = document.getElementById('btn-migrate-phase4-dry');
+    const $btnMigApply = document.getElementById('btn-migrate-phase4-apply');
+    
+    if (!$btnMigDry) console.warn('[migrate wire] btn-migrate-phase4-dry NOT FOUND in DOM');
+    if (!$btnMigApply) console.warn('[migrate wire] btn-migrate-phase4-apply NOT FOUND in DOM');
+    
+    if ($btnMigDry) {
+      $btnMigDry.type = 'button'; // force type to gain (กัน default submit)
+      $btnMigDry.onclick = async function(e) {
+        e.preventDefault();
+        e.stopPropagation();
+        console.log('[migrate dry-run] button clicked');
+        const btn = $btnMigDry;
       const orig = btn.textContent;
       btn.disabled = true;
       btn.textContent = '⏳ Scanning...';
@@ -26212,11 +26225,17 @@ function renderData(el) {
         btn.disabled = false;
         btn.textContent = orig;
       }
-    });
+      };
+    }
     
-    document.getElementById('btn-migrate-phase4-apply')?.addEventListener('click', async () => {
-      // Step 1: dry-run ก่อนเพื่อให้ user เห็น scope
-      const btn = document.getElementById('btn-migrate-phase4-apply');
+    if ($btnMigApply) {
+      $btnMigApply.type = 'button';
+      $btnMigApply.onclick = async function(e) {
+        e.preventDefault();
+        e.stopPropagation();
+        console.log('[migrate apply] button clicked');
+        // Step 1: dry-run ก่อนเพื่อให้ user เห็น scope
+        const btn = $btnMigApply;
       const orig = btn.textContent;
       btn.disabled = true;
       btn.textContent = '⏳ Scanning...';
@@ -26289,7 +26308,77 @@ function renderData(el) {
         btn.disabled = false;
         btn.textContent = orig;
       }
-    });
+      };
+    }
+    
+    console.log('[migrate wire] dry=' + !!$btnMigDry + ' apply=' + !!$btnMigApply);
+    
+    // ⭐ Phase 4 (5/6/26) — Backfill paid_by_sp ใน SP-PENDING เก่า
+    const $btnBackfill = document.getElementById('btn-backfill-paidby-dry');
+    if ($btnBackfill) {
+      $btnBackfill.type = 'button';
+      $btnBackfill.onclick = async function(e) {
+        e.preventDefault();
+        e.stopPropagation();
+        console.log('[backfill paid_by_sp] button clicked');
+        const btn = $btnBackfill;
+        const orig = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = '⏳ Scanning...';
+        try {
+          // Step 1: dry-run scan
+          const yr = String(new Date().getFullYear());
+          const r = await api('backfillSPPendingPaidBy', { dry_run: true, year: yr });
+          if (!r?.success) {
+            toast('❌ Scan ผิดพลาด: ' + (r?.error || 'unknown'), 'error', 5000);
+            console.error('[backfill]', r);
+            return;
+          }
+          const data = r.data || {};
+          const report = '🔍 BACKFILL paid_by_sp REPORT — year=' + yr + '\n' +
+                         '═══════════════════════════\n' +
+                         'Scanned (SP-PENDING): ' + (data.scanned || 0) + '\n' +
+                         '⏳ Will backfill: ' + (data.backfilled || 0) + '\n' +
+                         '⏭ Skipped (มี paid_by_sp อยู่แล้ว): ' + (data.skipped_already_set || 0) + '\n' +
+                         '⏭ Skipped (ไม่มี payments): ' + (data.skipped_no_payments || 0) + '\n' +
+                         (data.errors > 0 ? '\n⚠️ Errors: ' + data.errors : '\n✓ ไม่มี errors');
+          console.log(report);
+          
+          if ((data.backfilled || 0) === 0) {
+            alert(report);
+            toast('✓ ไม่มี SP-PENDING ที่ต้อง backfill', 'success', 4000);
+            return;
+          }
+          
+          // Step 2: confirm + apply
+          if (!confirm(report + '\n\n═══════════════════════════\n' +
+                       '⚡ APPLY backfill ' + data.backfilled + ' บิล?\n\n' +
+                       'จะเขียน paid_by_sp JSON กลับใน Sheet (idempotent — ไม่ทับของที่มี)')) {
+            toast('ยกเลิก backfill', 'info');
+            return;
+          }
+          
+          btn.textContent = '⏳ Applying...';
+          const r2 = await api('backfillSPPendingPaidBy', { dry_run: false, year: yr });
+          if (!r2?.success) {
+            toast('❌ Backfill ผิดพลาด: ' + (r2?.error || 'unknown'), 'error', 8000);
+            console.error('[backfill apply]', r2);
+            return;
+          }
+          const d2 = r2.data || {};
+          alert('✅ BACKFILL สำเร็จ\n\nBackfilled: ' + (d2.backfilled || 0) + ' SP-PENDING bills\n\n' +
+                '☁️ แนะนำกด 🔄 Refresh from Cloud เพื่อ reload bill list');
+          toast('✅ Backfill ' + (d2.backfilled || 0) + ' bills — กด Refresh from Cloud', 'success', 6000);
+        } catch (err) {
+          console.error('[backfill]', err);
+          toast('❌ Backfill error: ' + err.message, 'error', 5000);
+        } finally {
+          btn.disabled = false;
+          btn.textContent = orig;
+        }
+      };
+    }
+    console.log('[backfill wire]', !!$btnBackfill);
     
     // ── ซ่อม Meta UUID Swap (day↔month swap from Apps Script coercion) ──
     document.getElementById('btn-fix-meta-uuids')?.addEventListener('click', async () => {
