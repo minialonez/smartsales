@@ -20057,7 +20057,7 @@ async function renderBilling(el) {
   let loading = false;
 
   // List tab filters
-  let listFilter = { status: 'ALL', search: '', cust: '', creditOnly: false };
+  let listFilter = { status: 'ALL', search: '', cust: '', creditOnly: false, month: 'ALL' };
 
   // Create tab state
   let createState = {
@@ -20771,13 +20771,15 @@ async function renderBilling(el) {
                 </tr>
               </thead>
               <tbody>
-                ${sbsSorted.map(n => {
+                ${sbsSorted.map((n, idx) => {
                   const overdue = n.due_date && n.due_date < todayISO();
                   const ageDays = n.due_date ? Math.floor((Date.now() - new Date(n.due_date).getTime())/(1000*60*60*24)) : 0;
                   const statusColor = n.status === 'partial' ? '#3b82f6' : '#f59e0b';
+                  const bills = Array.isArray(n.bills_snapshot) ? n.bills_snapshot : [];
+                  const billsCount = bills.length;
                   return `
-                    <tr style="border-top:1px solid var(--border);${overdue?'background:rgba(239,68,68,0.04)':''}">
-                      <td style="padding:8px 10px"><strong>${n.billing_no||'-'}</strong></td>
+                    <tr class="cdr-sb-row" data-idx="${idx}" data-uuid="${n.billing_uuid}" style="border-top:1px solid var(--border);${overdue?'background:rgba(239,68,68,0.04)':''};cursor:pointer" title="คลิกเพื่อดูรายละเอียดบิล">
+                      <td style="padding:8px 10px"><span class="cdr-expand-icon" style="display:inline-block;width:14px;color:var(--muted);font-size:10px">▶</span> <strong>${n.billing_no||'-'}</strong> <span style="color:var(--muted);font-size:10.5px">(${billsCount} บิล)</span></td>
                       <td style="padding:8px 10px">${fmtThaiDate(n.billing_date)}</td>
                       <td style="padding:8px 10px;${overdue?'color:#ef4444;font-weight:600':''}">${fmtThaiDate(n.due_date)}${overdue?` (${ageDays}d)`:''}</td>
                       <td style="padding:8px 10px;text-align:right">฿${fmtNum(n.total_amount)}</td>
@@ -20785,6 +20787,59 @@ async function renderBilling(el) {
                       <td style="padding:8px 10px;text-align:center"><span style="color:${statusColor};font-size:11px">${n.status}</span></td>
                       <td style="padding:8px 10px;text-align:center">
                         <button class="cdr-print-one btn btn-outline" data-uuid="${n.billing_uuid}" style="font-size:11px;padding:3px 8px">🖨</button>
+                      </td>
+                    </tr>
+                    <tr class="cdr-sb-detail" data-idx="${idx}" style="display:none;background:var(--bg-elev)">
+                      <td colspan="7" style="padding:0">
+                        <div style="padding:10px 14px 14px 28px;border-left:3px solid var(--accent)">
+                          <div style="font-size:11px;color:var(--muted);margin-bottom:6px">📋 บิลใน ${n.billing_no} — ${billsCount} บิล</div>
+                          ${billsCount === 0 ? `
+                            <div style="color:var(--muted);font-size:12px;padding:6px">ไม่มีรายการบิล (legacy SB)</div>
+                          ` : `
+                            <table style="width:100%;font-size:12px;border-collapse:collapse">
+                              <thead>
+                                <tr style="border-bottom:1px solid var(--border);font-size:10.5px;color:var(--muted)">
+                                  <th style="padding:5px 8px;text-align:left;width:36px">#</th>
+                                  <th style="padding:5px 8px;text-align:left">เลขที่บิล</th>
+                                  <th style="padding:5px 8px;text-align:left">วันที่บิล</th>
+                                  <th style="padding:5px 8px;text-align:left">ประเภท</th>
+                                  <th style="padding:5px 8px;text-align:right">จำนวน</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                ${bills.map((b, bi) => {
+                                  const amt = Number(b.amount) || 0;
+                                  const isCredit = amt < 0;
+                                  const prefix = String(b.bill_no || '').slice(0,2);
+                                  const typeColor = isCredit ? '#16a34a' : 'var(--fg)';
+                                  return `
+                                    <tr style="${bi>0?'border-top:1px dashed var(--border-dim, var(--border))':''}">
+                                      <td style="padding:4px 8px;color:var(--muted)">${bi+1}</td>
+                                      <td style="padding:4px 8px;font-family:monospace"><strong>${b.bill_no||'-'}</strong></td>
+                                      <td style="padding:4px 8px">${fmtThaiDate(b.date)}</td>
+                                      <td style="padding:4px 8px;color:${typeColor}">${prefix}${isCredit?' (ลดหนี้)':''}</td>
+                                      <td style="padding:4px 8px;text-align:right;color:${typeColor};font-weight:${isCredit?'600':'normal'}">฿${fmtNum(amt)}</td>
+                                    </tr>
+                                  `;
+                                }).join('')}
+                                <tr style="border-top:1px solid var(--border);font-weight:600">
+                                  <td colspan="4" style="padding:6px 8px;text-align:right">รวม:</td>
+                                  <td style="padding:6px 8px;text-align:right">฿${fmtNum(n.total_amount)}</td>
+                                </tr>
+                                ${(n.paid_amount||0) > 0 ? `
+                                <tr style="font-size:11.5px">
+                                  <td colspan="4" style="padding:3px 8px;text-align:right;color:var(--success)">หัก ชำระแล้ว:</td>
+                                  <td style="padding:3px 8px;text-align:right;color:var(--success)">฿${fmtNum(n.paid_amount)}</td>
+                                </tr>
+                                <tr style="font-weight:600">
+                                  <td colspan="4" style="padding:3px 8px;text-align:right;color:#ef4444">ค้างชำระ:</td>
+                                  <td style="padding:3px 8px;text-align:right;color:#ef4444">฿${fmtNum(n.outstanding)}</td>
+                                </tr>
+                                ` : ''}
+                              </tbody>
+                            </table>
+                          `}
+                        </div>
                       </td>
                     </tr>
                   `;
@@ -20817,10 +20872,29 @@ async function renderBilling(el) {
       }
     });
     document.querySelectorAll('.cdr-print-one').forEach(btn => {
-      btn.onclick = () => {
+      btn.onclick = (e) => {
+        e.stopPropagation(); // ⭐ ห้าม bubble ไป tr (ไม่ให้กด print = expand)
         const uuid = btn.dataset.uuid;
         const sb = cust.sbs.find(n => n.billing_uuid === uuid);
         if (sb) printBillingNote(sb, cust);
+      };
+    });
+    
+    // ⭐ Expand SB row → show bills detail
+    document.querySelectorAll('.cdr-sb-row').forEach(row => {
+      row.onclick = () => {
+        const idx = row.dataset.idx;
+        const detail = document.querySelector(`.cdr-sb-detail[data-idx="${idx}"]`);
+        const icon = row.querySelector('.cdr-expand-icon');
+        if (!detail) return;
+        const isOpen = detail.style.display !== 'none';
+        if (isOpen) {
+          detail.style.display = 'none';
+          if (icon) icon.textContent = '▶';
+        } else {
+          detail.style.display = '';
+          if (icon) icon.textContent = '▼';
+        }
       };
     });
   }
@@ -21103,6 +21177,9 @@ ${bodyHtml}
     const q = listFilter.search.toLowerCase().trim();
     let rows = billingNotes.slice();
     if (listFilter.status !== 'ALL') rows = rows.filter(n => n.status === listFilter.status);
+    if (listFilter.month && listFilter.month !== 'ALL') {
+      rows = rows.filter(n => Number(n.cycle_month) === Number(listFilter.month));
+    }
     if (listFilter.cust) {
       const c = listFilter.cust.toLowerCase();
       rows = rows.filter(n => 
@@ -21224,6 +21301,7 @@ ${bodyHtml}
   // TAB 1: LIST
   // ══════════════════════════════════════════════════════════════
   function renderListTab() {
+    const TH_MONTHS = ['ม.ค.','ก.พ.','มี.ค.','เม.ย.','พ.ค.','มิ.ย.','ก.ค.','ส.ค.','ก.ย.','ต.ค.','พ.ย.','ธ.ค.'];
     return `
       <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;align-items:center">
         <input class="input" id="bn-list-search" placeholder="🔍 ค้นหา (เลขใบ / ชื่อลูกค้า / เลขบิล)" value="${listFilter.search}" style="flex:1;min-width:240px">
@@ -21233,6 +21311,10 @@ ${bodyHtml}
           <option value="partial"${listFilter.status==='partial'?' selected':''}>🔵 บางส่วน</option>
           <option value="paid"${listFilter.status==='paid'?' selected':''}>✅ ชำระครบ</option>
           <option value="cancelled"${listFilter.status==='cancelled'?' selected':''}>⛔ ยกเลิก</option>
+        </select>
+        <select class="input" id="bn-list-month" style="width:auto" title="กรองตาม cycle_month ของ SB">
+          <option value="ALL"${listFilter.month==='ALL'?' selected':''}>ทุกเดือน</option>
+          ${TH_MONTHS.map((lbl, i) => `<option value="${i+1}"${String(listFilter.month)===String(i+1)?' selected':''}>${lbl}</option>`).join('')}
         </select>
         <input class="input" id="bn-list-cust" placeholder="ลูกค้า" value="${listFilter.cust}" style="width:180px">
       </div>
@@ -21255,6 +21337,8 @@ ${bodyHtml}
     }
     const st = document.getElementById('bn-list-status');
     if (st) st.onchange = e => { listFilter.status = e.target.value; renderListRowsOnly(); };
+    const m = document.getElementById('bn-list-month');
+    if (m) m.onchange = e => { listFilter.month = e.target.value; renderListRowsOnly(); };
     const c = document.getElementById('bn-list-cust');
     if (c) {
       c.oninput = e => {
