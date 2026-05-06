@@ -20266,6 +20266,7 @@ async function renderBilling(el) {
 
       <div class="tab-nav" style="display:flex;gap:4px;border-bottom:1px solid var(--border);margin-bottom:16px;overflow-x:auto">
         ${tabBtn('list',     '📄 รายการใบวางบิล')}
+        ${tabBtn('customers','👥 ลูกหนี้รายบุคคล')}
         ${tabBtn('create',   '➕ สร้างใบใหม่')}
         ${tabBtn('aging',    '⏰ ติดตามหนี้ (Aging)')}
         ${tabBtn('payments', '💵 ประวัติชำระ')}
@@ -20313,18 +20314,20 @@ async function renderBilling(el) {
   }
 
   function renderTab() {
-    if (activeTab === 'list')     return renderListTab();
-    if (activeTab === 'create')   return renderCreateTab();
-    if (activeTab === 'aging')    return renderAgingTab();
-    if (activeTab === 'payments') return renderPaymentsTab();
+    if (activeTab === 'list')      return renderListTab();
+    if (activeTab === 'customers') return renderCustomersTab();
+    if (activeTab === 'create')    return renderCreateTab();
+    if (activeTab === 'aging')     return renderAgingTab();
+    if (activeTab === 'payments')  return renderPaymentsTab();
     return '';
   }
 
   function wireTabHandlers() {
-    if (activeTab === 'list')     wireListTab();
-    if (activeTab === 'create')   wireCreateTab();
-    if (activeTab === 'aging')    wireAgingTab();
-    if (activeTab === 'payments') wirePaymentsTab();
+    if (activeTab === 'list')      wireListTab();
+    if (activeTab === 'customers') wireCustomersTab();
+    if (activeTab === 'create')    wireCreateTab();
+    if (activeTab === 'aging')     wireAgingTab();
+    if (activeTab === 'payments')  wirePaymentsTab();
   }
 
   // ⭐ Phase 4 (5/5/26) — Helper: หา SP-PENDING bills ที่ "รอ match" (in-flight) สำหรับ SB ใบหนึ่ง
@@ -20438,6 +20441,652 @@ async function renderBilling(el) {
         </div>
       </div>
     `;
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  // ⭐ Customer Debt Tracker tab (5/6/26) — group SBs by ลูกค้า
+  // ════════════════════════════════════════════════════════════════════
+  let custTabFilter = { search: '', sort: 'outstanding_desc', creditOnly: false };
+  
+  // Aggregate SBs by customer (only pending/partial)
+  function _aggregateCustomerDebts() {
+    const map = {};
+    billingNotes.forEach(n => {
+      if (n.status !== 'pending' && n.status !== 'partial') return;
+      const code = String(n.cust_code || '').trim().toUpperCase();
+      const key = code || ('NAME:' + (n.cust_name || ''));
+      if (!map[key]) {
+        map[key] = {
+          cust_code: code,
+          cust_name: n.cust_name || '(ไม่ระบุ)',
+          sbs: [],
+          outstanding: 0,
+          total: 0,
+          paid: 0,
+          oldest_due: null,
+          max_age_days: 0,
+        };
+      }
+      const c = map[key];
+      c.sbs.push(n);
+      c.outstanding += Number(n.outstanding) || 0;
+      c.total += Number(n.total_amount) || 0;
+      c.paid += Number(n.paid_amount) || 0;
+      // อายุหนี้ = วันนี้ - due_date
+      if (n.due_date) {
+        const dueDate = new Date(n.due_date);
+        if (!isNaN(dueDate.getTime())) {
+          const ageDays = Math.floor((Date.now() - dueDate.getTime()) / (1000*60*60*24));
+          if (ageDays > c.max_age_days) {
+            c.max_age_days = ageDays;
+            c.oldest_due = n.due_date;
+          }
+        }
+      }
+    });
+    return Object.values(map);
+  }
+  
+  function renderCustomersTab() {
+    const all = _aggregateCustomerDebts();
+    
+    // Stats
+    const totalCusts = all.length;
+    const totalOutstanding = all.reduce((s, c) => s + c.outstanding, 0);
+    const overdue60 = all.filter(c => c.max_age_days > 60).length;
+    let creditWarn = 0, creditCritical = 0;
+    all.forEach(c => {
+      const u = getCreditUsage(c.cust_code);
+      if (u.level === 'critical') creditCritical++;
+      else if (u.level === 'warn') creditWarn++;
+    });
+    
+    // Apply filter
+    let rows = all.slice();
+    const q = (custTabFilter.search || '').toLowerCase().trim();
+    if (q) {
+      rows = rows.filter(c =>
+        String(c.cust_name||'').toLowerCase().includes(q) ||
+        String(c.cust_code||'').toLowerCase().includes(q)
+      );
+    }
+    if (custTabFilter.creditOnly) {
+      rows = rows.filter(c => {
+        const u = getCreditUsage(c.cust_code);
+        return u.level === 'warn' || u.level === 'critical';
+      });
+    }
+    
+    // Sort
+    const sorter = {
+      outstanding_desc: (a,b) => b.outstanding - a.outstanding,
+      credit_desc:      (a,b) => getCreditUsage(b.cust_code).ratio - getCreditUsage(a.cust_code).ratio,
+      age_desc:         (a,b) => b.max_age_days - a.max_age_days,
+      name_asc:         (a,b) => String(a.cust_name).localeCompare(String(b.cust_name), 'th'),
+    };
+    rows.sort(sorter[custTabFilter.sort] || sorter.outstanding_desc);
+    
+    return `
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:16px">
+        <div class="stat-card" style="border-left:4px solid #3b82f6">
+          <div class="stat-label">ลูกค้าค้างชำระ</div>
+          <div class="stat-value">${totalCusts} <span style="font-size:13px;color:var(--muted)">ราย</span></div>
+        </div>
+        <div class="stat-card" style="border-left:4px solid #ef4444">
+          <div class="stat-label">ยอดค้างรวม</div>
+          <div class="stat-value" style="color:#ef4444">฿${fmtNum(totalOutstanding)}</div>
+        </div>
+        <div class="stat-card" style="border-left:4px solid #f97316">
+          <div class="stat-label">เกิน 60 วัน</div>
+          <div class="stat-value" style="color:${overdue60>0?'#f97316':'var(--muted)'}">${overdue60} <span style="font-size:13px;color:var(--muted)">ราย</span></div>
+        </div>
+        <div class="stat-card" style="border-left:4px solid ${creditCritical>0?'#ef4444':creditWarn>0?'#f59e0b':'#6b7280'}">
+          <div class="stat-label">⚠️ ใกล้เต็มเครดิต</div>
+          <div class="stat-value" style="color:${creditCritical>0?'#ef4444':creditWarn>0?'#f59e0b':'var(--muted)'}">${creditWarn+creditCritical} <span style="font-size:13px;color:var(--muted)">ราย</span></div>
+          ${creditCritical>0?`<div style="font-size:11px;color:#ef4444;margin-top:2px">🚨 ${creditCritical} ราย ≥90%</div>`:''}
+        </div>
+      </div>
+      
+      <div style="display:flex;gap:10px;margin-bottom:12px;flex-wrap:wrap">
+        <input id="cust-search" class="input" placeholder="🔍 ค้นหาลูกค้า / รหัส" 
+               value="${custTabFilter.search}" style="flex:1;min-width:240px">
+        <select id="cust-sort" class="select" style="min-width:200px">
+          <option value="outstanding_desc"${custTabFilter.sort==='outstanding_desc'?' selected':''}>ค้างมากสุด</option>
+          <option value="credit_desc"${custTabFilter.sort==='credit_desc'?' selected':''}>เครดิต % สูงสุด</option>
+          <option value="age_desc"${custTabFilter.sort==='age_desc'?' selected':''}>อายุหนี้ (วัน) มากสุด</option>
+          <option value="name_asc"${custTabFilter.sort==='name_asc'?' selected':''}>ชื่อลูกค้า A→Z</option>
+        </select>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
+          <input type="checkbox" id="cust-credit-only"${custTabFilter.creditOnly?' checked':''}>
+          เฉพาะ ≥70%
+        </label>
+      </div>
+      
+      ${rows.length === 0 ? `
+        <div style="text-align:center;padding:60px;color:var(--muted);background:var(--bg-elev);border-radius:8px">
+          <div style="font-size:48px;margin-bottom:12px">🎉</div>
+          <div>ไม่มีลูกค้าค้างชำระ</div>
+        </div>
+      ` : `
+        <div style="overflow-x:auto;border:1px solid var(--border);border-radius:8px">
+          <table class="table" style="width:100%;font-size:13px">
+            <thead>
+              <tr style="background:var(--bg-elev)">
+                <th style="min-width:240px">ลูกค้า</th>
+                <th style="min-width:200px">เครดิต / วงเงิน</th>
+                <th style="text-align:right;min-width:130px">ยอดค้าง</th>
+                <th style="text-align:center;min-width:100px">SB / อายุ</th>
+                <th style="text-align:center;width:90px">จัดการ</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${rows.map(c => {
+                const u = getCreditUsage(c.cust_code);
+                let rowBg = '', leftBorder = '';
+                if (u.level === 'critical') { rowBg='background:rgba(239,68,68,0.08)'; leftBorder='box-shadow:inset 4px 0 0 #ef4444'; }
+                else if (u.level === 'warn') { rowBg='background:rgba(245,158,11,0.06)'; leftBorder='box-shadow:inset 4px 0 0 #f59e0b'; }
+                else if (c.max_age_days > 60) { rowBg='background:rgba(249,115,22,0.05)'; }
+                
+                let creditBlock = '<div style="font-size:11px;color:var(--muted)">ไม่กำหนดวงเงิน</div>';
+                if (u.level !== 'no_limit') {
+                  const pct = Math.min(100, Math.round(u.ratio*100));
+                  const barColor = u.level==='critical'?'#ef4444':u.level==='warn'?'#f59e0b':'#16a34a';
+                  const txtColor = u.level==='critical'?'#ef4444':u.level==='warn'?'#f59e0b':'var(--fg)';
+                  creditBlock = `
+                    <div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:3px">
+                      <span style="color:${txtColor};font-weight:600">${pct}%</span>
+                      <span style="color:var(--muted)">฿${fmtNum(u.outstanding)} / ฿${fmtNum(u.limit)}</span>
+                    </div>
+                    <div style="height:5px;background:var(--border);border-radius:3px;overflow:hidden">
+                      <div style="height:100%;width:${pct}%;background:${barColor}"></div>
+                    </div>
+                  `;
+                }
+                
+                const ageColor = c.max_age_days > 60 ? '#ef4444' : c.max_age_days > 30 ? '#f59e0b' : 'var(--muted)';
+                
+                return `
+                  <tr style="border-top:1px solid var(--border);${rowBg};${leftBorder}">
+                    <td>
+                      <div style="font-weight:500">${c.cust_name||'-'}</div>
+                      ${c.cust_code?`<div style="font-size:11px;color:var(--muted)">${c.cust_code}</div>`:''}
+                    </td>
+                    <td>${creditBlock}</td>
+                    <td style="text-align:right;font-weight:600;color:#ef4444">฿${fmtNum(c.outstanding)}</td>
+                    <td style="text-align:center">
+                      <div style="font-size:13px">${c.sbs.length} ใบ</div>
+                      <div style="font-size:10.5px;color:${ageColor};margin-top:2px">⏰ ${c.max_age_days} วัน</div>
+                    </td>
+                    <td style="text-align:center">
+                      <button class="btn btn-outline btn-sm cust-view-btn" data-key="${c.cust_code || ''}" data-name="${(c.cust_name||'').replace(/"/g,'&quot;')}" style="font-size:12px;padding:4px 10px">ดู</button>
+                    </td>
+                  </tr>
+                `;
+              }).join('')}
+            </tbody>
+          </table>
+        </div>
+        <div style="text-align:center;margin-top:8px;font-size:11px;color:var(--muted)">
+          คลิก "ดู" → เปิด detail ลูกหนี้ + พิมพ์ใบวางบิลรวม
+        </div>
+      `}
+    `;
+  }
+  
+  function wireCustomersTab() {
+    const $search = document.getElementById('cust-search');
+    const $sort = document.getElementById('cust-sort');
+    const $creditOnly = document.getElementById('cust-credit-only');
+    
+    if ($search) {
+      let timer = null;
+      $search.oninput = () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => {
+          custTabFilter.search = $search.value;
+          const body = document.getElementById('bn-body');
+          if (body) {
+            body.innerHTML = renderCustomersTab();
+            wireCustomersTab();
+            // Restore focus
+            const newSearch = document.getElementById('cust-search');
+            if (newSearch) {
+              newSearch.focus();
+              const v = newSearch.value;
+              newSearch.setSelectionRange(v.length, v.length);
+            }
+          }
+        }, 200);
+      };
+    }
+    if ($sort) {
+      $sort.onchange = () => {
+        custTabFilter.sort = $sort.value;
+        const body = document.getElementById('bn-body');
+        if (body) { body.innerHTML = renderCustomersTab(); wireCustomersTab(); }
+      };
+    }
+    if ($creditOnly) {
+      $creditOnly.onchange = () => {
+        custTabFilter.creditOnly = $creditOnly.checked;
+        const body = document.getElementById('bn-body');
+        if (body) { body.innerHTML = renderCustomersTab(); wireCustomersTab(); }
+      };
+    }
+    
+    // Wire "ดู" buttons → open customer drawer
+    document.querySelectorAll('.cust-view-btn').forEach(btn => {
+      btn.onclick = () => {
+        const code = btn.dataset.key;
+        const name = btn.dataset.name;
+        openCustomerDrawer(code, name);
+      };
+    });
+  }
+  
+  // ════════════════════════════════════════════════════════════════════
+  // Customer Drawer — แสดง SB ทุกใบ + ประวัติชำระ + ปุ่มพิมพ์
+  // ════════════════════════════════════════════════════════════════════
+  function openCustomerDrawer(custCode, custName) {
+    const all = _aggregateCustomerDebts();
+    const cust = all.find(c => 
+      (custCode && c.cust_code === custCode) || 
+      (!custCode && c.cust_name === custName)
+    );
+    if (!cust) {
+      toast('ไม่พบข้อมูลลูกค้า', 'error');
+      return;
+    }
+    
+    const u = getCreditUsage(custCode);
+    const sbsSorted = cust.sbs.slice().sort((a,b) => 
+      String(b.billing_no||'').localeCompare(String(a.billing_no||''))
+    );
+    
+    const creditHtml = u.level === 'no_limit' ? '<div style="color:var(--muted);font-size:13px">ไม่กำหนดวงเงิน</div>' : (() => {
+      const pct = Math.min(100, Math.round(u.ratio*100));
+      const barColor = u.level==='critical'?'#ef4444':u.level==='warn'?'#f59e0b':'#16a34a';
+      const txtColor = u.level==='critical'?'#ef4444':u.level==='warn'?'#f59e0b':'var(--success)';
+      const label = u.level==='critical'?'🚨 เกือบเต็มวงเงิน':u.level==='warn'?'⚠️ ใกล้เต็มวงเงิน':'✓ ปลอดภัย';
+      return `
+        <div style="display:flex;justify-content:space-between;margin-bottom:6px">
+          <span style="color:${txtColor};font-weight:600">${label} ${pct}%</span>
+          <span style="color:var(--muted);font-size:13px">฿${fmtNum(u.outstanding)} / ฿${fmtNum(u.limit)}</span>
+        </div>
+        <div style="height:8px;background:var(--border);border-radius:4px;overflow:hidden">
+          <div style="height:100%;width:${pct}%;background:${barColor}"></div>
+        </div>
+      `;
+    })();
+    
+    openModal(`👤 ${custName}`, `
+      <div style="max-height:78vh;overflow-y:auto;display:flex;flex-direction:column;gap:14px">
+        
+        <!-- ลูกค้า + เครดิต -->
+        <div style="background:var(--bg-elev);border-radius:8px;padding:14px;border:1px solid var(--border)">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">
+            <div>
+              <div style="font-size:11px;color:var(--muted)">รหัสลูกค้า</div>
+              <div style="font-size:14px;font-weight:600">${custCode || '(ไม่ระบุ)'}</div>
+            </div>
+            <div>
+              <div style="font-size:11px;color:var(--muted)">ค้างชำระทั้งหมด</div>
+              <div style="font-size:18px;font-weight:700;color:#ef4444">฿${fmtNum(cust.outstanding)}</div>
+            </div>
+          </div>
+          ${creditHtml}
+        </div>
+        
+        <!-- Action buttons -->
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button id="cdr-print-summary" class="btn btn-primary btn-sm">🖨 พิมพ์ใบวางบิลรวม (ทุกบิลค้าง)</button>
+          <button id="cdr-receive-payment" class="btn btn-outline btn-sm" style="border-color:var(--success);color:var(--success)">💵 รับชำระ</button>
+        </div>
+        
+        <!-- SB list -->
+        <div>
+          <div style="font-weight:600;margin-bottom:8px">ใบวางบิลค้างชำระ (${sbsSorted.length} ใบ)</div>
+          <div style="border:1px solid var(--border);border-radius:8px;overflow:hidden">
+            <table style="width:100%;font-size:13px">
+              <thead>
+                <tr style="background:var(--bg-elev);font-size:11.5px">
+                  <th style="padding:8px 10px;text-align:left">เลขที่</th>
+                  <th style="padding:8px 10px;text-align:left">วันที่</th>
+                  <th style="padding:8px 10px;text-align:left">ครบกำหนด</th>
+                  <th style="padding:8px 10px;text-align:right">ยอด</th>
+                  <th style="padding:8px 10px;text-align:right">ค้าง</th>
+                  <th style="padding:8px 10px;text-align:center">สถานะ</th>
+                  <th style="padding:8px 10px;text-align:center">พิมพ์</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${sbsSorted.map(n => {
+                  const overdue = n.due_date && n.due_date < todayISO();
+                  const ageDays = n.due_date ? Math.floor((Date.now() - new Date(n.due_date).getTime())/(1000*60*60*24)) : 0;
+                  const statusColor = n.status === 'partial' ? '#3b82f6' : '#f59e0b';
+                  return `
+                    <tr style="border-top:1px solid var(--border);${overdue?'background:rgba(239,68,68,0.04)':''}">
+                      <td style="padding:8px 10px"><strong>${n.billing_no||'-'}</strong></td>
+                      <td style="padding:8px 10px">${fmtThaiDate(n.billing_date)}</td>
+                      <td style="padding:8px 10px;${overdue?'color:#ef4444;font-weight:600':''}">${fmtThaiDate(n.due_date)}${overdue?` (${ageDays}d)`:''}</td>
+                      <td style="padding:8px 10px;text-align:right">฿${fmtNum(n.total_amount)}</td>
+                      <td style="padding:8px 10px;text-align:right;font-weight:600;color:#ef4444">฿${fmtNum(n.outstanding)}</td>
+                      <td style="padding:8px 10px;text-align:center"><span style="color:${statusColor};font-size:11px">${n.status}</span></td>
+                      <td style="padding:8px 10px;text-align:center">
+                        <button class="cdr-print-one btn btn-outline" data-uuid="${n.billing_uuid}" style="font-size:11px;padding:3px 8px">🖨</button>
+                      </td>
+                    </tr>
+                  `;
+                }).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    `, { width: '900px', maxWidth: '96vw' });
+    
+    // Wire actions
+    document.getElementById('cdr-print-summary')?.addEventListener('click', () => {
+      printBillingSummary(cust);
+    });
+    document.getElementById('cdr-receive-payment')?.addEventListener('click', () => {
+      closeModal();
+      // Open รับชำระ modal pre-filled กับลูกค้านี้
+      if (typeof openReceivePaymentModal === 'function') {
+        setTimeout(() => {
+          openReceivePaymentModal();
+          setTimeout(() => {
+            const $s = document.getElementById('rp-cust-search');
+            if ($s) {
+              $s.value = custCode || custName;
+              $s.dispatchEvent(new Event('input', { bubbles: true }));
+            }
+          }, 150);
+        }, 100);
+      }
+    });
+    document.querySelectorAll('.cdr-print-one').forEach(btn => {
+      btn.onclick = () => {
+        const uuid = btn.dataset.uuid;
+        const sb = cust.sbs.find(n => n.billing_uuid === uuid);
+        if (sb) printBillingNote(sb, cust);
+      };
+    });
+  }
+  
+  // ════════════════════════════════════════════════════════════════════
+  // Print: Single SB (ใบวางบิล 1 ใบ)
+  // ════════════════════════════════════════════════════════════════════
+  function _getCompanyInfo() {
+    try {
+      const raw = localStorage.getItem('sf_company_info');
+      if (raw) {
+        const c = JSON.parse(raw);
+        if (c && typeof c === 'object') return c;
+      }
+    } catch (_) {}
+    return {
+      name: 'ตั้งค่าชื่อบริษัทใน "จัดการข้อมูล"',
+      address: 'ที่อยู่บริษัท',
+      phone: 'เบอร์โทรศัพท์',
+      tax_id: 'เลขผู้เสียภาษี',
+      bank_account: 'เลขบัญชีธนาคาร',
+    };
+  }
+  
+  function _printHtml(bodyHtml, title) {
+    const win = window.open('', '_blank', 'width=900,height=1200');
+    if (!win) {
+      toast('Browser block popup — กดอนุญาต popup สำหรับเว็บนี้', 'error', 5000);
+      return;
+    }
+    win.document.write(`<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>${title}</title>
+<style>
+  @page { size: A4; margin: 15mm 15mm 18mm 15mm; }
+  * { box-sizing: border-box; }
+  body { font-family: 'Sarabun', 'Noto Sans Thai', Tahoma, sans-serif; font-size: 13px; color: #000; margin: 0; padding: 0; }
+  .header { border-bottom: 2px solid #000; padding-bottom: 10px; margin-bottom: 14px; }
+  .company-name { font-size: 22px; font-weight: 700; margin: 0 0 4px; }
+  .company-info { font-size: 11px; color: #333; line-height: 1.4; }
+  .doc-title { text-align: center; font-size: 18px; font-weight: 700; margin: 14px 0; padding: 6px; border: 1.5px solid #000; }
+  .info-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; font-size: 12px; }
+  .info-grid > div { border: 1px solid #999; padding: 8px 10px; min-height: 60px; }
+  .info-grid .label { font-size: 10px; color: #666; }
+  .info-grid .value { font-weight: 600; font-size: 13px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { border: 1px solid #888; padding: 6px 8px; }
+  th { background: #f0f0f0; font-weight: 700; font-size: 11.5px; }
+  .num { text-align: right; }
+  .total-row td { font-weight: 700; font-size: 13px; background: #f8f8f8; }
+  .footer { margin-top: 30px; display: grid; grid-template-columns: 1fr 1fr; gap: 30px; font-size: 12px; }
+  .signature { text-align: center; padding-top: 50px; border-top: 1px dashed #888; }
+  .signature .label { font-size: 11px; color: #555; margin-top: 4px; }
+  .note { font-size: 10.5px; color: #666; margin-top: 14px; line-height: 1.5; }
+  @media print { .no-print { display: none !important; } }
+  .no-print { position: fixed; top: 10px; right: 10px; padding: 8px 14px; background: #2563eb; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; }
+</style>
+</head><body>
+<button class="no-print" onclick="window.print()">🖨 พิมพ์</button>
+${bodyHtml}
+<script>setTimeout(() => window.print(), 500);<\/script>
+</body></html>`);
+    win.document.close();
+  }
+  
+  function _formatThaiDate(iso) {
+    if (!iso) return '-';
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return iso;
+    const m = ['ม.ค.','ก.พ.','มี.ค.','เม.ย.','พ.ค.','มิ.ย.','ก.ค.','ส.ค.','ก.ย.','ต.ค.','พ.ย.','ธ.ค.'];
+    return d.getDate() + ' ' + m[d.getMonth()] + ' ' + d.getFullYear();
+  }
+  
+  function printBillingNote(sb, cust) {
+    const co = _getCompanyInfo();
+    const bills = Array.isArray(sb.bills_snapshot) ? sb.bills_snapshot : [];
+    
+    let billRowsHtml = '';
+    let runningTotal = 0;
+    if (bills.length > 0) {
+      bills.forEach((b, i) => {
+        const amt = Number(b.amount) || 0;
+        runningTotal += amt;
+        billRowsHtml += `
+          <tr>
+            <td style="text-align:center">${i+1}</td>
+            <td>${b.bill_no||'-'}</td>
+            <td>${_formatThaiDate(b.date)}</td>
+            <td>${b.station||'-'}</td>
+            <td class="num">฿${fmtNum(amt)}</td>
+          </tr>
+        `;
+      });
+    } else {
+      // Fallback: ถ้าไม่มี bills_snapshot ใช้ summary
+      billRowsHtml = `
+        <tr><td colspan="4">รวมยอดตามใบวางบิล</td><td class="num">฿${fmtNum(sb.total_amount)}</td></tr>
+      `;
+      runningTotal = Number(sb.total_amount) || 0;
+    }
+    
+    const paid = Number(sb.paid_amount) || 0;
+    const outstanding = Number(sb.outstanding) || (runningTotal - paid);
+    
+    const body = `
+      <div class="header">
+        <div class="company-name">${co.name}</div>
+        <div class="company-info">
+          ${co.address}<br>
+          โทร. ${co.phone} · เลขประจำตัวผู้เสียภาษี ${co.tax_id}
+        </div>
+      </div>
+      
+      <div class="doc-title">ใบวางบิล / Billing Note</div>
+      
+      <div class="info-grid">
+        <div>
+          <div class="label">ลูกค้า</div>
+          <div class="value">${cust?.cust_name || sb.cust_name || '-'}</div>
+          ${(cust?.cust_code || sb.cust_code) ? `<div style="font-size:11px;color:#666">รหัส: ${cust?.cust_code || sb.cust_code}</div>` : ''}
+        </div>
+        <div>
+          <div class="label">เลขที่ใบวางบิล</div>
+          <div class="value">${sb.billing_no || '-'}</div>
+          <div style="margin-top:4px;font-size:11px">
+            วันที่ออก: ${_formatThaiDate(sb.billing_date)}<br>
+            ครบกำหนด: <strong>${_formatThaiDate(sb.due_date)}</strong>
+          </div>
+        </div>
+      </div>
+      
+      <table>
+        <thead>
+          <tr>
+            <th style="width:36px">#</th>
+            <th>เลขที่บิล</th>
+            <th style="width:110px">วันที่</th>
+            <th style="width:120px">สถานี</th>
+            <th class="num" style="width:120px">จำนวนเงิน</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${billRowsHtml}
+          <tr class="total-row">
+            <td colspan="4" class="num">รวมยอดทั้งสิ้น</td>
+            <td class="num">฿${fmtNum(runningTotal)}</td>
+          </tr>
+          ${paid > 0 ? `
+          <tr>
+            <td colspan="4" class="num" style="color:#16a34a">หัก ชำระแล้ว</td>
+            <td class="num" style="color:#16a34a">฿${fmtNum(paid)}</td>
+          </tr>
+          <tr class="total-row">
+            <td colspan="4" class="num" style="color:#ef4444">ค้างชำระ</td>
+            <td class="num" style="color:#ef4444">฿${fmtNum(outstanding)}</td>
+          </tr>
+          ` : ''}
+        </tbody>
+      </table>
+      
+      <div class="note">
+        กรุณาชำระเงินภายในวันที่ครบกำหนด · เลขบัญชีรับชำระ: ${co.bank_account}
+      </div>
+      
+      <div class="footer">
+        <div class="signature">
+          <div class="label">ผู้รับเงิน / Received by</div>
+        </div>
+        <div class="signature">
+          <div class="label">ผู้ส่ง / Issued by · ${_formatThaiDate(new Date().toISOString().slice(0,10))}</div>
+        </div>
+      </div>
+    `;
+    _printHtml(body, `ใบวางบิล ${sb.billing_no || ''}`);
+  }
+  
+  function printBillingSummary(cust) {
+    // พิมพ์รวม SB ทุกใบของลูกค้า
+    const co = _getCompanyInfo();
+    const sbs = cust.sbs.slice().sort((a,b) => 
+      String(a.billing_no||'').localeCompare(String(b.billing_no||''))
+    );
+    
+    let totalOutstanding = 0;
+    let totalAmount = 0;
+    let totalPaid = 0;
+    const rowsHtml = sbs.map((n, i) => {
+      const out = Number(n.outstanding) || 0;
+      const tot = Number(n.total_amount) || 0;
+      const pd  = Number(n.paid_amount) || 0;
+      totalOutstanding += out;
+      totalAmount += tot;
+      totalPaid += pd;
+      const overdue = n.due_date && n.due_date < todayISO();
+      const ageDays = n.due_date ? Math.floor((Date.now() - new Date(n.due_date).getTime())/(1000*60*60*24)) : 0;
+      return `
+        <tr ${overdue?'style="background:#fff5f5"':''}>
+          <td style="text-align:center">${i+1}</td>
+          <td><strong>${n.billing_no||'-'}</strong></td>
+          <td>${_formatThaiDate(n.billing_date)}</td>
+          <td ${overdue?'style="color:#c53030;font-weight:600"':''}>${_formatThaiDate(n.due_date)}${overdue?` <span style="font-size:10px">(${ageDays}d)</span>`:''}</td>
+          <td class="num">฿${fmtNum(tot)}</td>
+          <td class="num" style="color:${pd>0?'#16a34a':'#999'}">${pd>0?'฿'+fmtNum(pd):'-'}</td>
+          <td class="num" style="color:#ef4444;font-weight:600">฿${fmtNum(out)}</td>
+        </tr>
+      `;
+    }).join('');
+    
+    const u = getCreditUsage(cust.cust_code);
+    const creditLine = u.level !== 'no_limit' 
+      ? `วงเงินเครดิต: ฿${fmtNum(u.limit)} · ใช้ไปแล้ว: ฿${fmtNum(u.outstanding)} (${Math.round(u.ratio*100)}%)`
+      : '';
+    
+    const body = `
+      <div class="header">
+        <div class="company-name">${co.name}</div>
+        <div class="company-info">
+          ${co.address}<br>
+          โทร. ${co.phone} · เลขประจำตัวผู้เสียภาษี ${co.tax_id}
+        </div>
+      </div>
+      
+      <div class="doc-title">ใบสรุปยอดค้างชำระ / Statement of Account</div>
+      
+      <div class="info-grid">
+        <div>
+          <div class="label">ลูกค้า</div>
+          <div class="value">${cust.cust_name}</div>
+          ${cust.cust_code ? `<div style="font-size:11px;color:#666">รหัส: ${cust.cust_code}</div>` : ''}
+          ${creditLine ? `<div style="font-size:10.5px;color:#666;margin-top:4px">${creditLine}</div>` : ''}
+        </div>
+        <div>
+          <div class="label">วันที่ออกใบสรุป</div>
+          <div class="value">${_formatThaiDate(new Date().toISOString().slice(0,10))}</div>
+          <div style="margin-top:4px;font-size:11px">
+            จำนวนใบวางบิลที่ค้าง: <strong>${sbs.length} ใบ</strong>
+          </div>
+        </div>
+      </div>
+      
+      <table>
+        <thead>
+          <tr>
+            <th style="width:36px">#</th>
+            <th>เลขที่ใบวางบิล</th>
+            <th style="width:90px">วันที่ออก</th>
+            <th style="width:90px">ครบกำหนด</th>
+            <th class="num" style="width:100px">ยอดรวม</th>
+            <th class="num" style="width:100px">ชำระแล้ว</th>
+            <th class="num" style="width:110px">ค้างชำระ</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rowsHtml}
+          <tr class="total-row">
+            <td colspan="4" class="num">รวมทั้งสิ้น</td>
+            <td class="num">฿${fmtNum(totalAmount)}</td>
+            <td class="num" style="color:#16a34a">฿${fmtNum(totalPaid)}</td>
+            <td class="num" style="color:#ef4444">฿${fmtNum(totalOutstanding)}</td>
+          </tr>
+        </tbody>
+      </table>
+      
+      <div class="note">
+        เอกสารฉบับนี้ใช้สำหรับสรุปยอดค้างชำระ ณ วันที่ออกเอกสาร · กรุณาชำระเงินตามใบวางบิลแต่ละใบ<br>
+        เลขบัญชีรับชำระ: ${co.bank_account}
+      </div>
+      
+      <div class="footer">
+        <div class="signature">
+          <div class="label">ผู้รับเงิน / Received by</div>
+        </div>
+        <div class="signature">
+          <div class="label">ผู้ส่ง / Issued by · ${_formatThaiDate(new Date().toISOString().slice(0,10))}</div>
+        </div>
+      </div>
+    `;
+    _printHtml(body, `สรุปยอดค้าง ${cust.cust_name}`);
   }
 
   // ⭐ Helper (4/5/26): สร้างเฉพาะ rows part — ใช้ใน renderListRowsOnly เพื่อ update โดยไม่แตะ search input
@@ -24805,6 +25454,39 @@ function renderData(el) {
         </p>
       </div>
       
+      <!-- ⭐ Company Info (5/6/26) — สำหรับ letterhead ใบวางบิล -->
+      <div class="card mb-3" style="border:1px solid var(--border)">
+        <div class="font-semi mb-2" style="color:var(--info)">🏢 ข้อมูลบริษัท (สำหรับ letterhead ใบวางบิล)</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+          <div class="input-group" style="margin:0">
+            <label style="font-size:.8rem">ชื่อบริษัท</label>
+            <input class="input" id="ci-name" placeholder="บริษัท ตัวอย่าง จำกัด">
+          </div>
+          <div class="input-group" style="margin:0">
+            <label style="font-size:.8rem">เลขผู้เสียภาษี</label>
+            <input class="input" id="ci-tax-id" placeholder="0-0000-00000-00-0">
+          </div>
+          <div class="input-group" style="margin:0;grid-column:1/-1">
+            <label style="font-size:.8rem">ที่อยู่</label>
+            <input class="input" id="ci-address" placeholder="123 ถ.ตัวอย่าง อ.เมือง จ.นราธิวาส 96000">
+          </div>
+          <div class="input-group" style="margin:0">
+            <label style="font-size:.8rem">เบอร์โทรศัพท์</label>
+            <input class="input" id="ci-phone" placeholder="073-xxx-xxxx">
+          </div>
+          <div class="input-group" style="margin:0">
+            <label style="font-size:.8rem">เลขบัญชีรับชำระ</label>
+            <input class="input" id="ci-bank" placeholder="KBANK xxx-x-xxxxx-x">
+          </div>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:10px;justify-content:flex-end">
+          <button type="button" class="btn btn-primary btn-sm" id="btn-save-company">💾 บันทึก</button>
+        </div>
+        <p class="text-xs text-dim" style="margin-top:8px">
+          ข้อมูลนี้บันทึกใน browser นี้เท่านั้น (ไม่ sync) — ต้องตั้งใหม่หากเปลี่ยน device
+        </p>
+      </div>
+      
       <!-- ⭐ Phase 4 Migration Section (5/5/26) -->
       <div class="card mb-3" style="border:1.5px solid var(--accent);background:rgba(91,124,250,.04)">
         <div class="flex justify-between items-center mb-3">
@@ -26554,6 +27236,40 @@ function renderData(el) {
       };
     }
     console.log('[backfill wire]', !!$btnBackfill);
+    
+    // ⭐ Company Info (5/6/26) — load + save
+    (function wireCompanyInfo() {
+      const fields = ['name','tax-id','address','phone','bank'];
+      const fieldKeys = { 'name':'name', 'tax-id':'tax_id', 'address':'address', 'phone':'phone', 'bank':'bank_account' };
+      // Load existing
+      let saved = {};
+      try { saved = JSON.parse(localStorage.getItem('sf_company_info') || '{}'); } catch(_) {}
+      fields.forEach(f => {
+        const inp = document.getElementById('ci-' + f);
+        if (inp && saved[fieldKeys[f]]) inp.value = saved[fieldKeys[f]];
+      });
+      // Save handler
+      const $save = document.getElementById('btn-save-company');
+      if ($save) {
+        $save.onclick = () => {
+          const data = {};
+          fields.forEach(f => {
+            const inp = document.getElementById('ci-' + f);
+            if (inp) data[fieldKeys[f]] = inp.value.trim();
+          });
+          if (!data.name) {
+            toast('⚠️ กรอกชื่อบริษัทก่อน', 'warn', 3000);
+            return;
+          }
+          try {
+            localStorage.setItem('sf_company_info', JSON.stringify(data));
+            toast('✅ บันทึกข้อมูลบริษัทแล้ว — ใช้ใน letterhead ใบวางบิล', 'success', 3000);
+          } catch (e) {
+            toast('❌ บันทึกไม่สำเร็จ: ' + e.message, 'error', 4000);
+          }
+        };
+      }
+    })();
     
     // ── ซ่อม Meta UUID Swap (day↔month swap from Apps Script coercion) ──
     document.getElementById('btn-fix-meta-uuids')?.addEventListener('click', async () => {
