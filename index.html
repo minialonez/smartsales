@@ -1438,7 +1438,19 @@ function handleStmtUpload(result, fileName, opts = {}) {
     if (hRow < 0) hRow = 11;
     
     function parseKbankDate(val) {
-      if (!val) return '';
+      if (!val && val !== 0) return '';
+      // ⭐ Date object (cellDates:true จาก SheetJS)
+      if (val instanceof Date && !isNaN(val)) {
+        let y = val.getFullYear(); if (y > 2400) y -= 543;
+        return `${String(val.getDate()).padStart(2,'0')}/${String(val.getMonth()+1).padStart(2,'0')}/${y}`;
+      }
+      // ⭐ Excel serial number (CSV export ผ่าน Excel — เช่น 46147 = 2026-05-05)
+      //    เคยทำ silent data loss: stmt 1 รายการ date='' → ไม่เข้า auto-match
+      if (typeof val === 'number' && val > 10000 && val < 80000) {
+        const ep = new Date(1899, 11, 30);
+        const dt = new Date(ep.getTime() + val * 86400000);
+        return `${String(dt.getDate()).padStart(2,'0')}/${String(dt.getMonth()+1).padStart(2,'0')}/${dt.getFullYear()}`;
+      }
       const s = String(val).trim();
       // DD-MM-YY format (e.g. "01-04-26")
       const m = s.match(/^(\d{1,2})-(\d{1,2})-(\d{2,4})$/);
