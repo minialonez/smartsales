@@ -18541,7 +18541,6 @@ const NAV_ITEMS = [
   { id:'pp_recon',  icon:'check',   label:'📤 ตรวจ PP (เจ้าหนี้)' },
   { id:'billing',   icon:'card',    label:'📋 ใบวางบิล + หนี้' },
   { id:'data',      icon:'folder',  label:'จัดการข้อมูล' },
-  { id:'alerts',    icon:'bell',    label:'แจ้งเตือน', badge: true },
   { id:'reports',   icon:'file',    label:'รายงานบัญชี' },
   { id:'tax_export',icon:'file',    label:'📋 Export สรรพากร' },
   { id:'monthly',   icon:'file',    label:'📅 รายงานรายเดือน' },
@@ -19239,7 +19238,6 @@ const PAGE_RENDERERS = {
   sales: renderSales,
   matching: renderMatching,
   data: renderData,
-  alerts: renderAlerts,
   reports: renderReports,
   tax_export: renderTaxExport,
   monthly: renderMonthly,
@@ -19397,7 +19395,6 @@ async function renderDashboard(el) {
   const transferLogNoPP = [...(transferLog.vatTransfers||[]), ...(transferLog.novatTransfers||[])].filter(t => !t.pp_no).length;
   
   const totalUnmatched = unmatchedBillsTransfer.length + chequesAwaitingClear.length + unmatchedStmts.length + cashflowPending.length + supplierPendingPay.length + supplierUnmatched.length + transferLogNoPP;
-  const alerts = []; // populate after background fetch
   
   // ── Build period selector pills ──
   const PERIODS = [
@@ -19518,20 +19515,6 @@ async function renderDashboard(el) {
             </div>
           `).join('')
         }
-      </div>
-      <div class="card">
-        <div class="font-semi mb-3">แจ้งเตือนล่าสุด</div>
-        <div id="dash-alerts-container">
-          ${alerts.length === 0 ? `<div class="text-sm text-muted" style="padding:12px 0;text-align:center">กำลังโหลด...</div>` : 
-            alerts.map((a,i) => `
-              <div class="flex items-center gap-3" style="padding:10px 0;${i<alerts.length-1?'border-bottom:1px solid var(--border)':''}">
-                <div style="width:8px;height:8px;border-radius:50%;background:${a.alert_type==='overdue'?'var(--danger)':a.alert_type==='credit_break'?'var(--warn)':'var(--info)'};flex-shrink:0"></div>
-                <div class="flex-1"><div class="text-sm">${a.cust_name} — ${a.notes||a.alert_type}</div></div>
-                <span class="text-xs text-muted">${a.action_at||''}</span>
-              </div>
-            `).join('')
-          }
-        </div>
       </div>
     </div>
   `;
@@ -19721,42 +19704,6 @@ async function renderDashboard(el) {
     renderDashboard(el);
   });
   
-  // ⭐ Background fetch: เพิ่มความแม่นยำของ debt + recent_alerts จาก backend
-  // Non-blocking — ถ้าไม่ตอบใน 6s ใช้ค่า local ต่อไป
-  (async () => {
-    try {
-      const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 6000));
-      const res = await Promise.race([api('getDashboard'), timeout]);
-      if (!res?.success || !res.data) return;
-      const d = res.data;
-      
-      // Update debt stat card (reserved for future — backend debt may be more accurate)
-      // Currently we trust local compute
-      
-      // Update alerts panel
-      const alertsContainer = document.getElementById('dash-alerts-container');
-      if (alertsContainer) {
-        const list = Array.isArray(d.recent_alerts) ? d.recent_alerts : [];
-        if (list.length === 0) {
-          alertsContainer.innerHTML = `<div class="text-sm text-muted" style="padding:12px 0;text-align:center">ไม่มีแจ้งเตือน</div>`;
-        } else {
-          alertsContainer.innerHTML = list.map((a,i) => `
-            <div class="flex items-center gap-3" style="padding:10px 0;${i<list.length-1?'border-bottom:1px solid var(--border)':''}">
-              <div style="width:8px;height:8px;border-radius:50%;background:${a.alert_type==='overdue'?'var(--danger)':a.alert_type==='credit_break'?'var(--warn)':'var(--info)'};flex-shrink:0"></div>
-              <div class="flex-1"><div class="text-sm">${a.cust_name} — ${a.notes||a.alert_type}</div></div>
-              <span class="text-xs text-muted">${a.action_at||''}</span>
-            </div>
-          `).join('');
-        }
-      }
-    } catch(e) {
-      const alertsContainer = document.getElementById('dash-alerts-container');
-      if (alertsContainer && alertsContainer.innerHTML.includes('กำลังโหลด')) {
-        alertsContainer.innerHTML = `<div class="text-sm text-muted" style="padding:12px 0;text-align:center">ไม่สามารถโหลดแจ้งเตือนได้</div>`;
-      }
-      console.log('[dashboard] background fetch skipped:', e.message);
-    }
-  })();
 }
 
 // ⭐ Open modal showing pending bills (cheque or transfer/card) with action buttons
@@ -29050,258 +28997,6 @@ function renderData(el) {
   render();
 }
 
-// ── Alerts ──────────────────────────────────────────────────
-async function renderAlerts(el) {
-  const res = await api('getAlerts');
-  const backendAlerts = res.data || [];
-  const today = todayISO();
-  
-  // ── รวบรวม alerts จากทั้งระบบ ──
-  const alerts = [];
-  
-  // 1. Backend alerts (จาก ar_ledger)
-  backendAlerts.forEach(a => {
-    alerts.push({
-      category: 'debt',
-      priority: a.alert_type === 'overdue' ? 1 : a.alert_type === 'credit_break' ? 2 : 3,
-      title: a.cust_name,
-      detail: `ยอดค้าง ฿${fmtNum(a.amount_due||0)} · กำหนด ${fmtDate(a.due_date)}`,
-      meta: a.phone ? `📞 ${a.phone}` : '',
-      type: a.alert_type,
-      action: 'debt',
-      data: a,
-    });
-  });
-  
-  // 2. เช็คเลยวันคาด
-  billList.filter(b => 
-    b.match_status !== 'void' && b.type === 'Cheque' && 
-    b.due_date && toISODate(b.due_date) < today &&
-    b.match_status !== 'paid' && b.match_status !== 'bounced'
-  ).forEach(b => {
-    const daysOver = Math.floor((new Date(today) - new Date(toISODate(b.due_date))) / 86400000);
-    alerts.push({
-      category: 'cheque',
-      priority: 1,
-      title: `เช็ค ${b.bill_no||'(ไม่มีเลข)'} เลยวันคาด ${daysOver} วัน`,
-      detail: `฿${fmtNum(b.amount)} · วันที่คาด ${fmtDate(b.due_date)}`,
-      meta: b.remarks1 || '',
-      type: 'cheque_overdue',
-      action: 'main',
-      data: b,
-    });
-  });
-  
-  // 3. เช็คเด้ง
-  billList.filter(b => b.match_status === 'bounced').forEach(b => {
-    alerts.push({
-      category: 'cheque_bounce',
-      priority: 1,
-      title: `🚫 เช็คเด้ง ${b.bill_no||'(ไม่มีเลข)'}`,
-      detail: `฿${fmtNum(b.amount)} · ${b.remarks1||''}`,
-      meta: fmtDate(b.bounced_at),
-      type: 'cheque_bounced',
-      action: 'main',
-      data: b,
-    });
-  });
-  
-  // 4. SP-TEMP ที่ยังไม่แก้
-  paymentList.filter(p => p.is_temp || /^SP-TEMP-/.test(p.sp_no)).forEach(sp => {
-    alerts.push({
-      category: 'sp_temp',
-      priority: 3,
-      title: `SP ชั่วคราว ${sp.sp_no}`,
-      detail: `${sp.cust_name} · ฿${fmtNum(sp.total)} · ${fmtDate(sp.date)}`,
-      meta: 'รอ SP จริงจากโปรแกรม Smart',
-      type: 'sp_temp',
-      action: 'payments',
-      data: sp,
-    });
-  });
-  
-  // 5. Statement unmatched > 3 วัน
-  const old3days = new Date(Date.now() - 3*86400000).toISOString().substring(0,10);
-  getAllStatements().filter(s => 
-    s.match_status !== 'paid' && toISODate(s.date) < old3days
-  ).forEach(s => {
-    alerts.push({
-      category: 'stmt_unmatched',
-      priority: 2,
-      title: `Statement ${s.bank} ยังไม่ match`,
-      detail: `฿${fmtNum(s.amount)} · ${fmtDate(s.date)} · ${s.description||''}`,
-      meta: s.ref_no || '',
-      type: 'stmt_unmatched',
-      action: 'matching',
-      data: s,
-    });
-  });
-  
-  // 6. Business rule violations (Cashflow)
-  cashflowList.forEach(c => {
-    if (!c.bank || !c.vat) return;
-    const bankDef = BANK_ACCOUNTS[c.bank];
-    if (!bankDef) return;
-    if (bankDef.vat !== c.vat) {
-      alerts.push({
-        category: 'rule_violation',
-        priority: 1,
-        title: `🚨 กฎโดนละเมิด: ${c.type} ${c.vat}`,
-        detail: `ใช้ ${c.bank} (${bankDef.vat}) · ฿${fmtNum(c.amount)}`,
-        meta: c.counterparty || '',
-        type: 'rule_violation',
-        action: 'cashflow',
-        data: c,
-      });
-    }
-  });
-  
-  // 7. Supplier Payments — รอโอน / โอนแล้วยังไม่ match
-  (supplierPayments||[]).filter(p => p.status === 'pending' || p.status === 'scheduled').forEach(p => {
-    const isOverdue = p.scheduled_date && toISODate(p.scheduled_date) < today;
-    alerts.push({
-      category: 'supplier_pending',
-      priority: isOverdue ? 1 : 3,
-      title: `${isOverdue?'🚨 เลยวันนัด':'⏳ รอโอน'} ${p.supplier_name}`,
-      detail: `฿${fmtNum(p.amount)} · ${p.vat} · โอนจาก ${p.bank}${p.scheduled_date?' · นัด '+fmtDate(p.scheduled_date):''}`,
-      meta: p.invoice_no ? 'INV: '+p.invoice_no : '',
-      type: 'supplier_pending',
-      action: 'supplier',
-      data: p,
-    });
-  });
-  
-  (supplierPayments||[]).filter(p => p.status === 'paid' && p.match_status !== 'paid').forEach(p => {
-    alerts.push({
-      category: 'supplier_unmatched',
-      priority: 2,
-      title: `PP ${p.pp_no||'(ไม่มีเลข)'} ยังไม่ match`,
-      detail: `${p.supplier_name} · ฿${fmtNum(p.amount)} · โอนเมื่อ ${fmtDate(p.transfer_date)}`,
-      meta: p.reference || '',
-      type: 'supplier_unmatched',
-      action: 'matching',
-      data: p,
-    });
-  });
-  
-  // 8. Supplier cheques — ค้างขึ้นเงิน > 30 วัน
-  (supplierPayments||[]).filter(p => 
-    p.status === 'paid' && 
-    p.payment_method === 'เช็ค' && 
-    !p.cheque_cleared_date
-  ).forEach(p => {
-    const chqDate = toISODate(p.cheque_date || p.transfer_date);
-    if (!chqDate) return;
-    const daysOut = Math.floor((new Date(today) - new Date(chqDate)) / 86400000);
-    if (daysOut < 30) return; // ยังไม่ 30 วัน — ข้าม
-    alerts.push({
-      category: 'supplier_cheque_stale',
-      priority: daysOut > 60 ? 1 : 2,
-      title: `📝 เช็ค ${p.cheque_no||'(ไม่มีเลข)'} ค้างขึ้นเงิน ${daysOut} วัน`,
-      detail: `${p.supplier_name} · ฿${fmtNum(p.amount)} · เขียนเช็ค ${fmtDate(chqDate)}${p.pp_no?' · PP: '+p.pp_no:''}`,
-      meta: daysOut > 60 ? '🚨 ควรติดตาม Supplier' : `เช็คจ่ายออกจาก ${p.cheque_issued_bank||'KTB'}`,
-      type: 'supplier_cheque_stale',
-      action: 'supplier',
-      data: p,
-    });
-  });
-  
-  // 9. Misrouted Payments — ลูกค้าโอนผิดธนาคาร
-  // SS/SR (VAT) → โอนเข้า BBL NW = ผิด
-  // OS/OR (NOVAT) → โอนเข้า KTB/KBANK/BBL = ผิด
-  billList.filter(b => b.match_status === 'paid' && b.bill_no && b.bank).forEach(b => {
-    const misroute = detectMisroutedPayment(b.bill_no, b.bank);
-    if (!misroute) return;
-    alerts.push({
-      category: 'misrouted_payment',
-      priority: 2,
-      title: `⚠️ บิล ${b.bill_no} โอนผิดธนาคาร`,
-      detail: `${misroute.msg} · ฿${fmtNum(b.amount)}`,
-      meta: `${b.remarks1||b.station||''}${b.date?' · '+fmtDate(b.date):''}`,
-      type: 'misrouted_payment',
-      action: 'main',
-      data: b,
-    });
-  });
-  
-  // Sort by priority
-  alerts.sort((a, b) => a.priority - b.priority);
-  
-  // Category counts
-  const categories = {
-    all: alerts.length,
-    debt: alerts.filter(a => a.category === 'debt').length,
-    cheque: alerts.filter(a => a.category === 'cheque' || a.category === 'cheque_bounce').length,
-    sp_temp: alerts.filter(a => a.category === 'sp_temp').length,
-    stmt_unmatched: alerts.filter(a => a.category === 'stmt_unmatched').length,
-    rule_violation: alerts.filter(a => a.category === 'rule_violation').length,
-    supplier_pending: alerts.filter(a => a.category === 'supplier_pending').length,
-    supplier_unmatched: alerts.filter(a => a.category === 'supplier_unmatched').length,
-    supplier_cheque_stale: alerts.filter(a => a.category === 'supplier_cheque_stale').length,
-    misrouted_payment: alerts.filter(a => a.category === 'misrouted_payment').length,
-  };
-  
-  let filterCat = 'all';
-  
-  function renderList() {
-    const filtered = filterCat === 'all' ? alerts : alerts.filter(a => 
-      a.category === filterCat || (filterCat === 'cheque' && a.category === 'cheque_bounce')
-    );
-    
-    el.innerHTML = `
-      <div class="flex justify-between items-center mb-3">
-        <div class="page-title">🔔 แจ้งเตือนทั้งหมด</div>
-        <div class="text-xs text-muted">${alerts.length} รายการ</div>
-      </div>
-      
-      <!-- Filter pills -->
-      <div class="flex gap-2 mb-3 flex-wrap">
-        <button class="pill ${filterCat==='all'?'active':''}" data-cat="all">ทั้งหมด (${categories.all})</button>
-        ${categories.rule_violation > 0 ? `<button class="pill ${filterCat==='rule_violation'?'active':''}" data-cat="rule_violation" style="--pill-color:var(--danger)">🚨 Rule Violation (${categories.rule_violation})</button>` : ''}
-        ${categories.supplier_pending > 0 ? `<button class="pill ${filterCat==='supplier_pending'?'active':''}" data-cat="supplier_pending" style="--pill-color:var(--danger)">🏭 Supplier รอโอน (${categories.supplier_pending})</button>` : ''}
-        ${categories.supplier_unmatched > 0 ? `<button class="pill ${filterCat==='supplier_unmatched'?'active':''}" data-cat="supplier_unmatched" style="--pill-color:var(--warn)">💰 PP รอ Paid (${categories.supplier_unmatched})</button>` : ''}
-        ${categories.debt > 0 ? `<button class="pill ${filterCat==='debt'?'active':''}" data-cat="debt" style="--pill-color:var(--warn)">📋 หนี้ค้าง (${categories.debt})</button>` : ''}
-        ${categories.cheque > 0 ? `<button class="pill ${filterCat==='cheque'?'active':''}" data-cat="cheque" style="--pill-color:var(--danger)">🟡 เช็ค (${categories.cheque})</button>` : ''}
-        ${categories.sp_temp > 0 ? `<button class="pill ${filterCat==='sp_temp'?'active':''}" data-cat="sp_temp" style="--pill-color:var(--info)">🔷 SP ชั่วคราว (${categories.sp_temp})</button>` : ''}
-        ${categories.stmt_unmatched > 0 ? `<button class="pill ${filterCat==='stmt_unmatched'?'active':''}" data-cat="stmt_unmatched" style="--pill-color:var(--info)">🏦 Statement ค้าง (${categories.stmt_unmatched})</button>` : ''}
-        ${categories.supplier_cheque_stale > 0 ? `<button class="pill ${filterCat==='supplier_cheque_stale'?'active':''}" data-cat="supplier_cheque_stale" style="--pill-color:var(--warn)">📝 เช็คค้างขึ้นเงิน (${categories.supplier_cheque_stale})</button>` : ''}
-        ${categories.misrouted_payment > 0 ? `<button class="pill ${filterCat==='misrouted_payment'?'active':''}" data-cat="misrouted_payment" style="--pill-color:var(--warn)">🔀 โอนผิดธนาคาร (${categories.misrouted_payment})</button>` : ''}
-      </div>
-      
-      <div class="flex-col gap-3">
-        ${filtered.length === 0 ? 
-          '<div class="card text-dim text-sm" style="text-align:center;padding:40px">✅ ไม่มีแจ้งเตือนในหมวดนี้</div>' :
-          (() => {
-            const _t = truncateForRender(filtered);
-            return _t.visible.map(a => {
-            const color = a.priority === 1 ? 'var(--danger)' : a.priority === 2 ? 'var(--warn)' : 'var(--info)';
-            return `<div class="card" style="border-left:4px solid ${color}">
-              <div class="flex justify-between items-center flex-wrap gap-3">
-                <div style="flex:1;min-width:0">
-                  <div class="flex items-center gap-2 mb-1">
-                    <span class="font-semi" style="color:var(--text)">${a.title}</span>
-                  </div>
-                  <div class="text-sm" style="color:var(--text2)">${a.detail}</div>
-                  ${a.meta ? `<div class="text-xs text-muted" style="margin-top:3px">${a.meta}</div>` : ''}
-                </div>
-                <div class="flex gap-2">
-                  <button class="btn btn-outline btn-sm" onclick="navigateTo('${a.action}')">ไปจัดการ →</button>
-                </div>
-              </div>
-            </div>`;
-          }).join('') + (_t.truncated ? `<div class="card text-sm text-muted" style="text-align:center;padding:12px">${truncationFooter(_t.total)}</div>` : '');
-          })()
-        }
-      </div>
-    `;
-    
-    el.querySelectorAll('.pill[data-cat]').forEach(btn => {
-      btn.addEventListener('click', () => { filterCat = btn.dataset.cat; renderList(); });
-    });
-  }
-  
-  renderList();
-}
 
 // ── Reports ─────────────────────────────────────────────────
 function renderReports(el) {
