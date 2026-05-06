@@ -20142,6 +20142,17 @@ async function renderBilling(el) {
   async function loadNotes() {
     const r = await api('getBillingNotes', {});
     billingNotes = (r && r.success && Array.isArray(r.data)) ? r.data : [];
+    // ⭐ Normalize backend status → frontend canonical status (5/6/26)
+    //   Backend uses: open / partial / complete
+    //   Frontend STATUS_INFO uses: pending / partial / paid / cancelled
+    //   Use _status_raw to preserve original; status = canonical
+    billingNotes.forEach(n => {
+      n._status_raw = n.status;
+      const s = String(n.status || '').toLowerCase();
+      if (s === 'open')     n.status = 'pending';
+      else if (s === 'complete') n.status = 'paid';
+      // 'partial' / 'cancelled' / 'pending' / 'paid' pass through unchanged
+    });
   }
   async function loadPayments() {
     const r = await api('getBillingPayments', {});
