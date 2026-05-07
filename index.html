@@ -1818,6 +1818,217 @@ function clearStatementsByBank(bank) {
 let uploadedSales = [];
 let billList = []; // ศูนย์กลางข้อมูล: Smart bills + POS + Change
 
+// ════════════════════════════════════════════════════════════════════
+// ⭐ 7/5/26 — Bill Gap Detection (Phase 1)
+//   Detect missing bill numbers ในแต่ละ prefix series หลังเพิ่ม/import บิล
+//   Behavior: ตรวจ background ทุกครั้งที่บันทึกบิล → popup แจ้งช่องว่าง
+// ════════════════════════════════════════════════════════════════════
+
+// Parse bill_no → { prefix, monthCode, seq } | null
+//   SS00126-000123 → { prefix: 'SS', monthCode: '00126', seq: 123 }
+//   OR00126-001234 → { prefix: 'OR', monthCode: '00126', seq: 1234 }
+//   S2604001003-XXX (Front POS) → null (skip — รหัสไม่ใช่ format ตรวจได้)
+function _parseBillSeq(billNo) {
+  if (!billNo) return null;
+  const s = String(billNo).trim();
+  // Match: 2 letters (SR/SS/SC/OR/OS/JR/JS/SP) + 5 chars (00126) + dash + 6+ digits
+  const m = s.match(/^([A-Z]{2})(\d{5})-(\d+)$/);
+  if (!m) return null;
+  const prefix = m[1];
+  // Only check known business prefixes
+  if (!['SR','SS','SC','OR','OS','JR','JS','SP'].includes(prefix)) return null;
+  return {
+    prefix: prefix,
+    monthCode: m[2],
+    seq: parseInt(m[3], 10),
+    raw: s,
+  };
+}
+
+// Find gaps in bill numbers grouped by prefix+monthCode
+//   Returns: { 'SS-00126': { prefix, monthCode, gaps: [125,126,127], existing: 234 }, ... }
+//   Only reports gaps where there's at least 2 bills before AND 1 bill after the gap
+//     (กัน false positive จากบิลใหม่ที่ยังไม่ครบเดือน)
+function findBillGaps(billsToCheck) {
+  const groups = {}; // 'PREFIX-MONTHCODE' -> [seq, seq, ...]
+  
+  billsToCheck.forEach(b => {
+    const parsed = _parseBillSeq(b.bill_no);
+    if (!parsed) return;
+    const key = `${parsed.prefix}-${parsed.monthCode}`;
+    if (!groups[key]) groups[key] = { prefix: parsed.prefix, monthCode: parsed.monthCode, seqs: new Set() };
+    groups[key].seqs.add(parsed.seq);
+  });
+  
+  const results = {};
+  Object.entries(groups).forEach(([key, info]) => {
+    const sorted = [...info.seqs].sort((a, b) => a - b);
+    if (sorted.length < 2) return; // ต้องมีอย่างน้อย 2 ใบถึงจะดู gap ได้
+    
+    const gaps = [];
+    for (let i = 0; i < sorted.length - 1; i++) {
+      const cur = sorted[i];
+      const next = sorted[i + 1];
+      if (next - cur > 1) {
+        // gap = sequence ที่หายไป
+        for (let g = cur + 1; g < next; g++) {
+          gaps.push(g);
+        }
+      }
+    }
+    
+    if (gaps.length > 0) {
+      results[key] = {
+        prefix: info.prefix,
+        monthCode: info.monthCode,
+        gaps: gaps,
+        existing: sorted.length,
+        firstSeq: sorted[0],
+        lastSeq: sorted[sorted.length - 1],
+      };
+    }
+  });
+  
+  return results;
+}
+
+// Format bill no from prefix+monthCode+seq
+function _formatBillNo(prefix, monthCode, seq) {
+  return `${prefix}${monthCode}-${String(seq).padStart(6, '0')}`;
+}
+
+// ─── Show gap warning popup (modal) ───
+//   Called automatically after add/import bills.
+//   Compact UX: แสดงเฉพาะ gap ใหม่ที่เพิ่งเกิด (ไม่ spam ทุก gap เก่า)
+function _showGapPopup(gapResults, source) {
+  const keys = Object.keys(gapResults);
+  if (keys.length === 0) return;
+  
+  // Build human-friendly message
+  const sections = keys.map(key => {
+    const r = gapResults[key];
+    const PREFIX_LABEL = {
+      'SS': '🧾 SS (ใบกำกับเงินสด - Front POS)',
+      'SR': '🧾 SR (ใบกำกับเครดิต)',
+      'SC': '🧾 SC (ลดหนี้ VAT)',
+      'OR': '📄 OR (ใบส่งของเครดิต)',
+      'OS': '📄 OS (ใบส่งของเงินสด)',
+      'JR': '📄 JR (ลดหนี้เครดิต)',
+      'JS': '📄 JS (ลดหนี้เงินสด)',
+      'SP': '💵 SP (ใบรับชำระ)',
+    };
+    const label = PREFIX_LABEL[r.prefix] || r.prefix;
+    
+    // Group consecutive gaps for cleaner display
+    // [125,126,127, 200,201, 305] → "125-127, 200-201, 305"
+    const ranges = [];
+    let start = r.gaps[0], end = r.gaps[0];
+    for (let i = 1; i < r.gaps.length; i++) {
+      if (r.gaps[i] === end + 1) {
+        end = r.gaps[i];
+      } else {
+        ranges.push({ start, end });
+        start = r.gaps[i];
+        end = r.gaps[i];
+      }
+    }
+    ranges.push({ start, end });
+    
+    const rangeStrs = ranges.slice(0, 8).map(rg => {
+      const fmtStart = _formatBillNo(r.prefix, r.monthCode, rg.start);
+      const fmtEnd = _formatBillNo(r.prefix, r.monthCode, rg.end);
+      return rg.start === rg.end 
+        ? `<code style="font-family:monospace;font-size:.85rem">${fmtStart}</code>`
+        : `<code style="font-family:monospace;font-size:.85rem">${fmtStart}</code> ถึง <code style="font-family:monospace;font-size:.85rem">${fmtEnd}</code>`;
+    });
+    if (ranges.length > 8) rangeStrs.push(`<span style="color:var(--text2)">...และอีก ${ranges.length - 8} ช่วง</span>`);
+    
+    return `
+      <div style="background:var(--bg2);border-left:4px solid var(--warn);padding:10px 14px;margin-bottom:10px;border-radius:4px">
+        <div style="font-weight:700;margin-bottom:6px">${label}</div>
+        <div style="font-size:.82rem;color:var(--text2);margin-bottom:8px">มี ${r.existing} ใบ · ขาด <strong style="color:var(--warn)">${r.gaps.length} ใบ</strong></div>
+        <div style="font-size:.85rem;line-height:1.8">${rangeStrs.join('<br>')}</div>
+      </div>
+    `;
+  }).join('');
+  
+  const totalGaps = keys.reduce((s, k) => s + gapResults[k].gaps.length, 0);
+  
+  openModal(`⚠️ พบเลขบิลตกหล่น ${totalGaps} ใบ`, `
+    <div style="max-width:560px">
+      <div style="background:rgba(250,200,100,.08);border:1px solid rgba(250,200,100,.3);padding:12px 14px;border-radius:6px;margin-bottom:14px;font-size:.88rem;line-height:1.6">
+        ระบบตรวจพบ <strong>เลขบิลที่ไม่ต่อเนื่อง</strong> หลังจาก${source ? ` ${source}` : ''} —<br>
+        กรุณาตรวจสอบใน Smart software ว่า:<br>
+        <span style="display:inline-block;margin-top:6px">
+          • ดึงข้อมูลครบทุกบิลแล้วหรือยัง<br>
+          • บิลที่ขาดถูกยกเลิก/void แล้วหรือยัง<br>
+          • Print/บันทึก แล้วลืมกดบันทึกใหม่หรือเปล่า
+        </span>
+      </div>
+      
+      ${sections}
+      
+      <div style="display:flex;gap:8px;margin-top:14px">
+        <button class="btn btn-primary btn-sm" style="flex:1" onclick="closeModal()">เข้าใจแล้ว</button>
+      </div>
+    </div>
+  `);
+}
+
+// ─── Run gap check on ALL bills currently in billList ───
+//   Compares with previous run → only show NEW gaps that weren't there before
+//   Prevents popup spam when re-adding bills near existing gaps
+function runGapCheck(source) {
+  // ใช้ debounce กัน popup ซ้อนกัน (ถ้า import ไฟล์หลายไฟล์ติดกัน)
+  if (window._gapCheckTimer) clearTimeout(window._gapCheckTimer);
+  window._gapCheckTimer = setTimeout(() => {
+    const gaps = findBillGaps(billList);
+    if (Object.keys(gaps).length === 0) {
+      // No gaps found → reset baseline
+      window._lastGapKeys = new Set();
+      return;
+    }
+    
+    // Compare with last known gaps — เฉพาะ gap ใหม่ที่ไม่เคยเจอ → popup
+    if (!window._lastGapKeys) window._lastGapKeys = new Set();
+    const currentKeys = new Set();
+    const newGaps = {};
+    Object.entries(gaps).forEach(([prefixKey, info]) => {
+      info.gaps.forEach(seq => {
+        const fullKey = `${prefixKey}|${seq}`;
+        currentKeys.add(fullKey);
+        if (!window._lastGapKeys.has(fullKey)) {
+          // New gap
+          if (!newGaps[prefixKey]) newGaps[prefixKey] = { ...info, gaps: [] };
+          newGaps[prefixKey].gaps.push(seq);
+        }
+      });
+    });
+    
+    // Update baseline
+    window._lastGapKeys = currentKeys;
+    
+    // Show popup if NEW gaps appeared
+    if (Object.keys(newGaps).length > 0) {
+      _showGapPopup(newGaps, source);
+    }
+  }, 600);
+}
+
+// Init baseline gap set on first load (silent — no popup for existing gaps)
+window._lastGapKeys = null; // null = not yet initialized
+setTimeout(() => {
+  if (window._lastGapKeys === null) {
+    const gaps = findBillGaps(billList);
+    const keys = new Set();
+    Object.entries(gaps).forEach(([prefixKey, info]) => {
+      info.gaps.forEach(seq => keys.add(`${prefixKey}|${seq}`));
+    });
+    window._lastGapKeys = keys;
+  }
+}, 2000);
+
+
 // Global stub — จะถูก override เมื่อ renderMain() โหลด
 // กัน TypeError เมื่อ syncManager เรียกก่อนที่หน้า Main จะ render
 window.invalidateBillsCache = window.invalidateBillsCache || function() {};
@@ -5255,6 +5466,8 @@ function parseFrontPosReport(result, fileName) {
   console.log(`[Front POS] cashierToStation:`, cashierToStation);
   console.log(`[Front POS] Imported: Transfer=${tCount} · Card=${cCount} · Refund=${rCount} · Skipped dup=${dup}`);
   
+  runGapCheck('นำเข้า Front POS'); // ⭐ Phase 1 gap detection
+  
   if (currentPage === 'main') navigateTo('main');
 }
 
@@ -5588,6 +5801,8 @@ function generateBillList(result, fileName) {
   if (dupes.length > 0) {
     setTimeout(() => toast(`⚠️ พบบิลซ้ำ ${dupes.length} กลุ่ม — กด "🔍 ตรวจสอบ" เพื่อดูรายละเอียด`, 'warn'), 800);
   }
+  
+  runGapCheck('นำเข้าจาก Smart software'); // ⭐ Phase 1 gap detection
 
   if (currentPage === 'main' || currentPage === 'billlist') navigateTo('main');
 }
@@ -8289,6 +8504,7 @@ async function renderMain(el) {
           : '';
         toast(`เพิ่มบิล฿${amount.toFixed(2)}${netNote}`, 'success');
         renderKeepScroll();
+        runGapCheck('เพิ่มบิล'); // ⭐ Phase 1 gap detection
       });
     });
 
