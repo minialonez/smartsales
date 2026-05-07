@@ -30466,7 +30466,22 @@ async function renderSpRecon(el) {
       const idx = Number(cell.dataset.idx);
       const row = spV2State.mainRows[idx];
       if (!row) return;
-      row.vat_flag = row.vat_flag === 'Y' ? 'N' : 'Y';
+      
+      const newFlag = row.vat_flag === 'Y' ? 'N' : 'Y';
+      row.vat_flag = newFlag;
+      
+      // ⭐ 7/5/26 — ถ้า toggle ที่ header → apply ไปยัง bills ใน group นั้นด้วย
+      //   Header N → bills ทั้งหมด N
+      //   Header Y → bills ทั้งหมด Y
+      //   ส่วนถ้า user toggle ที่ bill row เฉพาะใบ → กระทบเฉพาะใบนั้น
+      if (row._is_header) {
+        spV2State.mainRows.forEach(r => {
+          if (!r._is_header && r._group_id === row._group_id) {
+            r.vat_flag = newFlag;
+          }
+        });
+      }
+      
       spV2InvalidateGenerated(); // ⭐ user แก้ → reset Report/SellBills
       persistSpV2();
       spV2RenderKeepScroll(el);
@@ -31214,47 +31229,71 @@ function spV2DownloadSellBills() {
 //   N headers → keep original (sp_number = bill_no)
 //   bills ใน group เดียวกัน → sync sp_number ด้วย
 function spV2GenerateReportNumbers() {
-  const counters = {}; // YYYYMM -> next counter
   let yCount = 0, nCount = 0;
+  const monthsSeen = new Set();
   
-  // Build map: group_id -> new sp_number
+  // ⭐ 7/5/26 — Counter เป็น GLOBAL (ต่อเนื่องข้ามเดือน) ตามที่ Toppy ต้องการ
+  //   - ม.ค. SP202601-0001..0171
+  //   - ก.พ. SP202602-0172..0345 (ต่อจาก ม.ค.)
+  //   - มี.ค. SP202603-0346..... (ต่อจาก ก.พ.)
+  //   - ฯลฯ
+  //   ยังคงใช้ {YYYYMM} ตาม pay_date ของ SP ใบนั้น แต่ counter เดียว
+  //   counter เริ่ม 1 เสมอเมื่อ Generate (re-assign ใหม่ตาม sort order)
+  let counter = 0;
+  
+  // Step 1: Sort Y headers ตาม pay_date asc → original SP seq asc
+  function _parseOriginalSpSeq(billNo) {
+    const m = String(billNo || '').match(/-(\d+)$/);
+    return m ? parseInt(m[1], 10) : 999999;
+  }
+  
+  const yHeaders = spV2State.mainRows
+    .filter(r => r._is_header && r.vat_flag === 'Y')
+    .slice()
+    .sort((a, b) => {
+      const da = String(a.pay_date || '').substring(0, 10);
+      const db = String(b.pay_date || '').substring(0, 10);
+      if (da !== db) return da.localeCompare(db);
+      return _parseOriginalSpSeq(a.bill_no) - _parseOriginalSpSeq(b.bill_no);
+    });
+  
+  // Step 2: Assign new SP number — counter เดียวต่อเนื่อง
   const newSpMap = {};
+  yHeaders.forEach(r => {
+    const date = r.pay_date ? new Date(r.pay_date) : new Date();
+    if (isNaN(date.getTime())) return;
+    const yyyy = date.getFullYear();
+    const mm = String(date.getMonth() + 1).padStart(2, '0');
+    monthsSeen.add(`${yyyy}-${mm}`);
+    counter++;
+    const newSp = `SP${yyyy}${mm}-${String(counter).padStart(4, '0')}`;
+    newSpMap[r._group_id] = newSp;
+    r.sp_number = newSp;
+    yCount++;
+  });
+  
+  // Step 3: N rows → keep original
   spV2State.mainRows.forEach(r => {
     if (!r._is_header) return;
-    
-    if (r.vat_flag === 'Y') {
-      // Generate new SP number
-      const date = r.pay_date ? new Date(r.pay_date) : new Date();
-      if (isNaN(date.getTime())) return;
-      const yyyy = date.getFullYear();
-      const mm = String(date.getMonth() + 1).padStart(2, '0');
-      const key = `${yyyy}${mm}`;
-      if (!counters[key]) counters[key] = 0;
-      counters[key]++;
-      const newSp = `SP${key}-${String(counters[key]).padStart(4, '0')}`;
-      newSpMap[r._group_id] = newSp;
-      r.sp_number = newSp;
-      yCount++;
-    } else {
-      // N rows: keep original
+    if (r.vat_flag !== 'Y') {
       newSpMap[r._group_id] = r.bill_no;
       r.sp_number = r.bill_no;
       nCount++;
     }
   });
   
-  // Apply to bills (sp_number column shows new value)
+  // Step 4: Apply mapping to bills
   spV2State.mainRows.forEach(r => {
     if (r._is_header) return;
     if (newSpMap[r._group_id]) r.sp_number = newSpMap[r._group_id];
   });
   
-  // Sync nextCounter (max of all months counters)
-  spV2State.nextCounter = Math.max(spV2State.nextCounter || 1, ...Object.values(counters), 1) + 1;
-  spV2State.reportGenerated = true; // ⭐ Mark as generated → Report view ใช้ได้
+  spV2State.nextCounter = counter + 1;
+  spV2State.reportGenerated = true;
   persistSpV2();
   
-  toast(`✓ Generate Report สำเร็จ — Y rows ${yCount} ใบ (เลขใหม่) · N rows ${nCount} ใบ (คงเดิม)`, 'success', 5000);
+  const monthsStr = monthsSeen.size > 1 ? ` (ครอบคลุม ${monthsSeen.size} เดือน)` : '';
+  toast(`✓ Generate Report สำเร็จ — Y rows ${yCount} ใบ (0001-${String(counter).padStart(4,'0')})${monthsStr} · N rows ${nCount} ใบ (คงเดิม)`, 'success', 6000);
   spV2RenderKeepScroll();
 }
 
