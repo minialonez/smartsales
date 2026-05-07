@@ -561,6 +561,42 @@ async function pushMatchDelta(bill, stmt) {
 
 // ── Date Helpers (dd/mm/yyyy เสมอ) ──
 // ──────────────────────────────────────────────────────────────────────────
+// 🔒 Date Lock — กันแก้ข้อมูลวันเก่าโดยไม่ตั้งใจ
+// ──────────────────────────────────────────────────────────────────────────
+// State: mainSummary.__lockedDates = { 'yyyy-mm-dd': true, ... }
+//   ถ้า isDateLocked(date) === true → block ทุก mutation ของวันนั้น
+//   user กด 🔒 toggle ได้เอง — unlock ต้อง confirm
+function isDateLocked(dateISO) {
+  if (!dateISO) return false;
+  if (typeof mainSummary !== 'object' || !mainSummary) return false;
+  const locks = mainSummary.__lockedDates || {};
+  return locks[dateISO] === true;
+}
+function lockDate(dateISO) {
+  if (!dateISO) return;
+  if (!mainSummary.__lockedDates) mainSummary.__lockedDates = {};
+  mainSummary.__lockedDates[dateISO] = true;
+  if (typeof persistMainState === 'function') persistMainState();
+  if (window.syncManager?.markDirty) syncManager.markDirty('meta', dateISO);
+}
+function unlockDate(dateISO) {
+  if (!dateISO) return;
+  if (!mainSummary.__lockedDates) return;
+  delete mainSummary.__lockedDates[dateISO];
+  if (typeof persistMainState === 'function') persistMainState();
+  if (window.syncManager?.markDirty) syncManager.markDirty('meta', dateISO);
+}
+// Guard helper: ตรวจก่อน mutation — return true ถ้า block, false ถ้า allow
+function blockIfLocked(dateISO, action) {
+  if (isDateLocked(dateISO)) {
+    if (typeof toast === 'function') {
+      toast(`🔒 วันที่ ${dateISO} ถูก lock — กดปลด lock ก่อน${action ? ' ('+action+')' : ''}`, 'warn', 3500);
+    }
+    return true;
+  }
+  return false;
+}
+
 function todayISO() {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
@@ -929,6 +965,22 @@ if (typeof window !== 'undefined') {
   }
 }
 
+
+// 🚫 Excluded customers cache (7/5/26) — ใช้ใน calcSales เพื่อไม่นับยอดขายของบริษัทเครือ
+// Source: localStorage 'sf_excluded_customers' (set ใน Data page UI)
+(function _initExcludedCustomers() {
+  try {
+    const raw = localStorage.getItem('sf_excluded_customers') || '[]';
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) {
+      window.__excludedCustomers = new Set();
+      return;
+    }
+    window.__excludedCustomers = new Set(arr.map(x => String(x.code || x).toUpperCase()));
+  } catch(_) {
+    window.__excludedCustomers = new Set();
+  }
+})();
 
 // ── Excel / CSV File Parser ──
 function parseExcelFile(file) {
@@ -1947,6 +1999,75 @@ window.buildCompactMetaRows = function(filterDates) {
     console.warn(`[buildCompactMetaRows] skipped ${skippedFuture} future/invalid dates (won't push to cloud)`);
   }
   
+  // ⭐ Locks row: 1 row per year ที่มี __lockedDates dict
+  //    bug ก่อนหน้า: ไม่ build locks row → lockDate/unlockDate/bulk_unlock ไม่ sync cloud
+  //    fix: ใส่ locks row ทุกปีที่มี locked dates (group by year prefix)
+  //    meta_uuid format: '<year>-locks' (e.g., '2026-locks')
+  //    date field: '<year>-01-01' (anchor date, not business date)
+  //    Push เสมอเมื่อ filter ไม่บังคับ หรือ 'locks' อยู่ใน dirty set
+  if (mainSummary && mainSummary.__lockedDates) {
+    const allLocks = mainSummary.__lockedDates;
+    // Group by year
+    const locksByYear = {};
+    Object.keys(allLocks).forEach(function(d) {
+      if (!allLocks[d]) return;
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) return;
+      const yr = d.substring(0, 4);
+      if (!locksByYear[yr]) locksByYear[yr] = {};
+      locksByYear[yr][d] = true;
+    });
+    
+    // Decide which years to push
+    //   - If filterDates is undefined/null/empty → push all years (full save)
+    //   - If filterDates contains 'locks' marker OR any date → push every year that intersects
+    //   - To allow lock changes to flow when meta dirty for any reason — push every year always when no filter
+    Object.keys(locksByYear).forEach(function(yr) {
+      // Skip locks row if filter is on AND filter doesn't include 'locks' marker AND no date in this year
+      if (useFilter) {
+        const hasLocksMarker = filterDates.has('locks') || filterDates.has(yr + '-locks');
+        const hasDateInYear = [...filterDates].some(function(d) { return typeof d === 'string' && d.startsWith(yr); });
+        if (!hasLocksMarker && !hasDateInYear) return;
+      }
+      const yearLocks = locksByYear[yr];
+      rows.push({
+        meta_uuid: yr + '-locks',
+        date: yr + '-01-01',
+        meta_type: 'locks',
+        data_json: JSON.stringify(yearLocks),
+        updated_at: nowStr,
+        updated_by: user,
+      });
+    });
+    
+    // ⭐ EMPTY-LOCKS case: ถ้า user bulk_unlock จนหมด → mainSummary.__lockedDates = {} 
+    //    locksByYear = {} → ไม่มี row build → cloud ยังเก็บ locks เก่า (desync)
+    //    Fix: ถ้าไม่มี year — push empty data_json="{}" ไปแทน
+    //    ให้ครอบคลุมปีปัจจุบัน + ปีที่ filterDates อ้างถึง
+    if (Object.keys(locksByYear).length === 0) {
+      const yearsToReset = new Set();
+      if (useFilter) {
+        [...filterDates].forEach(function(d) {
+          if (typeof d !== 'string') return;
+          if (d === 'locks') yearsToReset.add(String(new Date().getFullYear()));
+          else if (/^\d{4}/.test(d)) yearsToReset.add(d.substring(0, 4));
+        });
+      } else {
+        // Full save → reset locks ของปีปัจจุบัน
+        yearsToReset.add(String(new Date().getFullYear()));
+      }
+      yearsToReset.forEach(function(yr) {
+        rows.push({
+          meta_uuid: yr + '-locks',
+          date: yr + '-01-01',
+          meta_type: 'locks',
+          data_json: '{}',
+          updated_at: nowStr,
+          updated_by: user,
+        });
+      });
+    }
+  }
+  
   return rows;
 };
 
@@ -1965,9 +2086,14 @@ window.parseCompactMetaRows = function(rows, opts) {
     'returns': 'ยอดคืนสินค้า', 'cashDrawer': 'Cash Drawer',
     'transfer': 'Transfer', 'card': 'Card', 'cheque': 'Cheque', 'refund': 'Refund',
   };
-  const VALID_META_TYPES = ['summary', 'cash_count'];
+  const VALID_META_TYPES = ['summary', 'cash_count', 'locks'];
   const summary = { __byDate: {} };
   const cash = { __byDate: {} };
+  const lockedDates = {};
+  // ⭐ Track ว่า cloud มี locks row ของปีไหนบ้าง (ใช้เป็น source of truth สำหรับ replace)
+  //    ถ้ามี locks row → cloud คือ snapshot สมบูรณ์ → local ต้อง replace ตาม
+  //    ถ้าไม่มี locks row → คง local ไว้ (อาจจะยังไม่ pull ปีนั้น)
+  const yearsWithLocksRow = {};
   let skippedJunk = 0;
   
   rows.forEach(function(r) {
@@ -2087,12 +2213,20 @@ window.parseCompactMetaRows = function(rows, opts) {
         cleaned[k] = Number(data[k]) || 0;
       });
       if (Object.keys(cleaned).length > 0) cash.__byDate[dateISO] = cleaned;
+    } else if (r.meta_type === 'locks') {
+      // data = { 'yyyy-mm-dd': true, ... } — keys เป็น locked dates
+      // ⭐ Mark year นี้ว่ามี locks snapshot (cloud authoritative for this year)
+      const yearOfRow = String(dateISO).substring(0, 4);
+      if (yearOfRow) yearsWithLocksRow[yearOfRow] = true;
+      Object.keys(data).forEach(function(d) {
+        if (data[d] === true) lockedDates[d] = true;
+      });
     }
   });
   
   if (skippedJunk > 0) console.warn(`[parseMeta] Skipped ${skippedJunk} junk rows`);
   if (skippedGhost > 0) console.warn(`[parseMeta] Skipped ${skippedGhost} ghost rows (filtered by validDates/validMonths)`);
-  return { summary: summary, cashCount: cash, skippedJunk: skippedJunk, skippedGhost: skippedGhost };
+  return { summary: summary, cashCount: cash, lockedDates: lockedDates, yearsWithLocksRow: yearsWithLocksRow, skippedJunk: skippedJunk, skippedGhost: skippedGhost };
 };
 
 // ═══════════════════════════════════════════════════════════════════
@@ -3133,7 +3267,8 @@ const syncManager = {
           this._emit();
         } else if (type === 'meta') {
           // Meta สำคัญมาก — ใช้ full JSON fingerprint (หนักแต่คุ้ม กันบวม sheet)
-          const fp = this._fp({summary: mainSummary, cash_count: cashCount});
+          // ⭐ Include __lockedDates ใน fp — เปลี่ยน lock = trigger push
+          const fp = this._fp({summary: mainSummary, cash_count: cashCount, locks: mainSummary?.__lockedDates || {}});
           
           // ⭐ DEBUG (26/4/26): trace meta push flow
           console.log('[meta push] fp:', fp.substring(0, 30), '| cached:', String(this._fpCache.meta || 'null').substring(0, 30));
@@ -3457,6 +3592,15 @@ const syncManager = {
                       if (mode === 'force') {
                         Object.assign(localBill, b);
                         return;
+                      }
+                      // 🔒 Lock guard: ถ้าวันที่บิลถูก lock → ไม่ให้ cloud ทับ local (ยกเว้น matching fields)
+                      if (typeof isDateLocked === 'function' && isDateLocked(toISODate(localBill.date))) {
+                        // Allow merge เฉพาะ matching fields (เพราะ matching ทำได้ใน lock day)
+                        const MATCH_FIELDS = ['match_status','confirmation','matched_stmt_ref','matched_at','pay_date','paid_by_sp'];
+                        MATCH_FIELDS.forEach(f => {
+                          if (b[f] !== undefined) localBill[f] = b[f];
+                        });
+                        return; // skip full merge
                       }
                       // ⭐ Match-state guard: ถ้า local matched + matched_at ใหม่กว่า cloud updated_at → skip
                       //    ป้องกัน race delta push ค้าง → poll pull มาก่อน → revert
@@ -3818,6 +3962,9 @@ const syncManager = {
                   Object.entries(parsed.summary.__byDate).forEach(([d, v]) => {
                     // ⭐ Month-scope filter
                     if (monthScope && !_inMonthScope(d)) return;
+                    // 🔒 Lock guard: ถ้าวันที่ lock → ไม่ให้ cloud ทับ local (freeze ตัวเลข)
+                    //    ⭐ mode='force' (Refresh confirm "ทับการแก้ไข") → override lock guard
+                    if (mode !== 'force' && typeof isDateLocked === 'function' && isDateLocked(d)) return;
                     if (!mainSummary.__byDate[d]) mainSummary.__byDate[d] = {};
                     stats.meta += mergeFields(mainSummary.__byDate[d], v);
                   });
@@ -3828,9 +3975,38 @@ const syncManager = {
                   Object.entries(parsed.cashCount.__byDate).forEach(([d, v]) => {
                     // ⭐ Month-scope filter
                     if (monthScope && !_inMonthScope(d)) return;
+                    // 🔒 Lock guard — ⭐ mode='force' override
+                    if (mode !== 'force' && typeof isDateLocked === 'function' && isDateLocked(d)) return;
                     if (!cashCount.__byDate[d]) cashCount.__byDate[d] = {};
                     mergeFields(cashCount.__byDate[d], v);
                   });
+                }
+                // ⭐ REPLACE lockedDates per year (cloud = source of truth)
+                //    เดิม: UNION → unlock จากอีกเครื่องไม่ sync (local lock เก่ายังอยู่)
+                //    ใหม่: ปีไหนที่ cloud มี locks row → ลบ local locks ของปีนั้นทิ้ง → ใส่ cloud locks
+                //    ปีไหน cloud ไม่มี locks row → ไม่แตะ local (อาจยังไม่ pull ปีนั้น)
+                //    Dirty guard: ถ้า user มี local meta edit ที่ยังไม่ push → skip merge (กันทับ)
+                const isDirty = this.dirty.has('meta');
+                if (parsed.yearsWithLocksRow && Object.keys(parsed.yearsWithLocksRow).length > 0 && !isDirty) {
+                  if (!mainSummary.__lockedDates) mainSummary.__lockedDates = {};
+                  // ลบ local locks ของปีที่ cloud มี row
+                  Object.keys(parsed.yearsWithLocksRow).forEach(yr => {
+                    Object.keys(mainSummary.__lockedDates).forEach(d => {
+                      if (String(d).substring(0, 4) === yr) {
+                        delete mainSummary.__lockedDates[d];
+                      }
+                    });
+                  });
+                  // ใส่ cloud locks (เฉพาะที่อยู่ในปีที่มี row)
+                  Object.keys(parsed.lockedDates || {}).forEach(d => {
+                    const yr = String(d).substring(0, 4);
+                    if (parsed.yearsWithLocksRow[yr]) {
+                      mainSummary.__lockedDates[d] = true;
+                    }
+                  });
+                  console.log(`[sync] Lock dates REPLACED for years [${Object.keys(parsed.yearsWithLocksRow).join(',')}] → ${Object.keys(mainSummary.__lockedDates).length} total`);
+                } else if (isDirty) {
+                  console.log(`[sync] Lock merge SKIPPED (local meta dirty)`);
                 }
                 handled = true;
                 console.log(`[sync] Meta ${y}: ${r.data.rows.length} rows via getMetaWithUuid (new schema)`);
@@ -6549,16 +6725,31 @@ async function renderMain(el) {
   //   1) ใช้ mainSummary['sales_Front*'] ถ้า user กรอก หรือ import มาได้
   //   2) Fallback: รวมจาก bills ที่ station=Front* (ยกเว้นบิล type=Transfer ที่เป็น Invoice cross-station)
   //      เพราะ mainSummary อาจ import มาไม่ครบทุกวัน
+  //
+  // ⭐ Excluded customers (7/5/26): ตัดบิลของ cust_code ที่อยู่ใน window.__excludedCustomers
+  //    (set จาก localStorage 'sf_excluded_customers' — ตั้งใน Data page)
+  //    เหตุผล: บริษัทเครือ/ของตัวเอง — ออก SB ปกติ แต่ไม่นับเป็น "ยอดขาย" ทางการ
+  function _isExcludedBill(b) {
+    const excl = window.__excludedCustomers;
+    if (!excl || !excl.size) return false;
+    const code = (typeof extractCustCode === 'function')
+      ? String(extractCustCode(b.remarks1 || '') || '').toUpperCase()
+      : '';
+    return code && excl.has(code);
+  }
+  
   function calcSales(station) {
     if (['Invoice', 'Invoice Credit', 'Order', 'Order Credit', 'Payment'].includes(station)) {
       return getBillsForSelectedDate().filter(b => (b.station || '').trim() === station)
+        .filter(b => !_isExcludedBill(b))
         .reduce((s, b) => s + (Number(b.amount) || 0), 0);
     }
     // Front1-4: ใช้ mainSummary ถ้ามี → ไม่งั้น sum จาก bills
     var fromSummary = Number(mainSummary['sales_' + station]) || 0;
     if (fromSummary !== 0) return fromSummary;
-    // Fallback: sum bills ของ station นี้
+    // Fallback: sum bills ของ station นี้ (apply exclude ด้วย)
     return getBillsForSelectedDate().filter(b => (b.station || '').trim() === station)
+      .filter(b => !_isExcludedBill(b))
       .reduce((s, b) => s + (Number(b.amount) || 0), 0);
   }
 
@@ -6908,13 +7099,13 @@ async function renderMain(el) {
         <div class="flex gap-2 items-center flex-wrap">
           <div class="flex items-center" style="gap:4px;position:relative">
             <button class="btn btn-outline btn-sm" id="main-date-prev" title="วันก่อนหน้า" style="padding:4px 10px;font-weight:700">◀</button>
-            <button class="btn btn-outline" id="main-date-btn" style="padding:5px 14px;font-weight:600;min-width:160px;font-variant-numeric:tabular-nums${false?';background:rgba(239,87,87,.18);border-color:var(--danger);color:var(--danger)':''}" title="คลิกเพื่อเลือกวัน">
+            <button class="btn btn-outline" id="main-date-btn" style="padding:5px 14px;font-weight:600;min-width:160px;font-variant-numeric:tabular-nums${isDateLocked(selectedDate)?';background:rgba(239,87,87,.18);border-color:var(--danger);color:var(--danger)':''}" title="คลิกเพื่อเลือกวัน">
               ${(() => {
                 const d = new Date(selectedDate);
                 if (isNaN(d)) return selectedDate;
                 const thMonths = ['ม.ค.','ก.พ.','มี.ค.','เม.ย.','พ.ค.','มิ.ย.','ก.ค.','ส.ค.','ก.ย.','ต.ค.','พ.ย.','ธ.ค.'];
                 const dow = ['อา.','จ.','อ.','พ.','พฤ.','ศ.','ส.'][d.getDay()];
-                const lockIcon = false ? '🔒 ' : '📅 ';
+                const lockIcon = isDateLocked(selectedDate) ? '🔒 ' : '📅 ';
                 return `${lockIcon}${dow} ${d.getDate()} ${thMonths[d.getMonth()]} ${d.getFullYear()}`;
               })()}
             </button>
@@ -6925,6 +7116,9 @@ async function renderMain(el) {
           <button class="btn btn-info btn-sm" id="btn-import-pos" style="background:var(--info);color:#fff">${ICONS.download} Front POS</button>
           <button class="btn ${showChange?'btn-primary':'btn-outline'} btn-sm" id="btn-toggle-change">🪙 นับธนบัตร</button>
           <button class="btn btn-sm" id="btn-unmatch-day" style="background:var(--warn);color:#1a1d27;border:none;font-weight:700" title="Unmatch บิลทั้งหมดในวันนี้ — ปลด link statement ทุกตัวที่ match กับวันนี้">↩ Unmatch วันนี้</button>
+          <button class="btn btn-sm" id="btn-lock-day" ${isDateLocked(selectedDate)?'disabled':''} style="${isDateLocked(selectedDate)?'background:rgba(239,87,87,.08);border:1px solid rgba(239,87,87,.3);color:rgba(239,87,87,.4);cursor:not-allowed':'background:var(--danger);color:#fff;border:1px solid var(--danger);font-weight:700'}" title="Lock วันนี้ — ป้องกันการแก้ไข">🔒 Lock</button>
+          <button class="btn btn-sm" id="btn-unlock-day" ${!isDateLocked(selectedDate)?'disabled':''} style="${!isDateLocked(selectedDate)?'background:rgba(45,212,160,.08);border:1px solid rgba(45,212,160,.3);color:rgba(45,212,160,.4);cursor:not-allowed':'background:var(--success);color:#fff;border:1px solid var(--success);font-weight:700;box-shadow:0 0 0 2px rgba(45,212,160,.2)'}" title="ปลด Lock วันนี้">🔓 Unlock</button>
+          <button class="btn btn-outline btn-sm" id="btn-bulk-lock" title="Lock/Unlock หลายวันพร้อมกัน" style="border:1px dashed var(--text2);color:var(--text2)">📅 Bulk</button>
           <button class="btn btn-outline btn-sm" id="btn-check-issues">🔍 ตรวจสอบ</button>
           <button class="btn btn-outline btn-sm" id="btn-refresh-cloud" title="ดึงข้อมูลล่าสุดจาก Sheet (ทับ local)">🔄 Refresh</button>
           <button class="btn btn-success btn-sm" id="btn-save-main" style="position:relative">${ICONS.check} บันทึก<span id="dirty-count-badge" style="display:none;background:var(--warn);color:#1a1d27;font-size:.7rem;font-weight:700;padding:1px 6px;border-radius:9px;margin-left:6px"></span></button>
@@ -6953,6 +7147,17 @@ async function renderMain(el) {
           `;
         })()}
       </div>
+      
+      ${isDateLocked(selectedDate) ? `
+        <div style="padding:14px 18px;background:linear-gradient(90deg,rgba(239,87,87,.18),rgba(239,87,87,.08));border:2px solid var(--danger);border-left:6px solid var(--danger);border-radius:8px;color:var(--danger);margin-bottom:14px;display:flex;align-items:center;gap:14px;font-weight:700;box-shadow:0 2px 8px rgba(239,87,87,.15)">
+          <span style="font-size:1.6rem">🔒</span>
+          <div style="flex:1">
+            <div style="font-size:1rem;letter-spacing:.3px">วันที่ ${fmtDate(selectedDate)} ถูก LOCK</div>
+            <div style="font-weight:400;font-size:.78rem;color:var(--text2);margin-top:2px">แก้ไขตัวเลข/บิล/import ไม่ได้ — แต่ matching statement ยังทำได้</div>
+          </div>
+          <button class="btn btn-sm" onclick="document.getElementById('btn-unlock-day')?.click()" style="background:var(--success);color:#fff;border:none;font-weight:700;padding:6px 14px">🔓 ปลด Lock</button>
+        </div>
+      ` : ''}
       
       ${(() => {
         const v = validateAll();
@@ -6992,7 +7197,7 @@ async function renderMain(el) {
               ${(function(){
                 const vals = SUMMARY_STATIONS.map(s => calcSales(s) || _getSummaryValue('sales', s));
                 const allSum = vals.reduce((a,b)=>a+b,0);
-                const _locked = false;
+                const _locked = isDateLocked(selectedDate);
                 const _ro = _locked ? 'readonly' : '';
                 const _roStyle = _locked ? ';background:rgba(127,127,127,.08);color:var(--text2);cursor:not-allowed;opacity:.65' : '';
                 const cellParts = [];
@@ -7085,7 +7290,7 @@ async function renderMain(el) {
             <tbody>
               ${(() => {
                 const dayCash = getCashForDate(selectedDate);
-                const _locked = false;
+                const _locked = isDateLocked(selectedDate);
                 const _ro = _locked ? 'readonly' : '';
                 const _roStyle = _locked ? ';background:rgba(127,127,127,.08);color:var(--text2);cursor:not-allowed;opacity:.65' : '';
                 return DENOMINATIONS.map(d => `
@@ -7488,7 +7693,7 @@ async function renderMain(el) {
     const vals = SUMMARY_STATIONS.map(s => Number(_getVal(s)) || 0);
     const allSum = vals.reduce((a,b)=>a+b,0);
     // 🔒 Lock: readonly + visual จาง
-    const _locked = false;
+    const _locked = isDateLocked(selectedDate);
     const _ro = _locked ? 'readonly' : '';
     const _roStyle = _locked ? ';background:rgba(127,127,127,.08);color:var(--text2);cursor:not-allowed;opacity:.65' : '';
     // cashIn: Front1-4 + Invoice (Merged with Order/Payment), cashOut: Front1 + Invoice (Merged), returns: Front1-3 + Invoice (Merged)
@@ -7547,7 +7752,7 @@ async function renderMain(el) {
     const allSum = frontTotal + mergedInvoiceTotal;
     
     const cells = [];
-    const _locked = false;
+    const _locked = isDateLocked(selectedDate);
     const _ro = _locked ? 'readonly' : '';
     const _roStyle = _locked ? ';background:rgba(127,127,127,.08);color:var(--text2);cursor:not-allowed;opacity:.65' : '';
     SUMMARY_STATIONS.forEach(s => {
@@ -7610,11 +7815,11 @@ async function renderMain(el) {
     
     // Buttons
     document.getElementById('btn-gen-smart')?.addEventListener('click', () => {
-      if (false) return;
+      if (blockIfLocked(selectedDate, 'Smart import')) return;
       triggerFileUpload('file-sales', generateBillList);
     });
     document.getElementById('btn-import-pos')?.addEventListener('click', () => {
-      if (false) return;
+      if (blockIfLocked(selectedDate, 'Front POS import')) return;
       triggerFileUpload('file-sales', parseFrontPosReport);
     });
     
@@ -7622,8 +7827,1104 @@ async function renderMain(el) {
       showChange = !showChange; render();
     });
     
+    // ── 🔒 Lock วันนี้ ──
+    document.getElementById('btn-lock-day')?.addEventListener('click', () => {
+      const d = selectedDate;
+      if (isDateLocked(d)) return;
+      lockDate(d);
+      toast(`🔒 Lock ${fmtDate(d)} — ป้องกันการแก้ไข`, 'success');
+      render();
+    });
+    
+    // ── 🔓 Unlock วันนี้ ──
+    document.getElementById('btn-unlock-day')?.addEventListener('click', () => {
+      const d = selectedDate;
+      if (!isDateLocked(d)) return;
+      if (!confirm(`ปลด lock วันที่ ${fmtDate(d)}?\n\nหลังปลด lock จะแก้ไขข้อมูลได้อีกครั้ง`)) return;
+      unlockDate(d);
+      toast(`🔓 ปลด lock ${fmtDate(d)} แล้ว — แก้ไขได้`, 'info');
+      render();
+    });
+    
+    // ── 📅🔒 Bulk Lock — Lock/Unlock หลายวันพร้อมกัน ──
+    document.getElementById('btn-bulk-lock')?.addEventListener('click', () => {
+      const today = todayISO();
+      const lockedNow = Object.keys(mainSummary.__lockedDates || {}).sort();
+      const lockedCount = lockedNow.length;
+      
+      // Preset: เดือนนี้, เดือนก่อน, 30 วัน, ปีนี้
+      const _ym = (d) => d.substring(0, 7);
+      const _firstOfMonth = (ym) => ym + '-01';
+      const _lastOfMonth = (ym) => {
+        const [y, m] = ym.split('-').map(Number);
+        const last = new Date(y, m, 0).getDate();
+        return ym + '-' + String(last).padStart(2,'0');
+      };
+      const thisMonth = _ym(today);
+      const lastMonthYM = (() => {
+        const [y, m] = thisMonth.split('-').map(Number);
+        if (m === 1) return (y-1) + '-12';
+        return y + '-' + String(m-1).padStart(2,'0');
+      })();
+      const minus30 = (() => {
+        const d = new Date(today + 'T00:00:00');
+        d.setDate(d.getDate() - 30);
+        return d.toISOString().substring(0, 10);
+      })();
+      
+      openModal('📅 Bulk — Lock/Unlock + Unmatch หลายวัน', `
+        <div class="flex-col gap-3" style="min-width:480px">
+          <!-- Tab nav -->
+          <div class="flex gap-0" style="border-bottom:2px solid var(--border)">
+            <button class="bl-tab-btn" data-tab="lock" style="flex:1;padding:10px;background:transparent;border:none;border-bottom:3px solid var(--primary);color:var(--primary);font-weight:700;cursor:pointer;font-size:.9rem">🔒 Lock / Unlock</button>
+            <button class="bl-tab-btn" data-tab="unmatch" style="flex:1;padding:10px;background:transparent;border:none;border-bottom:3px solid transparent;color:var(--text2);font-weight:500;cursor:pointer;font-size:.9rem">↩ Unmatch</button>
+          </div>
+          
+          <!-- ── TAB 1: Lock/Unlock ── -->
+          <div class="bl-tab-pane" data-tab="lock">
+            <div class="flex-col gap-3">
+              <div style="padding:10px 12px;background:rgba(239,87,87,.08);border-radius:6px;border-left:3px solid var(--danger);font-size:.85rem">
+                <b>ตอนนี้มีวันที่ lock อยู่:</b> ${lockedCount} วัน
+                ${lockedCount > 0 ? `<div class="text-xs text-muted" style="margin-top:4px;max-height:60px;overflow-y:auto">${lockedNow.slice(0,20).map(d=>fmtDate(d)).join(', ')}${lockedCount>20?` +${lockedCount-20} อื่นๆ`:''}</div>` : ''}
+              </div>
+              
+              <div class="flex gap-2 items-center">
+                <span class="text-xs text-dim">Preset:</span>
+                <button class="btn btn-outline btn-xs bl-preset" data-from="${_firstOfMonth(thisMonth)}" data-to="${_lastOfMonth(thisMonth)}">เดือนนี้</button>
+                <button class="btn btn-outline btn-xs bl-preset" data-from="${_firstOfMonth(lastMonthYM)}" data-to="${_lastOfMonth(lastMonthYM)}">เดือนก่อน</button>
+                <button class="btn btn-outline btn-xs bl-preset" data-from="${minus30}" data-to="${today}">30 วันที่ผ่านมา</button>
+              </div>
+              
+              <div class="flex gap-2">
+                <div class="input-group flex-1">
+                  <label>จากวันที่</label>
+                  <input type="date" class="input" id="bl-from" value="${_firstOfMonth(thisMonth)}">
+                </div>
+                <div class="input-group flex-1">
+                  <label>ถึงวันที่</label>
+                  <input type="date" class="input" id="bl-to" value="${today}">
+                </div>
+              </div>
+              
+              <div id="bl-preview" style="padding:10px;background:var(--bg2);border-radius:6px;font-size:.82rem;color:var(--text2)"></div>
+              
+              <div class="flex gap-2 mt-2">
+                <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ยกเลิก</button>
+                <button class="btn btn-sm flex-1" id="bl-unlock" style="background:transparent;border:1px solid var(--success);color:var(--success);font-weight:600">🔓 Unlock ในช่วงนี้</button>
+                <button class="btn btn-sm flex-1" id="bl-lock" style="background:var(--danger);color:#fff;font-weight:700">🔒 Lock ในช่วงนี้</button>
+              </div>
+            </div>
+          </div>
+          
+          <!-- ── TAB 2: Unmatch ── -->
+          <div class="bl-tab-pane" data-tab="unmatch" style="display:none">
+            <div class="flex-col gap-3">
+              <div style="padding:10px 12px;background:rgba(245,166,35,.08);border-radius:6px;border-left:3px solid var(--warn);font-size:.82rem">
+                ⚠️ Unmatch จะปลด link ระหว่างบิล + statement ของวันที่เลือก<br>
+                · บิล match_status → "unpaid" + ล้าง confirmation, pay_date, matched_stmt_uuid<br>
+                · Statement match_status → "unpaid" + ล้าง matched_bills, match_station, match_bill<br>
+                · ไม่แตะบิล Cash (auto-matched)<br>
+                · 🔒 วันที่ lock อยู่ — block ต้องปลด lock ก่อน
+              </div>
+              
+              <div class="flex gap-2">
+                <div class="input-group flex-1">
+                  <label>จากวันที่</label>
+                  <input type="date" class="input" id="bu-from" value="${_firstOfMonth(thisMonth)}">
+                </div>
+                <div class="input-group flex-1">
+                  <label>ถึงวันที่</label>
+                  <input type="date" class="input" id="bu-to" value="${today}">
+                </div>
+              </div>
+              
+              <div class="flex gap-2 items-center">
+                <span class="text-xs text-dim">Preset:</span>
+                <button class="btn btn-outline btn-xs bu-preset" data-from="${_firstOfMonth(thisMonth)}" data-to="${_lastOfMonth(thisMonth)}">เดือนนี้</button>
+                <button class="btn btn-outline btn-xs bu-preset" data-from="${_firstOfMonth(lastMonthYM)}" data-to="${_lastOfMonth(lastMonthYM)}">เดือนก่อน</button>
+                <button class="btn btn-outline btn-xs bu-preset" data-from="${minus30}" data-to="${today}">30 วัน</button>
+              </div>
+              
+              <div class="flex gap-2 items-center" style="font-size:.82rem">
+                <button class="btn btn-outline btn-xs" id="bu-select-all">☑ เลือกทั้งหมด</button>
+                <button class="btn btn-outline btn-xs" id="bu-clear-all">☐ ยกเลิกทั้งหมด</button>
+                <span class="text-dim" style="margin-left:auto" id="bu-summary"></span>
+              </div>
+              
+              <div id="bu-day-list" style="max-height:280px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:6px;background:var(--bg2);font-size:.82rem"></div>
+              
+              <div class="flex gap-2 mt-2">
+                <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ยกเลิก</button>
+                <button class="btn btn-sm flex-1" id="bu-unmatch" style="background:var(--warn);color:#1a1d27;font-weight:700">↩ Unmatch ที่เลือก</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      `);
+      
+      // ── Tab switch logic ──
+      document.querySelectorAll('.bl-tab-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const tab = btn.dataset.tab;
+          document.querySelectorAll('.bl-tab-btn').forEach(b => {
+            const active = b.dataset.tab === tab;
+            b.style.borderBottomColor = active ? 'var(--primary)' : 'transparent';
+            b.style.color = active ? 'var(--primary)' : 'var(--text2)';
+            b.style.fontWeight = active ? '700' : '500';
+          });
+          document.querySelectorAll('.bl-tab-pane').forEach(p => {
+            p.style.display = (p.dataset.tab === tab) ? '' : 'none';
+          });
+          if (tab === 'unmatch') updateUnmatchList();
+        });
+      });
+      
+      const $from = document.getElementById('bl-from');
+      const $to = document.getElementById('bl-to');
+      const $preview = document.getElementById('bl-preview');
+      
+      function _datesBetween(from, to) {
+        const out = [];
+        if (!from || !to || from > to) return out;
+        const start = new Date(from + 'T00:00:00');
+        const end = new Date(to + 'T00:00:00');
+        // ⭐ ใช้ local date components — toISOString() แปลงเป็น UTC ทำให้ shift -1 วันใน TZ+
+        for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+          const y = d.getFullYear();
+          const m = String(d.getMonth() + 1).padStart(2, '0');
+          const dd = String(d.getDate()).padStart(2, '0');
+          out.push(`${y}-${m}-${dd}`);
+        }
+        return out;
+      }
+      
+      function updatePreview() {
+        const dates = _datesBetween($from.value, $to.value);
+        const willLock = dates.filter(d => !isDateLocked(d)).length;
+        const willUnlock = dates.filter(d => isDateLocked(d)).length;
+        $preview.innerHTML = `
+          ช่วง <b>${fmtDate($from.value)} → ${fmtDate($to.value)}</b> = <b>${dates.length} วัน</b><br>
+          <span style="color:var(--text3);font-size:.78rem">
+            • <span style="color:var(--danger)">ยังไม่ lock: ${willLock} วัน</span>
+            · <span style="color:var(--success)">lock อยู่: ${willUnlock} วัน</span>
+          </span>
+        `;
+      }
+      updatePreview();
+      $from.addEventListener('change', updatePreview);
+      $to.addEventListener('change', updatePreview);
+      
+      // Preset buttons
+      document.querySelectorAll('.bl-preset').forEach(btn => {
+        btn.addEventListener('click', () => {
+          $from.value = btn.dataset.from;
+          $to.value = btn.dataset.to;
+          updatePreview();
+        });
+      });
+      
+      document.getElementById('bl-lock')?.addEventListener('click', () => {
+        const dates = _datesBetween($from.value, $to.value);
+        if (dates.length === 0) { toast('เลือกช่วงวันที่ไม่ถูกต้อง', 'warn'); return; }
+        if (!confirm(`Lock ${dates.length} วัน ตั้งแต่ ${fmtDate($from.value)} → ${fmtDate($to.value)}?\n\nวันเหล่านี้จะแก้ไขไม่ได้`)) return;
+        if (!mainSummary.__lockedDates) mainSummary.__lockedDates = {};
+        let added = 0;
+        dates.forEach(d => {
+          if (!mainSummary.__lockedDates[d]) { mainSummary.__lockedDates[d] = true; added++; }
+        });
+        persistMainState();
+        if (window.syncManager?.markDirty) {
+          dates.forEach(d => syncManager.markDirty('meta', d));
+        }
+        closeModal();
+        toast(`🔒 Lock เพิ่ม ${added} วัน (รวมทั้งหมด ${Object.keys(mainSummary.__lockedDates).length} วัน)`, 'success', 4000);
+        render();
+      });
+      
+      document.getElementById('bl-unlock')?.addEventListener('click', () => {
+        const dates = _datesBetween($from.value, $to.value);
+        if (dates.length === 0) { toast('เลือกช่วงวันที่ไม่ถูกต้อง', 'warn'); return; }
+        const willUnlock = dates.filter(d => isDateLocked(d)).length;
+        if (willUnlock === 0) { toast('ไม่มีวันที่ lock ในช่วงนี้', 'info'); return; }
+        if (!confirm(`Unlock ${willUnlock} วัน ในช่วง ${fmtDate($from.value)} → ${fmtDate($to.value)}?`)) return;
+        let removed = 0;
+        dates.forEach(d => {
+          if (mainSummary.__lockedDates?.[d]) { delete mainSummary.__lockedDates[d]; removed++; }
+        });
+        persistMainState();
+        if (window.syncManager?.markDirty) {
+          dates.forEach(d => syncManager.markDirty('meta', d));
+        }
+        closeModal();
+        toast(`🔓 Unlock ${removed} วัน — แก้ไขได้แล้ว`, 'info', 4000);
+        render();
+      });
+      
+      // ═══════════════════════════════════════════════════════════════
+      // BULK UNMATCH TAB — date range + checkbox per day + lock guard
+      // ═══════════════════════════════════════════════════════════════
+      const $buFrom = document.getElementById('bu-from');
+      const $buTo = document.getElementById('bu-to');
+      const $buList = document.getElementById('bu-day-list');
+      const $buSummary = document.getElementById('bu-summary');
+      const buSelected = new Set();  // dates ที่ user ติ๊กไว้
+      
+      // คำนวณ matched bills + stmts per day
+      function getMatchedCountsByDay(fromISO, toISO) {
+        const counts = {};  // { dateISO: { bills, stmts, locked } }
+        const dates = _datesBetween(fromISO, toISO);
+        dates.forEach(d => { counts[d] = { bills: 0, stmts: 0, locked: isDateLocked(d) }; });
+        
+        // Bills
+        billList.forEach(b => {
+          if (b.match_status !== 'paid' || b.type === 'Cash') return;
+          const d = toISODate(b.date);
+          if (!d || !counts[d]) return;
+          counts[d].bills++;
+        });
+        
+        // Stmts (count if stmt date in range AND status=paid)
+        const allStmts = getAllStatements();
+        allStmts.forEach(s => {
+          if (s.match_status !== 'paid') return;
+          const d = toISODate(s.date || s.trans_date);
+          if (!d || !counts[d]) return;
+          counts[d].stmts++;
+        });
+        
+        return counts;
+      }
+      
+      function updateUnmatchList() {
+        const counts = getMatchedCountsByDay($buFrom.value, $buTo.value);
+        const days = Object.keys(counts).sort();
+        const daysWithMatches = days.filter(d => counts[d].bills > 0 || counts[d].stmts > 0);
+        
+        if (daysWithMatches.length === 0) {
+          $buList.innerHTML = '<div style="padding:20px;text-align:center;color:var(--text3)">ไม่มีวันที่มี matched bills/statements ในช่วงนี้</div>';
+          $buSummary.textContent = '';
+          return;
+        }
+        
+        $buList.innerHTML = daysWithMatches.map(d => {
+          const c = counts[d];
+          const checked = buSelected.has(d) ? 'checked' : '';
+          const lockBadge = c.locked ? '<span style="color:var(--danger);font-weight:700;margin-left:6px">🔒 LOCKED</span>' : '';
+          const dispDate = fmtDate(d);
+          const dow = ['อา','จ','อ','พ','พฤ','ศ','ส'][new Date(d+'T00:00:00').getDay()];
+          return `
+            <label class="flex items-center gap-2" style="padding:6px 8px;border-radius:4px;cursor:pointer;${c.locked?'background:rgba(239,87,87,.06)':''}" 
+                   onmouseover="this.style.background='${c.locked?'rgba(239,87,87,.12)':'rgba(91,124,250,.08)'}'"
+                   onmouseout="this.style.background='${c.locked?'rgba(239,87,87,.06)':'transparent'}'">
+              <input type="checkbox" class="bu-day-chk" data-date="${d}" ${checked} style="width:16px;height:16px;cursor:pointer">
+              <span style="font-variant-numeric:tabular-nums;color:var(--text2);min-width:130px">${dow} ${dispDate}</span>
+              <span style="color:var(--text3);font-size:.78rem">
+                <b style="color:var(--info)">${c.bills}</b> บิล · 
+                <b style="color:var(--purple)">${c.stmts}</b> stmt
+              </span>
+              ${lockBadge}
+            </label>
+          `;
+        }).join('');
+        
+        // Wire up checkboxes
+        document.querySelectorAll('.bu-day-chk').forEach(cb => {
+          cb.addEventListener('change', () => {
+            const d = cb.dataset.date;
+            if (cb.checked) buSelected.add(d); else buSelected.delete(d);
+            updateBuSummary();
+          });
+        });
+        
+        updateBuSummary();
+      }
+      
+      function updateBuSummary() {
+        const counts = getMatchedCountsByDay($buFrom.value, $buTo.value);
+        let bills = 0, stmts = 0;
+        buSelected.forEach(d => {
+          if (counts[d]) { bills += counts[d].bills; stmts += counts[d].stmts; }
+        });
+        $buSummary.textContent = buSelected.size > 0 
+          ? `เลือก ${buSelected.size} วัน · บิล ${bills} · stmt ${stmts}`
+          : 'ยังไม่ได้เลือก';
+      }
+      
+      $buFrom?.addEventListener('change', () => { buSelected.clear(); updateUnmatchList(); });
+      $buTo?.addEventListener('change', () => { buSelected.clear(); updateUnmatchList(); });
+      
+      document.querySelectorAll('.bu-preset').forEach(btn => {
+        btn.addEventListener('click', () => {
+          $buFrom.value = btn.dataset.from;
+          $buTo.value = btn.dataset.to;
+          buSelected.clear();
+          updateUnmatchList();
+        });
+      });
+      
+      document.getElementById('bu-select-all')?.addEventListener('click', () => {
+        const counts = getMatchedCountsByDay($buFrom.value, $buTo.value);
+        Object.keys(counts).forEach(d => {
+          if (counts[d].bills > 0 || counts[d].stmts > 0) buSelected.add(d);
+        });
+        document.querySelectorAll('.bu-day-chk').forEach(cb => { cb.checked = true; });
+        updateBuSummary();
+      });
+      
+      document.getElementById('bu-clear-all')?.addEventListener('click', () => {
+        buSelected.clear();
+        document.querySelectorAll('.bu-day-chk').forEach(cb => { cb.checked = false; });
+        updateBuSummary();
+      });
+      
+      document.getElementById('bu-unmatch')?.addEventListener('click', async () => {
+        if (buSelected.size === 0) {
+          toast('ยังไม่ได้เลือกวัน', 'warn');
+          return;
+        }
+        
+        // ── Lock guard: block ถ้ามีวัน lock อยู่ในรายการที่เลือก ──
+        const lockedSelected = [...buSelected].filter(d => isDateLocked(d)).sort();
+        if (lockedSelected.length > 0) {
+          alert(
+            `🔒 ไม่สามารถ Unmatch ได้ — มีวันที่ lock อยู่ ${lockedSelected.length} วัน\n\n` +
+            lockedSelected.slice(0, 15).map(d => '  • ' + fmtDate(d)).join('\n') +
+            (lockedSelected.length > 15 ? `\n  ... +${lockedSelected.length - 15} อื่นๆ` : '') +
+            `\n\nกรุณาปลด Lock ก่อน (ที่หน้านี้ → tab "Lock/Unlock") แล้วค่อย Unmatch`
+          );
+          return;
+        }
+        
+        // คำนวณยอดที่จะ unmatch
+        const counts = getMatchedCountsByDay($buFrom.value, $buTo.value);
+        let totalBills = 0, totalStmts = 0;
+        buSelected.forEach(d => {
+          if (counts[d]) { totalBills += counts[d].bills; totalStmts += counts[d].stmts; }
+        });
+        
+        if (!confirm(
+          `↩ Unmatch ${buSelected.size} วัน?\n\n` +
+          `• บิลที่จะ unmatch: ${totalBills} รายการ\n` +
+          `• Statement ที่จะ unmatch: ${totalStmts} รายการ\n\n` +
+          `จะเปลี่ยน match_status → unpaid\n` +
+          `ล้าง confirmation, pay_date, matched_stmt_uuid, matched_bills\n` +
+          `ไม่แตะบิล Cash`
+        )) return;
+        
+        // ── Execute unmatch ──
+        const targetDates = new Set(buSelected);
+        const dayISOSet = new Set([...buSelected]);
+        
+        // Unmatch bills (ถ้า bill date อยู่ใน selection)
+        let billCount = 0;
+        // ⚠️ แยก uuid (unique) จาก ref_no (อาจซ้ำเช่น BBL NW = "MOB")
+        const stmtUuidsToUnmatch = new Set();
+        const stmtRefsLegacy = new Set(); // fallback สำหรับ bills ที่ยังไม่มี uuid
+        billList.forEach(b => {
+          if (b.match_status !== 'paid' || b.type === 'Cash') return;
+          const d = toISODate(b.date);
+          if (!targetDates.has(d)) return;
+          if (b.matched_stmt_uuid) {
+            stmtUuidsToUnmatch.add(b.matched_stmt_uuid);
+          } else if (b.matched_stmt_ref) {
+            stmtRefsLegacy.add(b.matched_stmt_ref);
+          }
+          b.match_status = 'unpaid';
+          b.confirmation = '';
+          b.pay_date = '';
+          b.matched_stmt_ref = '';
+          b.matched_stmt_uuid = '';
+          b.matched_at = '';
+          billCount++;
+        });
+        
+        // Unmatch stmts (ถ้า stmt date อยู่ใน selection หรือ ถูก ref จากบิล)
+        let stmtCount = 0;
+        const allStmts = getAllStatements();
+        allStmts.forEach(s => {
+          const sDate = toISODate(s.date || s.trans_date);
+          const inDate = dayISOSet.has(sDate);
+          // Match by uuid (primary) or by ref_no (legacy fallback only for stmts without uuid)
+          const uuidMatch = s.stmt_uuid && stmtUuidsToUnmatch.has(s.stmt_uuid);
+          const refMatchLegacy = !s.stmt_uuid && s.ref_no && stmtRefsLegacy.has(s.ref_no);
+          if (!inDate && !uuidMatch && !refMatchLegacy) return;
+          if (s.match_status !== 'paid') return;
+          
+          // Clear SP-TEMP partial links to this stmt
+          if (s.stmt_uuid) {
+            spTempList.forEach(t => {
+              let touched = false;
+              (t.partials || []).forEach(pr => {
+                if (pr.matched_stmt_uuid === s.stmt_uuid) {
+                  pr.matched_stmt_uuid = '';
+                  pr.match_status = 'unpaid';
+                  touched = true;
+                }
+              });
+              if (touched) {
+                t.updated_at = new Date().toISOString();
+                if (typeof recomputeSpTempStatus === 'function') recomputeSpTempStatus(t);
+                if (typeof markDirtySpTemps === 'function') markDirtySpTemps();
+              }
+            });
+          }
+          s.match_status = 'unpaid';
+          s.match_station = '';
+          s.match_bill = '';
+          s.matched_bills = [];
+          s.matched_at = '';
+          s.matched_by = '';
+          s.match_method = '';
+          s.match_reason = '';
+          s.overpay_amount = '';
+          stmtCount++;
+        });
+        
+        try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(_){}
+        persistMainState();
+        
+        if (window.syncManager?.markDirty) {
+          if (billCount > 0) window.syncManager.markDirty('bills');
+          if (stmtCount > 0) window.syncManager.markDirty('stmts');
+        }
+        
+        closeModal();
+        toast(`↩ Bulk Unmatch ${buSelected.size} วัน — บิล ${billCount} · Stmt ${stmtCount}`, 'success', 5000);
+        render();
+      });
+      
+      // Initial render of unmatch list (lazy — only when tab opened)
+      // ไม่ต้อง render ตอนนี้ — ทำตอน user คลิก tab "Unmatch"
+    });
+    
+    // ── Unmatch บิล + statement ทั้งหมดในวันที่เลือก ──
+    document.getElementById('btn-unmatch-day')?.addEventListener('click', async () => {
+      if (blockIfLocked(selectedDate, 'Unmatch')) return;
+      const dayBills = getBillsForSelectedDate();
+      
+      // นับเฉพาะที่ matched (ไม่นับ Cash/void/paid)
+      const billsToUnmatch = dayBills.filter(b => 
+        b.match_status === 'paid' && b.type !== 'Cash'
+      );
+      
+      // หา stmt ที่ผูกอยู่กับบิลของวันนี้ (ใช้ uuid — unique stable key)
+      // ⚠️ ห้ามใช้ ref_no เพราะธนาคารบางแห่งใช้ ref ซ้ำกัน เช่น BBL NW = "MOB" ทั้ง 900+ รายการ
+      //    → ถ้าใช้ ref_no จะดึง stmt ทุกเดือนที่ ref="MOB" มา unmatch (overkill!)
+      const stmtUuidsOfDay = new Set();
+      const stmtRefsOfDayLegacy = new Set(); // fallback สำหรับ bills เก่าที่ยังไม่มี matched_stmt_uuid
+      billsToUnmatch.forEach(b => {
+        if (b.matched_stmt_uuid) {
+          stmtUuidsOfDay.add(b.matched_stmt_uuid);
+        } else if (b.matched_stmt_ref) {
+          // Legacy fallback — bill ที่ยังไม่ backfill uuid
+          stmtRefsOfDayLegacy.add(b.matched_stmt_ref);
+        }
+      });
+      
+      // หา stmt ของวันนี้ที่ matched (ครอบคลุมกรณีที่ stmt match กับบิลวันอื่น)
+      const dayISO = toISODate(selectedDate);
+      const allStmts = getAllStatements();
+      const stmtsToUnmatch = allStmts.filter(s => {
+        if (s.match_status !== 'paid') return false;
+        const sDate = toISODate(s.date || s.trans_date);
+        if (sDate === dayISO) return true; // stmt ของวันนี้
+        if (s.stmt_uuid && stmtUuidsOfDay.has(s.stmt_uuid)) return true; // stmt ที่บิลวันนี้ผูกอยู่ (by uuid)
+        // Legacy fallback only if no uuid linkage exists for this stmt
+        if (!s.stmt_uuid && stmtRefsOfDayLegacy.has(s.ref_no)) return true;
+        return false;
+      });
+      
+      if (billsToUnmatch.length === 0 && stmtsToUnmatch.length === 0) {
+        toast('ไม่มีรายการที่ match อยู่ในวันนี้', 'info');
+        return;
+      }
+      
+      const dateStr = fmtDate(dayISO);
+      if (!confirm(
+        `Unmatch ทั้งหมดของวันที่ ${dateStr}?\n\n` +
+        `• บิลที่จะ unmatch: ${billsToUnmatch.length} รายการ\n` +
+        `• Statement ที่จะ unmatch: ${stmtsToUnmatch.length} รายการ\n\n` +
+        `จะเปลี่ยน match_status → pending\n` +
+        `ล้าง confirmation, pay_date, matched_stmt_ref\n` +
+        `ไม่ลบข้อมูลบิล/statement\n` +
+        `ไม่แตะบิล Cash (auto-matched)`
+      )) return;
+      
+      // Unmatch bills
+      let billCount = 0;
+      const unmatchedBillUuids = [];
+      billsToUnmatch.forEach(b => {
+        b.match_status = 'pending';
+        b.confirmation = '';
+        b.pay_date = '';
+        b.matched_stmt_ref = '';
+        b.matched_stmt_uuid = '';
+        b.matched_at = '';
+        if (b.bill_uuid) unmatchedBillUuids.push(b.bill_uuid);
+        billCount++;
+      });
+      
+      // Unmatch statements
+      let stmtCount = 0;
+      const unmatchedStmtUuids = [];
+      stmtsToUnmatch.forEach(s => {
+        // ⚡ ถ้า stmt ผูกกับ SP-TEMP partial → clear stmt_ref ใน spTempList ด้วย
+        const stmtRef = s.ref_no;
+        if (stmtRef) {
+          spTempList.forEach(t => {
+            let touched = false;
+            (t.partials || []).forEach(pr => {
+              if (pr.matched_stmt_uuid === s.stmt_uuid) {
+                pr.matched_stmt_uuid = '';
+                pr.match_status = 'unpaid';
+                touched = true;
+              }
+            });
+            if (touched) {
+              t.updated_at = new Date().toISOString();
+              recomputeSpTempStatus(t);
+              markDirtySpTemps();
+            }
+          });
+        }
+        s.match_status = 'unpaid';
+        s.match_station = '';
+        s.match_bill = '';
+        s.matched_bills = [];
+        s.matched_at = '';
+        s.matched_by = '';
+        s.match_method = '';
+        s.match_reason = '';
+        s.overpay_amount = '';
+        if (s.stmt_uuid) unmatchedStmtUuids.push(s.stmt_uuid);
+        stmtCount++;
+      });
+      
+      try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(_){}
+      persistMainState();
+      
+      // ⭐ Mark dirty per-uuid (was: type-only, broke selective push)
+      //    เก่า: markDirty('bills') / markDirty('stmts') — ไม่ใส่ uuid
+      //    → dirtyUuids.bills/stmts ว่าง → ถ้ามี uuid อื่นใน dirtyUuids
+      //    → selective push filter เฉพาะ uuid นั้น → unmatch records หายไป
+      //    ใหม่: markDirty(type, uuid) per record → ครอบคลุมแน่นอน
+      if (window.syncManager?.markDirty) {
+        unmatchedBillUuids.forEach(u => window.syncManager.markDirty('bills', u));
+        unmatchedStmtUuids.forEach(u => window.syncManager.markDirty('stmts', u));
+        // Reset fingerprint cache to ensure push detects changes
+        if (window.syncManager._fpCache) {
+          window.syncManager._fpCache.bills = null;
+          window.syncManager._fpCache.stmts = null;
+        }
+      }
+      
+      toast(`↩ Unmatch ${dateStr} — บิล ${billCount} · Stmt ${stmtCount}`, 'success', 5000);
+      render();
+    });
+    
+    // ── Checkbox selection + Delete Selected ──
+    function updateDeleteButton() {
+      const checked = el.querySelectorAll('.chk-bill:checked');
+      const btn = document.getElementById('btn-delete-selected');
+      const countEl = document.getElementById('del-count');
+      if (!btn) return;
+      if (checked.length > 0) {
+        btn.style.display = 'inline-block';
+        if (countEl) countEl.textContent = checked.length;
+      } else {
+        btn.style.display = 'none';
+      }
+    }
+    
+    el.querySelectorAll('.chk-bill').forEach(chk => {
+      chk.addEventListener('change', updateDeleteButton);
+    });
+    
+    document.getElementById('chk-all-bills')?.addEventListener('change', (e) => {
+      const checked = e.target.checked;
+      el.querySelectorAll('.chk-bill').forEach(chk => { chk.checked = checked; });
+      updateDeleteButton();
+    });
+    
+    document.getElementById('btn-delete-selected')?.addEventListener('click', () => {
+      const checked = el.querySelectorAll('.chk-bill:checked');
+      if (checked.length === 0) return;
+      
+      const indexes = Array.from(checked).map(c => Number(c.dataset.idx));
+      const toDelete = indexes.map(i => billList[i]).filter(Boolean);
+      
+      // ⭐ ตรวจ lock — ถ้ามีบิลในวัน lock แม้ 1 บิล → block
+      const lockedBill = toDelete.find(b => isDateLocked(toISODate(b.date)));
+      if (lockedBill) {
+        toast(`🔒 มีบิลในวัน ${fmtDate(lockedBill.date)} ที่ถูก lock — ปลด lock ก่อน`, 'warn', 3500);
+        return;
+      }
+      
+      const byStation = {};
+      toDelete.forEach(b => { byStation[b.station||'(ว่าง)'] = (byStation[b.station||'(ว่าง)']||0) + 1; });
+      const stationStr = Object.keys(byStation).sort().map(s => `${s}: ${byStation[s]}`).join(', ');
+      
+      if (!confirm(`ยืนยันลบ ${toDelete.length} บิล?\n\n${stationStr}\n\n⚠️ ลบแล้วกู้คืนไม่ได้`)) return;
+      
+      const toDeleteSet = new Set(toDelete);
+      // ⭐ Track uuids for cloud sync delete
+      toDelete.forEach(b => {
+        if (b.bill_uuid && typeof syncManager !== 'undefined' && syncManager.markDeleted) {
+          syncManager.markDeleted('bills', b.bill_uuid);
+        }
+      });
+      billList = billList.filter(b => !toDeleteSet.has(b));
+      
+      persistMainState();
+      invalidateBillsCache();
+      toast(`ลบ ${toDelete.length} บิลสำเร็จ`, 'success');
+      render();
+    });
+    
+    // Quick sync button (แสดงเมื่อ billList ว่างเปล่า)
+    document.getElementById('btn-quick-sync-bills')?.addEventListener('click', async (e) => {
+      const btn = e.currentTarget;
+      btn.disabled = true;
+      btn.textContent = '⏳ กำลังดึง...';
+      try {
+        const stats = await syncManager.pullFromCloud(2, 'force');
+        const total = (stats.bills||0) + (stats.stmts||0) + (stats.payments||0) + (stats.cashflow||0) + (stats.suppliers||0);
+        
+        // Diagnostic output — แสดง error รายละเอียด
+        const hasErrors = stats.errors && stats.errors.length > 0;
+        const detail = 
+          `☁️ ผลการดึงข้อมูล:\n\n` +
+          `  • Bills: +${stats.bills||0}\n` +
+          `  • Statements: +${stats.stmts||0}\n` +
+          `  • SP Payments: +${stats.payments||0}\n` +
+          `  • Cashflow: +${stats.cashflow||0}\n` +
+          `  • Suppliers: +${stats.suppliers||0}\n` +
+          (hasErrors ? `\n⚠️ ข้อผิดพลาด:\n${stats.errors.slice(0,5).join('\n')}` : '');
+        
+        if (total > 0 && !hasErrors) {
+          toast(`☁️ ดึงสำเร็จ — Bills +${stats.bills}, Stmts +${stats.stmts}`, 'success', 4000);
+          render();
+        } else if (total > 0 && hasErrors) {
+          alert(detail);
+          render();
+          btn.disabled = false;
+          btn.textContent = '☁️ ดึงข้อมูลจาก Cloud (บางส่วน)';
+        } else {
+          // total = 0 — แสดง dialog ชัดเจน
+          const msg = hasErrors 
+            ? detail 
+            : `ไม่พบข้อมูลใน cloud\n\nสาเหตุที่เป็นไปได้:\n  • Backend API ยังไม่ได้ deploy (URL ผิด)\n  • ไม่มีข้อมูลใน Google Sheet ปีนี้\n  • User นี้ไม่มีสิทธิ์เข้าถึง\n\nดู Console (F12) เพื่อ debug เพิ่ม`;
+          alert(msg);
+          btn.disabled = false;
+          btn.textContent = '☁️ ลองใหม่';
+        }
+      } catch(err) {
+        const msg = `Sync ล้มเหลว: ${err.message}\n\nดู Console (F12) เพื่อ debug เพิ่ม`;
+        alert(msg);
+        console.error('[sync] Quick sync failed:', err);
+        btn.disabled = false;
+        btn.textContent = '☁️ ลองใหม่';
+      }
+    });
+    
+    document.getElementById('btn-clear-bl')?.addEventListener('click', () => {
+      if (blockIfLocked(selectedDate, 'ล้างวัน')) return;
+      if (!confirm('ล้างข้อมูลของวัน ' + fmtDate(selectedDate) + ' ทั้งหมด?\n\n• Bill List\n• Summary (นำเงินเข้า/ยอดขาย/Cash Drawer ฯลฯ)\n• Cash counting (นับธนบัตร)')) return;
+      
+      // 1) ล้างบิลของวันที่เลือก (เก็บวันอื่น)
+      // ⭐ Track uuids ที่ถูกลบ → sync จะ push delete ไป cloud
+      var selectedDisplay = fmtDate(selectedDate);
+      var billsToDelete = billList.filter(function(b) {
+        var d = String(b.date || '').trim();
+        return d === selectedDisplay || d === selectedDate;
+      });
+      var deletedCount = 0;
+      billsToDelete.forEach(function(b) {
+        if (b.bill_uuid && typeof syncManager !== 'undefined' && syncManager.markDeleted) {
+          syncManager.markDeleted('bills', b.bill_uuid);
+          deletedCount++;
+        }
+      });
+      billList = billList.filter(function(b) {
+        var d = String(b.date || '').trim();
+        return d !== selectedDisplay && d !== selectedDate;
+      });
+      
+      // 2) ล้าง summary flat keys (ของวันปัจจุบัน — __byDate[selectedDate] ด้วย)
+      Object.keys(mainSummary).forEach(function(k) {
+        if (k.startsWith('__')) return;
+        if (k.includes('_')) delete mainSummary[k];
+      });
+      if (mainSummary.__byDate && mainSummary.__byDate[selectedDate]) {
+        delete mainSummary.__byDate[selectedDate];
+      }
+      
+      // 3) ล้าง cash count ของวันนี้
+      if (cashCount.__byDate && cashCount.__byDate[selectedDate]) {
+        delete cashCount.__byDate[selectedDate];
+      }
+      
+      persistMainState();
+      invalidateBillsCache();
+      render();
+      toast('ล้างข้อมูลของ ' + fmtDate(selectedDate) + ' แล้ว (' + billsToDelete.length + ' บิล, sync กำลังลบใน cloud)', 'success', 4000);
+    });
+
+    // Date range filter handlers
+    document.getElementById('filter-date-from')?.addEventListener('change', e => { filterDateFrom = e.target.value; render(); });
+    document.getElementById('filter-date-to')?.addEventListener('change', e => { filterDateTo = e.target.value; render(); });
+    document.getElementById('btn-clear-date')?.addEventListener('click', () => { filterDateFrom = ''; filterDateTo = ''; render(); });
+    document.getElementById('btn-hide-paid')?.addEventListener('click', () => { hidePaid = !hidePaid; render(); });
+    
+    // ── Bill search (ค้นเลขบิล/confirmation/remarks/ยอด) ──
+    // ใช้ debounce 200ms กัน re-render ทุกตัวอักษร
+    const billSearchInput = document.getElementById('filter-bill-search');
+    if (billSearchInput) {
+      let _searchTimer = null;
+      billSearchInput.addEventListener('input', e => {
+        const val = e.target.value;
+        clearTimeout(_searchTimer);
+        _searchTimer = setTimeout(() => {
+          filterBillSearch = val;
+          render();
+          // คืน focus + คงตำแหน่ง cursor หลัง render
+          const fresh = document.getElementById('filter-bill-search');
+          if (fresh) {
+            fresh.focus();
+            const pos = fresh.value.length;
+            try { fresh.setSelectionRange(pos, pos); } catch(e) {}
+          }
+        }, 200);
+      });
+      // Enter = apply ทันที (ข้าม debounce)
+      billSearchInput.addEventListener('keydown', e => {
+        if (e.key === 'Enter') {
+          clearTimeout(_searchTimer);
+          filterBillSearch = e.target.value;
+          render();
+        } else if (e.key === 'Escape') {
+          clearTimeout(_searchTimer);
+          filterBillSearch = '';
+          render();
+        }
+      });
+    }
+    document.getElementById('btn-toggle-pending-only')?.addEventListener('click', () => {
+      filterPendingOnly = !filterPendingOnly;
+      render();
+    });
+    
+    document.getElementById('btn-clear-bill-search')?.addEventListener('click', () => {
+      filterBillSearch = '';
+      render();
+    });
+
+    // ⭐ Phase 3 (5/5/26) — รับชำระลูกค้า + ตัดจ่าย SB
+    document.getElementById('btn-receive-payment')?.addEventListener('click', () => {
+      if (blockIfLocked(selectedDate, 'รับชำระ')) return;
+      openReceivePaymentModal();
+    });
+
+    // ── เพิ่มบิลเอง ──
+    document.getElementById('btn-add-bill')?.addEventListener('click', () => {
+      if (blockIfLocked(selectedDate, 'เพิ่มบิล')) return;
+      openModal('➕ เพิ่มบิลด้วยตัวเอง', `
+        <div class="flex-col gap-3">
+          <div class="flex gap-2">
+            <div class="input-group flex-1">
+              <label>Bill Number</label>
+              <input class="input" id="ab-bill" placeholder="เช่น SS00126-xxx (ปล่อยว่างได้)">
+            </div>
+            <div class="input-group flex-1">
+              <label>Bill Date</label>
+              <input type="date" class="input" id="ab-date" value="${todayISO()}">
+            </div>
+          </div>
+          <div class="flex gap-2">
+            <div class="input-group flex-1">
+              <label>Station</label>
+              <select class="select" id="ab-station">
+                ${STATION_OPTIONS.map(o=>`<option value="${o}">${o||'(เลือก)'}</option>`).join('')}
+              </select>
+            </div>
+            <div class="input-group flex-1">
+              <label>Type</label>
+              <select class="select" id="ab-type">
+                ${TYPE_OPTIONS.map(o=>`<option value="${o}">${o||'(เลือก)'}</option>`).join('')}
+              </select>
+            </div>
+          </div>
+          <div class="input-group">
+            <label>ยอดเต็ม (รวม VAT)</label>
+            <input type="number" class="input" id="ab-amount" placeholder="0.00" step="0.01" style="font-size:1.1rem;font-weight:600">
+          </div>
+          
+          <!-- Fee/WHT Section -->
+          <div id="ab-fee-box" style="background:rgba(79,156,249,.05);border:1px solid rgba(79,156,249,.2);border-radius:6px;padding:10px;display:none">
+            <div style="font-size:.85rem;color:var(--info);font-weight:600;margin-bottom:8px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+              <span>⚡ การหัก / ค่าธรรมเนียม</span>
+              <label id="ab-wht-toggle-label" style="display:none;align-items:center;gap:6px;cursor:pointer;font-weight:400;color:var(--purple);background:rgba(167,139,250,.1);padding:3px 10px;border-radius:4px;border:1px solid rgba(167,139,250,.3)">
+                <input type="checkbox" id="ab-wht-enable" style="margin:0">
+                <span>หัก ณ ที่จ่าย 1%</span>
+              </label>
+            </div>
+            <!-- Transfer/Cheque row: ฐาน + WHT + ค่าโอน -->
+            <div class="flex gap-2" id="ab-fee-transfer" style="display:none">
+              <div class="input-group flex-1">
+                <label>ฐานก่อน VAT</label>
+                <input type="number" class="input" id="ab-base" readonly style="background:rgba(255,255,255,.02)">
+              </div>
+              <div class="input-group flex-1" id="ab-wht-group" style="display:none">
+                <label style="color:var(--purple)">หัก ณ ที่จ่าย 1%</label>
+                <input type="number" class="input" id="ab-wht" step="0.01" style="color:var(--purple)" title="คำนวณอัตโนมัติ = ROUND(ยอด/1.07 × 1%, 2) — แก้ไขได้">
+              </div>
+              <div class="input-group flex-1">
+                <label style="color:var(--warn)">ค่าโอน</label>
+                <input type="number" class="input" id="ab-transfer-fee" placeholder="0.00" step="0.01" style="color:var(--warn)">
+              </div>
+            </div>
+            <!-- Extra fee row: แสดงเมื่อ Card (ค่าธรรมเนียมบัตร) หรือ Cheque (ค่าธรรมเนียม) -->
+            <div class="flex gap-2" id="ab-fee-extra" style="display:none;margin-top:8px">
+              <div class="input-group flex-1">
+                <label style="color:var(--warn)" id="ab-card-label">ค่าธรรมเนียมบัตร</label>
+                <input type="number" class="input" id="ab-card-fee" value="0" step="0.01" style="color:var(--warn)">
+              </div>
+            </div>
+            <div id="ab-summary" style="margin-top:10px;padding:10px;background:rgba(0,0,0,.2);border-radius:5px;font-size:.9rem;display:none">
+              <div style="display:flex;justify-content:space-between;padding:3px 0"><span>ยอดเต็ม</span><span id="ab-sum-full">฿0.00</span></div>
+              <div id="ab-sum-wht-row" style="display:none;justify-content:space-between;padding:3px 0;color:var(--purple)"><span>− หัก ณ ที่จ่าย 1%</span><span id="ab-sum-wht">฿0.00</span></div>
+              <div id="ab-sum-tf-row" style="display:none;justify-content:space-between;padding:3px 0;color:var(--warn)"><span>− ค่าโอน</span><span id="ab-sum-tf">฿0.00</span></div>
+              <div id="ab-sum-cf-row" style="display:none;justify-content:space-between;padding:3px 0;color:var(--warn)"><span id="ab-sum-cf-label">− ค่าธรรมเนียมบัตร</span><span id="ab-sum-cf">฿0.00</span></div>
+              <div style="display:flex;justify-content:space-between;padding:8px 0 0;border-top:1px solid var(--border);margin-top:4px;font-weight:600;color:var(--success);font-size:1.05rem"><span>สุทธิ (ยอดโอนจริงที่คาดหวัง)</span><span id="ab-sum-net">฿0.00</span></div>
+            </div>
+          </div>
+          
+          <div class="flex gap-2">
+            <div class="input-group flex-1">
+              <label>Confirmation (ธนาคารที่รับ)</label>
+              <input class="input" id="ab-confirmation" placeholder="KTB / KBANK / BBL / BBL NW">
+            </div>
+            <div class="input-group flex-1">
+              <label>Due Date <span class="text-xs text-muted">(Cheque: วันเข้าเช็ค)</span></label>
+              <input type="date" class="input" id="ab-due">
+            </div>
+          </div>
+          <div class="input-group">
+            <label>Remarks</label>
+            <input class="input" id="ab-remarks" placeholder="หมายเหตุ">
+          </div>
+          <div class="flex gap-2 mt-2">
+            <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ยกเลิก</button>
+            <button class="btn btn-primary btn-sm flex-1" id="ab-confirm">${ICONS.check} บันทึก</button>
+          </div>
+        </div>
+      `);
+      
+      // ── Fee calculation logic ──
+      const $type = document.getElementById('ab-type');
+      const $station = document.getElementById('ab-station');
+      const $amount = document.getElementById('ab-amount');
+      const $bill = document.getElementById('ab-bill');
+      const $whtOut = document.getElementById('ab-wht');
+      const $base = document.getElementById('ab-base');
+      const $tf = document.getElementById('ab-transfer-fee');
+      const $cf = document.getElementById('ab-card-fee');
+      const $feeBox = document.getElementById('ab-fee-box');
+      const $feeTransfer = document.getElementById('ab-fee-transfer');
+      const $feeExtra = document.getElementById('ab-fee-extra');
+      const $cardLabel = document.getElementById('ab-card-label');
+      const $summary = document.getElementById('ab-summary');
+      const $sumCfLabel = document.getElementById('ab-sum-cf-label');
+      
+      // Track ว่า user แก้ WHT เองหรือยัง (ถ้าแก้แล้ว = ห้าม auto-overwrite)
+      let whtManuallyEdited = false;
+      $whtOut.addEventListener('input', () => { whtManuallyEdited = true; });
+      
+      function feeApplies() {
+        // แสดงช่อง fee เมื่อ Type = Transfer, Cheque, หรือ Card
+        const type = $type.value || '';
+        return type === 'Transfer' || type === 'Cheque' || type === 'Card';
+      }
+      
+      // สูตรตาม Excel: C = ROUND((B/1.07) * 1%, 2)
+      function calcWHT(amount) {
+        if (!amount || amount <= 0) return 0;
+        return Math.round((amount / 1.07) * 0.01 * 100) / 100;
+      }
+      function calcBase(amount) {
+        if (!amount || amount <= 0) return 0;
+        return Math.round((amount / 1.07) * 100) / 100;
+      }
+      
+      function updateFeeUI() {
+        const type = $type.value || '';
+        const applies = feeApplies();
+        const $whtToggleLabel = document.getElementById('ab-wht-toggle-label');
+        const $whtGroup = document.getElementById('ab-wht-group');
+        const $whtEnable = document.getElementById('ab-wht-enable');
+        
+        if (!applies) {
+          $feeBox.style.display = 'none';
+          return;
+        }
+        $feeBox.style.display = 'block';
+        
+        // แสดงแถวตาม Type:
+        //   Transfer: ฐาน + (WHT ถ้าเปิด) + ค่าโอน
+        //   Cheque:   ฐาน + (WHT ถ้าเปิด) + ค่าโอน + extra (label: ค่าธรรมเนียม)
+        //   Card:     extra (label: ค่าธรรมเนียมบัตร)
+        if (type === 'Card') {
+          $feeTransfer.style.display = 'none';
+          $feeExtra.style.display = 'flex';
+          $cardLabel.textContent = 'ค่าธรรมเนียมบัตร';
+          $sumCfLabel.textContent = '− ค่าธรรมเนียมบัตร';
+          // Card ไม่มี WHT
+          if ($whtToggleLabel) $whtToggleLabel.style.display = 'none';
+          if ($whtGroup) $whtGroup.style.display = 'none';
+        } else if (type === 'Cheque') {
+          $feeTransfer.style.display = 'flex';
+          $feeExtra.style.display = 'flex';
+          $cardLabel.textContent = 'ค่าธรรมเนียม';
+          $sumCfLabel.textContent = '− ค่าธรรมเนียม';
+          // แสดง toggle WHT
+          if ($whtToggleLabel) $whtToggleLabel.style.display = 'inline-flex';
+          if ($whtGroup) $whtGroup.style.display = $whtEnable?.checked ? 'block' : 'none';
+        } else if (type === 'Transfer') {
+          $feeTransfer.style.display = 'flex';
+          $feeExtra.style.display = 'none';
+          // แสดง toggle WHT
+          if ($whtToggleLabel) $whtToggleLabel.style.display = 'inline-flex';
+          if ($whtGroup) $whtGroup.style.display = $whtEnable?.checked ? 'block' : 'none';
+        }
+        updateSummary();
+      }
+      
+      function updateSummary() {
+        const amount = Number($amount.value) || 0;
+        const type = $type.value || '';
+        const applies = feeApplies();
+        const $whtEnable = document.getElementById('ab-wht-enable');
+        const whtOn = $whtEnable?.checked || false;
+        
+        let wht = 0, tf = 0, cf = 0;
+        
+        if (applies && (type === 'Transfer' || type === 'Cheque')) {
+          $base.value = calcBase(amount).toFixed(2);
+          // ⭐ Auto-fill WHT เฉพาะเมื่อ checkbox เปิด — เว้นแต่ user แก้เอง
+          if (whtOn) {
+            if (!whtManuallyEdited) {
+              $whtOut.value = calcWHT(amount).toFixed(2);
+            }
+            wht = Number($whtOut.value) || 0;
+          } else {
+            // ปิด WHT — เคลียร์ค่า
+            $whtOut.value = '';
+            wht = 0;
+          }
+          tf = Number($tf.value) || 0;
+          if (type === 'Cheque') cf = Number($cf.value) || 0;
+        } else if (applies && type === 'Card') {
+          cf = Number($cf.value) || 0;
+        }
+        
+        const net = Math.round((amount - wht - tf - cf) * 100) / 100;
+        
+        if (applies) {
+          $summary.style.display = 'block';
+          document.getElementById('ab-sum-full').textContent = '฿' + amount.toFixed(2);
+          document.getElementById('ab-sum-wht-row').style.display = wht > 0 ? 'flex' : 'none';
+          document.getElementById('ab-sum-wht').textContent = '−฿' + wht.toFixed(2);
+          document.getElementById('ab-sum-tf-row').style.display = tf > 0 ? 'flex' : 'none';
+          document.getElementById('ab-sum-tf').textContent = '−฿' + tf.toFixed(2);
+          document.getElementById('ab-sum-cf-row').style.display = cf > 0 ? 'flex' : 'none';
+          document.getElementById('ab-sum-cf').textContent = '−฿' + cf.toFixed(2);
+          document.getElementById('ab-sum-net').textContent = '฿' + net.toFixed(2);
+        } else {
+          $summary.style.display = 'none';
+        }
+      }
+      
+      // Trigger recalc เมื่อเปลี่ยน type/amount/fee
+      $type?.addEventListener('change', updateFeeUI);
+      $station?.addEventListener('change', updateFeeUI);
+      $bill?.addEventListener('input', updateFeeUI);
+      $amount?.addEventListener('input', () => { whtManuallyEdited = false; updateFeeUI(); });
+      $tf?.addEventListener('input', updateSummary);
+      $cf?.addEventListener('input', updateSummary);
+      // ⭐ WHT toggle — เปิด/ปิดการหัก ณ ที่จ่าย
+      document.getElementById('ab-wht-enable')?.addEventListener('change', () => {
+        whtManuallyEdited = false; // reset เพื่อให้ auto-fill ทำงาน
+        updateFeeUI();
+      });
+      
+      // ⭐ Wire customer autocomplete ใน Remarks
+      const $abRemarks = document.getElementById('ab-remarks');
+      if ($abRemarks) wireRemarks1Autocomplete($abRemarks);
+
+      document.getElementById('ab-confirm')?.addEventListener('click', () => {
+        const amount = Number(document.getElementById('ab-amount').value) || 0;
+        const type = document.getElementById('ab-type').value;
+        const applies = feeApplies();
+        
+        let whtAmount = 0, transferFee = 0, cardFee = 0;
+        if (applies && (type === 'Transfer' || type === 'Cheque')) {
+          // WHT: ใช้ค่าจาก input โดยตรง (อาจถูก user แก้เอง หรือ auto-calc)
+          whtAmount = Number($whtOut.value) || 0;
+          transferFee = Number($tf.value) || 0;
+        } else if (applies && type === 'Card') {
+          cardFee = Number($cf.value) || 0;
+        }
+        
+        const confirmation = document.getElementById('ab-confirmation').value.trim();
+        // ⭐ Cash type → auto matched (เงินสด = เข้าลิ้นชักแล้ว ไม่ต้องผ่านธนาคาร)
+        const isCash = type === 'Cash';
+        
+        const newBill = {
+          bill_uuid: (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : 'b-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10),
+          bill_no: document.getElementById('ab-bill').value.trim() || 'MANUAL-' + Date.now(),
+          date: document.getElementById('ab-date').value,
+          station: document.getElementById('ab-station').value,
+          type: type,
+          amount: amount,
+          created_at: new Date().toISOString(),  // ใช้ sort บิลใหม่อยู่บนสุดของ station
+          // Fee fields
+          wht_enabled: whtAmount > 0,
+          wht_amount: whtAmount,
+          transfer_fee: transferFee,
+          card_fee: cardFee,
+          // Confirmation & status
+          confirmation: isCash ? '' : confirmation,                                // Cash: ไม่มี confirmation
+          pay_date: isCash ? document.getElementById('ab-date').value 
+                    : (confirmation ? document.getElementById('ab-date').value : ''),
+          remarks1: document.getElementById('ab-remarks').value,
+          remarks2: '',
+          bank: '', // ช่อง manual ปล่อยว่าง
+          due_date: document.getElementById('ab-due').value,
+          match_status: isCash ? 'matched' : (confirmation ? 'matched' : 'pending'),  // Cash → matched auto
+          source: 'manual',
+        };
+        billList.push(newBill);
+        persistMainState();
+        invalidateBillsCache();
+        
+        // ⭐ markDirty per-uuid (was: missing — Add Bill silent push fail)
+        if (newBill.bill_uuid && window.syncManager?.markDirty) {
+          window.syncManager.markDirty('bills', newBill.bill_uuid);
+          if (window.syncManager._fpCache) window.syncManager._fpCache.bills = null;
+        }
+        
+        closeModal();
+        const netNote = (whtAmount || transferFee || cardFee) 
+          ? ` (สุทธิ ฿${(amount - whtAmount - transferFee - cardFee).toFixed(2)})` 
+          : '';
+        toast(`เพิ่มบิล฿${amount.toFixed(2)}${netNote}`, 'success');
+        renderKeepScroll();
+      });
+    });
+
+    // ── Bulk ตั้งวันที่ ──
     document.getElementById('btn-bulk-date')?.addEventListener('click', () => {
-      if (false) return;
+      if (blockIfLocked(selectedDate, 'Bulk')) return;
       const visible = filterStation === 'ALL' && filterType === 'ALL' ? billList : 
         billList.filter(b => (filterStation === 'ALL' || b.station === filterStation) && (filterType === 'ALL' || b.type === filterType));
       
@@ -7682,7 +8983,7 @@ async function renderMain(el) {
         // เฉพาะบิลเครดิต (Invoice Credit / Order Credit) ที่ยังไม่มี Due Date
         if ((b.station === 'Invoice Credit' || b.station === 'Order Credit') && !b.due_date && b.date) {
           // 🔒 Lock guard: ข้าม bills ในวัน lock
-          if (false) { skippedLocked++; return; }
+          if (isDateLocked(toISODate(b.date))) { skippedLocked++; return; }
           const next = calcNextMonth20(b.date);
           if (next) {
             b.due_date = next;
@@ -8270,7 +9571,7 @@ async function renderMain(el) {
         const idx = Number(btn.dataset.idx);
         const b = billList[idx];
         if (!b) return;
-        if (false) return;
+        if (blockIfLocked(toISODate(b.date), 'แก้ไขบิล')) return;
         
         openModal(`✏️ แก้ไขบิล — ${b.bill_no || '(ไม่มีเลข)'}`, `
           <div class="flex-col gap-3">
@@ -8641,7 +9942,7 @@ async function renderMain(el) {
 
     // 🗑️ Reset cashIn ของวันที่เลือก — re-enter ใหม่ (ตัวเลือก B)
     el.querySelector('.btn-reset-cashin')?.addEventListener('click', () => {
-      if (false) {
+      if (isDateLocked(selectedDate)) {
         toast(`🔒 ${fmtDate(selectedDate)} ถูก lock — ปลด lock ก่อน`, 'warn', 3000);
         return;
       }
@@ -8672,7 +9973,7 @@ async function renderMain(el) {
     el.querySelectorAll('.sum-cell').forEach(inp => {
       inp.addEventListener('input', debounce(() => {
         // ⭐ ตรวจ lock — ถ้า locked ห้ามแก้
-        if (false) {
+        if (isDateLocked(selectedDate)) {
           toast(`🔒 ${fmtDate(selectedDate)} ถูก lock — ปลด lock ก่อน`, 'warn', 3000);
           // Reset value กลับเป็นเดิม
           const key = inp.dataset.k;
@@ -8750,7 +10051,7 @@ async function renderMain(el) {
     el.querySelectorAll('.cash-cell').forEach(inp => {
       inp.addEventListener('input', debounce(() => {
         // ⭐ ตรวจ lock
-        if (false) {
+        if (isDateLocked(selectedDate)) {
           toast(`🔒 ${fmtDate(selectedDate)} ถูก lock — ปลด lock ก่อน`, 'warn', 3000);
           const dayCash = getCashForDate(selectedDate);
           const k = inp.dataset.denom + '_' + inp.dataset.station;
@@ -8854,7 +10155,7 @@ async function renderMain(el) {
         const b = billList[idx];
         // ⭐ ตรวจ lock — ถ้าวันที่บิลถูก lock → block
         //    ⚠️ ยกเว้น 'confirmation' — เพราะเป็น matching action (อนุญาตแม้ locked)
-        if (b && field !== 'confirmation' && false) {
+        if (b && field !== 'confirmation' && isDateLocked(toISODate(b.date))) {
           toast(`🔒 ${fmtDate(b.date)} ถูก lock — แก้ไขไม่ได้ (ยกเว้น confirmation)`, 'warn', 3000);
           // Reset value
           inp.value = b[field] || '';
@@ -9029,7 +10330,7 @@ async function renderMain(el) {
         const idx = Number(btn.dataset.idx);
         const b = billList[idx];
         if (!b) return;
-        if (false) return;
+        if (blockIfLocked(toISODate(b.date), 'ยกเลิกบิล')) return;
         
         openModal(`❌ ยกเลิกบิล ${b.bill_no||'(ไม่มีเลข)'}`, `
           <div class="flex-col gap-3">
@@ -9071,7 +10372,7 @@ async function renderMain(el) {
         const idx = Number(btn.dataset.idx);
         const b = billList[idx];
         if (!b) return;
-        if (false) return;
+        if (blockIfLocked(toISODate(b.date), 'คืนบิล')) return;
         if (!confirm(`คืนบิล ${b.bill_no||''} กลับมาใช้งาน?\n(เหตุผลเดิม: ${b.void_reason||'-'})`)) return;
         b.match_status = 'pending';
         delete b.voided_at;
@@ -12303,8 +13604,8 @@ async function renderPayments(el) {
         // Clear dirty (user accepted overwrite)
         if (hasDirty) syncManager.dirty.clear();
         
-        // ⭐ Targeted pull: SP-TEMP + Payments + Meta เท่านั้น (ไม่ดึง bills/stmts หนัก)
-        const before = { sp: paymentList.length, temp: spTempList.length };
+        // ⭐ Targeted pull: SP-TEMP + Payments + Meta(locks) เท่านั้น (ไม่ดึง bills/stmts หนัก)
+        const before = { sp: paymentList.length, temp: spTempList.length, locks: Object.keys(mainSummary.__lockedDates||{}).length };
         
         // Pull SP-TEMPs (force mode → override local)
         try {
@@ -12337,7 +13638,20 @@ async function renderPayments(el) {
           for (const y of [String(yr), String(yr-1)]) {
             const r = await api('getMetaWithUuid', { year: y });
             if (r?.success && Array.isArray(r.data?.rows) && typeof window.parseCompactMetaRows === 'function') {
-              window.parseCompactMetaRows(r.data.rows);
+              const parsed = window.parseCompactMetaRows(r.data.rows);
+              // REPLACE locks per year (cloud=truth)
+              if (parsed.yearsWithLocksRow && Object.keys(parsed.yearsWithLocksRow).length > 0) {
+                if (!mainSummary.__lockedDates) mainSummary.__lockedDates = {};
+                Object.keys(parsed.yearsWithLocksRow).forEach(yr2 => {
+                  Object.keys(mainSummary.__lockedDates).forEach(d => {
+                    if (String(d).substring(0, 4) === yr2) delete mainSummary.__lockedDates[d];
+                  });
+                });
+                Object.keys(parsed.lockedDates || {}).forEach(d => {
+                  const yr2 = String(d).substring(0, 4);
+                  if (parsed.yearsWithLocksRow[yr2]) mainSummary.__lockedDates[d] = true;
+                });
+              }
             }
           }
           persistMainState();
@@ -12350,7 +13664,7 @@ async function renderPayments(el) {
           delete syncManager._fpCache.meta;
         }
         
-        const after = { sp: paymentList.length, temp: spTempList.length };
+        const after = { sp: paymentList.length, temp: spTempList.length, locks: Object.keys(mainSummary.__lockedDates||{}).length };
         const dSp = after.sp-before.sp, dTemp = after.temp-before.temp, dLocks = after.locks-before.locks;
         toast(`✅ Refresh สำเร็จ — SP ${after.sp} (${dSp>=0?'+':''}${dSp}) · SP-TEMP ${after.temp} (${dTemp>=0?'+':''}${dTemp}) · Locks ${after.locks} (${dLocks>=0?'+':''}${dLocks})`, 'success', 4000);
         render();
@@ -17840,6 +19154,26 @@ async function loadMetaFromBackend(opts) {
           });
         }
       }
+      
+      // ── Replace lockedDates per year (cloud = source of truth) — ทำเหมือนกันทั้ง merge/force ──
+      // เก่า: UNION → unlock จากเครื่องอื่นไม่ sync
+      // ใหม่: ปีไหน cloud มี locks row → ลบ local locks ของปีนั้น → ใส่ cloud locks
+      if (parsed.yearsWithLocksRow && Object.keys(parsed.yearsWithLocksRow).length > 0) {
+        if (!mainSummary.__lockedDates) mainSummary.__lockedDates = {};
+        Object.keys(parsed.yearsWithLocksRow).forEach(function(yr) {
+          Object.keys(mainSummary.__lockedDates).forEach(function(d) {
+            if (String(d).substring(0, 4) === yr) {
+              delete mainSummary.__lockedDates[d];
+            }
+          });
+        });
+        Object.keys(parsed.lockedDates || {}).forEach(function(d) {
+          var yr = String(d).substring(0, 4);
+          if (parsed.yearsWithLocksRow[yr]) {
+            mainSummary.__lockedDates[d] = true;
+          }
+        });
+      }
     }
     
     if (_skipped > 0) console.warn('[loadMetaFromBackend] skipped ' + _skipped + ' future/invalid dates from cloud');
@@ -19465,6 +20799,7 @@ async function renderBilling(el) {
                   <th style="padding:8px 10px;text-align:right">ค้าง</th>
                   <th style="padding:8px 10px;text-align:center">สถานะ</th>
                   <th style="padding:8px 10px;text-align:center">พิมพ์</th>
+                  <th style="padding:8px 10px;text-align:center">จ่ายแล้ว</th>
                 </tr>
               </thead>
               <tbody>
@@ -19485,9 +20820,13 @@ async function renderBilling(el) {
                       <td style="padding:8px 10px;text-align:center">
                         <button class="cdr-print-one btn btn-outline" data-uuid="${n.billing_uuid}" style="font-size:11px;padding:3px 8px">🖨</button>
                       </td>
+                      <td style="padding:8px 10px;text-align:center">
+                        ${n.status === 'complete' ? '<span style="color:var(--success);font-size:11px">✓</span>' :
+                          `<button class="cdr-mark-paid btn btn-outline" data-uuid="${n.billing_uuid}" data-no="${n.billing_no||''}" data-total="${n.total_amount||0}" style="font-size:11px;padding:3px 8px;border-color:var(--success);color:var(--success)" title="Quick mark — จ่ายเต็มยอด">💵</button>`}
+                      </td>
                     </tr>
                     <tr class="cdr-sb-detail" data-idx="${idx}" style="display:none;background:var(--bg-elev)">
-                      <td colspan="7" style="padding:0">
+                      <td colspan="8" style="padding:0">
                         <div style="padding:10px 14px 14px 28px;border-left:3px solid var(--accent)">
                           <div style="font-size:11px;color:var(--muted);margin-bottom:6px">📋 บิลใน ${n.billing_no} — ${billsCount} บิล</div>
                           ${billsCount === 0 ? `
@@ -19574,6 +20913,50 @@ async function renderBilling(el) {
         const uuid = btn.dataset.uuid;
         const sb = cust.sbs.find(n => n.billing_uuid === uuid);
         if (sb) printBillingNote(sb, cust);
+      };
+    });
+    
+    // ⭐ Quick mark-paid (no payment record) — Toppy ใช้ชั่วคราวเพื่อให้ status ตรงตามจริง
+    document.querySelectorAll('.cdr-mark-paid').forEach(btn => {
+      btn.onclick = async (e) => {
+        e.stopPropagation();
+        const uuid = btn.dataset.uuid;
+        const billingNo = btn.dataset.no;
+        const total = Number(btn.dataset.total) || 0;
+        
+        if (!confirm(
+          `💵 Mark "${billingNo}" เป็นจ่ายแล้วเต็มยอด?\n\n` +
+          `ยอดรวม: ฿${fmtNum(total)}\n\n` +
+          `⚠️ จะไม่บันทึก payment record (ใช้ชั่วคราวเพื่อให้ status ตรง)\n` +
+          `→ status: open/partial → complete\n` +
+          `→ paid_amount = total · outstanding = 0\n\n` +
+          `ดำเนินการต่อ?`
+        )) return;
+        
+        const orig = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = '⏳';
+        
+        try {
+          const res = await api('markBillingNotePaid', { billing_uuid: uuid });
+          if (!res?.success) {
+            throw new Error(res?.message || res?.error || 'ไม่สำเร็จ');
+          }
+          toast(`✓ ${billingNo} → จ่ายครบแล้ว`, 'success');
+          closeModal();
+          // Reload drawer ใหม่
+          setTimeout(() => {
+            if (typeof loadNotes === 'function') {
+              loadNotes().then(() => openCustomerDrawer(custCode, custName));
+            } else {
+              openCustomerDrawer(custCode, custName);
+            }
+          }, 400);
+        } catch(err) {
+          toast('ไม่สำเร็จ: ' + (err.message || err), 'error');
+          btn.disabled = false;
+          btn.textContent = orig;
+        }
       };
     });
     
@@ -22195,7 +23578,7 @@ async function renderMatching(el) {
                 const _isDirty = (typeof isDirtyStmt === 'function') && isDirtyStmt(s.stmt_uuid);
                 // 🔒 Lock indicator — stmt date อยู่ในวัน lock?
                 const _stmtDateISO = (typeof toISODate === 'function') ? toISODate(s.date) : '';
-                const _isLocked = (false) && false;
+                const _isLocked = (typeof isDateLocked === 'function') && isDateLocked(_stmtDateISO);
                 const rowStyle = isMatched 
                   ? (isReasonOnly ? 'background:rgba(165,134,255,.07)' : 'background:rgba(45,212,160,.06)')
                   : 'background:rgba(239,87,87,.06);border-left:3px solid var(--danger)';
@@ -22524,7 +23907,7 @@ async function renderMatching(el) {
         const d = new Date(); d.setDate(d.getDate() + 30);
         return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
       })();
-      const _isLocked = (false) && false;
+      const _isLocked = (typeof isDateLocked === 'function') && isDateLocked(currentDate);
       const matchedNote = (stmt.match_status === 'paid' && stmt.match_bill) 
         ? `<div style="padding:8px;background:rgba(245,166,35,.08);border-radius:4px;border-left:3px solid var(--warn);margin-top:8px;font-size:.82rem">⚠️ Statement matched กับบิล <strong>${stmt.match_bill}</strong> — pay_date ของบิลจะอัปเดตตามวันใหม่</div>`
         : '';
@@ -22562,9 +23945,9 @@ async function renderMatching(el) {
         if (newD === currentDate) { closeModal(); return; }
         if (!/^\d{4}-\d{2}-\d{2}$/.test(newD)) { toast('format วันที่ผิด', 'error'); return; }
         
-        if (false) {
-          if (false && !confirm(`🔒 วันเดิม (${fmtDate(currentDate)}) ถูก lock\n\nยืนยันแก้ไข?`)) return;
-          if (false && !confirm(`🔒 วันใหม่ (${fmtDate(newD)}) ถูก lock\n\nยืนยันย้ายไปวันนั้น?`)) return;
+        if (typeof isDateLocked === 'function') {
+          if (isDateLocked(currentDate) && !confirm(`🔒 วันเดิม (${fmtDate(currentDate)}) ถูก lock\n\nยืนยันแก้ไข?`)) return;
+          if (isDateLocked(newD) && !confirm(`🔒 วันใหม่ (${fmtDate(newD)}) ถูก lock\n\nยืนยันย้ายไปวันนั้น?`)) return;
         }
         
         const orig = uploadedStatements.find(x => x.stmt_uuid === stmt.stmt_uuid) || stmt;
@@ -22600,7 +23983,7 @@ async function renderMatching(el) {
       if (!stmtUuid) { toast('ไม่พบ stmt_uuid — refresh ก่อน', 'error'); return; }
       
       const stmtDate = toISODate(stmt.date) || '';
-      if (false && false) {
+      if (typeof isDateLocked === 'function' && isDateLocked(stmtDate)) {
         toast(`🔒 วัน ${fmtDate(stmtDate)} ถูก lock — ปลด lock ก่อน`, 'warn', 4000);
         return;
       }
@@ -22698,7 +24081,7 @@ async function renderMatching(el) {
       if (!stmtUuid) { toast('ไม่พบ stmt_uuid', 'error'); return; }
       
       const stmtDateISO = toISODate(stmt.date) || '';
-      if (false && false) {
+      if (typeof isDateLocked === 'function' && isDateLocked(stmtDateISO)) {
         toast(`🔒 วัน ${fmtDate(stmtDateISO)} ถูก lock`, 'warn', 3500);
         return;
       }
@@ -24309,6 +25692,37 @@ function renderData(el) {
         </div>
       </div>
       
+      <!-- 🔄 Reset All SB Payments (7/5/26) -->
+      <div class="card mb-3" style="border:1.5px solid var(--danger);background:rgba(239,68,68,.04)">
+        <div class="font-semi mb-2" style="color:var(--danger)">🔄 Reset ใบวางบิลทั้งหมด (Undo Migration)</div>
+        <div class="text-xs text-muted" style="line-height:1.6">
+          ⚠️ <strong>Destructive:</strong> ลบ payment records ทุกใบ + reset ทุก SB กลับเป็น <strong>open</strong><br>
+          → ลบ <strong>billing_payments</strong> ทั้ง sheet (migration + manual)<br>
+          → Reset <strong>billing_notes</strong>: paid_amount=0, outstanding=total, status=open<br>
+          🛡 ไม่แตะ: SB ที่ <code>status='cancelled'</code><br>
+          ใช้กรณี migration ไม่ตรง — Reset แล้วใช้ปุ่ม 💵 จ่ายแล้ว ใน drawer แทน
+        </div>
+        <div style="display:flex;gap:8px;margin-top:10px">
+          <button type="button" class="btn btn-sm" id="btn-reset-all-sb-pay" style="background:var(--danger);color:#fff;border:none;font-weight:700">🔄 Reset ทุกใบวางบิล</button>
+        </div>
+        <div id="reset-sb-status" style="margin-top:10px;font-size:.85rem;color:var(--muted)"></div>
+      </div>
+      
+      <!-- 🚫 Excluded from Sales (7/5/26) -->
+      <div class="card mb-3" style="border:1.5px solid var(--warn);background:rgba(245,158,11,.04)">
+        <div class="font-semi mb-2" style="color:var(--warn)">🚫 ลูกค้าที่ไม่นับยอดขาย</div>
+        <div class="text-xs text-muted" style="line-height:1.6">
+          บิลของลูกค้าใน list นี้จะ <strong>ไม่ถูกรวม</strong> ในการคำนวณยอดขาย (Main page row "ยอดขาย" + Dashboard + Reports)<br>
+          แต่ <strong>ยังออกใบวางบิลปกติ</strong> เพื่อตัดจ่าย<br>
+          (เก็บใน browser localStorage — ไม่ sync)
+        </div>
+        <div style="display:flex;gap:8px;margin-top:10px;align-items:center;flex-wrap:wrap">
+          <input type="text" id="excl-cust-input" class="input" placeholder="cust_code (เช่น BC-00109) หรือชื่อบางส่วน" style="flex:1;min-width:240px">
+          <button type="button" class="btn btn-sm" id="btn-add-excl-cust" style="background:var(--warn);color:#000;border:none;font-weight:700">➕ เพิ่ม</button>
+        </div>
+        <div id="excl-cust-list" style="margin-top:10px;display:flex;flex-direction:column;gap:6px"></div>
+      </div>
+      
       <!-- ⭐ Phase 4 Migration Section (5/5/26) -->
       <div class="card mb-3" style="border:1.5px solid var(--accent);background:rgba(91,124,250,.04)">
         <div class="flex justify-between items-center mb-3">
@@ -24482,12 +25896,18 @@ function renderData(el) {
       const beforeStmts = getAllStatements().length;
       const beforePayments = paymentList.length;
       
+      // 🔒 Lock guard: เตือนถ้ามี locked dates
+      const lockedDates = Object.keys(mainSummary.__lockedDates || {});
+      const lockMsg = lockedDates.length > 0 
+        ? `\n\n⚠️ พบ ${lockedDates.length} วันที่ lock — Rebuild จะทับข้อมูลทั้งหมดรวมวัน lock` 
+        : '';
+      
       if (!confirm(
         `🔄 Rebuild Local จาก Cloud\n\n` +
         `Local ตอนนี้:\n` +
         `  • Bills: ${beforeBills}\n` +
         `  • Statements: ${beforeStmts}\n` +
-        `  • SP Payments: ${beforePayments}\n\n` +
+        `  • SP Payments: ${beforePayments}${lockMsg}\n\n` +
         `ระบบจะ pull จาก cloud ก่อน → validate → ถ้า OK ค่อยแทนที่ local\n` +
         `(ถ้า pull ได้น้อยผิดปกติ จะ abort + เก็บ local เดิมไว้)\n\n` +
         `⚠️ ควร Backup JSON ไว้ก่อน\nทำต่อ?`
@@ -26417,6 +27837,138 @@ function renderData(el) {
       }
     })();
     
+    // 🔄 Reset All SB Payments (7/5/26)
+    (function wireResetAllSBPayments() {
+      const $btn = document.getElementById('btn-reset-all-sb-pay');
+      const $st = document.getElementById('reset-sb-status');
+      if (!$btn) return;
+      $btn.onclick = async () => {
+        const c1 = confirm(
+          `🔄 RESET ใบวางบิลทั้งหมด?\n\n` +
+          `จะ:\n` +
+          `  • ลบ billing_payments ทุก row (migration + manual)\n` +
+          `  • Reset billing_notes ทุกใบ:\n` +
+          `      paid_amount = 0\n` +
+          `      outstanding = total_amount\n` +
+          `      status = 'open'\n\n` +
+          `ไม่แตะ: SB ที่ status='cancelled'\n\n` +
+          `⚠️ ไม่สามารถย้อนกลับได้ (Backup JSON ก่อน)\n\nดำเนินการต่อ?`
+        );
+        if (!c1) return;
+        const c2 = confirm('🚨 ยืนยันอีกครั้ง\n\nBackup JSON ของ Sheet เรียบร้อยแล้วใช่ไหม?');
+        if (!c2) return;
+        
+        const orig = $btn.textContent;
+        $btn.disabled = true;
+        $btn.textContent = '⏳ กำลัง reset...';
+        if ($st) $st.textContent = '⏳ ส่ง request...';
+        
+        try {
+          const res = await api('bulkResetAllBillingPayments', { confirm: true, by: 'Hello' });
+          if (!res?.success) throw new Error(res?.message || res?.error || 'unknown');
+          const d = res.data || {};
+          if ($st) $st.innerHTML = `✅ Reset สำเร็จ — payments ลบ ${d.payments_deleted||0} · SB reset ${d.notes_reset||0} · ข้าม cancelled ${d.skipped_cancelled||0}`;
+          toast(`✓ Reset สำเร็จ — ${d.notes_reset||0} SB กลับเป็น open`, 'success', 5000);
+          // Reload notes
+          if (typeof loadNotes === 'function') {
+            setTimeout(() => loadNotes(), 600);
+          }
+        } catch(err) {
+          if ($st) $st.innerHTML = `❌ Error: ${err.message || err}`;
+          toast('Reset ไม่สำเร็จ: ' + (err.message || err), 'error', 5000);
+        } finally {
+          $btn.disabled = false;
+          $btn.textContent = orig;
+        }
+      };
+    })();
+    
+    // 🚫 Excluded customers (7/5/26) — ไม่นับยอดขาย แต่ยังออก SB
+    (function wireExcludedCustomers() {
+      const $input = document.getElementById('excl-cust-input');
+      const $btnAdd = document.getElementById('btn-add-excl-cust');
+      const $list = document.getElementById('excl-cust-list');
+      if (!$list) return;
+      
+      function loadList() {
+        try {
+          const raw = localStorage.getItem('sf_excluded_customers') || '[]';
+          const arr = JSON.parse(raw);
+          return Array.isArray(arr) ? arr : [];
+        } catch(_) { return []; }
+      }
+      function saveList(arr) {
+        try {
+          localStorage.setItem('sf_excluded_customers', JSON.stringify(arr));
+          window.__excludedCustomers = new Set(arr.map(x => String(x.code || x).toUpperCase()));
+        } catch(_) {}
+      }
+      function render() {
+        const arr = loadList();
+        if (arr.length === 0) {
+          $list.innerHTML = `<div class="text-xs text-muted" style="padding:8px;text-align:center;background:rgba(127,127,127,.04);border-radius:6px">— ยังไม่มีลูกค้าใน list —</div>`;
+        } else {
+          $list.innerHTML = arr.map((c, i) => {
+            const code = c.code || c;
+            const name = c.name || '';
+            return `<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:rgba(245,158,11,.06);border-radius:6px;border-left:3px solid var(--warn)">
+              <div style="font-size:.9rem"><strong style="font-family:monospace">${code}</strong>${name ? ` — ${name}` : ''}</div>
+              <button class="btn btn-sm excl-cust-rm" data-idx="${i}" style="background:transparent;border:1px solid var(--danger);color:var(--danger);padding:3px 10px;font-size:.8rem">🗑 ลบ</button>
+            </div>`;
+          }).join('');
+          $list.querySelectorAll('.excl-cust-rm').forEach(b => {
+            b.onclick = () => {
+              const idx = Number(b.dataset.idx);
+              const arr = loadList();
+              arr.splice(idx, 1);
+              saveList(arr);
+              render();
+              toast('✓ ลบจาก list แล้ว', 'info');
+            };
+          });
+        }
+        // Sync window cache for calcSales
+        window.__excludedCustomers = new Set(arr.map(x => String(x.code || x).toUpperCase()));
+      }
+      
+      // Initial: cache to window for fast lookup in calcSales
+      saveList(loadList());
+      render();
+      
+      $btnAdd.onclick = () => {
+        const v = ($input.value || '').trim();
+        if (!v) { toast('กรอก cust_code หรือชื่อก่อน', 'warn'); return; }
+        const arr = loadList();
+        // Try to find customer by code first, then by name match
+        let code = v.toUpperCase();
+        let name = '';
+        if (Array.isArray(window.customerList)) {
+          const exact = window.customerList.find(c => String(c.cust_code||'').toUpperCase() === code);
+          if (exact) {
+            code = exact.cust_code;
+            name = exact.cust_name || '';
+          } else {
+            const match = window.customerList.find(c => String(c.cust_name||'').toLowerCase().includes(v.toLowerCase()));
+            if (match) {
+              code = match.cust_code;
+              name = match.cust_name || '';
+            }
+          }
+        }
+        // Dedup
+        if (arr.some(x => (x.code || x).toUpperCase() === code.toUpperCase())) {
+          toast('มีอยู่ใน list แล้ว', 'warn');
+          return;
+        }
+        arr.push({ code, name });
+        saveList(arr);
+        render();
+        $input.value = '';
+        toast(`✓ เพิ่ม ${code}${name ? ' — ' + name : ''}`, 'success');
+      };
+      $input.onkeydown = (e) => { if (e.key === 'Enter') $btnAdd.click(); };
+    })();
+    
     // ⭐ Company Info (5/6/26) — load + save
     (function wireCompanyInfo() {
       const fields = ['name','tax-id','address','phone','bank'];
@@ -26545,12 +28097,14 @@ function renderData(el) {
     document.getElementById('btn-clear-meta-all')?.addEventListener('click', async () => {
       const summaryDays = Object.keys(mainSummary || {}).length;
       const cashDays = Object.keys(cashCount || {}).length;
+      const lockDays = Object.keys(lockedDates || {}).length;
       
       const msg1 = `🗑 ล้าง Meta ทั้งหมด?\n\n` +
                    `จะลบ:\n` +
                    `  • Local mainSummary: ${summaryDays} วัน\n` +
                    `  • Local cashCount: ${cashDays} วัน\n` +
-                   `  • Cloud meta_YYYY: cash_count + summary ทุกปี\n\n` +
+                   `  • Local lockedDates: ${lockDays} วัน\n` +
+                   `  • Cloud meta_YYYY: cash_count + summary + locks ทุกปี\n\n` +
                    `ไม่แตะ: Bills, Statements, SP/PP, Cashflow, Suppliers\n\n` +
                    `แน่ใจไหม? (ไม่สามารถย้อนกลับได้)`;
       if (!confirm(msg1)) return;
@@ -26578,6 +28132,12 @@ function renderData(el) {
         // 3. Clear Local memory
         mainSummary = {};
         cashCount = {};
+        if (typeof lockedDates !== 'undefined') {
+          if (window.lockedDates) {
+            Object.keys(window.lockedDates).forEach(k => delete window.lockedDates[k]);
+          }
+        }
+        try { safeStorage.del('sf_lockedDates'); } catch(_) {}
         
         // 4. Persist local
         try {
@@ -26802,6 +28362,11 @@ function renderData(el) {
     
     // ── Restore JSON ──
     document.getElementById('btn-restore-json')?.addEventListener('click', () => {
+      // 🔒 Lock guard: เตือนถ้ามี locked dates
+      const lockedDates = Object.keys(mainSummary.__lockedDates || {});
+      if (lockedDates.length > 0) {
+        if (!confirm(`⚠️ พบ ${lockedDates.length} วันที่ถูก lock อยู่\n\nการ Restore จะทับข้อมูลทั้งหมด รวมวันที่ lock\n\nต้องการดำเนินการต่อ?`)) return;
+      }
       const inp = document.createElement('input');
       inp.type = 'file';
       inp.accept = '.json';
@@ -27230,6 +28795,42 @@ function renderData(el) {
         });
       }
       
+      // ⭐ Locked Dates: 1 row รวมทุกวันที่ lock (ใน data_json)
+      //    Format: { "2026-04-25": true, "2026-04-26": true, ... }
+      //    เก็บ row เดียวต่อปี (ใช้ year ของวันแรก หรือปีปัจจุบันถ้าไม่มี)
+      if (mainSummary && mainSummary.__lockedDates && Object.keys(mainSummary.__lockedDates).length > 0) {
+        // group by year
+        const byYear = {};
+        Object.keys(mainSummary.__lockedDates).forEach(function(d) {
+          if (!mainSummary.__lockedDates[d]) return; // เฉพาะที่ true
+          const y = String(d).substring(0, 4);
+          if (!byYear[y]) byYear[y] = {};
+          byYear[y][d] = true;
+        });
+        // Selective: ถ้ามี filter → push locks เฉพาะปีที่มี filterDate เป็นสมาชิก
+        let yearsToPush;
+        if (useFilter) {
+          const filterYears = new Set();
+          filterDates.forEach(function(d) {
+            const y = String(d).substring(0, 4);
+            if (y) filterYears.add(y);
+          });
+          yearsToPush = Object.keys(byYear).filter(function(y) { return filterYears.has(y); });
+        } else {
+          yearsToPush = Object.keys(byYear);
+        }
+        yearsToPush.forEach(function(year) {
+          rows.push({
+            meta_uuid: year + '-01-01|locks',
+            date: '01/01/' + year,
+            meta_type: 'locks',
+            data_json: JSON.stringify(byYear[year]),
+            updated_at: nowStr,
+            updated_by: user,
+          });
+        });
+      }
+      
       return rows;
     }
     
@@ -27240,9 +28841,10 @@ function renderData(el) {
         'returns': 'ยอดคืนสินค้า', 'cashDrawer': 'Cash Drawer',
         'transfer': 'Transfer', 'card': 'Card', 'cheque': 'Cheque', 'refund': 'Refund',
       };
-      const VALID_META_TYPES = ['summary', 'cash_count'];
+      const VALID_META_TYPES = ['summary', 'cash_count', 'locks'];
       const summary = { __byDate: {} };
       const cash = { __byDate: {} };
+      const lockedDates = {}; // ⭐ NEW
       let skippedJunk = 0;
       
       rows.forEach(function(r) {
@@ -27306,6 +28908,11 @@ function renderData(el) {
           });
         } else if (r.meta_type === 'cash_count') {
           cash.__byDate[dateISO] = data;
+        } else if (r.meta_type === 'locks') {
+          // data = { 'yyyy-mm-dd': true, ... }
+          Object.keys(data).forEach(function(d) {
+            if (data[d] === true) lockedDates[d] = true;
+          });
         }
       });
       
@@ -27313,7 +28920,7 @@ function renderData(el) {
         console.warn(`[parseMeta] Skipped ${skippedJunk} junk rows (shifted-column legacy data)`);
       }
       
-      return { summary: summary, cashCount: cash };
+      return { summary: summary, cashCount: cash, lockedDates: lockedDates };
     }
     
     // Expose to window scope so syncManager (global) + other code can access
