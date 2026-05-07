@@ -20821,8 +20821,8 @@ async function renderBilling(el) {
                         <button class="cdr-print-one btn btn-outline" data-uuid="${n.billing_uuid}" style="font-size:11px;padding:3px 8px">🖨</button>
                       </td>
                       <td style="padding:8px 10px;text-align:center">
-                        ${n.status === 'complete' ? '<span style="color:var(--success);font-size:11px">✓</span>' :
-                          `<button class="cdr-mark-paid btn btn-outline" data-uuid="${n.billing_uuid}" data-no="${n.billing_no||''}" data-total="${n.total_amount||0}" style="font-size:11px;padding:3px 8px;border-color:var(--success);color:var(--success)" title="Quick mark — จ่ายเต็มยอด">💵</button>`}
+                        ${n.status === 'complete' || n.status === 'paid' ? '<span style="color:var(--success);font-size:11px">✓</span>' :
+                          `<button class="cdr-receive-pay btn btn-outline" data-uuid="${n.billing_uuid}" style="font-size:11px;padding:3px 8px;border-color:var(--success);color:var(--success)" title="รับชำระ — เลือกวิธีจ่าย/วันที่/ยอด">💵</button>`}
                       </td>
                     </tr>
                     <tr class="cdr-sb-detail" data-idx="${idx}" style="display:none;background:var(--bg-elev)">
@@ -20916,47 +20916,16 @@ async function renderBilling(el) {
       };
     });
     
-    // ⭐ Quick mark-paid (no payment record) — Toppy ใช้ชั่วคราวเพื่อให้ status ตรงตามจริง
-    document.querySelectorAll('.cdr-mark-paid').forEach(btn => {
-      btn.onclick = async (e) => {
+    // ⭐ Drawer: รับชำระ → เปิด openPayModal เหมือนใน list view
+    document.querySelectorAll('.cdr-receive-pay').forEach(btn => {
+      btn.onclick = (e) => {
         e.stopPropagation();
         const uuid = btn.dataset.uuid;
-        const billingNo = btn.dataset.no;
-        const total = Number(btn.dataset.total) || 0;
-        
-        if (!confirm(
-          `💵 Mark "${billingNo}" เป็นจ่ายแล้วเต็มยอด?\n\n` +
-          `ยอดรวม: ฿${fmtNum(total)}\n\n` +
-          `⚠️ จะไม่บันทึก payment record (ใช้ชั่วคราวเพื่อให้ status ตรง)\n` +
-          `→ status: open/partial → complete\n` +
-          `→ paid_amount = total · outstanding = 0\n\n` +
-          `ดำเนินการต่อ?`
-        )) return;
-        
-        const orig = btn.textContent;
-        btn.disabled = true;
-        btn.textContent = '⏳';
-        
-        try {
-          const res = await api('markBillingNotePaid', { billing_uuid: uuid });
-          if (!res?.success) {
-            throw new Error(res?.message || res?.error || 'ไม่สำเร็จ');
-          }
-          toast(`✓ ${billingNo} → จ่ายครบแล้ว`, 'success');
-          closeModal();
-          // Reload drawer ใหม่
-          setTimeout(() => {
-            if (typeof loadNotes === 'function') {
-              loadNotes().then(() => openCustomerDrawer(custCode, custName));
-            } else {
-              openCustomerDrawer(custCode, custName);
-            }
-          }, 400);
-        } catch(err) {
-          toast('ไม่สำเร็จ: ' + (err.message || err), 'error');
-          btn.disabled = false;
-          btn.textContent = orig;
-        }
+        closeModal();
+        // Wait for drawer to close → openPayModal
+        setTimeout(() => {
+          if (typeof openPayModal === 'function') openPayModal(uuid);
+        }, 150);
       };
     });
     
@@ -21363,7 +21332,6 @@ ${bodyHtml}
                   <button class="btn btn-outline btn-sm bn-print" data-uuid="${n.billing_uuid}" title="พิมพ์">🖨</button>
                   ${n.status !== 'cancelled' ? `<button class="btn btn-outline btn-sm bn-refresh" data-uuid="${n.billing_uuid}" data-cust="${n.cust_code||''}" data-y="${n.cycle_year||''}" data-m="${n.cycle_month||''}" title="🔄 Refresh ยอดจากบิลปัจจุบัน — กรณียอดบิลผิด/แก้บิลย้อนหลัง" style="color:var(--warn)">🔄</button>` : ''}
                   ${n.status !== 'paid' && n.status !== 'cancelled' ? `<button class="btn btn-primary btn-sm bn-pay" data-uuid="${n.billing_uuid}" title="รับชำระ (กรอกรายละเอียด)">💵</button>` : ''}
-                  ${n.status !== 'paid' && n.status !== 'cancelled' ? `<button class="btn btn-outline btn-sm bn-quick-paid" data-uuid="${n.billing_uuid}" data-no="${n.billing_no||''}" data-total="${n.total_amount||0}" title="Quick mark — จ่ายเต็มยอด (ไม่ลง payment record)" style="border-color:var(--success);color:var(--success)">✓</button>` : ''}
                   ${n.paid_amount === 0 && n.status !== 'cancelled' ? `<button class="btn btn-outline btn-sm bn-edit" data-uuid="${n.billing_uuid}" title="แก้ไข">✏</button>` : ''}
                   ${n.status !== 'cancelled' ? `<button class="btn btn-outline btn-sm bn-cancel" data-uuid="${n.billing_uuid}" title="ยกเลิก" style="color:#ef4444">✖</button>` : ''}
                   ${n.paid_amount === 0 && n.status === 'cancelled' ? `<button class="btn btn-outline btn-sm bn-delete" data-uuid="${n.billing_uuid}" title="ลบ" style="color:#ef4444">🗑</button>` : ''}
@@ -21431,7 +21399,6 @@ ${bodyHtml}
     document.querySelectorAll('.bn-view').forEach(b => b.onclick = () => openViewModal(b.dataset.uuid));
     document.querySelectorAll('.bn-print').forEach(b => b.onclick = () => openPrintWindow(b.dataset.uuid));
     document.querySelectorAll('.bn-pay').forEach(b => b.onclick = () => openPayModal(b.dataset.uuid));
-    document.querySelectorAll('.bn-quick-paid').forEach(b => b.onclick = () => doQuickMarkPaid(b.dataset.uuid, b.dataset.no, Number(b.dataset.total) || 0));
     document.querySelectorAll('.bn-edit').forEach(b => b.onclick = () => openEditModal(b.dataset.uuid));
     document.querySelectorAll('.bn-cancel').forEach(b => b.onclick = () => doCancel(b.dataset.uuid));
     document.querySelectorAll('.bn-delete').forEach(b => b.onclick = () => doDelete(b.dataset.uuid));
@@ -21451,7 +21418,6 @@ ${bodyHtml}
     document.querySelectorAll('.bn-view').forEach(b => b.onclick = () => openViewModal(b.dataset.uuid));
     document.querySelectorAll('.bn-print').forEach(b => b.onclick = () => openPrintWindow(b.dataset.uuid));
     document.querySelectorAll('.bn-pay').forEach(b => b.onclick = () => openPayModal(b.dataset.uuid));
-    document.querySelectorAll('.bn-quick-paid').forEach(b => b.onclick = () => doQuickMarkPaid(b.dataset.uuid, b.dataset.no, Number(b.dataset.total) || 0));
     document.querySelectorAll('.bn-edit').forEach(b => b.onclick = () => openEditModal(b.dataset.uuid));
     document.querySelectorAll('.bn-cancel').forEach(b => b.onclick = () => doCancel(b.dataset.uuid));
     document.querySelectorAll('.bn-delete').forEach(b => b.onclick = () => doDelete(b.dataset.uuid));
@@ -21459,31 +21425,6 @@ ${bodyHtml}
   }
   
   // ⭐ Refresh ยอด SB ตัวเดียว (4/5/26): re-aggregate เฉพาะ cust_code+year+month
-  // ⭐ Quick mark-paid (7/5/26): flip status='paid' + paid_amount=total ไม่ลง payment record
-  //    ใช้ชั่วคราวเพื่อ sync status SB กับความเป็นจริง (กรณี migration ไม่ตรง)
-  async function doQuickMarkPaid(uuid, billingNo, total) {
-    if (!confirm(
-      `💵 Mark "${billingNo}" เป็นจ่ายแล้วเต็มยอด?\n\n` +
-      `ยอดรวม: ฿${fmtNum(total)}\n\n` +
-      `⚠️ จะไม่บันทึก payment record (ใช้ชั่วคราวเพื่อให้ status ตรง)\n` +
-      `→ status: pending/partial → paid (complete)\n` +
-      `→ paid_amount = total · outstanding = 0\n\n` +
-      `ดำเนินการต่อ?`
-    )) return;
-    
-    try {
-      const res = await api('markBillingNotePaid', { billing_uuid: uuid });
-      if (!res?.success) {
-        throw new Error(res?.message || res?.error || 'ไม่สำเร็จ');
-      }
-      toast(`✓ ${billingNo} → จ่ายครบแล้ว`, 'success');
-      await loadNotes();
-      render();
-    } catch(err) {
-      toast('ไม่สำเร็จ: ' + (err.message || err), 'error', 4000);
-    }
-  }
-  
   //    ใช้กรณี:
   //    - แก้ยอดบิลใน Sheet ตรงๆ → ยอดเก่าใน SB ค้าง
   //    - เพิ่มบิลย้อนหลัง → ยังไม่อยู่ใน SB
@@ -27895,12 +27836,10 @@ function renderData(el) {
           const res = await api('bulkResetAllBillingPayments', { confirm: true, by: 'Hello' });
           if (!res?.success) throw new Error(res?.message || res?.error || 'unknown');
           const d = res.data || {};
-          if ($st) $st.innerHTML = `✅ Reset สำเร็จ — payments ลบ ${d.payments_deleted||0} · SB reset ${d.notes_reset||0} · ข้าม cancelled ${d.skipped_cancelled||0}`;
-          toast(`✓ Reset สำเร็จ — ${d.notes_reset||0} SB กลับเป็น open`, 'success', 5000);
-          // Reload notes
-          if (typeof loadNotes === 'function') {
-            setTimeout(() => loadNotes(), 600);
-          }
+          if ($st) $st.innerHTML = `✅ Reset สำเร็จ — payments ลบ ${d.payments_deleted||0} · SB reset ${d.notes_reset||0} · ข้าม cancelled ${d.skipped_cancelled||0}<br><br>⏳ กำลัง reload หน้าใน 2 วินาที...`;
+          toast(`✓ Reset สำเร็จ — ${d.notes_reset||0} SB · กำลัง reload หน้า`, 'success', 4000);
+          // Force full page reload — clear all in-memory state guaranteed
+          setTimeout(() => location.reload(), 2000);
         } catch(err) {
           if ($st) $st.innerHTML = `❌ Error: ${err.message || err}`;
           toast('Reset ไม่สำเร็จ: ' + (err.message || err), 'error', 5000);
