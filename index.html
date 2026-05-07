@@ -29783,6 +29783,7 @@ let spV2State = {
   view: 'main',          // main | report | sellbills
   groupByCustomer: false, // ← Sell Bills: group by customer
   expandedCustomers: new Set(), // ← which customers are expanded
+  collapsedGroups: new Set(), // ⭐ 7/5/26 — _group_id ที่ collapse (ซ่อน bills) — empty = expand all
   rawPayMain: [],        // parsed file 1
   rawPayType: [],        // parsed file 2
   rawTaxSales: [],       // parsed file 3
@@ -29793,6 +29794,10 @@ try {
   const saved = JSON.parse(localStorage.getItem('sf_spV2') || '{}');
   if (saved.nextCounter) spV2State.nextCounter = saved.nextCounter;
   if (saved.mainRows) spV2State.mainRows = saved.mainRows;
+  if (Array.isArray(saved.rawPayMain)) spV2State.rawPayMain = saved.rawPayMain;
+  if (Array.isArray(saved.rawPayType)) spV2State.rawPayType = saved.rawPayType;
+  if (Array.isArray(saved.rawTaxSales)) spV2State.rawTaxSales = saved.rawTaxSales;
+  if (Array.isArray(saved.collapsedGroups)) spV2State.collapsedGroups = new Set(saved.collapsedGroups);
 } catch(e) {}
 
 function persistSpV2() {
@@ -29800,8 +29805,23 @@ function persistSpV2() {
     localStorage.setItem('sf_spV2', JSON.stringify({
       nextCounter: spV2State.nextCounter,
       mainRows: spV2State.mainRows,
+      rawPayMain: spV2State.rawPayMain,
+      rawPayType: spV2State.rawPayType,
+      rawTaxSales: spV2State.rawTaxSales,
+      collapsedGroups: [...spV2State.collapsedGroups],
     }));
-  } catch(e) { console.warn('persistSpV2 failed', e); }
+  } catch(e) {
+    console.warn('persistSpV2 failed (อาจเกิน localStorage limit)', e);
+    // Fallback: persist เฉพาะ counter+mainRows
+    try {
+      localStorage.setItem('sf_spV2', JSON.stringify({
+        nextCounter: spV2State.nextCounter,
+        mainRows: spV2State.mainRows,
+        collapsedGroups: [...spV2State.collapsedGroups],
+      }));
+      if (typeof toast === 'function') toast('⚠ ภาษีขาย/การชำระเงิน raw data ใหญ่เกิน localStorage — ต้อง upload ใหม่ถ้า reload page', 'warn', 5000);
+    } catch(_) {}
+  }
 }
 
 // Classify VAT by bill prefix
@@ -30264,6 +30284,9 @@ async function renderSpRecon(el) {
       alert(`พบปัญหากับบางไฟล์:\n\n${issues.join('\n')}`);
     }
     
+    // ⭐ Persist raw arrays ทันทีหลัง upload — กัน reload หาย
+    persistSpV2();
+    
     e.target.value = ''; // reset input
     renderSpRecon(el);
   });
@@ -30440,6 +30463,42 @@ async function renderSpRecon(el) {
       renderSpRecon(el);
     });
   });
+  
+  // ⭐ 7/5/26 — Toggle expand/collapse SP group
+  el.querySelectorAll('.spv2-toggle-expand').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const gid = btn.dataset.gid;
+      if (spV2State.collapsedGroups.has(gid)) spV2State.collapsedGroups.delete(gid);
+      else spV2State.collapsedGroups.add(gid);
+      persistSpV2();
+      renderSpRecon(el);
+    });
+  });
+  
+  // ⭐ 7/5/26 — Edit bill (in SP)
+  el.querySelectorAll('.spv2-bill-edit').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      spV2OpenBillModal('edit', Number(btn.dataset.idx));
+    });
+  });
+  
+  // ⭐ 7/5/26 — Delete bill (from SP)
+  el.querySelectorAll('.spv2-bill-delete').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      spV2DeleteBill(Number(btn.dataset.idx), el);
+    });
+  });
+  
+  // ⭐ 7/5/26 — Add bill to SP
+  el.querySelectorAll('.spv2-bill-add').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      spV2OpenBillModal('add', null, btn.dataset.gid);
+    });
+  });
 }
 
 // Render Main table (20 cols)
@@ -30480,18 +30539,36 @@ function spV2RenderMainTable(rows) {
     </thead>
   `;
   
-  const tbody = rows.map(r => {
+  // ⭐ Build tbody — render rows with collapse/expand + per-bill actions
+  const tbodyParts = [];
+  rows.forEach((r, i) => {
     const origIdx = spV2State.mainRows.indexOf(r);
     const isHdr = r._is_header;
+    const isCollapsed = !isHdr && spV2State.collapsedGroups.has(r._group_id);
+    
+    // Skip bill rows of collapsed SPs
+    if (isCollapsed) return;
+    
     const paid = spV2IsPaid(r);
     const rowBg = isHdr 
       ? (paid === true ? 'background:rgba(63,196,143,.08)' : paid === false ? 'background:rgba(239,87,87,.08)' : '')
       : '';
     const vatColor = r.vat_flag === 'Y' ? 'var(--info)' : 'var(--warn)';
     
-    return `
+    // Chevron icon for header row
+    const groupCollapsed = isHdr && spV2State.collapsedGroups.has(r._group_id);
+    const chevron = isHdr 
+      ? `<span class="spv2-toggle-expand" data-gid="${r._group_id}" title="${groupCollapsed?'แสดงบิล':'ซ่อนบิล'}" style="display:inline-block;cursor:pointer;width:16px;text-align:center;color:var(--text2);user-select:none">${groupCollapsed?'▶':'▼'}</span>` 
+      : '';
+    
+    // Action buttons
+    const actionCell = isHdr 
+      ? `<button class="spv2-edit-pay" data-gid="${r._group_id}" title="แก้วิธีชำระ" style="background:var(--info-bg);border:1px solid var(--info);color:var(--info);padding:3px 8px;border-radius:4px;cursor:pointer;font-size:.75rem">✏️</button>`
+      : `<button class="spv2-bill-edit" data-idx="${origIdx}" title="แก้บิล" style="background:transparent;border:1px solid var(--border);padding:2px 6px;border-radius:3px;cursor:pointer;font-size:.7rem;margin-right:2px">✏️</button><button class="spv2-bill-delete" data-idx="${origIdx}" title="ลบบิล" style="background:transparent;border:1px solid var(--danger);color:var(--danger);padding:2px 6px;border-radius:3px;cursor:pointer;font-size:.7rem">🗑</button>`;
+    
+    const rowHtml = `
       <tr style="font-size:.75rem;${rowBg};${isHdr?'font-weight:600':''}">
-        <td style="text-align:center;padding:4px 6px">${r.seq}</td>
+        <td style="text-align:center;padding:4px 6px">${chevron} ${r.seq}</td>
         <td style="text-align:center;padding:4px 6px">
           <span class="spv2-vat-cell" data-idx="${origIdx}" 
                 style="cursor:pointer;color:${vatColor};font-weight:700;padding:2px 8px;border:1px solid ${vatColor};border-radius:3px">
@@ -30510,9 +30587,7 @@ function spV2RenderMainTable(rows) {
           const trfAmt = Number(r.transfer_amt) || 0;
           const chqAmt = Number(r.cheque_amt) || 0;
           const crdAmt = Number(r.credit_amt) || 0;
-          // credit_date จะแสดง ถ้ามี credit_date ใน data (แม้ amt=0 เช่น OR+JR offset)
           const showCrdDate = !!r.credit_date;
-          // Read-only display: เว้นว่างเมื่อ amt=0 (ยกเว้น credit ที่ดู credit_date)
           const cellStyle = 'padding:4px 6px;font-size:.7rem;text-align:center';
           const amtStyle = 'padding:4px 6px;font-size:.72rem;text-align:right';
           return `
@@ -30531,10 +30606,28 @@ function spV2RenderMainTable(rows) {
         
         <td style="padding:4px 6px;font-family:monospace;color:${r._is_generated?'var(--info)':''}">${r.sp_number}</td>
         <td style="text-align:center;padding:4px 6px;font-size:.7rem">${fmtD(r.pay_date)}</td>
-        <td style="text-align:center;padding:2px 4px">${isHdr ? `<button class="spv2-edit-pay" data-gid="${r._group_id}" title="แก้วิธีชำระ" style="background:var(--info-bg);border:1px solid var(--info);color:var(--info);padding:3px 8px;border-radius:4px;cursor:pointer;font-size:.75rem">✏️</button>` : ''}</td>
+        <td style="text-align:center;padding:2px 4px;white-space:nowrap">${actionCell}</td>
       </tr>
     `;
-  }).join('');
+    tbodyParts.push(rowHtml);
+    
+    // ⭐ Insert "+ เพิ่มบิล" row after last bill of expanded SP (or right after header if no bills)
+    const next = rows[i+1];
+    const isLastOfGroup = !next || (next._group_id !== r._group_id);
+    if (isLastOfGroup && !spV2State.collapsedGroups.has(r._group_id)) {
+      tbodyParts.push(`
+        <tr style="background:rgba(63,196,143,.04)">
+          <td colspan="18" style="padding:4px 6px 6px 30px">
+            <button class="spv2-bill-add" data-gid="${r._group_id}" 
+                    style="background:transparent;border:1px dashed var(--success);color:var(--success);padding:3px 12px;border-radius:4px;cursor:pointer;font-size:.72rem;font-weight:500">
+              ➕ เพิ่มบิลใน SP นี้
+            </button>
+          </td>
+        </tr>
+      `);
+    }
+  });
+  const tbody = tbodyParts.join('');
   
   return `<table style="width:100%;border-collapse:collapse;min-width:1700px">${thead}<tbody>${tbody}</tbody></table>`;
 }
@@ -31049,6 +31142,180 @@ function spV2DownloadSellBills() {
   const fn = `SellBills_${todayISO()}.xlsx`;
   XLSX.writeFile(wb, fn);
   toast(`Download ${fn} — ${bills.length} rows`, 'success');
+}
+
+// ════════════════════════════════════════════════════════════════════
+// ⭐ 7/5/26 — Bill management in SP (add/edit/delete)
+// ════════════════════════════════════════════════════════════════════
+
+// Recompute header row totals from bills in same group
+function spV2RecomputeHeader(groupId) {
+  const billRows = spV2State.mainRows.filter(r => !r._is_header && r._group_id === groupId);
+  const header = spV2State.mainRows.find(r => r._is_header && r._group_id === groupId);
+  if (!header) return;
+  
+  // Sum bills (positive — credit notes already negative in amount)
+  const sum = billRows.reduce((s, b) => s + (Number(b.amount) || 0), 0);
+  // Update header amount = sum of bills
+  header.amount = sum;
+  // Note: pay_total is the actual paid amount (cash+transfer+cheque) — don't change from bill changes
+  // But if pay_total > new amount, mark unpaid (amount changed below pay)
+  // We leave pay_total alone — Toppy uses Edit Pay Modal to change it
+  
+  // Re-sequence
+  let seq = 0;
+  spV2State.mainRows.forEach(r => {
+    seq++;
+    r.seq = seq;
+  });
+}
+
+// Open modal to add new bill or edit existing
+function spV2OpenBillModal(mode, idx, gid) {
+  let row, header;
+  if (mode === 'edit') {
+    row = spV2State.mainRows[idx];
+    if (!row || row._is_header) { toast('ไม่พบบิล', 'error'); return; }
+    header = spV2State.mainRows.find(r => r._is_header && r._group_id === row._group_id);
+  } else { // add
+    header = spV2State.mainRows.find(r => r._is_header && r._group_id === gid);
+    if (!header) { toast('ไม่พบ SP', 'error'); return; }
+    row = {
+      _is_header: false,
+      _group_id: gid,
+      bill_no: '',
+      amount: 0,
+      ref_doc: '',
+      sale_date: '',
+      note1: '',
+      vat_flag: '',
+    };
+  }
+  
+  const title = mode === 'edit' ? '✏️ แก้ไขบิล' : `➕ เพิ่มบิลใน SP — ${header.bill_no}`;
+  
+  openModal(title, `
+    <div style="max-width:520px">
+      <div style="font-size:.85rem;color:var(--text2);margin-bottom:12px;padding:8px 10px;background:var(--bg2);border-radius:4px">
+        SP: <strong>${header.bill_no}</strong> · ลูกค้า: ${String(header.sale_date||'').substring(0, 60)}
+      </div>
+      
+      <div class="flex flex-col gap-3">
+        <div class="input-group">
+          <label>เลขบิล <span style="color:var(--danger)">*</span></label>
+          <input type="text" class="input" id="spv2-bill-no" value="${row.bill_no || ''}" placeholder="เช่น OR00126-XXX, SR00126-XXX" style="font-family:monospace">
+          <div style="font-size:.7rem;color:var(--text2);margin-top:2px">VAT จะตรวจจาก prefix อัตโนมัติ (SR/SS/SC = VAT, OR/OS/JR/JS = NOVAT)</div>
+        </div>
+        
+        <div class="input-group">
+          <label>ยอดบิล <span style="color:var(--danger)">*</span></label>
+          <input type="number" step="0.01" class="input" id="spv2-bill-amount" value="${row.amount || ''}" placeholder="0.00" style="font-size:1.1rem;font-weight:600">
+          <div style="font-size:.7rem;color:var(--text2);margin-top:2px">JR/SC (ใบลดหนี้) ใส่ติดลบ เช่น -1500</div>
+        </div>
+        
+        <div class="flex gap-2">
+          <div class="input-group" style="flex:1">
+            <label>เอกสารอ้างอิง</label>
+            <input type="date" class="input" id="spv2-bill-ref" value="${row.ref_doc ? String(row.ref_doc).substring(0,10) : ''}">
+          </div>
+          <div class="input-group" style="flex:1">
+            <label>วันขาย</label>
+            <input type="date" class="input" id="spv2-bill-date" value="${row.sale_date ? String(row.sale_date).substring(0,10) : ''}">
+          </div>
+        </div>
+        
+        <div class="input-group">
+          <label>หมายเหตุ</label>
+          <input type="text" class="input" id="spv2-bill-note" value="${row.note1 || ''}" placeholder="เช่น ใบรับของ/ใบซื้อ">
+        </div>
+        
+        <div class="flex gap-2 mt-2">
+          <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ยกเลิก</button>
+          <button class="btn btn-primary btn-sm flex-1" id="spv2-bill-save">💾 ${mode==='edit'?'บันทึก':'เพิ่มบิล'}</button>
+        </div>
+      </div>
+    </div>
+  `);
+  
+  setTimeout(() => {
+    document.getElementById('spv2-bill-save')?.addEventListener('click', () => {
+      const billNo = document.getElementById('spv2-bill-no').value.trim();
+      const amount = Number(document.getElementById('spv2-bill-amount').value) || 0;
+      const refDoc = document.getElementById('spv2-bill-ref').value;
+      const saleDate = document.getElementById('spv2-bill-date').value;
+      const note = document.getElementById('spv2-bill-note').value.trim();
+      
+      if (!billNo) { toast('กรอกเลขบิล', 'error'); return; }
+      if (amount === 0) { toast('กรอกยอด (ไม่ใช่ 0)', 'error'); return; }
+      
+      // Auto-detect VAT from prefix
+      const prefix = String(billNo).substring(0, 2).toUpperCase();
+      const vatFlag = ['SS','SR','SC'].includes(prefix) ? 'Y' : (['OR','OS','JS','JR'].includes(prefix) ? 'N' : '');
+      
+      if (mode === 'edit') {
+        // Update in place
+        row.bill_no = billNo;
+        row.amount = amount;
+        row.ref_doc = refDoc;
+        row.sale_date = saleDate;
+        row.note1 = note;
+        row.vat_flag = vatFlag;
+      } else {
+        // Insert after last bill of this group (or right after header)
+        const newBill = {
+          _is_header: false,
+          _group_id: gid,
+          bill_no: billNo,
+          amount: amount,
+          ref_doc: refDoc,
+          sale_date: saleDate,
+          note1: note,
+          vat_flag: vatFlag,
+          sp_number: header.sp_number,
+          pay_date: header.pay_date,
+        };
+        // Find last index in this group
+        let insertIdx = -1;
+        for (let i = spV2State.mainRows.length - 1; i >= 0; i--) {
+          if (spV2State.mainRows[i]._group_id === gid) {
+            insertIdx = i + 1;
+            break;
+          }
+        }
+        if (insertIdx === -1) insertIdx = spV2State.mainRows.length;
+        spV2State.mainRows.splice(insertIdx, 0, newBill);
+      }
+      
+      spV2RecomputeHeader(header._group_id);
+      persistSpV2();
+      closeModal();
+      toast(mode === 'edit' ? '✓ บันทึกแล้ว' : '✓ เพิ่มบิลแล้ว', 'success');
+      // Re-render
+      const container = document.querySelector('[data-page="sp_recon"]') || document.getElementById('main-content');
+      if (container) renderSpRecon(container);
+    });
+  }, 50);
+}
+
+// Delete bill from SP (with confirm)
+function spV2DeleteBill(idx, el) {
+  const row = spV2State.mainRows[idx];
+  if (!row || row._is_header) return;
+  const header = spV2State.mainRows.find(r => r._is_header && r._group_id === row._group_id);
+  if (!confirm(
+    `🗑 ลบบิล "${row.bill_no}" (฿${fmtNum(row.amount)}) จาก SP "${header?.bill_no || row._group_id}"?\n\n` +
+    `ระบบจะ:\n` +
+    `  • ลบบิลออกจาก SP\n` +
+    `  • คำนวณยอด SP ใหม่\n\n` +
+    `ดำเนินการต่อ?`
+  )) return;
+  
+  const gid = row._group_id;
+  spV2State.mainRows.splice(idx, 1);
+  spV2RecomputeHeader(gid);
+  persistSpV2();
+  toast(`✓ ลบบิล ${row.bill_no} แล้ว`, 'success');
+  renderSpRecon(el);
 }
 
 // ════════════════════════════════════════════════════════════════════
