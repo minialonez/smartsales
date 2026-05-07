@@ -20213,7 +20213,8 @@ async function renderBilling(el) {
       await loadNotes();
       // ⭐ Load customerList ทุกครั้ง (สำหรับ credit warning ใน list/aging tabs)
       await loadCustomerListIfNeeded();
-      if (activeTab === 'payments') await loadPayments();
+      // ⭐ Load payments เสมอ (7/5/26) — view modal ใน list tab ก็ต้องใช้ดูประวัติ
+      await loadPayments();
       if (activeTab === 'aging') await loadAging();
       if (activeTab === 'create') {
         await loadNextNo();
@@ -22123,6 +22124,65 @@ ${bodyHtml}
         <div><div style="color:var(--muted);font-size:12px">คงเหลือ</div><div style="font-weight:600;color:#ef4444">฿${fmtNum(n.outstanding)}</div></div>
       </div>
       ${n.remarks?`<div style="margin-top:12px;padding:8px;background:var(--bg);border-radius:4px;font-size:13px"><strong>หมายเหตุ:</strong> ${n.remarks}</div>`:''}
+      
+      <!-- 💳 ประวัติการชำระ (7/5/26) -->
+      ${(() => {
+        const pays = (billingPayments || []).filter(p => p.billing_uuid === uuid)
+          .sort((a, b) => String(b.payment_date || '').localeCompare(String(a.payment_date || '')));
+        if (pays.length === 0) {
+          return `<div style="margin-top:16px;padding:14px;background:rgba(127,127,127,.04);border-radius:6px;text-align:center;color:var(--muted);font-size:13px">— ยังไม่มีประวัติการชำระ —</div>`;
+        }
+        const METHOD_LABEL = { 'Cash':'💵 เงินสด', 'Transfer':'🏦 โอน', 'Cheque':'📜 เช็ค', 'Card':'💳 บัตรเครดิต' };
+        const totalPaid = pays.reduce((s, p) => s + (Number(p.amount) || 0) + (Number(p.wht_amount) || 0) + (Number(p.fee_amount) || 0), 0);
+        return `
+          <div style="margin-top:16px;border-top:1px solid var(--border);padding-top:14px">
+            <h4 style="margin:0 0 10px 0;display:flex;justify-content:space-between;align-items:baseline">
+              <span>💳 ประวัติการชำระ (${pays.length} ครั้ง)</span>
+              <span style="font-size:13px;color:var(--muted);font-weight:400">รวม ฿${fmtNum(totalPaid)}</span>
+            </h4>
+            <div style="max-height:240px;overflow-y:auto;border:1px solid var(--border);border-radius:6px">
+              <table style="width:100%;font-size:12.5px;border-collapse:collapse">
+                <thead>
+                  <tr style="background:var(--bg-elev);font-size:11px;color:var(--muted);position:sticky;top:0">
+                    <th style="padding:7px 10px;text-align:left">วันที่</th>
+                    <th style="padding:7px 10px;text-align:left">วิธีจ่าย</th>
+                    <th style="padding:7px 10px;text-align:right">ยอด</th>
+                    <th style="padding:7px 10px;text-align:right">WHT</th>
+                    <th style="padding:7px 10px;text-align:right">ค่าธรรมเนียม</th>
+                    <th style="padding:7px 10px;text-align:left">อ้างอิง / หมายเหตุ</th>
+                    <th style="padding:7px 10px;text-align:center">ลบ</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${pays.map(p => {
+                    const method = METHOD_LABEL[p.payment_method] || p.payment_method || '-';
+                    const ref = String(p.reference || '').trim();
+                    const remarks = String(p.remarks || '').trim();
+                    const refHtml = [
+                      ref ? `<span style="font-family:monospace;font-size:11px;color:var(--muted)">${ref}</span>` : '',
+                      remarks ? `<span style="font-size:11.5px">${remarks}</span>` : '',
+                    ].filter(Boolean).join(' · ') || '<span style="color:var(--muted)">-</span>';
+                    return `
+                      <tr style="border-top:1px solid var(--border)">
+                        <td style="padding:6px 10px">${fmtThaiDate(p.payment_date)}</td>
+                        <td style="padding:6px 10px">${method}</td>
+                        <td style="padding:6px 10px;text-align:right;font-weight:600;color:#16a34a">฿${fmtNum(p.amount)}</td>
+                        <td style="padding:6px 10px;text-align:right;color:${(Number(p.wht_amount)||0)>0?'#3b82f6':'var(--muted)'}">${(Number(p.wht_amount)||0)>0?'฿'+fmtNum(p.wht_amount):'-'}</td>
+                        <td style="padding:6px 10px;text-align:right;color:${(Number(p.fee_amount)||0)>0?'#f59e0b':'var(--muted)'}">${(Number(p.fee_amount)||0)>0?'฿'+fmtNum(p.fee_amount):'-'}</td>
+                        <td style="padding:6px 10px">${refHtml}</td>
+                        <td style="padding:6px 10px;text-align:center">
+                          <button class="bn-pay-del btn btn-outline" data-puid="${p.payment_uuid}" data-buid="${uuid}" style="font-size:11px;padding:2px 8px;border-color:var(--danger);color:var(--danger)" title="ลบรายการชำระนี้">🗑</button>
+                        </td>
+                      </tr>
+                    `;
+                  }).join('')}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        `;
+      })()}
+      
       <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
         <button class="btn btn-outline" id="bn-view-print">🖨 พิมพ์</button>
         ${n.status !== 'paid' && n.status !== 'cancelled' ? `<button class="btn btn-primary" id="bn-view-pay">💵 รับชำระ</button>` : ''}
@@ -22134,6 +22194,41 @@ ${bodyHtml}
       if (p) p.onclick = () => { closeModal(); openPrintWindow(uuid); };
       const pay = document.getElementById('bn-view-pay');
       if (pay) pay.onclick = () => { closeModal(); openPayModal(uuid); };
+      
+      // ⭐ Delete payment record handlers
+      document.querySelectorAll('.bn-pay-del').forEach(btn => {
+        btn.onclick = async () => {
+          const puid = btn.dataset.puid;
+          const buid = btn.dataset.buid;
+          if (!confirm(
+            `🗑 ลบรายการชำระนี้?\n\n` +
+            `ระบบจะ:\n` +
+            `  • ลบ payment record\n` +
+            `  • คืนยอด paid_amount → outstanding\n` +
+            `  • คำนวณ status ใหม่\n\n` +
+            `ดำเนินการต่อ?`
+          )) return;
+          
+          const orig = btn.textContent;
+          btn.disabled = true;
+          btn.textContent = '⏳';
+          
+          try {
+            const res = await api('deleteBillingPayment', { payment_uuid: puid });
+            if (!res?.success) throw new Error(res?.message || res?.error || 'ไม่สำเร็จ');
+            const d = res.data || {};
+            toast(`✓ ลบรายการชำระ — คืน ฿${fmtNum(d.removed_amount||0)} → ${d.new_status}`, 'success', 4000);
+            closeModal();
+            // Reload notes + payments + reopen view
+            await Promise.all([loadNotes(), loadPayments()]);
+            setTimeout(() => openViewModal(buid), 200);
+          } catch(err) {
+            toast('ลบไม่สำเร็จ: ' + (err.message || err), 'error', 4000);
+            btn.disabled = false;
+            btn.textContent = orig;
+          }
+        };
+      });
     }, 50);
   }
 
