@@ -29784,6 +29784,8 @@ let spV2State = {
   groupByCustomer: false, // ← Sell Bills: group by customer
   expandedCustomers: new Set(), // ← which customers are expanded
   collapsedGroups: new Set(), // ⭐ 7/5/26 — _group_id ที่ collapse (ซ่อน bills) — empty = expand all
+  reportGenerated: false, // ⭐ 7/5/26 — true หลังกด Generate Report (assign new SP numbers)
+  sellBillsRows: [], // ⭐ 7/5/26 — cached array — empty = ยังไม่ generate
   rawPayMain: [],        // parsed file 1
   rawPayType: [],        // parsed file 2
   rawTaxSales: [],       // parsed file 3
@@ -29798,6 +29800,8 @@ try {
   if (Array.isArray(saved.rawPayType)) spV2State.rawPayType = saved.rawPayType;
   if (Array.isArray(saved.rawTaxSales)) spV2State.rawTaxSales = saved.rawTaxSales;
   if (Array.isArray(saved.collapsedGroups)) spV2State.collapsedGroups = new Set(saved.collapsedGroups);
+  if (saved.reportGenerated === true) spV2State.reportGenerated = true;
+  if (Array.isArray(saved.sellBillsRows)) spV2State.sellBillsRows = saved.sellBillsRows;
 } catch(e) {}
 
 function persistSpV2() {
@@ -29809,6 +29813,8 @@ function persistSpV2() {
       rawPayType: spV2State.rawPayType,
       rawTaxSales: spV2State.rawTaxSales,
       collapsedGroups: [...spV2State.collapsedGroups],
+      reportGenerated: spV2State.reportGenerated,
+      sellBillsRows: spV2State.sellBillsRows,
     }));
   } catch(e) {
     console.warn('persistSpV2 failed (อาจเกิน localStorage limit)', e);
@@ -29818,10 +29824,25 @@ function persistSpV2() {
         nextCounter: spV2State.nextCounter,
         mainRows: spV2State.mainRows,
         collapsedGroups: [...spV2State.collapsedGroups],
+        reportGenerated: spV2State.reportGenerated,
       }));
       if (typeof toast === 'function') toast('⚠ ภาษีขาย/การชำระเงิน raw data ใหญ่เกิน localStorage — ต้อง upload ใหม่ถ้า reload page', 'warn', 5000);
     } catch(_) {}
   }
+}
+
+// ⭐ 7/5/26 — Invalidate Report + Sell Bills (เรียกเมื่อ user แก้ Main)
+//   Force user ให้ regenerate Report/Sell Bills หลังจาก edit
+function spV2InvalidateGenerated() {
+  spV2State.reportGenerated = false;
+  spV2State.sellBillsRows = [];
+  // Clear match status (ต้อง re-match หลัง regenerate)
+  spV2State.mainRows.forEach(r => {
+    if (r._is_header) {
+      r._match_status = '';
+      r._matched_stmt_uuid = '';
+    }
+  });
 }
 
 // Classify VAT by bill prefix
@@ -30281,8 +30302,9 @@ async function renderSpRecon(el) {
           if (r._is_header) appendedHeaders++;
         }
         spV2State.mainRows = spV2State.mainRows.concat(accepted);
+        spV2InvalidateGenerated(); // ⭐ ข้อมูลเปลี่ยน → reset Report/SellBills
         persistSpV2();
-        toast(`✅ เพิ่ม ${appendedHeaders} SP (รวมเป็น ${existingHeaders + appendedHeaders} SP)`, 'success', 4000);
+        toast(`✅ เพิ่ม ${appendedHeaders} SP (รวมเป็น ${existingHeaders + appendedHeaders} SP) — กรุณา <b>Generate Report</b> ใหม่`, 'success', 5000);
         renderSpRecon(el);
         return;
       }
@@ -30302,8 +30324,9 @@ async function renderSpRecon(el) {
         } else {
           spV2State.mainRows = newRows;
         }
+        spV2InvalidateGenerated(); // ⭐ ข้อมูลเปลี่ยน → reset Report/SellBills
         persistSpV2();
-        toast(`✅ ทับข้อมูลใหม่ — ${spV2State.mainRows.filter(r=>r._is_header).length} SP`, 'success', 4000);
+        toast(`✅ ทับข้อมูลใหม่ — ${spV2State.mainRows.filter(r=>r._is_header).length} SP — กรุณา <b>Generate Report</b> ก่อนใช้ Report/Sell Bills`, 'success', 5000);
         renderSpRecon(el);
         return;
       }
@@ -30313,10 +30336,11 @@ async function renderSpRecon(el) {
       return;
     }
     
-    // ⭐ ครั้งแรก — ไม่มีข้อมูลเดิม → ใส่เลย
+    // ⭐ ครั้งแรก — ไม่มีข้อมูลเดิม → ใส่เลย (Main only — Report/SellBills ยังว่าง)
     spV2State.mainRows = newRows;
+    spV2InvalidateGenerated(); // ⭐ Reset flags (ครั้งแรกก็ต้อง false)
     persistSpV2();
-    toast(`✅ สร้าง Main — ${newHeaders} SP`, 'success', 4000);
+    toast(`✅ สร้าง Main สำเร็จ — ${newHeaders} SP. ตรวจสอบ Y/N + บิลครบถ้วน → กด <b>🔢 Generate Report</b>`, 'success', 6000);
     renderSpRecon(el);
   });
   
@@ -30361,6 +30385,15 @@ async function renderSpRecon(el) {
       `ดำเนินการต่อ?`
     )) return;
     spV2MatchWithStatements();
+  });
+  
+  // ⭐ 7/5/26 — Generate Sell Bills (manual, ไม่ทำตอน upload)
+  document.getElementById('spv2-btn-gen-sellbills')?.addEventListener('click', () => {
+    const bills = spV2GenerateSellBills();
+    spV2State.sellBillsRows = bills;
+    persistSpV2();
+    toast(`✓ Generate Sell Bills สำเร็จ — ${bills.length} บิล`, 'success', 4000);
+    spV2RenderKeepScroll(el);
   });
   
   // ── Group by customer toggle ──
@@ -30434,6 +30467,7 @@ async function renderSpRecon(el) {
       const row = spV2State.mainRows[idx];
       if (!row) return;
       row.vat_flag = row.vat_flag === 'Y' ? 'N' : 'Y';
+      spV2InvalidateGenerated(); // ⭐ user แก้ → reset Report/SellBills
       persistSpV2();
       spV2RenderKeepScroll(el);
     });
@@ -30616,6 +30650,28 @@ function spV2RenderMainTable(rows) {
 
 // Render Report view (grouped, honors filterVat)
 function spV2RenderReportView(rows) {
+  // ⭐ 7/5/26 — ถ้ายังไม่ได้ Generate Report → แสดง empty state + คำแนะนำ
+  if (!spV2State.reportGenerated) {
+    return `
+      <div style="padding:60px 20px;text-align:center;color:var(--text2);max-width:520px;margin:0 auto">
+        <div style="font-size:3.5rem;margin-bottom:18px">📊</div>
+        <div style="font-weight:700;font-size:1.15rem;margin-bottom:10px;color:var(--text)">ยังไม่ได้ Generate Report</div>
+        <div style="font-size:.92rem;line-height:1.7;margin-bottom:24px">
+          ตรวจสอบใน <b>📋 Main</b> view ก่อน:<br>
+          <span style="display:inline-block;text-align:left;font-size:.88rem;margin-top:8px">
+            ✓ บิลครบถ้วน (เพิ่มบิลขาด/ลบบิลเกิน)<br>
+            ✓ Y/N flag ถูกต้อง (Y = ใบที่จะนำส่งเป็น report)<br>
+            ✓ ยอดชำระตรงกับที่ลูกค้าจ่ายจริง
+          </span>
+        </div>
+        <button class="btn btn-primary" data-view="main" style="font-weight:700">↩ ไปหน้า Main</button>
+        <div style="font-size:.78rem;color:var(--text3);margin-top:18px">
+          หลังจากตรวจ Main เสร็จ → กลับมาที่ Main → กด <b>🔢 Generate Report</b>
+        </div>
+      </div>
+    `;
+  }
+  
   // Group by sp_number (filter pills already applied via spV2FilterRows)
   const groups = {};
   rows.forEach(r => {
@@ -30846,7 +30902,34 @@ function spV2GenerateSellBills() {
 
 // Render Sell Bills table
 function spV2RenderSellBillsView() {
-  let bills = spV2GenerateSellBills();
+  // ⭐ 7/5/26 — ถ้ายังไม่ได้ Generate Sell Bills → empty state + ปุ่ม
+  if (!Array.isArray(spV2State.sellBillsRows) || spV2State.sellBillsRows.length === 0) {
+    const hasRawTax = Array.isArray(spV2State.rawTaxSales) && spV2State.rawTaxSales.length > 0;
+    const hasMainData = spV2State.mainRows.length > 0;
+    return `
+      <div style="padding:60px 20px;text-align:center;color:var(--text2);max-width:520px;margin:0 auto">
+        <div style="font-size:3.5rem;margin-bottom:18px">📑</div>
+        <div style="font-weight:700;font-size:1.15rem;margin-bottom:10px;color:var(--text)">ยังไม่ได้ Generate Sell Bills</div>
+        <div style="font-size:.92rem;line-height:1.7;margin-bottom:24px">
+          ดึงบิลขาย <span style="font-family:monospace;font-size:.85rem">SR/SS/SC/OR/OS/JR/JS</span> จาก Sell Bills Raw<br>
+          <span style="font-size:.86rem">+ match กับการชำระจาก Main → ยอดที่จ่ายแล้ว / ยังไม่จ่าย</span>
+        </div>
+        ${!hasRawTax ? `
+          <div style="padding:12px;background:rgba(239,87,87,.1);border:1px solid var(--danger);border-radius:6px;margin-bottom:14px;color:var(--danger);font-size:.85rem">
+            ⚠️ ยังไม่มีข้อมูล <b>Sell Bills Raw</b> — upload ไฟล์ "ภาษีขาย" ก่อน
+          </div>
+        ` : !hasMainData ? `
+          <div style="padding:12px;background:rgba(250,200,100,.1);border:1px solid var(--warn);border-radius:6px;margin-bottom:14px;color:var(--warn);font-size:.85rem">
+            ⚠️ ยังไม่มีข้อมูล Main — สร้าง Main ก่อน (สถานะการชำระจะดึงจาก Main)
+          </div>
+        ` : `
+          <button class="btn btn-primary" id="spv2-btn-gen-sellbills" style="font-weight:700;padding:8px 24px">📑 Generate Sell Bills</button>
+        `}
+      </div>
+    `;
+  }
+  
+  let bills = spV2State.sellBillsRows.slice(); // use cached
   
   // ── Filters ──
   const { filterVat, filterPaid, filterPrefixes, groupByCustomer } = spV2State;
@@ -31168,6 +31251,7 @@ function spV2GenerateReportNumbers() {
   
   // Sync nextCounter (max of all months counters)
   spV2State.nextCounter = Math.max(spV2State.nextCounter || 1, ...Object.values(counters), 1) + 1;
+  spV2State.reportGenerated = true; // ⭐ Mark as generated → Report view ใช้ได้
   persistSpV2();
   
   toast(`✓ Generate Report สำเร็จ — Y rows ${yCount} ใบ (เลขใหม่) · N rows ${nCount} ใบ (คงเดิม)`, 'success', 5000);
@@ -31473,6 +31557,7 @@ function spV2OpenBillModal(mode, idx, gid) {
       }
       
       spV2RecomputeHeader(header._group_id);
+      spV2InvalidateGenerated(); // ⭐ user แก้ → reset Report/SellBills
       persistSpV2();
       closeModal();
       toast(mode === 'edit' ? '✓ บันทึกแล้ว' : '✓ เพิ่มบิลแล้ว', 'success');
@@ -31506,6 +31591,7 @@ function spV2DeleteBill(idx, el) {
   spV2State.mainRows.splice(idx, 1);
   spV2AdjustMethod(header, methodToDeduct, -billAmt);
   spV2RecomputeHeader(gid);
+  spV2InvalidateGenerated(); // ⭐ user แก้ → reset Report/SellBills
   persistSpV2();
   toast(`✓ ลบบิล ${row.bill_no} แล้ว`, 'success');
   spV2RenderKeepScroll(el);
@@ -31590,6 +31676,7 @@ function spV2OpenEditModal(groupId) {
     // Recompute pay_total
     headerRow.pay_total = cashAmt + trfAmt + chqAmt + crdAmt;
     
+    spV2InvalidateGenerated(); // ⭐ user แก้ → reset Report/SellBills
     persistSpV2();
     closeModal();
     toast('บันทึกแล้ว', 'success');
