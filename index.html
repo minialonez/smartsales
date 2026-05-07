@@ -29856,14 +29856,16 @@ function spV2BuildRows(payMain, payType, taxSales) {
   payMain.forEach(sp => {
     const ptEntry = payTypeMap[sp.no] || { methods: [] };
     
-    // Separate children by VAT class
-    const vatBills = [];
-    const novatBills = [];
+    // ⭐ 7/5/26 — 1 SP = 1 group (no split). vat_flag จากบิลทั้งหมด:
+    //   ทุกบิล VAT (SR/SS/SC) → Y
+    //   ทุกบิล NOVAT (OR/OS/JR/JS) หรือ mixed → N (default safe; user แก้เอง)
+    let vatBillCount = 0, novatBillCount = 0;
     sp.bills.forEach(b => {
       const c = spV2ClassifyVat(b.bill_no);
-      if (c === 'Y') vatBills.push(b);
-      else novatBills.push(b);
+      if (c === 'Y') vatBillCount++;
+      else if (c === 'N') novatBillCount++;
     });
+    const vatFlag = (vatBillCount > 0 && novatBillCount === 0) ? 'Y' : 'N';
     
     // ── Calculate payment method distribution ──
     const methodInfo = { cash: {d:'', a:0}, transfer: {d:'', a:0}, cheque: {d:'', a:0} };
@@ -29872,102 +29874,40 @@ function spV2BuildRows(payMain, payType, taxSales) {
       else if (/โอนเงิน|เงินโอน/.test(m.type)) { methodInfo.transfer.d = m.date; methodInfo.transfer.a += m.amount; }
       else if (/เช็ค/.test(m.type))            { methodInfo.cheque.d = m.date; methodInfo.cheque.a += m.amount; }
     });
-    // Credit notes (JR/SC/JS) — credit_amt คำนวณจาก "residual ของ pay_total หลังหักวิธีจ่าย"
-    //   formula: creditAmt = allBillsTotal - cash - transfer - cheque
-    //
-    // Cases ที่ offset กันพอดี (positive บิล = |negative บิล|, ไม่มี methods) → creditAmt = 0:
-    //   • OR + JR ตัดกันพอดี (NOVAT)
-    //   • OS + JS ตัดกันพอดี (NOVAT)
-    //   • SS + SC ตัดกันพอดี (VAT)
-    //   • SR + SC ตัดกันพอดี (VAT)
-    // ทุก case ใช้ formula เดียวกัน เพราะ allBillsTotal รวมทั้ง VAT+NOVAT
-    // → allBillsTotal = 0 (offset), methods = 0 (ไม่มีจ่าย) → creditAmt = 0 ✓
-    // hasCreditActivity ยังเป็น true เพื่อแสดง credit_date
+    // Credit residual (offsets เกิดเอง)
     const hasCreditActivity = sp.bills.some(b => b.amount < 0);
     const allBillsTotal = sp.bills.reduce((s,b) => s + b.amount, 0);
     const creditAmt = allBillsTotal - methodInfo.cash.a - methodInfo.transfer.a - methodInfo.cheque.a;
     
-    // ── NOVAT group: use original SP number ──
-    if (novatBills.length > 0) {
-      seq++;
-      const novatTotal = novatBills.reduce((s,b) => s + b.amount, 0);
-      // SP header (original)
-      const headerRow = {
-        seq: seq, vat_flag: 'N',
-        bill_no: sp.no, ref_doc: sp.date, sale_date: sp.customer,
-        note1: '', amount: null, pay_total: novatTotal,
-        cash_date: methodInfo.cash.a > 0 ? methodInfo.cash.d : '', cash_amt: methodInfo.cash.a,
-        transfer_date: methodInfo.transfer.a > 0 ? methodInfo.transfer.d : '', transfer_amt: methodInfo.transfer.a,
-        cheque_date: methodInfo.cheque.a > 0 ? methodInfo.cheque.d : '', cheque_amt: methodInfo.cheque.a,
-        credit_date: hasCreditActivity ? sp.date : '', credit_amt: creditAmt,
-        note2: '', sp_number: sp.no, pay_date: sp.date,
-        _is_header: true, _group_id: sp.no,
-      };
-      // If mixed (also has VAT), split the payment between groups? → for now, put all in NOVAT header
-      if (vatBills.length === 0) {
-        // all NOVAT — full payment here
-      } else {
-        // mixed — keep payment in NOVAT header (dominant group)
-      }
-      rows.push(headerRow);
-      
-      novatBills.forEach(b => {
-        seq++;
-        rows.push({
-          seq: seq, vat_flag: 'N',
-          bill_no: b.bill_no, ref_doc: b.ref_no || '', sale_date: b.bill_date || '',
-          note1: b.type_desc || '', amount: b.amount, pay_total: 0,
-          cash_date: '', cash_amt: 0, transfer_date: '', transfer_amt: 0,
-          cheque_date: '', cheque_amt: 0, credit_date: '', credit_amt: 0,
-          note2: '', sp_number: sp.no, pay_date: sp.date,
-          _is_header: false, _group_id: sp.no,
-        });
-      });
-    }
+    seq++;
+    // SP header — sp_number = original (จะ generate ใหม่ตอนกด Generate Report)
+    const headerRow = {
+      seq: seq, vat_flag: vatFlag,
+      bill_no: sp.no, ref_doc: sp.date, sale_date: sp.customer,
+      note1: '', amount: null, pay_total: allBillsTotal,
+      cash_date: methodInfo.cash.a > 0 ? methodInfo.cash.d : '', cash_amt: methodInfo.cash.a,
+      transfer_date: methodInfo.transfer.a > 0 ? methodInfo.transfer.d : '', transfer_amt: methodInfo.transfer.a,
+      cheque_date: methodInfo.cheque.a > 0 ? methodInfo.cheque.d : '', cheque_amt: methodInfo.cheque.a,
+      credit_date: hasCreditActivity ? sp.date : '', credit_amt: creditAmt,
+      note2: '', sp_number: sp.no, pay_date: sp.date,
+      _is_header: true, _group_id: sp.no,
+      _match_status: '', _matched_stmt_uuid: '', // ⭐ for cross-check with stmts
+    };
+    rows.push(headerRow);
     
-    // ── VAT group: generate new SP number ──
-    if (vatBills.length > 0) {
-      const vatSp = spV2GenNumber(sp.date);
-      const vatTotal = vatBills.reduce((s,b) => s + b.amount, 0);
+    // Bills (vat_flag at bill level = actual classification)
+    sp.bills.forEach(b => {
       seq++;
-      // VAT header (generated)
-      const vatHeader = {
-        seq: seq, vat_flag: 'Y',
-        bill_no: vatSp, ref_doc: sp.date, sale_date: sp.customer,
-        note1: '', amount: null, pay_total: vatTotal,
-        cash_date: '', cash_amt: 0,
-        transfer_date: '', transfer_amt: 0,
-        cheque_date: '', cheque_amt: 0,
-        credit_date: '', credit_amt: 0,
-        note2: '', sp_number: vatSp, pay_date: sp.date,
-        _is_header: true, _is_generated: true, _group_id: vatSp,
-      };
-      // If VAT only (no NOVAT) — full payment here
-      if (novatBills.length === 0) {
-        vatHeader.cash_date = methodInfo.cash.a > 0 ? methodInfo.cash.d : ''; vatHeader.cash_amt = methodInfo.cash.a;
-        vatHeader.transfer_date = methodInfo.transfer.a > 0 ? methodInfo.transfer.d : ''; vatHeader.transfer_amt = methodInfo.transfer.a;
-        vatHeader.cheque_date = methodInfo.cheque.a > 0 ? methodInfo.cheque.d : ''; vatHeader.cheque_amt = methodInfo.cheque.a;
-        vatHeader.credit_date = hasCreditActivity ? sp.date : ''; vatHeader.credit_amt = creditAmt;
-      } else if (vatTotal > 0) {
-        // Mixed — VAT total as separate transfer payment (เฉพาะเมื่อมียอดจริง)
-        vatHeader.transfer_date = sp.date;
-        vatHeader.transfer_amt = vatTotal;
-      }
-      rows.push(vatHeader);
-      
-      vatBills.forEach(b => {
-        seq++;
-        rows.push({
-          seq: seq, vat_flag: 'Y',
-          bill_no: b.bill_no, ref_doc: b.ref_no || '', sale_date: b.bill_date || '',
-          note1: b.type_desc || '', amount: b.amount, pay_total: 0,
-          cash_date: '', cash_amt: 0, transfer_date: '', transfer_amt: 0,
-          cheque_date: '', cheque_amt: 0, credit_date: '', credit_amt: 0,
-          note2: '', sp_number: vatSp, pay_date: sp.date,
-          _is_header: false, _group_id: vatSp,
-        });
+      rows.push({
+        seq: seq, vat_flag: spV2ClassifyVat(b.bill_no),
+        bill_no: b.bill_no, ref_doc: b.ref_no || '', sale_date: b.bill_date || '',
+        note1: b.type_desc || '', amount: b.amount, pay_total: 0,
+        cash_date: '', cash_amt: 0, transfer_date: '', transfer_amt: 0,
+        cheque_date: '', cheque_amt: 0, credit_date: '', credit_amt: 0,
+        note2: '', sp_number: sp.no, pay_date: sp.date,
+        _is_header: false, _group_id: sp.no,
       });
-    }
+    });
   });
   
   return rows;
@@ -30182,6 +30122,13 @@ async function renderSpRecon(el) {
         
         <div style="flex:1"></div>
         
+        ${view === 'main' ? `
+          <button class="btn btn-sm" id="spv2-btn-gen-report" title="Assign SP number ใหม่ใน Y rows (เรียงตามลำดับ) + sync N rows" 
+                  style="background:var(--info);color:#fff;border:none;font-weight:700">🔢 Generate Report</button>
+          <button class="btn btn-outline btn-sm" id="spv2-btn-match-stmt" title="Match SP กับ Bank Statement (cross-check)"
+                  style="border-color:var(--success);color:var(--success);font-weight:700">🔗 Match Statement</button>
+        ` : ''}
+        
         ${view === 'report' ? `<button class="btn btn-success btn-sm" id="spv2-btn-download">⬇️ Download Report</button>` : ''}
       </div>
       
@@ -30388,6 +30335,34 @@ async function renderSpRecon(el) {
     spV2DownloadSellBills();
   });
   
+  // ⭐ 7/5/26 — Generate SP Numbers (assign new SP number to Y rows)
+  document.getElementById('spv2-btn-gen-report')?.addEventListener('click', () => {
+    if (!confirm(
+      `🔢 Generate SP Numbers ใน Y rows?\n\n` +
+      `ระบบจะ:\n` +
+      `  • Loop SP ที่ vat_flag = Y → assign เลขใหม่เรียงตามลำดับ (SP{YYYYMM}-XXXX)\n` +
+      `  • SP ที่ vat_flag = N → คงเลขเดิม (SP{YY}126-XXXXXX)\n` +
+      `  • bills ใน group เดียวกัน → sync เลขด้วย\n\n` +
+      `ทำซ้ำได้ — ทุกครั้งจะ reset counter ใหม่ตาม Y rows ปัจจุบัน\n\n` +
+      `ดำเนินการต่อ?`
+    )) return;
+    spV2GenerateReportNumbers();
+  });
+  
+  // ⭐ 7/5/26 — Match กับ Statement
+  document.getElementById('spv2-btn-match-stmt')?.addEventListener('click', () => {
+    if (!confirm(
+      `🔗 Match SP กับ Bank Statement?\n\n` +
+      `ระบบจะ:\n` +
+      `  • Loop Y headers (skip N rows)\n` +
+      `  • หา statement ที่ amount + วันใกล้เคียง (±3 วัน)\n` +
+      `  • mark ✓ matched / ✗ no_match\n\n` +
+      `ใช้สำหรับ cross-check ว่า SP ที่นำส่ง report ตรงกับเงินที่เข้าจริงในธนาคารไหม\n\n` +
+      `ดำเนินการต่อ?`
+    )) return;
+    spV2MatchWithStatements();
+  });
+  
   // ── Group by customer toggle ──
   document.getElementById('spv2-btn-group-cust')?.addEventListener('click', () => {
     spV2State.groupByCustomer = !spV2State.groupByCustomer;
@@ -30561,9 +30536,16 @@ function spV2RenderMainTable(rows) {
       ? `<span class="spv2-toggle-expand" data-gid="${r._group_id}" title="${groupCollapsed?'แสดงบิล':'ซ่อนบิล'}" style="display:inline-block;cursor:pointer;width:16px;text-align:center;color:var(--text2);user-select:none">${groupCollapsed?'▶':'▼'}</span>` 
       : '';
     
+    // Match status badge for header rows (Y only — N rows skipped during match)
+    const matchBadge = (isHdr && r._match_status) ? (
+      r._match_status === 'matched'
+        ? `<span title="match กับ statement (cross-check)" style="display:inline-block;padding:2px 6px;background:rgba(63,196,143,.18);color:var(--success);border:1px solid var(--success);border-radius:3px;font-size:.65rem;font-weight:700;margin-right:3px">✓</span>`
+        : `<span title="ไม่ตรง statement" style="display:inline-block;padding:2px 6px;background:rgba(239,87,87,.12);color:var(--danger);border:1px solid var(--danger);border-radius:3px;font-size:.65rem;font-weight:700;margin-right:3px">✗</span>`
+    ) : '';
+    
     // Action buttons
     const actionCell = isHdr 
-      ? `<button class="spv2-edit-pay" data-gid="${r._group_id}" title="แก้วิธีชำระ" style="background:var(--info-bg);border:1px solid var(--info);color:var(--info);padding:3px 8px;border-radius:4px;cursor:pointer;font-size:.75rem">✏️</button>`
+      ? `${matchBadge}<button class="spv2-edit-pay" data-gid="${r._group_id}" title="แก้วิธีชำระ" style="background:var(--info-bg);border:1px solid var(--info);color:var(--info);padding:3px 8px;border-radius:4px;cursor:pointer;font-size:.75rem">✏️</button>`
       : `<button class="spv2-bill-edit" data-idx="${origIdx}" title="แก้บิล" style="background:transparent;border:1px solid var(--border);padding:2px 6px;border-radius:3px;cursor:pointer;font-size:.7rem;margin-right:2px">✏️</button><button class="spv2-bill-delete" data-idx="${origIdx}" title="ลบบิล" style="background:transparent;border:1px solid var(--danger);color:var(--danger);padding:2px 6px;border-radius:3px;cursor:pointer;font-size:.7rem">🗑</button>`;
     
     const rowHtml = `
@@ -31142,6 +31124,136 @@ function spV2DownloadSellBills() {
   const fn = `SellBills_${todayISO()}.xlsx`;
   XLSX.writeFile(wb, fn);
   toast(`Download ${fn} — ${bills.length} rows`, 'success');
+}
+
+// ⭐ 7/5/26 — Generate Report SP numbers
+//   Loop Y headers ตามลำดับ → assign sp_number = SPYYYYMM-XXXX (counter รัน per month)
+//   N headers → keep original (sp_number = bill_no)
+//   bills ใน group เดียวกัน → sync sp_number ด้วย
+function spV2GenerateReportNumbers() {
+  const counters = {}; // YYYYMM -> next counter
+  let yCount = 0, nCount = 0;
+  
+  // Build map: group_id -> new sp_number
+  const newSpMap = {};
+  spV2State.mainRows.forEach(r => {
+    if (!r._is_header) return;
+    
+    if (r.vat_flag === 'Y') {
+      // Generate new SP number
+      const date = r.pay_date ? new Date(r.pay_date) : new Date();
+      if (isNaN(date.getTime())) return;
+      const yyyy = date.getFullYear();
+      const mm = String(date.getMonth() + 1).padStart(2, '0');
+      const key = `${yyyy}${mm}`;
+      if (!counters[key]) counters[key] = 0;
+      counters[key]++;
+      const newSp = `SP${key}-${String(counters[key]).padStart(4, '0')}`;
+      newSpMap[r._group_id] = newSp;
+      r.sp_number = newSp;
+      yCount++;
+    } else {
+      // N rows: keep original
+      newSpMap[r._group_id] = r.bill_no;
+      r.sp_number = r.bill_no;
+      nCount++;
+    }
+  });
+  
+  // Apply to bills (sp_number column shows new value)
+  spV2State.mainRows.forEach(r => {
+    if (r._is_header) return;
+    if (newSpMap[r._group_id]) r.sp_number = newSpMap[r._group_id];
+  });
+  
+  // Sync nextCounter (max of all months counters)
+  spV2State.nextCounter = Math.max(spV2State.nextCounter || 1, ...Object.values(counters), 1) + 1;
+  persistSpV2();
+  
+  toast(`✓ Generate Report สำเร็จ — Y rows ${yCount} ใบ (เลขใหม่) · N rows ${nCount} ใบ (คงเดิม)`, 'success', 5000);
+  spV2RenderKeepScroll();
+}
+
+// ⭐ 7/5/26 — Match SP กับ Statement (cross-check)
+//   Loop Y headers → หา stmt ที่ amount + date ตรง (±3 วัน) → mark _match_status
+function spV2MatchWithStatements() {
+  let stmts = [];
+  try {
+    if (typeof getAllStatements === 'function') {
+      stmts = getAllStatements();
+    }
+  } catch(e) { console.warn('[spV2Match] getAllStatements failed', e); }
+  
+  if (!Array.isArray(stmts) || stmts.length === 0) {
+    toast('⚠ ไม่พบ statements ใน Smart Finance — upload bank statement (หน้า Main / Data) ก่อน', 'warn', 5000);
+    return;
+  }
+  
+  // Round to 2 decimals key for fast lookup
+  const k2 = n => Math.round(Math.abs(Number(n) || 0) * 100);
+  const stmtByAmt = {};
+  stmts.forEach(s => {
+    const key = k2(s.amount);
+    if (!stmtByAmt[key]) stmtByAmt[key] = [];
+    stmtByAmt[key].push(s);
+  });
+  
+  let matched = 0, noMatch = 0, skipped = 0;
+  spV2State.mainRows.forEach(r => {
+    if (!r._is_header) return;
+    if (r.vat_flag !== 'Y') {
+      // N rows: ไม่ match (ไม่ใช่ใบที่นำส่ง report)
+      r._match_status = '';
+      r._matched_stmt_uuid = '';
+      skipped++;
+      return;
+    }
+    
+    const payTotal = Number(r.pay_total) || 0;
+    if (payTotal === 0) {
+      r._match_status = 'no_match';
+      r._matched_stmt_uuid = '';
+      noMatch++;
+      return;
+    }
+    
+    // Find candidate statements (same amount)
+    const candidates = stmtByAmt[k2(payTotal)] || [];
+    const payDate = r.pay_date;
+    let bestMatch = null;
+    let bestDateDiff = Infinity;
+    
+    if (payDate) {
+      const payT = new Date(payDate).getTime();
+      if (!isNaN(payT)) {
+        for (const s of candidates) {
+          const stmtDate = String(s.date || s.entry_date || '').substring(0, 10);
+          if (!stmtDate) continue;
+          const stmtT = new Date(stmtDate).getTime();
+          if (isNaN(stmtT)) continue;
+          const diffDays = Math.abs(payT - stmtT) / (1000 * 60 * 60 * 24);
+          if (diffDays <= 3 && diffDays < bestDateDiff) {
+            bestMatch = s;
+            bestDateDiff = diffDays;
+          }
+        }
+      }
+    }
+    
+    if (bestMatch) {
+      r._match_status = 'matched';
+      r._matched_stmt_uuid = bestMatch.stmt_uuid || bestMatch.ref_no || '';
+      matched++;
+    } else {
+      r._match_status = 'no_match';
+      r._matched_stmt_uuid = '';
+      noMatch++;
+    }
+  });
+  
+  persistSpV2();
+  toast(`✓ Match สำเร็จ — ตรง ${matched} ใบ · ไม่ตรง ${noMatch} ใบ · ข้าม N ${skipped} ใบ`, matched > 0 ? 'success' : 'warn', 6000);
+  spV2RenderKeepScroll();
 }
 
 // ════════════════════════════════════════════════════════════════════
