@@ -30460,7 +30460,7 @@ async function renderSpRecon(el) {
       if (!row) return;
       row.vat_flag = row.vat_flag === 'Y' ? 'N' : 'Y';
       persistSpV2();
-      renderSpRecon(el);
+      spV2RenderKeepScroll(el);
     });
   });
   
@@ -30472,7 +30472,7 @@ async function renderSpRecon(el) {
       if (spV2State.collapsedGroups.has(gid)) spV2State.collapsedGroups.delete(gid);
       else spV2State.collapsedGroups.add(gid);
       persistSpV2();
-      renderSpRecon(el);
+      spV2RenderKeepScroll(el);
     });
   });
   
@@ -30506,10 +30506,10 @@ function spV2RenderMainTable(rows) {
   const fmt = v => v == null || v === '' || v === 0 ? '' : (typeof v === 'number' ? fmtNum(v) : String(v));
   const fmtD = v => v ? String(v).substring(0, 10) : '';
   
-  // 2-level header — matching Excel layout
+  // 2-level header — matching Excel layout (transparent + blur, see-through)
   const thead = `
-    <thead style="position:sticky;top:0;background:var(--card);z-index:2;border-bottom:2px solid var(--border)">
-      <tr style="font-size:.72rem;background:var(--bg2)">
+    <thead style="position:sticky;top:0;background:color-mix(in srgb,var(--card) 70%,transparent);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);z-index:2;border-bottom:2px solid var(--border)">
+      <tr style="font-size:.72rem;background:color-mix(in srgb,var(--bg2) 70%,transparent)">
         <th rowspan="2" style="text-align:center;padding:6px;border-right:1px solid var(--border)">#</th>
         <th rowspan="2" style="text-align:center;padding:6px;border-right:1px solid var(--border)">Y/N</th>
         <th rowspan="2" style="text-align:left;padding:6px;border-right:1px solid var(--border)">เลขที่เอกสาร</th>
@@ -30526,7 +30526,7 @@ function spV2RenderMainTable(rows) {
         <th rowspan="2" style="text-align:center;padding:6px;border-right:1px solid var(--border)">Pay Date</th>
         <th rowspan="2" style="text-align:center;padding:6px">Action</th>
       </tr>
-      <tr style="font-size:.68rem;background:var(--bg2);color:var(--text2)">
+      <tr style="font-size:.68rem;background:color-mix(in srgb,var(--bg2) 70%,transparent);color:var(--text2)">
         <th style="text-align:center;padding:4px">วันที่รับ</th>
         <th style="text-align:right;padding:4px;border-right:1px solid var(--border)">ยอด</th>
         <th style="text-align:center;padding:4px">วันที่รับ</th>
@@ -31148,19 +31148,48 @@ function spV2DownloadSellBills() {
 // ⭐ 7/5/26 — Bill management in SP (add/edit/delete)
 // ════════════════════════════════════════════════════════════════════
 
-// Recompute header row totals from bills in same group
+// Helper: re-render SP Recon while preserving scroll position
+function spV2RenderKeepScroll(el) {
+  if (!el) {
+    el = document.querySelector('[data-page="sp_recon"]') || document.getElementById('main-content');
+    if (!el) return;
+  }
+  const sy = window.scrollY || window.pageYOffset || 0;
+  renderSpRecon(el);
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    window.scrollTo({ top: sy, left: 0, behavior: 'instant' });
+  }));
+}
+
+// Adjust a payment method column by delta amount (NEVER touches credit_amt)
+//   methodKey: 'cash_amt' | 'transfer_amt' | 'cheque_amt'
+function spV2AdjustMethod(header, methodKey, deltaAmount) {
+  const validKeys = ['cash_amt', 'transfer_amt', 'cheque_amt'];
+  if (!validKeys.includes(methodKey)) methodKey = 'cash_amt';
+  const cur = Number(header[methodKey]) || 0;
+  header[methodKey] = Math.round((cur + deltaAmount) * 100) / 100;
+  
+  // Set date if first time using this method (and now > 0)
+  const dateKey = methodKey.replace('_amt', '_date');
+  if (!header[dateKey] && header[methodKey] > 0) {
+    header[dateKey] = header.pay_date || new Date().toISOString().substring(0, 10);
+  }
+  
+  // Recompute pay_total from all 4 columns (credit_amt untouched)
+  header.pay_total = (Number(header.cash_amt)||0) + (Number(header.transfer_amt)||0) 
+                   + (Number(header.cheque_amt)||0) + (Number(header.credit_amt)||0);
+}
+
+// Recompute header.amount = sum of bills in group (credit_amt untouched)
+//   pay_total ตรงกันถ้า delta ถูก apply ผ่าน spV2AdjustMethod แล้ว
 function spV2RecomputeHeader(groupId) {
   const billRows = spV2State.mainRows.filter(r => !r._is_header && r._group_id === groupId);
   const header = spV2State.mainRows.find(r => r._is_header && r._group_id === groupId);
   if (!header) return;
   
-  // Sum bills (positive — credit notes already negative in amount)
+  // Sum bills (credit notes are negative in amount)
   const sum = billRows.reduce((s, b) => s + (Number(b.amount) || 0), 0);
-  // Update header amount = sum of bills
   header.amount = sum;
-  // Note: pay_total is the actual paid amount (cash+transfer+cheque) — don't change from bill changes
-  // But if pay_total > new amount, mark unpaid (amount changed below pay)
-  // We leave pay_total alone — Toppy uses Edit Pay Modal to change it
   
   // Re-sequence
   let seq = 0;
@@ -31170,12 +31199,22 @@ function spV2RecomputeHeader(groupId) {
   });
 }
 
-// Open modal to add new bill or edit existing
+// Pick default payment method for bill modal — biggest existing method, fallback Cash
+function spV2DefaultMethod(header) {
+  const cashV = Number(header.cash_amt) || 0;
+  const trfV = Number(header.transfer_amt) || 0;
+  const chqV = Number(header.cheque_amt) || 0;
+  if (trfV > 0 && trfV >= cashV && trfV >= chqV) return 'transfer_amt';
+  if (chqV > 0 && chqV >= cashV) return 'cheque_amt';
+  return 'cash_amt';
+}
+
 function spV2OpenBillModal(mode, idx, gid) {
-  let row, header;
+  let row, header, oldAmount = 0;
   if (mode === 'edit') {
     row = spV2State.mainRows[idx];
     if (!row || row._is_header) { toast('ไม่พบบิล', 'error'); return; }
+    oldAmount = Number(row.amount) || 0;
     header = spV2State.mainRows.find(r => r._is_header && r._group_id === row._group_id);
   } else { // add
     header = spV2State.mainRows.find(r => r._is_header && r._group_id === gid);
@@ -31192,10 +31231,14 @@ function spV2OpenBillModal(mode, idx, gid) {
     };
   }
   
+  const defaultMethod = spV2DefaultMethod(header);
   const title = mode === 'edit' ? '✏️ แก้ไขบิล' : `➕ เพิ่มบิลใน SP — ${header.bill_no}`;
   
+  // Method radio button styling
+  const methodOptStyle = 'flex:1;cursor:pointer;padding:8px 6px;border:1px solid var(--border);border-radius:5px;text-align:center;font-size:.82rem;display:flex;align-items:center;justify-content:center;gap:6px';
+  
   openModal(title, `
-    <div style="max-width:520px">
+    <div style="max-width:540px">
       <div style="font-size:.85rem;color:var(--text2);margin-bottom:12px;padding:8px 10px;background:var(--bg2);border-radius:4px">
         SP: <strong>${header.bill_no}</strong> · ลูกค้า: ${String(header.sale_date||'').substring(0, 60)}
       </div>
@@ -31229,9 +31272,33 @@ function spV2OpenBillModal(mode, idx, gid) {
           <input type="text" class="input" id="spv2-bill-note" value="${row.note1 || ''}" placeholder="เช่น ใบรับของ/ใบซื้อ">
         </div>
         
+        <div class="input-group">
+          <label>วิธีชำระ <span style="color:var(--danger)">*</span> <span style="font-weight:400;font-size:.75rem;color:var(--text2)">(ยอดที่เปลี่ยนจะเข้าช่องนี้)</span></label>
+          <div class="flex gap-2" id="spv2-method-radios">
+            <label style="${methodOptStyle}${defaultMethod==='cash_amt'?';background:rgba(250,200,100,.15);border-color:var(--warn)':''}">
+              <input type="radio" name="spv2-pay-method" value="cash_amt" ${defaultMethod==='cash_amt'?'checked':''} style="margin:0">
+              <span>💵 เงินสด</span>
+            </label>
+            <label style="${methodOptStyle}${defaultMethod==='transfer_amt'?';background:rgba(100,200,150,.15);border-color:var(--success)':''}">
+              <input type="radio" name="spv2-pay-method" value="transfer_amt" ${defaultMethod==='transfer_amt'?'checked':''} style="margin:0">
+              <span>🏦 โอนเงิน</span>
+            </label>
+            <label style="${methodOptStyle}${defaultMethod==='cheque_amt'?';background:rgba(150,180,240,.15);border-color:var(--info)':''}">
+              <input type="radio" name="spv2-pay-method" value="cheque_amt" ${defaultMethod==='cheque_amt'?'checked':''} style="margin:0">
+              <span>📋 เช็ค</span>
+            </label>
+          </div>
+          <div style="font-size:.7rem;color:var(--text2);margin-top:4px">
+            ${mode === 'edit' 
+              ? `ปัจจุบัน ฿${fmtNum(oldAmount)} → ถ้าเปลี่ยนยอดบิล ส่วนต่างจะ <strong>เพิ่ม/ลด</strong> ในช่องนี้` 
+              : 'ยอดบิลที่ใส่จะ <strong>เพิ่ม</strong> ในช่องนี้ — ช่องลดหนี้ไม่ถูกแตะต้อง'
+            }
+          </div>
+        </div>
+        
         <div class="flex gap-2 mt-2">
-          <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ยกเลิก</button>
-          <button class="btn btn-primary btn-sm flex-1" id="spv2-bill-save">💾 ${mode==='edit'?'บันทึก':'เพิ่มบิล'}</button>
+          <button class="btn btn-outline btn-sm" style="flex:1" onclick="closeModal()">ยกเลิก</button>
+          <button class="btn btn-primary btn-sm" style="flex:1" id="spv2-bill-save">💾 ${mode==='edit'?'บันทึก':'เพิ่มบิล'}</button>
         </div>
       </div>
     </div>
@@ -31240,33 +31307,34 @@ function spV2OpenBillModal(mode, idx, gid) {
   setTimeout(() => {
     document.getElementById('spv2-bill-save')?.addEventListener('click', () => {
       const billNo = document.getElementById('spv2-bill-no').value.trim();
-      const amount = Number(document.getElementById('spv2-bill-amount').value) || 0;
+      const newAmount = Number(document.getElementById('spv2-bill-amount').value) || 0;
       const refDoc = document.getElementById('spv2-bill-ref').value;
       const saleDate = document.getElementById('spv2-bill-date').value;
       const note = document.getElementById('spv2-bill-note').value.trim();
+      const selectedMethod = document.querySelector('input[name="spv2-pay-method"]:checked')?.value || 'cash_amt';
       
       if (!billNo) { toast('กรอกเลขบิล', 'error'); return; }
-      if (amount === 0) { toast('กรอกยอด (ไม่ใช่ 0)', 'error'); return; }
+      if (newAmount === 0) { toast('กรอกยอด (ไม่ใช่ 0)', 'error'); return; }
       
       // Auto-detect VAT from prefix
       const prefix = String(billNo).substring(0, 2).toUpperCase();
       const vatFlag = ['SS','SR','SC'].includes(prefix) ? 'Y' : (['OR','OS','JS','JR'].includes(prefix) ? 'N' : '');
       
+      let delta = 0;
       if (mode === 'edit') {
-        // Update in place
         row.bill_no = billNo;
-        row.amount = amount;
+        row.amount = newAmount;
         row.ref_doc = refDoc;
         row.sale_date = saleDate;
         row.note1 = note;
         row.vat_flag = vatFlag;
+        delta = newAmount - oldAmount;
       } else {
-        // Insert after last bill of this group (or right after header)
         const newBill = {
           _is_header: false,
-          _group_id: gid,
+          _group_id: header._group_id,
           bill_no: billNo,
-          amount: amount,
+          amount: newAmount,
           ref_doc: refDoc,
           sale_date: saleDate,
           note1: note,
@@ -31274,25 +31342,29 @@ function spV2OpenBillModal(mode, idx, gid) {
           sp_number: header.sp_number,
           pay_date: header.pay_date,
         };
-        // Find last index in this group
+        // Insert after last bill of this group
         let insertIdx = -1;
         for (let i = spV2State.mainRows.length - 1; i >= 0; i--) {
-          if (spV2State.mainRows[i]._group_id === gid) {
+          if (spV2State.mainRows[i]._group_id === header._group_id) {
             insertIdx = i + 1;
             break;
           }
         }
         if (insertIdx === -1) insertIdx = spV2State.mainRows.length;
         spV2State.mainRows.splice(insertIdx, 0, newBill);
+        delta = newAmount;
+      }
+      
+      // Apply delta to selected payment method (NEVER touches credit_amt)
+      if (Math.abs(delta) > 0.001) {
+        spV2AdjustMethod(header, selectedMethod, delta);
       }
       
       spV2RecomputeHeader(header._group_id);
       persistSpV2();
       closeModal();
       toast(mode === 'edit' ? '✓ บันทึกแล้ว' : '✓ เพิ่มบิลแล้ว', 'success');
-      // Re-render
-      const container = document.querySelector('[data-page="sp_recon"]') || document.getElementById('main-content');
-      if (container) renderSpRecon(container);
+      spV2RenderKeepScroll();
     });
   }, 50);
 }
@@ -31302,20 +31374,29 @@ function spV2DeleteBill(idx, el) {
   const row = spV2State.mainRows[idx];
   if (!row || row._is_header) return;
   const header = spV2State.mainRows.find(r => r._is_header && r._group_id === row._group_id);
+  
+  // Auto-pick method to deduct from = biggest non-credit method
+  const methodToDeduct = spV2DefaultMethod(header);
+  const methodLabel = { cash_amt: '💵 เงินสด', transfer_amt: '🏦 โอนเงิน', cheque_amt: '📋 เช็ค' }[methodToDeduct];
+  const billAmt = Number(row.amount) || 0;
+  
   if (!confirm(
-    `🗑 ลบบิล "${row.bill_no}" (฿${fmtNum(row.amount)}) จาก SP "${header?.bill_no || row._group_id}"?\n\n` +
+    `🗑 ลบบิล "${row.bill_no}" (฿${fmtNum(billAmt)}) จาก SP "${header?.bill_no || row._group_id}"?\n\n` +
     `ระบบจะ:\n` +
     `  • ลบบิลออกจาก SP\n` +
+    `  • หัก ฿${fmtNum(billAmt)} ออกจากช่อง ${methodLabel}\n` +
     `  • คำนวณยอด SP ใหม่\n\n` +
+    `(ถ้าต้องการหักจากช่องอื่น ไปกด "✏️ แก้วิธีชำระ" หลังลบบิลแล้ว)\n\n` +
     `ดำเนินการต่อ?`
   )) return;
   
   const gid = row._group_id;
   spV2State.mainRows.splice(idx, 1);
+  spV2AdjustMethod(header, methodToDeduct, -billAmt);
   spV2RecomputeHeader(gid);
   persistSpV2();
   toast(`✓ ลบบิล ${row.bill_no} แล้ว`, 'success');
-  renderSpRecon(el);
+  spV2RenderKeepScroll(el);
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -31400,8 +31481,7 @@ function spV2OpenEditModal(groupId) {
     persistSpV2();
     closeModal();
     toast('บันทึกแล้ว', 'success');
-    const mainEl = document.getElementById('main');
-    if (mainEl) renderSpRecon(mainEl);
+    spV2RenderKeepScroll();
   });
 }
 
