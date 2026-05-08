@@ -31229,7 +31229,7 @@ function spV2RenderMainTable(rows) {
         const isAuto = String(r._matched_stmt_uuid || '').startsWith('auto_');
         if (isAuto) {
           return `<span title="✓ ซื้อสด (OS/SS/JS) — match จาก Daily แล้ว ไม่ต้องตรวจ bank stmt" 
-            style="display:inline-block;padding:3px 10px;background:rgba(120,180,200,.18);color:var(--info);border:1.5px solid var(--info);border-radius:12px;font-size:.72rem;font-weight:700;margin-right:6px;letter-spacing:.5px">✓ ซื้อสด</span>`;
+            style="display:inline-block;padding:3px 10px;background:rgba(63,196,143,.22);color:var(--success);border:1.5px solid var(--success);border-radius:12px;font-size:.72rem;font-weight:700;margin-right:6px;letter-spacing:.5px">✓ MATCHED</span>`;
         }
         return `<span title="✓ ตรงกับ Bank Statement (uuid: ${r._matched_stmt_uuid || 'N/A'})" 
             style="display:inline-block;padding:3px 10px;background:rgba(63,196,143,.22);color:var(--success);border:1.5px solid var(--success);border-radius:12px;font-size:.72rem;font-weight:700;margin-right:6px;letter-spacing:.5px">✓ MATCHED</span>`;
@@ -31247,10 +31247,7 @@ function spV2RenderMainTable(rows) {
     let matchRowTint = '';
     if (isHdr && r._match_status) {
       if (r._match_status === 'matched') {
-        const isAuto = String(r._matched_stmt_uuid || '').startsWith('auto_');
-        matchRowTint = isAuto 
-          ? 'border-left:4px solid var(--info);' // 💙 ซื้อสด
-          : 'border-left:4px solid var(--success);'; // 💚 ซื้อเชื่อ match stmt
+        matchRowTint = 'border-left:4px solid var(--success);'; // 💚 matched (ทั้ง auto cash และ stmt match)
       } else if (r._match_status === 'no_match') {
         matchRowTint = 'border-left:4px solid var(--danger);background:rgba(239,87,87,.05) !important;';
       } else if (r._match_status === 'warn_mixed') {
