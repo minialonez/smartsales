@@ -2876,17 +2876,42 @@ const syncManager = {
     
     let abortReasons = [];
     
+    // ⭐ 7/5/26 — Strict absolute drop guard (catch small but suspicious drops)
+    //    เดิม: 50% threshold → Smart 30 ใบใน 9000 = 0.3% drop → guard ไม่จับ → ข้อมูลหาย
+    //    ใหม่: ถ้า bills drop > 5 ใบ จาก high-water → ABORT (require explicit override)
+    //          source breakdown: log Smart bills count → ดูได้ว่าหายเฉพาะ source ไหน
     if (willPushBills && window._billsPushHighWater > 100) {
+      const drop = window._billsPushHighWater - _currentBills;
       const ratio = _currentBills / window._billsPushHighWater;
-      if (ratio < dangerThreshold) {
+      // ABSOLUTE drop check (>5 ใบ) — strict
+      if (drop > 5) {
+        abortReasons.push(`Bills: drop ${drop} ใบ (${_currentBills}/${window._billsPushHighWater}) — high-water threshold เข้มงวด 5 ใบ`);
+      }
+      // Existing 50% relative check (catastrophic)
+      else if (ratio < dangerThreshold) {
         abortReasons.push(`Bills: memory มี ${_currentBills} ลด > 50% จาก ${window._billsPushHighWater} (high-water)`);
       }
     }
     if (willPushStmts && window._stmtsPushHighWater > 100) {
+      const drop = window._stmtsPushHighWater - _currentStmts;
       const ratio = _currentStmts / window._stmtsPushHighWater;
-      if (ratio < dangerThreshold) {
+      if (drop > 5) {
+        abortReasons.push(`Stmts: drop ${drop} ใบ (${_currentStmts}/${window._stmtsPushHighWater}) — high-water threshold เข้มงวด 5 ใบ`);
+      }
+      else if (ratio < dangerThreshold) {
         abortReasons.push(`Stmts: memory มี ${_currentStmts} ลด > 50% จาก ${window._stmtsPushHighWater} (high-water)`);
       }
+    }
+    
+    // ⭐ Source breakdown log (เพื่อ debug Smart bills หาย)
+    if (willPushBills) {
+      const counts = { smart: 0, front: 0, manual: 0, other: 0 };
+      billList.forEach(b => {
+        const src = b.source || 'other';
+        if (counts[src] !== undefined) counts[src]++;
+        else counts.other++;
+      });
+      console.log(`[push] bills source breakdown:`, counts, `total=${_currentBills}`);
     }
     
     if (abortReasons.length > 0 && !window._allowPushPartial) {
@@ -5790,6 +5815,17 @@ function generateBillList(result, fileName) {
   const duplicateCount = newBills.length - uniqueNewBills.length;
   billList = billList.concat(uniqueNewBills);
   persistMainState();
+  
+  // ⭐ 7/5/26 — Fix Bug A: markDirty per-uuid (was missing — Smart import silent push fail)
+  //    เดิม: imported bills เข้า billList ใน memory แต่ ไม่ขึ้น Google Sheet
+  //    เพราะ syncManager fingerprint อาจไม่เปลี่ยน (ถ้า bills ไม่ครบจน fp ตรง) หรือ push delay จาก dirty pull race
+  //    ใหม่: mark each bill_uuid → selective push เหมือน parseFrontPosReport
+  if (uniqueNewBills.length > 0 && window.syncManager?.markDirty) {
+    uniqueNewBills.forEach(b => {
+      if (b.bill_uuid) window.syncManager.markDirty('bills', b.bill_uuid);
+    });
+    if (window.syncManager._fpCache) window.syncManager._fpCache.bills = null;
+  }
   
   // ── ตรวจสอบบิลซ้ำหลัง import ──
   const dupes = findDuplicateBills();
@@ -8785,6 +8821,20 @@ async function renderMain(el) {
       
       // Mark everything dirty + force flush (push ทันที ไม่รอ debounce 5s)
       try {
+        // ⭐ 7/5/26 — Pre-save snapshot for debugging "Smart bills disappear"
+        const _preSnap = {
+          billList_total: billList.length,
+          smart: billList.filter(b => b.source === 'smart').length,
+          front: billList.filter(b => b.source === 'front').length,
+          manual: billList.filter(b => b.source === 'manual').length,
+          stmts: getAllStatements().length,
+          dirty_types: [...syncManager.dirty],
+          dirtyBillUuids: syncManager.dirtyUuids?.bills?.size || 0,
+          dirtyStmtUuids: syncManager.dirtyUuids?.stmts?.size || 0,
+        };
+        console.log(`[save] PRE-SNAPSHOT:`, _preSnap);
+        window._lastPreSaveSnap = _preSnap; // expose for inspection
+        
         // ⭐ Clear stuck flags ก่อน save (กรณี pull fail ทำให้ค้าง)
         syncManager._inPull = false;
         syncManager.status = 'idle';
@@ -8799,6 +8849,22 @@ async function renderMain(el) {
         
         toast('กำลังบันทึก...', 'info');
         const result = await syncManager._flushPush();
+        
+        // ⭐ POST-SAVE snapshot
+        const _postSnap = {
+          billList_total: billList.length,
+          smart: billList.filter(b => b.source === 'smart').length,
+          front: billList.filter(b => b.source === 'front').length,
+          stmts: getAllStatements().length,
+        };
+        console.log(`[save] POST-SNAPSHOT:`, _postSnap);
+        // Detect drop
+        if (_postSnap.smart < _preSnap.smart) {
+          console.error(`🚨 [save] SMART BILLS DROP: ${_preSnap.smart} → ${_postSnap.smart} (lost ${_preSnap.smart - _postSnap.smart} bills)`);
+          if (typeof toast === 'function') {
+            toast(`🚨 Smart bills หาย ${_preSnap.smart - _postSnap.smart} ใบ! ดู console + report ผม`, 'error', 15000);
+          }
+        }
         
         const stats = result || {};
         const pushed = stats.ok || stats.pushed || 0;
