@@ -30648,11 +30648,9 @@ async function renderSpRecon(el) {
           <button class="pill ${spV2State.filterMatchStmt==='matched'?'active':''}" data-fmatch="matched"
             style="${spV2State.filterMatchStmt==='matched'?'background:rgba(63,196,143,.2);border-color:var(--success);color:var(--success)':''}">✓ Matched (${ms.matched})</button>
           <button class="pill ${spV2State.filterMatchStmt==='no_match'?'active':''}" data-fmatch="no_match"
-            style="${spV2State.filterMatchStmt==='no_match'?'background:rgba(239,87,87,.15);border-color:var(--danger);color:var(--danger)':''}">✗ No match (${ms.noMatch}) ← ตรวจ!</button>
-          ${ms.warnMixed ? `
+            style="${spV2State.filterMatchStmt==='no_match'?'background:rgba(239,87,87,.15);border-color:var(--danger);color:var(--danger)':''}">✗ No match (${ms.noMatch})${ms.noMatch>0?' ← ตรวจ!':''}</button>
           <button class="pill ${spV2State.filterMatchStmt==='warn_mixed'?'active':''}" data-fmatch="warn_mixed"
-            style="${spV2State.filterMatchStmt==='warn_mixed'?'background:rgba(245,158,11,.18);border-color:var(--warn);color:var(--warn)':'background:rgba(245,158,11,.08);border-color:var(--warn);color:var(--warn)'}">⚠️ Mixed (${ms.warnMixed}) ← ผิดปกติ!</button>
-          ` : ''}
+            style="${spV2State.filterMatchStmt==='warn_mixed'?'background:rgba(245,158,11,.18);border-color:var(--warn);color:var(--warn)':(ms.warnMixed>0?'background:rgba(245,158,11,.08);border-color:var(--warn);color:var(--warn)':'')}">⚠️ Mixed (${ms.warnMixed||0})${ms.warnMixed>0?' ← ผิดปกติ!':''}</button>
         </div>
         `;
       })() : ''}
