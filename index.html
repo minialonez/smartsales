@@ -30218,6 +30218,87 @@ function spV2GenNumber(payDate) {
 }
 
 // Build 20-col rows from 3 parsed files
+// ⭐ 8/5/26 — Classify SP match type based on bill prefixes (Toppy's rule):
+//   กลุ่ม 1: SP ที่มี OS/SS/JS (+SC ที่คู่กับ SS) = ซื้อสด → match จาก Daily แล้ว → auto matched
+//   กลุ่ม 2: SP ที่มี OR/SR/JR (+SC ที่คู่กับ SR) = ซื้อเชื่อ → ต้อง match กับ bank stmt
+//   ถ้า SP มี mixed (OS+SR หรือคล้าย) → ผิดปกติ → flag warn
+//
+// SC rule: SC = ลดหนี้ → ต้องดูว่าคู่กับ SS หรือ SR
+//   ถ้าใน SP มี SS + SC → SC คู่กับ SS = ซื้อสด
+//   ถ้าใน SP มี SR + SC → SC คู่กับ SR = ซื้อเชื่อ
+//
+// Returns: { kind, reason, warn }
+//   kind: 'auto_cash' | 'need_stmt' | 'unknown' 
+//   warn: true if mixed prefix (suspicious)
+function spV2ClassifyMatchType(header) {
+  const billsInGroup = spV2State.mainRows.filter(
+    r => !r._is_header && r._group_id === header._group_id
+  );
+  
+  if (billsInGroup.length === 0) {
+    return { kind: 'unknown', reason: 'no bills in SP', warn: false };
+  }
+  
+  const prefixes = new Set();
+  billsInGroup.forEach(b => {
+    const p = String(b.bill_no || '').substring(0, 2).toUpperCase();
+    if (p) prefixes.add(p);
+  });
+  
+  const hasCash = prefixes.has('OS') || prefixes.has('SS') || prefixes.has('JS');
+  const hasCredit = prefixes.has('OR') || prefixes.has('SR') || prefixes.has('JR');
+  const hasSC = prefixes.has('SC');
+  
+  // Mixed = ซื้อสด + ซื้อเชื่อ ใน SP เดียวกัน → ผิดปกติ
+  if (hasCash && hasCredit) {
+    return { 
+      kind: 'unknown', 
+      reason: `mixed prefixes: ${[...prefixes].join(',')}`, 
+      warn: true 
+    };
+  }
+  
+  if (hasCash) {
+    // ซื้อสด — SC ที่อยู่ด้วย = คู่กับ SS → auto match
+    return { 
+      kind: 'auto_cash', 
+      reason: hasSC ? 'cash sale (SS+SC)' : 'cash sale (OS/SS/JS)', 
+      warn: false 
+    };
+  }
+  
+  if (hasCredit) {
+    // ซื้อเชื่อ — SC ที่อยู่ด้วย = คู่กับ SR → ต้อง match stmt
+    return { 
+      kind: 'need_stmt', 
+      reason: hasSC ? 'credit sale (SR+SC)' : 'credit sale (OR/SR/JR)', 
+      warn: false 
+    };
+  }
+  
+  // เฉพาะ SC อย่างเดียว (ไม่มี SS/SR ใน SP) — เป็นไปได้ยาก
+  if (hasSC) {
+    return { 
+      kind: 'unknown', 
+      reason: 'SC only (no SS/SR pair found)', 
+      warn: true 
+    };
+  }
+  
+  return { kind: 'unknown', reason: `unknown prefixes: ${[...prefixes].join(',')}`, warn: true };
+}
+
+// ⭐ Legacy helper — kept for backward compat (used in buildRows + match)
+//    Now wraps spV2ClassifyMatchType
+function spV2AutoMatchKind(header) {
+  const total = Number(header.pay_total) || 0;
+  if (total === 0) return null;
+  
+  const cls = spV2ClassifyMatchType(header);
+  if (cls.kind === 'auto_cash') return 'auto_cash';
+  return null; // need_stmt or unknown → ไม่ auto match
+}
+
 function spV2BuildRows(payMain, payType, taxSales) {
   // Index for lookups
   const payTypeMap = {};
@@ -30268,6 +30349,20 @@ function spV2BuildRows(payMain, payType, taxSales) {
       _is_header: true, _group_id: sp.no,
       _match_status: '', _matched_stmt_uuid: '', // ⭐ for cross-check with stmts
     };
+    // ⭐ 8/5/26 — Auto-match SP ที่มีบิลซื้อสด (OS/SS/JS, +SC) → match จาก Daily แล้ว
+    //    Classify ตาม bill prefixes (Toppy's rule)
+    const _prefixes = new Set(sp.bills.map(b => String(b.bill_no || '').substring(0, 2).toUpperCase()).filter(Boolean));
+    const _hasCash = _prefixes.has('OS') || _prefixes.has('SS') || _prefixes.has('JS');
+    const _hasCredit = _prefixes.has('OR') || _prefixes.has('SR') || _prefixes.has('JR');
+    if (_hasCash && !_hasCredit) {
+      // ซื้อสด — auto matched
+      headerRow._match_status = 'matched';
+      headerRow._matched_stmt_uuid = 'auto_cash';
+    } else if (_hasCash && _hasCredit) {
+      // Mixed — flag warn (ไม่ auto match)
+      headerRow._match_status = 'warn_mixed';
+      headerRow._matched_stmt_uuid = `mixed:${[..._prefixes].sort().join(',')}`;
+    }
     rows.push(headerRow);
     
     // Bills (vat_flag at bill level = actual classification)
@@ -30340,6 +30435,7 @@ function spV2FilterRows() {
       if (filterMatchStmt && filterMatchStmt !== 'ALL') {
         if (filterMatchStmt === 'matched' && r._match_status !== 'matched') keep = false;
         if (filterMatchStmt === 'no_match' && r._match_status !== 'no_match') keep = false;
+        if (filterMatchStmt === 'warn_mixed' && r._match_status !== 'warn_mixed') keep = false;
       }
       if (keep) groupsMatch.add(r._group_id);
     }
@@ -30534,9 +30630,12 @@ async function renderSpRecon(el) {
             <span style="font-size:.72rem;color:var(--text3);font-weight:400">· รัน ${ranStr}</span>
           </div>
           <div style="display:flex;gap:18px;flex-wrap:wrap">
-            <span style="color:var(--success);font-weight:700">✓ Matched: <span style="font-size:1.1rem">${ms.matched}</span></span>
+            <span style="color:var(--success);font-weight:700">✓ Matched: <span style="font-size:1.1rem">${ms.matched}</span>
+              ${(ms.autoCash || ms.stmtMatched) ? `<span style="font-size:.72rem;color:var(--text2);font-weight:400">(💵 ซื้อสด ${ms.autoCash||0} · 🏦 ซื้อเชื่อ ${ms.stmtMatched||0})</span>` : ''}
+            </span>
             <span style="color:var(--danger);font-weight:700">✗ No match: <span style="font-size:1.1rem">${ms.noMatch}</span></span>
-            <span style="color:var(--text2)" title="ข้าม: ยังไม่ชำระ หรือ จ่าย Cash/Cheque (ไม่มีใน Bank Statement)">⊘ Skip: ${ms.skipped}</span>
+            ${ms.warnMixed ? `<span style="color:var(--warn);font-weight:700" title="SP ที่มี OS/OR หรือ SS/SR ปนกัน — ผิดปกติ ตรวจสอบ">⚠️ Mixed: <span style="font-size:1.1rem">${ms.warnMixed}</span></span>` : ''}
+            <span style="color:var(--text2)" title="ข้าม: ยังไม่ชำระ (Unpaid)">⊘ Skip: ${ms.skipped}</span>
             <span style="color:var(--info);font-weight:700">success rate: ${pct}%</span>
           </div>
           <div style="flex:1"></div>
@@ -30550,6 +30649,10 @@ async function renderSpRecon(el) {
             style="${spV2State.filterMatchStmt==='matched'?'background:rgba(63,196,143,.2);border-color:var(--success);color:var(--success)':''}">✓ Matched (${ms.matched})</button>
           <button class="pill ${spV2State.filterMatchStmt==='no_match'?'active':''}" data-fmatch="no_match"
             style="${spV2State.filterMatchStmt==='no_match'?'background:rgba(239,87,87,.15);border-color:var(--danger);color:var(--danger)':''}">✗ No match (${ms.noMatch}) ← ตรวจ!</button>
+          ${ms.warnMixed ? `
+          <button class="pill ${spV2State.filterMatchStmt==='warn_mixed'?'active':''}" data-fmatch="warn_mixed"
+            style="${spV2State.filterMatchStmt==='warn_mixed'?'background:rgba(245,158,11,.18);border-color:var(--warn);color:var(--warn)':'background:rgba(245,158,11,.08);border-color:var(--warn);color:var(--warn)'}">⚠️ Mixed (${ms.warnMixed}) ← ผิดปกติ!</button>
+          ` : ''}
         </div>
         `;
       })() : ''}
@@ -31121,19 +31224,38 @@ function spV2RenderMainTable(rows) {
     
     // Match status badge for header rows (Y only — N rows skipped during match)
     //   ⭐ 8/5/26 — bigger badge + tooltip with stmt details
-    const matchBadge = (isHdr && r._match_status) ? (
-      r._match_status === 'matched'
-        ? `<span title="✓ ตรงกับ Bank Statement (uuid: ${r._matched_stmt_uuid || 'N/A'})" 
-            style="display:inline-block;padding:3px 10px;background:rgba(63,196,143,.22);color:var(--success);border:1.5px solid var(--success);border-radius:12px;font-size:.72rem;font-weight:700;margin-right:6px;letter-spacing:.5px">✓ MATCHED</span>`
-        : `<span title="✗ ไม่พบ Bank Statement ที่ตรง — ตรวจดูว่าได้รับเงินจริงไหม / amount ตรงไหม / วันใกล้เคียงไหม" 
-            style="display:inline-block;padding:3px 10px;background:rgba(239,87,87,.18);color:var(--danger);border:1.5px solid var(--danger);border-radius:12px;font-size:.72rem;font-weight:700;margin-right:6px;letter-spacing:.5px;animation:spv2-pulse-warn 2s ease-in-out infinite">✗ NO MATCH</span>`
-    ) : '';
+    const matchBadge = (isHdr && r._match_status) ? (() => {
+      if (r._match_status === 'matched') {
+        const isAuto = String(r._matched_stmt_uuid || '').startsWith('auto_');
+        if (isAuto) {
+          return `<span title="✓ ซื้อสด (OS/SS/JS) — match จาก Daily แล้ว ไม่ต้องตรวจ bank stmt" 
+            style="display:inline-block;padding:3px 10px;background:rgba(120,180,200,.18);color:var(--info);border:1.5px solid var(--info);border-radius:12px;font-size:.72rem;font-weight:700;margin-right:6px;letter-spacing:.5px">✓ ซื้อสด</span>`;
+        }
+        return `<span title="✓ ตรงกับ Bank Statement (uuid: ${r._matched_stmt_uuid || 'N/A'})" 
+            style="display:inline-block;padding:3px 10px;background:rgba(63,196,143,.22);color:var(--success);border:1.5px solid var(--success);border-radius:12px;font-size:.72rem;font-weight:700;margin-right:6px;letter-spacing:.5px">✓ MATCHED</span>`;
+      }
+      if (r._match_status === 'warn_mixed') {
+        const detail = String(r._matched_stmt_uuid || '').replace(/^mixed:/, '');
+        return `<span title="⚠️ SP มี OS/SS/JS ปนกับ OR/SR/JR (ซื้อสด+ซื้อเชื่อ) — ผิดปกติ ตรวจสอบ! (${detail})" 
+            style="display:inline-block;padding:3px 10px;background:rgba(245,158,11,.18);color:var(--warn);border:1.5px solid var(--warn);border-radius:12px;font-size:.72rem;font-weight:700;margin-right:6px;letter-spacing:.5px;animation:spv2-pulse-warn 2s ease-in-out infinite">⚠️ MIXED</span>`;
+      }
+      return `<span title="✗ ไม่พบ Bank Statement ที่ตรง — ตรวจดูว่าได้รับเงินจริงไหม / amount ตรงไหม / วันใกล้เคียงไหม" 
+            style="display:inline-block;padding:3px 10px;background:rgba(239,87,87,.18);color:var(--danger);border:1.5px solid var(--danger);border-radius:12px;font-size:.72rem;font-weight:700;margin-right:6px;letter-spacing:.5px;animation:spv2-pulse-warn 2s ease-in-out infinite">✗ NO MATCH</span>`;
+    })() : '';
     
     // ⭐ 8/5/26 — Tint entire row by match status (Y headers only)
     let matchRowTint = '';
     if (isHdr && r._match_status) {
-      if (r._match_status === 'matched') matchRowTint = 'border-left:4px solid var(--success);';
-      else if (r._match_status === 'no_match') matchRowTint = 'border-left:4px solid var(--danger);background:rgba(239,87,87,.05) !important;';
+      if (r._match_status === 'matched') {
+        const isAuto = String(r._matched_stmt_uuid || '').startsWith('auto_');
+        matchRowTint = isAuto 
+          ? 'border-left:4px solid var(--info);' // 💙 ซื้อสด
+          : 'border-left:4px solid var(--success);'; // 💚 ซื้อเชื่อ match stmt
+      } else if (r._match_status === 'no_match') {
+        matchRowTint = 'border-left:4px solid var(--danger);background:rgba(239,87,87,.05) !important;';
+      } else if (r._match_status === 'warn_mixed') {
+        matchRowTint = 'border-left:4px solid var(--warn);background:rgba(245,158,11,.05) !important;';
+      }
     }
     
     // Action buttons
@@ -31477,16 +31599,12 @@ function spV2MatchWithStatements() {
     stmtByAmt[key].push(s);
   });
   
-  let matched = 0, noMatch = 0, skipped = 0;
+  let matched = 0, noMatch = 0, skipped = 0, autoCash = 0, warnMixed = 0;
   spV2State.mainRows.forEach(r => {
     if (!r._is_header) return;
     
     const payTotal = Number(r.pay_total) || 0;
     
-    // ⭐ 8/5/26 — Match ทั้ง Y และ N (ทั้ง VAT/NOVAT ลูกค้าจ่ายผ่าน bank ได้)
-    //   เดิม: skip N rows → SP ที่ Toppy match จาก Main page (เห็น stmt ตรง bill_no) ไม่ขึ้น
-    //   ใหม่: Skip เฉพาะ SP ที่ pay_total = 0 (Unpaid — ยังไม่จ่าย ไม่ต้องหา stmt)
-    //         หรือ Cash + Cheque only (ไม่ผ่าน bank)
     if (payTotal === 0) {
       // Unpaid — ไม่ match
       r._match_status = '';
@@ -31495,18 +31613,37 @@ function spV2MatchWithStatements() {
       return;
     }
     
-    // ⭐ Skip ถ้าจ่ายเงินสด/เช็ค ทั้งหมด (ไม่ผ่าน bank — ไม่ควรมีใน stmt)
+    // ⭐ 8/5/26 — Classify ตาม bill prefixes (Toppy's rule)
+    //    กลุ่ม 1: OS/SS/JS (+SC) = ซื้อสด → match จาก Daily แล้ว → auto matched
+    //    กลุ่ม 2: OR/SR/JR (+SC) = ซื้อเชื่อ → ต้อง match กับ bank stmt
+    //    Mixed → flag warn
+    const cls = spV2ClassifyMatchType(r);
+    
+    if (cls.kind === 'auto_cash') {
+      r._match_status = 'matched';
+      r._matched_stmt_uuid = 'auto_cash';
+      matched++;
+      autoCash++;
+      return;
+    }
+    
+    if (cls.warn) {
+      r._match_status = 'warn_mixed';
+      r._matched_stmt_uuid = `mixed:${cls.reason}`;
+      warnMixed++;
+      return;
+    }
+    
+    // need_stmt → ต้องเจอใน bank stmt (match by transfer_amt)
     const transferAmt = Number(r.transfer_amt) || 0;
     if (transferAmt === 0) {
+      // ซื้อเชื่อ แต่ไม่มี transfer → จ่าย Cash/Cheque อย่างเดียว → skip
       r._match_status = '';
       r._matched_stmt_uuid = '';
       skipped++;
       return;
     }
     
-    // ⭐ 8/5/26 — Use transfer_amt as lookup key (เฉพาะส่วนที่ผ่าน bank)
-    //    bank stmt บันทึกแค่ยอดโอน ไม่รวม cash/cheque ของ user
-    //    ถ้า user เลือก Match ใน Main page: stmt จะ match กับ bill ที่ amount = transfer ของ SP นั้น
     // Find candidate statements (same amount = transfer_amt)
     const candidates = stmtByAmt[k2(transferAmt)] || [];
     const payDate = r.pay_date;
@@ -31542,13 +31679,23 @@ function spV2MatchWithStatements() {
   });
   
   // ⭐ 8/5/26 — Save summary for display
+  const stmtMatched = matched - autoCash;
   spV2State.matchSummary = {
     matched: matched, noMatch: noMatch, skipped: skipped,
+    autoCash: autoCash, // ⭐ ซื้อสด (OS/SS/JS) → auto match
+    stmtMatched: stmtMatched, // ซื้อเชื่อ (OR/SR/JR) → match กับ bank stmt จริง
+    warnMixed: warnMixed, // ⭐ SP ที่มี mixed prefixes → ต้องตรวจ
     ranAt: new Date().toISOString(),
   };
   
   persistSpV2();
-  toast(`✓ Match สำเร็จ — ตรง ${matched} ใบ · ไม่ตรง ${noMatch} ใบ · ข้าม ${skipped} ใบ (ยังไม่จ่าย/Cash/Cheque)`, matched > 0 ? 'success' : 'warn', 6000);
+  const warnPart = warnMixed > 0 ? ` · ⚠️ Mixed ${warnMixed} ใบ (ตรวจด่วน!)` : '';
+  toast(
+    `✓ Match สำเร็จ — ตรง ${matched} ใบ ` +
+    `(💵 ซื้อสด: ${autoCash} · 🏦 ซื้อเชื่อ: ${stmtMatched}) · ` +
+    `ไม่ตรง ${noMatch} ใบ · ข้าม ${skipped} ใบ${warnPart}`, 
+    warnMixed > 0 ? 'warn' : (matched > 0 ? 'success' : 'warn'), 8000
+  );
   spV2RenderKeepScroll();
 }
 
