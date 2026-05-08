@@ -30536,7 +30536,7 @@ async function renderSpRecon(el) {
           <div style="display:flex;gap:18px;flex-wrap:wrap">
             <span style="color:var(--success);font-weight:700">✓ Matched: <span style="font-size:1.1rem">${ms.matched}</span></span>
             <span style="color:var(--danger);font-weight:700">✗ No match: <span style="font-size:1.1rem">${ms.noMatch}</span></span>
-            <span style="color:var(--text2)">⊘ Skip (N): ${ms.skipped}</span>
+            <span style="color:var(--text2)" title="ข้าม: ยังไม่ชำระ หรือ จ่าย Cash/Cheque (ไม่มีใน Bank Statement)">⊘ Skip: ${ms.skipped}</span>
             <span style="color:var(--info);font-weight:700">success rate: ${pct}%</span>
           </div>
           <div style="flex:1"></div>
@@ -31131,7 +31131,7 @@ function spV2RenderMainTable(rows) {
     
     // ⭐ 8/5/26 — Tint entire row by match status (Y headers only)
     let matchRowTint = '';
-    if (isHdr && r.vat_flag === 'Y' && r._match_status) {
+    if (isHdr && r._match_status) {
       if (r._match_status === 'matched') matchRowTint = 'border-left:4px solid var(--success);';
       else if (r._match_status === 'no_match') matchRowTint = 'border-left:4px solid var(--danger);background:rgba(239,87,87,.05) !important;';
     }
@@ -31480,24 +31480,35 @@ function spV2MatchWithStatements() {
   let matched = 0, noMatch = 0, skipped = 0;
   spV2State.mainRows.forEach(r => {
     if (!r._is_header) return;
-    if (r.vat_flag !== 'Y') {
-      // N rows: ไม่ match (ไม่ใช่ใบที่นำส่ง report)
+    
+    const payTotal = Number(r.pay_total) || 0;
+    
+    // ⭐ 8/5/26 — Match ทั้ง Y และ N (ทั้ง VAT/NOVAT ลูกค้าจ่ายผ่าน bank ได้)
+    //   เดิม: skip N rows → SP ที่ Toppy match จาก Main page (เห็น stmt ตรง bill_no) ไม่ขึ้น
+    //   ใหม่: Skip เฉพาะ SP ที่ pay_total = 0 (Unpaid — ยังไม่จ่าย ไม่ต้องหา stmt)
+    //         หรือ Cash + Cheque only (ไม่ผ่าน bank)
+    if (payTotal === 0) {
+      // Unpaid — ไม่ match
       r._match_status = '';
       r._matched_stmt_uuid = '';
       skipped++;
       return;
     }
     
-    const payTotal = Number(r.pay_total) || 0;
-    if (payTotal === 0) {
-      r._match_status = 'no_match';
+    // ⭐ Skip ถ้าจ่ายเงินสด/เช็ค ทั้งหมด (ไม่ผ่าน bank — ไม่ควรมีใน stmt)
+    const transferAmt = Number(r.transfer_amt) || 0;
+    if (transferAmt === 0) {
+      r._match_status = '';
       r._matched_stmt_uuid = '';
-      noMatch++;
+      skipped++;
       return;
     }
     
-    // Find candidate statements (same amount)
-    const candidates = stmtByAmt[k2(payTotal)] || [];
+    // ⭐ 8/5/26 — Use transfer_amt as lookup key (เฉพาะส่วนที่ผ่าน bank)
+    //    bank stmt บันทึกแค่ยอดโอน ไม่รวม cash/cheque ของ user
+    //    ถ้า user เลือก Match ใน Main page: stmt จะ match กับ bill ที่ amount = transfer ของ SP นั้น
+    // Find candidate statements (same amount = transfer_amt)
+    const candidates = stmtByAmt[k2(transferAmt)] || [];
     const payDate = r.pay_date;
     let bestMatch = null;
     let bestDateDiff = Infinity;
@@ -31537,7 +31548,7 @@ function spV2MatchWithStatements() {
   };
   
   persistSpV2();
-  toast(`✓ Match สำเร็จ — ตรง ${matched} ใบ · ไม่ตรง ${noMatch} ใบ · ข้าม N ${skipped} ใบ`, matched > 0 ? 'success' : 'warn', 6000);
+  toast(`✓ Match สำเร็จ — ตรง ${matched} ใบ · ไม่ตรง ${noMatch} ใบ · ข้าม ${skipped} ใบ (ยังไม่จ่าย/Cash/Cheque)`, matched > 0 ? 'success' : 'warn', 6000);
   spV2RenderKeepScroll();
 }
 
