@@ -30123,13 +30123,9 @@ let spV2State = {
   filterVat: 'ALL',      // ALL | Y | N
   filterPaid: 'ALL',     // ALL | paid | unpaid
   filterMonths: new Set(), // ⭐ multi-select เดือน "YYYY-MM" — empty = ALL
-  filterPrefixes: new Set(), // multi-select bill prefixes (SR/SS/SC/OR/OS/JR/JS) — empty = ALL
-  view: 'main',          // main | report | sellbills
-  groupByCustomer: false, // ← Sell Bills: group by customer
-  expandedCustomers: new Set(), // ← which customers are expanded
+  view: 'main',          // main | report
   collapsedGroups: new Set(), // ⭐ 7/5/26 — _group_id ที่ collapse (ซ่อน bills) — empty = expand all
   reportGenerated: false, // ⭐ 7/5/26 — true หลังกด Generate Report (assign new SP numbers)
-  sellBillsRows: [], // ⭐ 7/5/26 — cached array — empty = ยังไม่ generate
   rawPayMain: [],        // parsed file 1
   rawPayType: [],        // parsed file 2
   rawTaxSales: [],       // parsed file 3
@@ -30145,7 +30141,6 @@ try {
   if (Array.isArray(saved.rawTaxSales)) spV2State.rawTaxSales = saved.rawTaxSales;
   if (Array.isArray(saved.collapsedGroups)) spV2State.collapsedGroups = new Set(saved.collapsedGroups);
   if (saved.reportGenerated === true) spV2State.reportGenerated = true;
-  if (Array.isArray(saved.sellBillsRows)) spV2State.sellBillsRows = saved.sellBillsRows;
 } catch(e) {}
 
 function persistSpV2() {
@@ -30158,7 +30153,6 @@ function persistSpV2() {
       rawTaxSales: spV2State.rawTaxSales,
       collapsedGroups: [...spV2State.collapsedGroups],
       reportGenerated: spV2State.reportGenerated,
-      sellBillsRows: spV2State.sellBillsRows,
     }));
   } catch(e) {
     console.warn('persistSpV2 failed (อาจเกิน localStorage limit)', e);
@@ -30175,11 +30169,10 @@ function persistSpV2() {
   }
 }
 
-// ⭐ 7/5/26 — Invalidate Report + Sell Bills (เรียกเมื่อ user แก้ Main)
-//   Force user ให้ regenerate Report/Sell Bills หลังจาก edit
+// ⭐ 7/5/26 — Invalidate Report (เรียกเมื่อ user แก้ Main)
+//   Force user ให้ regenerate Report หลังจาก edit
 function spV2InvalidateGenerated() {
   spV2State.reportGenerated = false;
-  spV2State.sellBillsRows = [];
   // Clear match status (ต้อง re-match หลัง regenerate)
   spV2State.mainRows.forEach(r => {
     if (r._is_header) {
@@ -30470,7 +30463,6 @@ async function renderSpRecon(el) {
         <div class="flex gap-1">
           <button class="pill ${view==='main'?'active':''}" data-view="main">📋 Main</button>
           <button class="pill ${view==='report'?'active':''}" data-view="report">📊 Report</button>
-          <button class="pill ${view==='sellbills'?'active':''}" data-view="sellbills">📑 Sell Bills</button>
         </div>
         
         <div style="width:1px;height:24px;background:var(--border)"></div>
@@ -30497,36 +30489,20 @@ async function renderSpRecon(el) {
           ${spV2State.reportGenerated ? `
           <button class="btn btn-success btn-sm" id="spv2-btn-export-main" title="ส่งออก Report ที่ Generate แล้วเป็น Excel — ใช้เลข SP202601-XXXX">⬇️ Export Report (เลขใหม่)</button>
           ` : ''}
+          <div style="width:1px;height:24px;background:var(--border);margin:0 4px"></div>
+          <button class="btn btn-sm" id="spv2-btn-save-cloud" title="บันทึกข้อมูล SP Recon ลง Google Sheet (ทับของเดิมในปีนั้น)"
+                  style="background:var(--accent);color:#fff;border:none;font-weight:700">☁️ บันทึกขึ้น Cloud</button>
+          <button class="btn btn-outline btn-sm" id="spv2-btn-load-cloud" title="โหลดข้อมูล SP Recon ที่บันทึกไว้จาก Google Sheet"
+                  style="border-color:var(--accent);color:var(--accent)">📥 โหลดจาก Cloud</button>
         ` : ''}
         
         ${view === 'report' ? `<button class="btn btn-success btn-sm" id="spv2-btn-download">⬇️ Download Report</button>` : ''}
       </div>
       
-      <!-- Prefix filter (multi-select) — only in Sell Bills view -->
-      ${view === 'sellbills' ? `
-      <div class="flex gap-2 flex-wrap items-center" style="margin-bottom:12px">
-        <button class="pill ${spV2State.filterPrefixes.size===0?'active':''}" data-fprefix="ALL" title="แสดงทั้งหมด">ALL</button>
-        <div style="width:1px;height:20px;background:var(--border)"></div>
-        <span class="text-xs" style="color:var(--info);font-weight:600">VAT:</span>
-        ${['SS','SR','SC'].map(p => `
-          <button class="pill ${spV2State.filterPrefixes.has(p)?'active':''}" data-fprefix="${p}" 
-            style="${spV2State.filterPrefixes.has(p)?'background:var(--info-bg);border-color:var(--info);color:var(--info)':''}">${p}</button>
-        `).join('')}
-        <div style="width:1px;height:20px;background:var(--border)"></div>
-        <span class="text-xs" style="color:var(--warn);font-weight:600">NOVAT:</span>
-        ${['OR','OS','JR','JS'].map(p => `
-          <button class="pill ${spV2State.filterPrefixes.has(p)?'active':''}" data-fprefix="${p}" 
-            style="${spV2State.filterPrefixes.has(p)?'background:rgba(245,158,11,.15);border-color:var(--warn);color:var(--warn)':''}">${p}</button>
-        `).join('')}
-        ${spV2State.filterPrefixes.size > 0 ? `<span class="text-xs" style="color:var(--info);margin-left:4px">· เลือก ${spV2State.filterPrefixes.size} prefix</span>` : ''}
-      </div>
-      ` : ''}
-      
       <!-- Table -->
       <div class="card" style="padding:0;overflow:auto;max-height:70vh">
         ${view === 'main' ? spV2RenderMainTable(rows) 
-        : view === 'report' ? spV2RenderReportView(rows) 
-        : spV2RenderSellBillsView()}
+        : spV2RenderReportView(rows)}
       </div>
     ` : `
       <div class="card" style="text-align:center;padding:40px;color:var(--text3)">
@@ -30724,8 +30700,131 @@ async function renderSpRecon(el) {
     toast('✓ Export Main (เลขเดิม) สำเร็จ', 'success', 3000);
   });
   
-  document.getElementById('spv2-btn-download-sellbills')?.addEventListener('click', () => {
-    spV2DownloadSellBills();
+  // ⭐ 8/5/26 — Save SP Recon to Google Sheet (replace-all per year)
+  document.getElementById('spv2-btn-save-cloud')?.addEventListener('click', async () => {
+    if (!spV2State.mainRows || spV2State.mainRows.length === 0) {
+      toast('⚠ ยังไม่มีข้อมูลให้บันทึก', 'warn', 4000);
+      return;
+    }
+    
+    // Detect years from data
+    const years = new Set();
+    spV2State.mainRows.forEach(r => {
+      if (r._is_header && r.pay_date) {
+        const y = String(r.pay_date).substring(0, 4);
+        if (/^\d{4}$/.test(y)) years.add(parseInt(y));
+      }
+    });
+    const yearList = [...years].sort();
+    
+    if (yearList.length === 0) {
+      toast('⚠ ไม่พบปีในข้อมูล (ตรวจ pay_date)', 'error', 4000);
+      return;
+    }
+    
+    const headerCount = spV2State.mainRows.filter(r => r._is_header).length;
+    const billCount = spV2State.mainRows.length - headerCount;
+    const yearStr = yearList.length === 1 ? `ปี ${yearList[0]}` : `${yearList.length} ปี (${yearList.join(', ')})`;
+    
+    if (!confirm(
+      `☁️ บันทึก SP Recon ขึ้น Google Sheet?\n\n` +
+      `ข้อมูล: ${headerCount} SP + ${billCount} bills (รวม ${spV2State.mainRows.length} แถว)\n` +
+      `เก็บใน: sp_recon_${yearList[0]}${yearList.length>1?` ถึง sp_recon_${yearList[yearList.length-1]}`:''}\n\n` +
+      `⚠️ ข้อมูล SP Recon เดิมใน ${yearStr} จะถูก <b>ลบทิ้ง</b> แล้วทับด้วยของใหม่\n\n` +
+      `ดำเนินการต่อ?`
+    )) return;
+    
+    toast('☁️ กำลังบันทึก...', 'info', 30000);
+    let totalSaved = 0;
+    let errors = [];
+    
+    try {
+      // Group rows by year of pay_date (header) — bills inherit year from their group's header
+      const byYear = {};
+      yearList.forEach(y => byYear[y] = []);
+      
+      // First pass: assign year to each header
+      const groupYearMap = {}; // _group_id -> year
+      spV2State.mainRows.forEach(r => {
+        if (r._is_header && r.pay_date) {
+          const y = parseInt(String(r.pay_date).substring(0, 4));
+          if (!isNaN(y)) groupYearMap[r._group_id] = y;
+        }
+      });
+      
+      // Second pass: route rows to year buckets
+      spV2State.mainRows.forEach(r => {
+        const y = groupYearMap[r._group_id];
+        if (y && byYear[y]) byYear[y].push(r);
+      });
+      
+      const by = (window.currentUser?.display_name) || 'Admin';
+      
+      for (const year of yearList) {
+        const rows = byYear[year];
+        if (!rows || rows.length === 0) continue;
+        
+        const r = await api('saveSpRecon', { year: year, rows: rows, by: by });
+        if (r?.success === false) {
+          errors.push(`ปี ${year}: ${r.error || 'unknown'}`);
+        } else {
+          totalSaved += (r?.saved || rows.length);
+        }
+      }
+      
+      if (errors.length > 0) {
+        toast(`⚠ บันทึกบางส่วน — ${totalSaved} แถว · errors: ${errors.join('; ')}`, 'warn', 8000);
+      } else {
+        toast(`✅ บันทึกสำเร็จ — ${totalSaved} แถว ใน ${yearList.length} ปี`, 'success', 5000);
+      }
+    } catch(err) {
+      console.error('[saveSpRecon] error:', err);
+      toast(`❌ บันทึกล้มเหลว: ${err.message || err}`, 'error', 8000);
+    }
+  });
+  
+  // ⭐ 8/5/26 — Load SP Recon from Google Sheet
+  document.getElementById('spv2-btn-load-cloud')?.addEventListener('click', async () => {
+    const yearInput = prompt('โหลด SP Recon ปีไหน? (กรอกปี ค.ศ.)', String(new Date().getFullYear()));
+    if (!yearInput) return;
+    const year = parseInt(yearInput);
+    if (isNaN(year) || year < 2020 || year > 2050) {
+      toast('⚠ ปีไม่ถูกต้อง', 'error', 4000);
+      return;
+    }
+    
+    const hasExisting = spV2State.mainRows.length > 0;
+    if (hasExisting && !confirm(
+      `📥 โหลด SP Recon ปี ${year} จาก Google Sheet?\n\n` +
+      `⚠️ ข้อมูลปัจจุบันในหน้านี้ (${spV2State.mainRows.filter(r=>r._is_header).length} SP) จะถูก<b>ทับ</b>\n\n` +
+      `ดำเนินการต่อ?`
+    )) return;
+    
+    toast('📥 กำลังโหลด...', 'info', 30000);
+    
+    try {
+      const r = await api('getSpRecon', { year: year });
+      if (r?.success === false) {
+        toast(`❌ โหลดล้มเหลว: ${r.error || 'unknown'}`, 'error', 6000);
+        return;
+      }
+      
+      const rows = r?.rows || [];
+      if (rows.length === 0) {
+        toast(`⚠ ไม่มีข้อมูล SP Recon ปี ${year} ใน Sheet`, 'warn', 5000);
+        return;
+      }
+      
+      spV2State.mainRows = rows;
+      spV2State.reportGenerated = rows.some(r => r._is_header && r.sp_number && r.sp_number.startsWith('SP' + year));
+      persistSpV2();
+      
+      toast(`✅ โหลดสำเร็จ — ${rows.filter(r => r._is_header).length} SP + ${rows.filter(r => !r._is_header).length} bills`, 'success', 5000);
+      renderSpRecon(el);
+    } catch(err) {
+      console.error('[getSpRecon] error:', err);
+      toast(`❌ โหลดล้มเหลว: ${err.message || err}`, 'error', 8000);
+    }
   });
   
   // ⭐ 7/5/26 — Generate SP Numbers (assign new SP number to Y rows)
@@ -30756,34 +30855,6 @@ async function renderSpRecon(el) {
     spV2MatchWithStatements();
   });
   
-  // ⭐ 7/5/26 — Generate Sell Bills (manual, ไม่ทำตอน upload)
-  document.getElementById('spv2-btn-gen-sellbills')?.addEventListener('click', () => {
-    const bills = spV2GenerateSellBills();
-    spV2State.sellBillsRows = bills;
-    persistSpV2();
-    toast(`✓ Generate Sell Bills สำเร็จ — ${bills.length} บิล`, 'success', 4000);
-    spV2RenderKeepScroll(el);
-  });
-  
-  // ── Group by customer toggle ──
-  document.getElementById('spv2-btn-group-cust')?.addEventListener('click', () => {
-    spV2State.groupByCustomer = !spV2State.groupByCustomer;
-    renderSpRecon(el);
-  });
-  
-  // ── Expand/collapse customer group ──
-  el.querySelectorAll('.spv2-cust-header').forEach(row => {
-    row.addEventListener('click', () => {
-      const custName = row.dataset.cust;
-      if (spV2State.expandedCustomers.has(custName)) {
-        spV2State.expandedCustomers.delete(custName);
-      } else {
-        spV2State.expandedCustomers.add(custName);
-      }
-      renderSpRecon(el);
-    });
-  });
-  
   // Wire edit buttons in Report view
   el.querySelectorAll('.spv2-edit-pay').forEach(btn => {
     btn.addEventListener('click', (e) => {
@@ -30800,17 +30871,6 @@ async function renderSpRecon(el) {
   }));
   el.querySelectorAll('[data-fpaid]').forEach(b => b.addEventListener('click', () => {
     spV2State.filterPaid = b.dataset.fpaid; renderSpRecon(el);
-  }));
-  el.querySelectorAll('[data-fprefix]').forEach(b => b.addEventListener('click', () => {
-    const p = b.dataset.fprefix;
-    if (p === 'ALL') {
-      spV2State.filterPrefixes.clear();
-    } else {
-      // toggle
-      if (spV2State.filterPrefixes.has(p)) spV2State.filterPrefixes.delete(p);
-      else spV2State.filterPrefixes.add(p);
-    }
-    renderSpRecon(el);
   }));
   
   // ⭐ Month filter wire (5/6/26)
@@ -31203,404 +31263,6 @@ function spV2DownloadXlsx(opts) {
   const fn = `${fnPrefix}_${todayISO()}.xlsx`;
   XLSX.writeFile(wb, fn);
   toast(`Download ${fn}`, 'success');
-}
-
-// ════════════════════════════════════════════════════════════════════
-// Sell Bills — Generate จาก Main V2 + lookup ภาษีขาย
-// ════════════════════════════════════════════════════════════════════
-
-// Lookup: bill_no → Main row (child)
-function spV2GetMainBillMap() {
-  const map = {};
-  spV2State.mainRows.forEach(r => {
-    if (!r._is_header && r.bill_no) {
-      map[r.bill_no] = r;
-    }
-  });
-  return map;
-}
-
-// Lookup: group_id → header row
-function spV2GetHeaderMap() {
-  const map = {};
-  spV2State.mainRows.forEach(r => {
-    if (r._is_header) map[r._group_id] = r;
-  });
-  return map;
-}
-
-// Format Thai tax ID: 13 digits → "x xxxx xxxxx xx x"
-function spV2FormatTaxId(taxId) {
-  const digits = String(taxId || '').replace(/\D/g, '');
-  if (digits.length !== 13) return String(taxId || '').trim();
-  return `${digits[0]} ${digits.slice(1,5)} ${digits.slice(5,10)} ${digits.slice(10,12)} ${digits[12]}`;
-}
-
-// Generate Sell Bills from ภาษีขาย (primary source) + Main lookup for payment status
-function spV2GenerateSellBills() {
-  const mainBillMap = spV2GetMainBillMap();
-  const headerMap = spV2GetHeaderMap();
-  const sellBills = [];
-  
-  // Primary source = ภาษีขาย.xls (one row per tax record)
-  const source = spV2State.rawTaxSales || [];
-  
-  source.forEach((tax, idx) => {
-    const prefix = String(tax.bill_no).substring(0, 2).toUpperCase();
-    const isVat = ['SS','SR','SC'].includes(prefix);
-    const isNv = ['OR','OS','JR','JS'].includes(prefix);
-    const vatFlag = isVat ? 'Y' : (isNv ? 'N' : '');
-    
-    // Lookup payment status from Main
-    const mainRow = mainBillMap[tax.bill_no];
-    let payStatus = '';
-    let payDate = '';
-    let note = '';
-    
-    if (mainRow) {
-      const header = headerMap[mainRow._group_id];
-      const paid = header ? spV2IsPaid(header) : false;
-      
-      if (paid) {
-        payStatus = mainRow.sp_number || '';  // Main Col.S
-        payDate = mainRow.pay_date || '';     // Main Col.T
-      }
-      note = mainRow.note1 || '';              // Main Col.R (note/type_desc)
-    }
-    // ยกเลิก (SC/JR/JS — ใบลดหนี้)
-    const isVoid = ['SC','JR','JS'].includes(prefix);
-    if (isVoid && !payStatus) payStatus = 'ยกเลิก';
-    
-    sellBills.push({
-      seq: idx + 1,
-      doc_date: tax.bill_date || '',
-      bill_no: tax.bill_no || '',
-      ref_doc: tax.ref_doc || '',
-      customer: tax.customer || '',
-      tax_id: spV2FormatTaxId(tax.tax_id),
-      branch: tax.branch || '',
-      value: Number(tax.amount) || 0,
-      vat: Number(tax.vat) || 0,
-      novat: Number(tax.novat) || 0,
-      total: Number(tax.total) || 0,
-      pay_status: payStatus,
-      pay_date: payDate,
-      note: note,
-      _vat_flag: vatFlag,
-      _is_void: isVoid,
-    });
-  });
-  
-  return sellBills;
-}
-
-// Render Sell Bills table
-function spV2RenderSellBillsView() {
-  // ⭐ 7/5/26 — ถ้ายังไม่ได้ Generate Sell Bills → empty state + ปุ่ม
-  if (!Array.isArray(spV2State.sellBillsRows) || spV2State.sellBillsRows.length === 0) {
-    const hasRawTax = Array.isArray(spV2State.rawTaxSales) && spV2State.rawTaxSales.length > 0;
-    const hasMainData = spV2State.mainRows.length > 0;
-    return `
-      <div style="padding:60px 20px;text-align:center;color:var(--text2);max-width:520px;margin:0 auto">
-        <div style="font-size:3.5rem;margin-bottom:18px">📑</div>
-        <div style="font-weight:700;font-size:1.15rem;margin-bottom:10px;color:var(--text)">ยังไม่ได้ Generate Sell Bills</div>
-        <div style="font-size:.92rem;line-height:1.7;margin-bottom:24px">
-          ดึงบิลขาย <span style="font-family:monospace;font-size:.85rem">SR/SS/SC/OR/OS/JR/JS</span> จาก Sell Bills Raw<br>
-          <span style="font-size:.86rem">+ match กับการชำระจาก Main → ยอดที่จ่ายแล้ว / ยังไม่จ่าย</span>
-        </div>
-        ${!hasRawTax ? `
-          <div style="padding:12px;background:rgba(239,87,87,.1);border:1px solid var(--danger);border-radius:6px;margin-bottom:14px;color:var(--danger);font-size:.85rem">
-            ⚠️ ยังไม่มีข้อมูล <b>Sell Bills Raw</b> — upload ไฟล์ "ภาษีขาย" ก่อน
-          </div>
-        ` : !hasMainData ? `
-          <div style="padding:12px;background:rgba(250,200,100,.1);border:1px solid var(--warn);border-radius:6px;margin-bottom:14px;color:var(--warn);font-size:.85rem">
-            ⚠️ ยังไม่มีข้อมูล Main — สร้าง Main ก่อน (สถานะการชำระจะดึงจาก Main)
-          </div>
-        ` : `
-          <button class="btn btn-primary" id="spv2-btn-gen-sellbills" style="font-weight:700;padding:8px 24px">📑 Generate Sell Bills</button>
-        `}
-      </div>
-    `;
-  }
-  
-  let bills = spV2State.sellBillsRows.slice(); // use cached
-  
-  // ── Filters ──
-  const { filterVat, filterPaid, filterPrefixes, groupByCustomer } = spV2State;
-  if (filterVat === 'Y') bills = bills.filter(b => b._vat_flag === 'Y');
-  else if (filterVat === 'N') bills = bills.filter(b => b._vat_flag === 'N');
-  
-  if (filterPaid === 'paid') bills = bills.filter(b => b.pay_status && b.pay_status !== 'ยกเลิก');
-  else if (filterPaid === 'unpaid') bills = bills.filter(b => !b.pay_status);
-  
-  // Prefix filter (multi-select) — empty Set = ALL
-  if (filterPrefixes && filterPrefixes.size > 0) {
-    bills = bills.filter(b => {
-      const p = String(b.bill_no).substring(0,2).toUpperCase();
-      return filterPrefixes.has(p);
-    });
-  }
-  
-  // ── Sort by custom order: SR → SS → SC → OR → OS → JR → JS, then bill_no ascending (numeric-aware) ──
-  const PREFIX_ORDER = ['SR','SS','SC','OR','OS','JR','JS'];
-  const getOrder = (billNo) => {
-    const p = String(billNo).substring(0,2).toUpperCase();
-    const i = PREFIX_ORDER.indexOf(p);
-    return i >= 0 ? i : 99;
-  };
-  bills.sort((a, b) => {
-    const oa = getOrder(a.bill_no);
-    const ob = getOrder(b.bill_no);
-    if (oa !== ob) return oa - ob;
-    // Same prefix → bill_no ascending (numeric-aware, handles embedded numbers correctly)
-    return String(a.bill_no).localeCompare(String(b.bill_no), undefined, { numeric: true });
-  });
-  
-  // Re-index seq for current display
-  bills.forEach((b, i) => b.seq = i + 1);
-  
-  // Totals
-  const totalValue = bills.reduce((s,b) => s + b.value, 0);
-  const totalVat = bills.reduce((s,b) => s + b.vat, 0);
-  const totalNovat = bills.reduce((s,b) => s + b.novat, 0);
-  const totalAll = bills.reduce((s,b) => s + b.total, 0);
-  const unpaidTotal = bills.filter(b => !b.pay_status).reduce((s,b) => s + b.total, 0);
-  
-  const fmt = v => v == null || v === 0 ? '' : fmtNum(v);
-  const fmtD = v => v ? String(v).substring(0, 10) : '';
-  
-  let html = `<div style="padding:12px">
-    <div class="flex gap-2 items-center flex-wrap" style="margin-bottom:12px">
-      <div style="font-weight:700">📊 Sell Bills — ${bills.length} รายการ</div>
-      ${unpaidTotal > 0 ? `<span style="color:var(--danger);font-weight:600">ค้างชำระรวม: ${fmtNum(unpaidTotal)}</span>` : ''}
-      <div style="flex:1"></div>
-      <button class="btn ${groupByCustomer?'btn-primary':'btn-outline'} btn-sm" id="spv2-btn-group-cust">
-        ${groupByCustomer ? '📋 แสดงทุกบิล' : '👥 กลุ่มตามลูกค้า'}
-      </button>
-      <button class="btn btn-success btn-sm" id="spv2-btn-download-sellbills">⬇️ Download XLSX</button>
-    </div>`;
-  
-  // ═══ GROUPED VIEW ═══
-  if (groupByCustomer) {
-    // Group bills by customer
-    const groups = {};
-    bills.forEach(b => {
-      const key = b.customer || '(ไม่มีชื่อ)';
-      if (!groups[key]) groups[key] = [];
-      groups[key].push(b);
-    });
-    
-    // Sort customers: unpaid total first (descending), then name
-    const entries = Object.entries(groups).map(([name, items]) => {
-      const unpaidAmt = items.filter(b => !b.pay_status).reduce((s,b) => s + b.total, 0);
-      const paidAmt = items.filter(b => b.pay_status && b.pay_status !== 'ยกเลิก').reduce((s,b) => s + b.total, 0);
-      const totalAmt = items.reduce((s,b) => s + b.total, 0);
-      return { name, items, unpaidAmt, paidAmt, totalAmt };
-    });
-    entries.sort((a, b) => {
-      if (a.unpaidAmt !== b.unpaidAmt) return b.unpaidAmt - a.unpaidAmt; // unpaid มากขึ้นก่อน
-      return String(a.name).localeCompare(String(b.name), 'th');
-    });
-    
-    html += `
-      <table style="width:100%;border-collapse:collapse;font-size:.8rem;min-width:900px">
-        <thead style="position:sticky;top:0;background:var(--card);z-index:1">
-          <tr style="background:var(--bg2);border-bottom:2px solid var(--border)">
-            <th style="padding:8px;text-align:center;width:40px"></th>
-            <th style="padding:8px;text-align:left">ชื่อลูกค้า</th>
-            <th style="padding:8px;text-align:center">จำนวนบิล</th>
-            <th style="padding:8px;text-align:right">ค้างชำระ</th>
-            <th style="padding:8px;text-align:right">ชำระแล้ว</th>
-            <th style="padding:8px;text-align:right">ยอดรวม</th>
-          </tr>
-        </thead>
-        <tbody>`;
-    
-    entries.forEach(({ name, items, unpaidAmt, paidAmt, totalAmt }) => {
-      const isExpanded = spV2State.expandedCustomers.has(name);
-      const hasUnpaid = unpaidAmt > 0;
-      const rowBg = hasUnpaid ? 'rgba(239,87,87,.04)' : 'rgba(63,196,143,.04)';
-      
-      html += `
-        <tr class="spv2-cust-header" data-cust="${name.replace(/"/g,'&quot;')}" 
-            style="cursor:pointer;background:${rowBg};border-bottom:1px solid var(--border);font-weight:600">
-          <td style="padding:8px;text-align:center;font-size:1rem">${isExpanded ? '▼' : '▶'}</td>
-          <td style="padding:8px">${String(name).substring(0, 55)}</td>
-          <td style="padding:8px;text-align:center">${items.length}</td>
-          <td style="padding:8px;text-align:right;color:${hasUnpaid?'var(--danger)':''}">${fmt(unpaidAmt)}</td>
-          <td style="padding:8px;text-align:right;color:var(--success)">${fmt(paidAmt)}</td>
-          <td style="padding:8px;text-align:right">${fmtNum(totalAmt)}</td>
-        </tr>`;
-      
-      // Child rows (only if expanded)
-      if (isExpanded) {
-        // Sort children by bill_no asc
-        const sorted = [...items].sort((a,b) => String(a.bill_no).localeCompare(String(b.bill_no)));
-        html += `<tr><td colspan="6" style="padding:0;background:var(--bg2)">
-          <table style="width:100%;border-collapse:collapse;font-size:.73rem">
-            <thead>
-              <tr style="border-bottom:1px solid var(--border);color:var(--text2)">
-                <th style="padding:4px 8px;text-align:center;width:40px">#</th>
-                <th style="padding:4px;text-align:center">วันที่</th>
-                <th style="padding:4px;text-align:left">เลขเอกสาร</th>
-                <th style="padding:4px;text-align:right">มูลค่า</th>
-                <th style="padding:4px;text-align:right">ภาษี</th>
-                <th style="padding:4px;text-align:right">รวม</th>
-                <th style="padding:4px;text-align:center">สถานะ</th>
-                <th style="padding:4px;text-align:center">วันที่ชำระ</th>
-              </tr>
-            </thead>
-            <tbody>`;
-        sorted.forEach((b, idx) => {
-          const isVoid = b.pay_status === 'ยกเลิก';
-          const isPaid = b.pay_status && !isVoid;
-          const statusColor = isVoid ? 'var(--text3)' : isPaid ? 'var(--success)' : 'var(--danger)';
-          const statusText = isPaid ? b.pay_status : (isVoid ? 'ยกเลิก' : 'ค้างชำระ');
-          const bg = isVoid ? 'rgba(128,128,128,.06)' : isPaid ? 'rgba(63,196,143,.02)' : 'rgba(239,87,87,.02)';
-          html += `
-            <tr style="background:${bg};border-bottom:1px solid var(--border)">
-              <td style="padding:3px 8px;text-align:center">${idx + 1}</td>
-              <td style="padding:3px;text-align:center">${fmtD(b.doc_date)}</td>
-              <td style="padding:3px;font-family:monospace">${b.bill_no}</td>
-              <td style="padding:3px;text-align:right">${fmt(b.value)}</td>
-              <td style="padding:3px;text-align:right">${fmt(b.vat)}</td>
-              <td style="padding:3px;text-align:right;font-weight:600">${fmt(b.total)}</td>
-              <td style="padding:3px;text-align:center;color:${statusColor};font-weight:600;font-size:.72rem">${statusText}</td>
-              <td style="padding:3px;text-align:center">${fmtD(b.pay_date)}</td>
-            </tr>`;
-        });
-        html += `</tbody></table></td></tr>`;
-      }
-    });
-    
-    html += `</tbody></table></div>`;
-    return html;
-  }
-  
-  // ═══ FLAT VIEW (default) ═══
-  html += `
-    <table style="width:100%;border-collapse:collapse;font-size:.75rem;min-width:1400px">
-      <thead style="position:sticky;top:0;background:var(--card);z-index:1">
-        <tr style="background:var(--bg2);border-bottom:2px solid var(--border)">
-          <th style="padding:6px;text-align:center">#</th>
-          <th style="padding:6px;text-align:center">วันที่เอกสาร</th>
-          <th style="padding:6px;text-align:left">เลขที่เอกสาร</th>
-          <th style="padding:6px;text-align:left">อ้างอิง</th>
-          <th style="padding:6px;text-align:left">ชื่อลูกค้า</th>
-          <th style="padding:6px;text-align:left">เลขผู้เสียภาษี</th>
-          <th style="padding:6px;text-align:left">สำนักงาน</th>
-          <th style="padding:6px;text-align:right">มูลค่า</th>
-          <th style="padding:6px;text-align:right">ภาษี</th>
-          <th style="padding:6px;text-align:right">ยกเว้น</th>
-          <th style="padding:6px;text-align:right">รวม</th>
-          <th style="padding:6px;text-align:center">สถานะชำระ</th>
-          <th style="padding:6px;text-align:center">วันที่ชำระ</th>
-          <th style="padding:6px;text-align:left">หมายเหตุ</th>
-        </tr>
-      </thead>
-      <tbody>`;
-  
-  bills.forEach(b => {
-    const isVoid = b.pay_status === 'ยกเลิก';
-    const isPaid = b.pay_status && !isVoid;
-    const bg = isVoid ? 'background:rgba(128,128,128,.12);color:var(--text3)' 
-             : isPaid ? 'background:rgba(63,196,143,.06)' 
-             : 'background:rgba(239,87,87,.06)';
-    const statusColor = isVoid ? 'var(--text3)' : isPaid ? 'var(--success)' : 'var(--danger)';
-    const statusText = isPaid ? b.pay_status : (isVoid ? 'ยกเลิก' : 'ค้างชำระ');
-    html += `
-      <tr style="${bg};border-bottom:1px solid var(--border)">
-        <td style="padding:4px 6px;text-align:center">${b.seq}</td>
-        <td style="padding:4px 6px;text-align:center">${fmtD(b.doc_date)}</td>
-        <td style="padding:4px 6px;font-family:monospace">${b.bill_no}</td>
-        <td style="padding:4px 6px;font-family:monospace;font-size:.7rem">${b.ref_doc}</td>
-        <td style="padding:4px 6px">${String(b.customer||'').substring(0, 45)}</td>
-        <td style="padding:4px 6px;font-size:.7rem;font-family:monospace">${b.tax_id}</td>
-        <td style="padding:4px 6px;font-size:.7rem">${b.branch}</td>
-        <td style="padding:4px 6px;text-align:right">${fmt(b.value)}</td>
-        <td style="padding:4px 6px;text-align:right">${fmt(b.vat)}</td>
-        <td style="padding:4px 6px;text-align:right">${fmt(b.novat)}</td>
-        <td style="padding:4px 6px;text-align:right;font-weight:600">${fmt(b.total)}</td>
-        <td style="padding:4px 6px;text-align:center;color:${statusColor};font-weight:600;font-size:.7rem">${statusText}</td>
-        <td style="padding:4px 6px;text-align:center">${fmtD(b.pay_date)}</td>
-        <td style="padding:4px 6px;font-size:.7rem">${b.note || ''}</td>
-      </tr>`;
-  });
-  
-  html += `
-      </tbody>
-    </table>
-  </div>`;
-  
-  return html;
-}
-
-// Download Sell Bills XLSX
-function spV2DownloadSellBills() {
-  let bills = spV2GenerateSellBills();
-  
-  const { filterVat, filterPaid, filterPrefixes } = spV2State;
-  if (filterVat === 'Y') bills = bills.filter(b => b._vat_flag === 'Y');
-  else if (filterVat === 'N') bills = bills.filter(b => b._vat_flag === 'N');
-  if (filterPaid === 'paid') bills = bills.filter(b => b.pay_status && b.pay_status !== 'ยกเลิก');
-  else if (filterPaid === 'unpaid') bills = bills.filter(b => !b.pay_status);
-  
-  // Prefix filter (multi-select)
-  if (filterPrefixes && filterPrefixes.size > 0) {
-    bills = bills.filter(b => filterPrefixes.has(String(b.bill_no).substring(0,2).toUpperCase()));
-  }
-  
-  // Sort by custom order: SR → SS → SC → OR → OS → JR → JS, then bill_no ascending (numeric-aware)
-  const PREFIX_ORDER = ['SR','SS','SC','OR','OS','JR','JS'];
-  const getOrder = (billNo) => {
-    const p = String(billNo).substring(0,2).toUpperCase();
-    const i = PREFIX_ORDER.indexOf(p);
-    return i >= 0 ? i : 99;
-  };
-  bills.sort((a, b) => {
-    const oa = getOrder(a.bill_no);
-    const ob = getOrder(b.bill_no);
-    if (oa !== ob) return oa - ob;
-    return String(a.bill_no).localeCompare(String(b.bill_no), undefined, { numeric: true });
-  });
-  bills.forEach((b, i) => b.seq = i + 1);
-  
-  const fmtD = v => v ? String(v).substring(0, 10) : '';
-  
-  // Unpaid totals (for row 1 like sample)
-  const unpaidBills = bills.filter(b => !b.pay_status);
-  const unpaidValue = unpaidBills.reduce((s,b) => s + b.value, 0);
-  const unpaidVat = unpaidBills.reduce((s,b) => s + b.vat, 0);
-  const unpaidNovat = unpaidBills.reduce((s,b) => s + b.novat, 0);
-  const unpaidTotal = unpaidBills.reduce((s,b) => s + b.total, 0);
-  
-  const aoa = [
-    ['', '', '', '', '', '', 'ค้างชำระรวม', unpaidValue, unpaidVat, unpaidNovat, unpaidTotal, '', '', ''],
-    ['ลำดับ', 'วันที่เอกสาร', 'เลขที่เอกสาร', 'อ้างถึง', 'ชื่อลูกค้า', 'เลขเสียภาษี', 'สำนักงาน',
-     'มูลค่า', 'ภาษี', 'ยกเว้นภาษี', 'รวม', 'สถานะการชำระ', 'วันที่ชำระ', 'หมายเหตุ'],
-  ];
-  
-  bills.forEach(b => {
-    const statusText = b.pay_status || '';
-    aoa.push([
-      b.seq, fmtD(b.doc_date), b.bill_no, b.ref_doc, b.customer,
-      b.tax_id, b.branch,
-      b.value, b.vat, b.novat, b.total,
-      statusText, fmtD(b.pay_date), b.note
-    ]);
-  });
-  
-  const ws = XLSX.utils.aoa_to_sheet(aoa);
-  ws['!cols'] = [
-    {wch:6},{wch:14},{wch:18},{wch:18},{wch:30},{wch:18},{wch:18},
-    {wch:12},{wch:12},{wch:12},{wch:12},{wch:18},{wch:14},{wch:22}
-  ];
-  
-  const wb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(wb, ws, 'Sell Bills');
-  const fn = `SellBills_${todayISO()}.xlsx`;
-  XLSX.writeFile(wb, fn);
-  toast(`Download ${fn} — ${bills.length} rows`, 'success');
 }
 
 // ⭐ 7/5/26 — Generate Report SP numbers
