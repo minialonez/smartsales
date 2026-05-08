@@ -31686,6 +31686,26 @@ function spV2MatchWithStatements() {
       r._match_status = 'matched';
       r._matched_stmt_uuid = bestMatch.stmt_uuid || bestMatch.ref_no || '';
       matched++;
+      
+      // ⭐ 8/5/26 — Write sp_no back to stmt (match_sp + match_status fields)
+      //   ใช้ sp_number ถ้ามี (Generate Report แล้ว) ไม่งั้น bill_no (เลขเดิม)
+      //   stmt ที่ถูก mark dirty → push ขึ้น cloud ตอน save
+      const spNo = r.sp_number || r.bill_no || '';
+      if (spNo && bestMatch.stmt_uuid) {
+        bestMatch.match_sp = spNo;
+        bestMatch.match_status = 'paid';
+        bestMatch.match_bill = spNo; // ใช้เลข SP เป็น bill ref ใน stmt
+        bestMatch.match_station = 'Payment';
+        bestMatch.matched_by = (window.currentUser?.display_name) || 'SP Recon';
+        bestMatch.matched_at = new Date().toISOString();
+        // Mark stmt dirty for next save
+        if (window.syncManager) {
+          window.syncManager.markDirty('stmts');
+          if (!window.syncManager.dirtyUuids) window.syncManager.dirtyUuids = {};
+          if (!window.syncManager.dirtyUuids.stmts) window.syncManager.dirtyUuids.stmts = new Set();
+          window.syncManager.dirtyUuids.stmts.add(bestMatch.stmt_uuid);
+        }
+      }
     } else {
       r._match_status = 'no_match';
       r._matched_stmt_uuid = '';
@@ -31705,11 +31725,12 @@ function spV2MatchWithStatements() {
   
   persistSpV2();
   const warnPart = warnMixed > 0 ? ` · ⚠️ Mixed ${warnMixed} ใบ (ตรวจด่วน!)` : '';
+  const stmtSavePart = stmtMatched > 0 ? ` · 💾 กดบันทึกหน้า Main เพื่อ push stmts ขึ้น cloud` : '';
   toast(
     `✓ Match สำเร็จ — ตรง ${matched} ใบ ` +
     `(💵 ซื้อสด: ${autoCash} · 🏦 ซื้อเชื่อ: ${stmtMatched}) · ` +
-    `ไม่ตรง ${noMatch} ใบ · ข้าม ${skipped} ใบ${warnPart}`, 
-    warnMixed > 0 ? 'warn' : (matched > 0 ? 'success' : 'warn'), 8000
+    `ไม่ตรง ${noMatch} ใบ · ข้าม ${skipped} ใบ${warnPart}${stmtSavePart}`, 
+    warnMixed > 0 ? 'warn' : (matched > 0 ? 'success' : 'warn'), 9000
   );
   spV2RenderKeepScroll();
 }
