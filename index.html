@@ -30364,6 +30364,9 @@ async function renderSpRecon(el) {
                   style="background:var(--info);color:#fff;border:none;font-weight:700">🔢 Generate Report</button>
           <button class="btn btn-outline btn-sm" id="spv2-btn-match-stmt" title="Match SP กับ Bank Statement (cross-check)"
                   style="border-color:var(--success);color:var(--success);font-weight:700">🔗 Match Statement</button>
+          ${spV2State.reportGenerated ? `
+          <button class="btn btn-success btn-sm" id="spv2-btn-export-main" title="ส่งออก Report ที่ Generate แล้วเป็น Excel">⬇️ Export Report</button>
+          ` : ''}
         ` : ''}
         
         ${view === 'report' ? `<button class="btn btn-success btn-sm" id="spv2-btn-download">⬇️ Download Report</button>` : ''}
@@ -30569,6 +30572,16 @@ async function renderSpRecon(el) {
   
   document.getElementById('spv2-btn-download')?.addEventListener('click', () => {
     spV2DownloadXlsx();
+  });
+  
+  // ⭐ 7/5/26 — Export Report จากหน้า Main (เรียก function เดิม)
+  document.getElementById('spv2-btn-export-main')?.addEventListener('click', () => {
+    if (!spV2State.reportGenerated) {
+      toast('⚠ ต้องกด Generate Report ก่อน', 'warn', 4000);
+      return;
+    }
+    spV2DownloadXlsx();
+    toast('✓ Export Report สำเร็จ', 'success', 3000);
   });
   
   document.getElementById('spv2-btn-download-sellbills')?.addEventListener('click', () => {
@@ -30956,7 +30969,7 @@ function spV2RenderReportView(rows) {
     
     html += `
       <tr style="${rowColor};font-weight:600;border-top:2px solid var(--border)">
-        <td style="padding:6px;font-family:monospace">${header.bill_no}</td>
+        <td style="padding:6px;font-family:monospace">${header.sp_number || header.bill_no}</td>
         <td style="padding:6px">${fmtD(header.ref_doc)}</td>
         <td style="padding:6px">${String(header.sale_date||'').substring(0,35)}</td>
         <td style="padding:6px;text-align:right">${fmt(header.pay_total)}</td>
@@ -31015,7 +31028,7 @@ function spV2DownloadXlsx() {
     const paid = spV2IsPaid(header);
     
     aoa.push([
-      header.bill_no, fmtD(header.ref_doc), header.sale_date, '',
+      header.sp_number || header.bill_no, fmtD(header.ref_doc), header.sale_date, '',
       Number(header.pay_total)||0, fmtD(header.cash_date), Number(header.cash_amt)||0,
       fmtD(header.transfer_date), Number(header.transfer_amt)||0,
       fmtD(header.cheque_date), paid ? 'Paid' : 'Unpaid'
