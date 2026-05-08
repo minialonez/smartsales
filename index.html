@@ -2905,7 +2905,7 @@ const syncManager = {
     
     // ⭐ Source breakdown log (เพื่อ debug Smart bills หาย)
     if (willPushBills) {
-      const counts = { smart: 0, front: 0, manual: 0, other: 0 };
+      const counts = { smart: 0, pos: 0, manual: 0, other: 0 };
       billList.forEach(b => {
         const src = b.source || 'other';
         if (counts[src] !== undefined) counts[src]++;
@@ -8825,7 +8825,7 @@ async function renderMain(el) {
         const _preSnap = {
           billList_total: billList.length,
           smart: billList.filter(b => b.source === 'smart').length,
-          front: billList.filter(b => b.source === 'front').length,
+          pos: billList.filter(b => b.source === 'pos').length,
           manual: billList.filter(b => b.source === 'manual').length,
           stmts: getAllStatements().length,
           dirty_types: [...syncManager.dirty],
@@ -8854,7 +8854,7 @@ async function renderMain(el) {
         const _postSnap = {
           billList_total: billList.length,
           smart: billList.filter(b => b.source === 'smart').length,
-          front: billList.filter(b => b.source === 'front').length,
+          pos: billList.filter(b => b.source === 'pos').length,
           stmts: getAllStatements().length,
         };
         console.log(`[save] POST-SNAPSHOT:`, _postSnap);
@@ -18288,6 +18288,31 @@ function showApp() {
 async function loadAllFromCloud(opts) {
   opts = opts || {};
   const reason = opts.reason || 'manual';
+  
+  // ⭐ 7/5/26 — Patch 1 (CIC ranked C4): Block when bills/stmts are dirty (pending push)
+  //    Bug: Smart bills หายหลัง stmt save flow:
+  //      T+0:  Save bills (push success → cloud OK)
+  //      T+1:  Stmt import + save → trigger loadAllFromCloud
+  //      T+2:  pull cloud bills → cloud ยังไม่ propagate Smart 28 ใบล่าสุด
+  //      T+3:  swap billList = tempBills (ขาด Smart) → ข้อมูลหาย ❌
+  //    Fix: ถ้า user มี dirty bills/stmts ที่ยัง push ไม่เสร็จ → defer pull
+  //    เฉพาะ reason='manual-click' (user กดปุ่ม Refresh เอง) ผ่านได้
+  try {
+    const sm = window.syncManager;
+    const dirtyBillUuidsCount = sm?.dirtyUuids?.bills?.size || 0;
+    const dirtyStmtUuidsCount = sm?.dirtyUuids?.stmts?.size || 0;
+    const dirtyTypes = sm?.dirty || new Set();
+    const hasDirty = dirtyTypes.has('bills') || dirtyTypes.has('stmts') 
+                  || dirtyBillUuidsCount > 0 || dirtyStmtUuidsCount > 0;
+    
+    if (hasDirty && reason !== 'manual-click') {
+      console.warn(`[loadAllFromCloud] DEFERRED — dirty pending: bills_uuids=${dirtyBillUuidsCount} stmt_uuids=${dirtyStmtUuidsCount} types=[${[...dirtyTypes].join(',')}] reason=${reason}`);
+      if (typeof toast === 'function' && !opts.silent) {
+        toast(`⏸ Skip pull — รอ push ${dirtyBillUuidsCount + dirtyStmtUuidsCount} dirty รายการเสร็จก่อน`, 'info', 4000);
+      }
+      return { ok: false, reason: 'dirty-pending', dirtyBillUuidsCount, dirtyStmtUuidsCount };
+    }
+  } catch(e) { console.warn('[loadAllFromCloud] dirty-check error:', e); }
   const silent = !!opts.silent;
   const currentYear = new Date().getFullYear();
   // ⭐ Default: ปีปัจจุบันเท่านั้น (ลด time จาก 94s → ~10s)
@@ -18569,17 +18594,28 @@ async function loadAllFromCloud(opts) {
     }
     
     // ── Per-type threshold ──
-    const swapBills = (beforeBillsCount === 0) || (tempBills.length >= beforeBillsCount * 0.1);
-    const swapStmts = (beforeStmtsCount === 0) || (totalStmts >= beforeStmtsCount * 0.1);
+    // ⭐ 7/5/26 — Patch 2 (CIC): Tighter check using high-water (sync gauge)
+    //    เดิม: threshold 10% ของ before — drop 28 ใบจาก 10715 = 0.26% → ผ่าน → ข้อมูลหาย
+    //    ใหม่: ตรวจ drop จาก high-water ด้วย — drop > 5 ใบ → ABORT swap (เหมือน _flushPush guard)
+    //    +95% threshold เพื่อกัน swap ตอน cloud ยังไม่ propagate ข้อมูลใหม่
+    const highWaterBills = window._billsPushHighWater || 0;
+    const highWaterStmts = window._stmtsPushHighWater || 0;
+    const dropFromHighBills = highWaterBills - tempBills.length;
+    const dropFromHighStmts = highWaterStmts - totalStmts;
+    
+    const swapBills = (beforeBillsCount === 0) 
+      || (dropFromHighBills <= 5 && tempBills.length >= beforeBillsCount * 0.95);
+    const swapStmts = (beforeStmtsCount === 0) 
+      || (dropFromHighStmts <= 5 && totalStmts >= beforeStmtsCount * 0.95);
     
     const skipReasons = [];
     if (!swapBills) {
-      skipReasons.push(`Bills ${tempBills.length}/${beforeBillsCount} (< 10%)`);
-      console.warn(`[loadAllFromCloud] ABORT bills swap: pulled ${tempBills.length}, before ${beforeBillsCount}`);
+      skipReasons.push(`Bills ${tempBills.length} (high-water ${highWaterBills}, drop ${dropFromHighBills})`);
+      console.warn(`[loadAllFromCloud] ABORT bills swap: tempBills=${tempBills.length} highWater=${highWaterBills} drop=${dropFromHighBills} before=${beforeBillsCount}`);
     }
     if (!swapStmts) {
-      skipReasons.push(`Stmts ${totalStmts}/${beforeStmtsCount} (< 10%)`);
-      console.warn(`[loadAllFromCloud] ABORT stmts swap: pulled ${totalStmts}, before ${beforeStmtsCount}`);
+      skipReasons.push(`Stmts ${totalStmts} (high-water ${highWaterStmts}, drop ${dropFromHighStmts})`);
+      console.warn(`[loadAllFromCloud] ABORT stmts swap: tempStmts=${totalStmts} highWater=${highWaterStmts} drop=${dropFromHighStmts} before=${beforeStmtsCount}`);
     }
     
     if (skipReasons.length > 0 && !silent) {
