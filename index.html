@@ -30492,8 +30492,10 @@ async function renderSpRecon(el) {
                   style="background:var(--info);color:#fff;border:none;font-weight:700">🔢 Generate Report</button>
           <button class="btn btn-outline btn-sm" id="spv2-btn-match-stmt" title="Match SP กับ Bank Statement (cross-check)"
                   style="border-color:var(--success);color:var(--success);font-weight:700">🔗 Match Statement</button>
+          <button class="btn btn-outline btn-sm" id="spv2-btn-export-orig" title="ส่งออก Main เป็น Excel — ใช้เลข SP เดิม (ก่อน Generate)"
+                  style="border-color:var(--text2);color:var(--text2)">⬇️ Export Main (เลขเดิม)</button>
           ${spV2State.reportGenerated ? `
-          <button class="btn btn-success btn-sm" id="spv2-btn-export-main" title="ส่งออก Report ที่ Generate แล้วเป็น Excel">⬇️ Export Report</button>
+          <button class="btn btn-success btn-sm" id="spv2-btn-export-main" title="ส่งออก Report ที่ Generate แล้วเป็น Excel — ใช้เลข SP202601-XXXX">⬇️ Export Report (เลขใหม่)</button>
           ` : ''}
         ` : ''}
         
@@ -30708,8 +30710,18 @@ async function renderSpRecon(el) {
       toast('⚠ ต้องกด Generate Report ก่อน', 'warn', 4000);
       return;
     }
-    spV2DownloadXlsx();
-    toast('✓ Export Report สำเร็จ', 'success', 3000);
+    spV2DownloadXlsx({ useOriginal: false });
+    toast('✓ Export Report (เลขใหม่) สำเร็จ', 'success', 3000);
+  });
+  
+  // ⭐ 7/5/26 — Export Main เลขเดิม (ก่อน Generate)
+  document.getElementById('spv2-btn-export-orig')?.addEventListener('click', () => {
+    if (!spV2State.mainRows || spV2State.mainRows.length === 0) {
+      toast('⚠ ยังไม่มีข้อมูล Main', 'warn', 4000);
+      return;
+    }
+    spV2DownloadXlsx({ useOriginal: true });
+    toast('✓ Export Main (เลขเดิม) สำเร็จ', 'success', 3000);
   });
   
   document.getElementById('spv2-btn-download-sellbills')?.addEventListener('click', () => {
@@ -31131,7 +31143,13 @@ function spV2RenderReportView(rows) {
 }
 
 // XLSX export
-function spV2DownloadXlsx() {
+function spV2DownloadXlsx(opts) {
+  // ⭐ 7/5/26 — opts.useOriginal=true → ใช้เลขเดิม (Main view export)
+  //    default (Report export) → ใช้ sp_number ที่ Generate Report ใหม่
+  opts = opts || {};
+  const useOriginal = !!opts.useOriginal;
+  const titleSuffix = useOriginal ? ' (Main - เลขเดิม)' : '';
+  
   const rows = spV2FilterRows();
   const groupsByGid = {};
   rows.forEach(r => {
@@ -31140,7 +31158,7 @@ function spV2DownloadXlsx() {
   
   // Build aoa (array of arrays)
   const aoa = [
-    ['รายงาน - การชำระเงิน', '', '', '', '', '', '', '', '', '', ''],
+    ['รายงาน - การชำระเงิน' + titleSuffix, '', '', '', '', '', '', '', '', '', ''],
     ['บริษัท จงกลณีการไฟฟ้า จำกัด', '', '', '', '', '', '', '', '', '', ''],
     ['เลขเอกสารชำระ', 'วันที่ชำระ', 'ลูกค้า', '', 'รวมชำระจริง', 'เงินสด', '', 'โอนเงิน', '', 'เช็ค', 'Status'],
     ['เลขเอกสาร', 'เอกสารอ้างอิง', 'วันเอกสารขาย', 'หมายเหตุ', 'จำนวนเงิน', 'วันรับ', 'ยอด', 'วันรับ', 'ยอด', 'วันรับ', 'ยอด'],
@@ -31155,8 +31173,11 @@ function spV2DownloadXlsx() {
     if (!header) return;
     const paid = spV2IsPaid(header);
     
+    // ⭐ Pick SP number based on mode
+    const headerSpDisplay = useOriginal ? header.bill_no : (header.sp_number || header.bill_no);
+    
     aoa.push([
-      header.sp_number || header.bill_no, fmtD(header.ref_doc), header.sale_date, '',
+      headerSpDisplay, fmtD(header.ref_doc), header.sale_date, '',
       Number(header.pay_total)||0, fmtD(header.cash_date), Number(header.cash_amt)||0,
       fmtD(header.transfer_date), Number(header.transfer_amt)||0,
       fmtD(header.cheque_date), paid ? 'Paid' : 'Unpaid'
@@ -31178,7 +31199,8 @@ function spV2DownloadXlsx() {
   
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, 'Report');
-  const fn = `SP_Report_${todayISO()}.xlsx`;
+  const fnPrefix = useOriginal ? 'SP_Main_Original' : 'SP_Report';
+  const fn = `${fnPrefix}_${todayISO()}.xlsx`;
   XLSX.writeFile(wb, fn);
   toast(`Download ${fn}`, 'success');
 }
