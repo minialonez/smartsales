@@ -18309,7 +18309,11 @@ async function loadAllFromCloud(opts) {
     //    Bug Scenario: push 82s slow → tab-focus reload → cloud ยังไม่ propagate → swap → ข้อมูลหาย
     const isPushingOrError = (status === 'pushing' || status === 'error');
     
-    if ((hasDirty || isPushingOrError) && reason !== 'manual-click') {
+    // ⭐ Bypass: ทุก reason ที่ขึ้นต้น 'manual' = user explicit click → ผ่านเสมอ
+    //    (รองรับทั้ง 'manual', 'manual-click' — กัน CIC test failure)
+    const isManual = String(reason || '').startsWith('manual');
+    
+    if ((hasDirty || isPushingOrError) && !isManual) {
       console.warn(`[loadAllFromCloud] DEFERRED — dirty=${[...dirtyTypes].join(',')} bills_uuids=${dirtyBillUuidsCount} stmt_uuids=${dirtyStmtUuidsCount} status=${status} reason=${reason}`);
       if (typeof toast === 'function' && !opts.silent) {
         toast(`⏸ Skip pull — sync ยัง pending (status=${status})`, 'info', 4000);
@@ -18331,11 +18335,12 @@ async function loadAllFromCloud(opts) {
     return { ok: false, reason: 'already-loading' };
   }
   
-  // ⭐ Time-based guard (4/5/26): ห้ามเรียกซ้ำใน 10s ยกเว้น manual-click
+  // ⭐ Time-based guard (4/5/26): ห้ามเรียกซ้ำใน 10s ยกเว้น manual click
   //    Bug fix: showApp + manual-click + tab-focus เคยยิง 3 ครั้งติดกัน → 33s + 36 invocations
-  //    Manual-click bypass guard (user explicitly request)
+  //    Manual click bypass guard (user explicitly request) — ทุก reason ขึ้นต้น 'manual'
   const sinceLast = Date.now() - (Number(window._lastCloudLoad) || 0);
-  if (sinceLast < 10000 && reason !== 'manual-click') {
+  const isManualThrottle = String(reason || '').startsWith('manual');
+  if (sinceLast < 10000 && !isManualThrottle) {
     console.warn(`[loadAllFromCloud] skipped (${reason}) — last load ${Math.round(sinceLast/1000)}s ago, debounce 10s`);
     return { ok: false, reason: 'debounce' };
   }
