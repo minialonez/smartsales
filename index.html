@@ -4283,12 +4283,40 @@ function persistMainState() {
   // ⭐ CRITICAL: ถ้ากำลัง pull อยู่ (หรือเพิ่ง pull เสร็จ) → ห้าม markDirty
   //   เหตุผล: pullFromCloud → persistMainState (L2302) ต้องไม่ trigger push
   //   เพราะข้อมูลมาจาก cloud อยู่แล้ว — push กลับ = sheet บวม + race condition ข้ามเครื่อง
+  //
+  // ⭐ 8/5/26 Round 4 fix (CIC P7): ตรวจ fingerprint ก่อน mark dirty
+  //   ถ้า data ไม่เปลี่ยน → ไม่ mark dirty (กัน stale dirty Set)
+  //   เดิม: mark dirty ทุกครั้งที่ persistMainState → fp-skip ใน push → dirty ค้าง
+  //   ใหม่: เช็ค fp ที่ persist time → ถ้าไม่เปลี่ยน skip mark
   try {
     const isPulling = syncManager.status === 'pulling' || syncManager._inPull === true;
     if (!isPulling) {
-      syncManager.markDirty();           // NO_ARG_TYPES
-      syncManager.markDirty('bills');    // bills explicit
-      syncManager.markDirty('stmts');    // stmts explicit
+      // ⭐ Compute fp ก่อน mark — เฉพาะ type ที่ fp เปลี่ยนค่อย mark
+      const sm = syncManager;
+      sm._fpCache = sm._fpCache || {};
+      
+      const fpAndMark = (type) => {
+        try {
+          const fp = sm._computeFp ? sm._computeFp(type) : null;
+          if (!fp) {
+            // No fp logic available → fallback to mark anyway (safer)
+            sm.markDirty(type);
+            return;
+          }
+          if (fp !== sm._fpCache[type]) {
+            sm.markDirty(type);
+          }
+          // ถ้า fp เท่าเดิม → ไม่ mark (data unchanged)
+        } catch(e) {
+          sm.markDirty(type); // fallback safe
+        }
+      };
+      
+      // bills + stmts ใช้ uuid tracking → safe ที่จะ mark (uuid set จะบอกว่ามีอะไรเปลี่ยนจริง)
+      sm.markDirty('bills');
+      sm.markDirty('stmts');
+      // type อื่น ใช้ fp check เพื่อกัน stale
+      ['payments', 'sp_temps', 'cashflow', 'suppliers', 'meta'].forEach(fpAndMark);
     }
   } catch(_) {}
 }
@@ -18306,8 +18334,18 @@ async function loadAllFromCloud(opts) {
     const dirtyStmtUuidsCount = sm?.dirtyUuids?.stmts?.size || 0;
     const dirtyTypes = sm?.dirty || new Set();
     const status = sm?.status;
-    const hasDirty = dirtyTypes.has('bills') || dirtyTypes.has('stmts') 
+    
+    // ⭐ 8/5/26 — Round 4 fix (CIC P7): bills/stmts ต้องมี dirtyUuids จริงด้วย
+    //   เคสเก่า: dirty.has('bills') = true แต่ dirtyUuids.bills.size = 0 (stale) → false-positive DEFER
+    //   ใหม่: เฉพาะ bills/stmts ใน dirty Set + มี uuid จริง = ถือว่ามี data จริงต้อง push
+    //   types อื่น (payments/sp_temps/cashflow/suppliers/meta) ใช้ dirty Set เฉยๆ (ยังไม่มี uuid tracking)
+    const billsHasRealDirty = dirtyTypes.has('bills') && dirtyBillUuidsCount > 0;
+    const stmtsHasRealDirty = dirtyTypes.has('stmts') && dirtyStmtUuidsCount > 0;
+    const otherDirty = ['payments', 'sp_temps', 'cashflow', 'suppliers', 'meta']
+      .some(t => dirtyTypes.has(t));
+    const hasDirty = billsHasRealDirty || stmtsHasRealDirty || otherDirty 
                   || dirtyBillUuidsCount > 0 || dirtyStmtUuidsCount > 0;
+    
     // ⭐ Also block while push is in-flight or in error state (CIC Patch 1 enhanced)
     //    Bug Scenario: push 82s slow → tab-focus reload → cloud ยังไม่ propagate → swap → ข้อมูลหาย
     const isPushingOrError = (status === 'pushing' || status === 'error');
