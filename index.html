@@ -18302,15 +18302,19 @@ async function loadAllFromCloud(opts) {
     const dirtyBillUuidsCount = sm?.dirtyUuids?.bills?.size || 0;
     const dirtyStmtUuidsCount = sm?.dirtyUuids?.stmts?.size || 0;
     const dirtyTypes = sm?.dirty || new Set();
+    const status = sm?.status;
     const hasDirty = dirtyTypes.has('bills') || dirtyTypes.has('stmts') 
                   || dirtyBillUuidsCount > 0 || dirtyStmtUuidsCount > 0;
+    // ⭐ Also block while push is in-flight or in error state (CIC Patch 1 enhanced)
+    //    Bug Scenario: push 82s slow → tab-focus reload → cloud ยังไม่ propagate → swap → ข้อมูลหาย
+    const isPushingOrError = (status === 'pushing' || status === 'error');
     
-    if (hasDirty && reason !== 'manual-click') {
-      console.warn(`[loadAllFromCloud] DEFERRED — dirty pending: bills_uuids=${dirtyBillUuidsCount} stmt_uuids=${dirtyStmtUuidsCount} types=[${[...dirtyTypes].join(',')}] reason=${reason}`);
+    if ((hasDirty || isPushingOrError) && reason !== 'manual-click') {
+      console.warn(`[loadAllFromCloud] DEFERRED — dirty=${[...dirtyTypes].join(',')} bills_uuids=${dirtyBillUuidsCount} stmt_uuids=${dirtyStmtUuidsCount} status=${status} reason=${reason}`);
       if (typeof toast === 'function' && !opts.silent) {
-        toast(`⏸ Skip pull — รอ push ${dirtyBillUuidsCount + dirtyStmtUuidsCount} dirty รายการเสร็จก่อน`, 'info', 4000);
+        toast(`⏸ Skip pull — sync ยัง pending (status=${status})`, 'info', 4000);
       }
-      return { ok: false, reason: 'dirty-pending', dirtyBillUuidsCount, dirtyStmtUuidsCount };
+      return { ok: false, reason: 'sync-pending', status, dirtyBillUuidsCount, dirtyStmtUuidsCount };
     }
   } catch(e) { console.warn('[loadAllFromCloud] dirty-check error:', e); }
   const silent = !!opts.silent;
@@ -18623,8 +18627,25 @@ async function loadAllFromCloud(opts) {
     }
     
     // ── SWAP (selective) ──
+    // ⭐ 7/5/26 — Patch 4 (CIC): pre/post snapshot ตรวจ drop หลัง swap
+    //    ถ้าเกิด drop จริง → toast แดง + console.error ให้ user เห็นทันที
+    const _smartBefore = Array.isArray(billList) ? billList.filter(b => b.source === 'smart').length : 0;
+    const _posBefore = Array.isArray(billList) ? billList.filter(b => b.source === 'pos').length : 0;
     if (swapBills) {
       billList = tempBills;
+      const _smartAfter = billList.filter(b => b.source === 'smart').length;
+      const _posAfter = billList.filter(b => b.source === 'pos').length;
+      if (_smartAfter < _smartBefore || _posAfter < _posBefore) {
+        const lostSmart = _smartBefore - _smartAfter;
+        const lostPos = _posBefore - _posAfter;
+        console.error(`🚨 [loadAllFromCloud] BILLS DROP from swap: smart ${_smartBefore}→${_smartAfter} (lost ${lostSmart}) · pos ${_posBefore}→${_posAfter} (lost ${lostPos}) · reason=${reason}`);
+        if (typeof toast === 'function') {
+          const parts = [];
+          if (lostSmart > 0) parts.push(`Smart ${lostSmart} ใบ`);
+          if (lostPos > 0) parts.push(`Front ${lostPos} ใบ`);
+          toast(`🚨 บิลหายจาก reload (${reason}): ${parts.join(' + ')}`, 'error', 15000);
+        }
+      }
     }
     if (swapStmts) {
       statementsByBank = { KTB: [], KBANK: [], 'BBL NW': [], BBL: [], TTB: [], UNKNOWN: [] };
