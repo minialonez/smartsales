@@ -180,6 +180,7 @@ tr.row-danger td{background:rgba(239,87,87,.06);border-left:3px solid var(--dang
 /* ── Spinner ── */
 .spinner{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite;vertical-align:middle}
 @keyframes spin{to{transform:rotate(360deg)}}
+@keyframes spv2-pulse-warn{0%,100%{opacity:1}50%{opacity:.55}}
 
 /* ── Responsive ── */
 @media(max-width:768px){
@@ -30123,6 +30124,8 @@ let spV2State = {
   filterVat: 'ALL',      // ALL | Y | N
   filterPaid: 'ALL',     // ALL | paid | unpaid
   filterMonths: new Set(), // ⭐ multi-select เดือน "YYYY-MM" — empty = ALL
+  filterMatchStmt: 'ALL', // ⭐ 8/5/26 — ALL | matched | no_match — filter Y headers ตาม match status
+  matchSummary: null, // ⭐ 8/5/26 — { matched, noMatch, skipped, ranAt } หลังกด Match
   view: 'main',          // main | report
   collapsedGroups: new Set(), // ⭐ 7/5/26 — _group_id ที่ collapse (ซ่อน bills) — empty = expand all
   reportGenerated: false, // ⭐ 7/5/26 — true หลังกด Generate Report (assign new SP numbers)
@@ -30171,7 +30174,8 @@ function persistSpV2() {
 
 // ⭐ 7/5/26 — Invalidate Report (เรียกเมื่อ user แก้ Main)
 //   Force user ให้ regenerate Report หลังจาก edit
-function spV2InvalidateGenerated() {
+//   ⭐ 8/5/26 — เพิ่ม: mark group dirty → upsertSpRecon push เฉพาะที่แก้
+function spV2InvalidateGenerated(groupId) {
   spV2State.reportGenerated = false;
   // Clear match status (ต้อง re-match หลัง regenerate)
   spV2State.mainRows.forEach(r => {
@@ -30180,6 +30184,19 @@ function spV2InvalidateGenerated() {
       r._matched_stmt_uuid = '';
     }
   });
+  // ⭐ Mark dirty: ถ้าระบุ groupId → เฉพาะ rows ใน group นั้น, ไม่งั้น = ทั้งหมด
+  if (groupId) {
+    spV2State.mainRows.forEach(r => {
+      if (r._group_id === groupId) r._dirty = true;
+    });
+  } else {
+    spV2State.mainRows.forEach(r => { r._dirty = true; });
+  }
+}
+
+// ⭐ 8/5/26 — Mark dirty per row (granular — used in toggle Y/N เฉพาะ bill)
+function spV2MarkRowDirty(row) {
+  if (row) row._dirty = true;
 }
 
 // Classify VAT by bill prefix
@@ -30300,7 +30317,7 @@ function spV2GetAvailableMonths() {
 
 // Filter rows by current filters
 function spV2FilterRows() {
-  const { filterVat, filterPaid, filterMonths } = spV2State;
+  const { filterVat, filterPaid, filterMonths, filterMatchStmt } = spV2State;
   // First pass: collect group_ids that match
   const groupsMatch = new Set();
   const headerMap = {};
@@ -30318,6 +30335,11 @@ function spV2FilterRows() {
       if (filterMonths && filterMonths.size > 0) {
         const m = spV2GetMonth(r);
         if (!filterMonths.has(m)) keep = false;
+      }
+      // ⭐ Match status filter (8/5/26): หลังกด Match Statement
+      if (filterMatchStmt && filterMatchStmt !== 'ALL') {
+        if (filterMatchStmt === 'matched' && r._match_status !== 'matched') keep = false;
+        if (filterMatchStmt === 'no_match' && r._match_status !== 'no_match') keep = false;
       }
       if (keep) groupsMatch.add(r._group_id);
     }
@@ -30498,6 +30520,39 @@ async function renderSpRecon(el) {
         
         ${view === 'report' ? `<button class="btn btn-success btn-sm" id="spv2-btn-download">⬇️ Download Report</button>` : ''}
       </div>
+      
+      ${view === 'main' && spV2State.matchSummary ? (() => {
+        const ms = spV2State.matchSummary;
+        const ranDate = ms.ranAt ? new Date(ms.ranAt) : null;
+        const ranStr = ranDate ? ranDate.toLocaleString('th-TH', {hour:'2-digit',minute:'2-digit',day:'2-digit',month:'short'}) : '';
+        const total = ms.matched + ms.noMatch;
+        const pct = total > 0 ? Math.round(ms.matched / total * 100) : 0;
+        return `
+        <div style="background:linear-gradient(90deg,rgba(63,196,143,.08),rgba(239,87,87,.08));border:1px solid var(--border);border-radius:8px;padding:12px 16px;margin-bottom:12px;display:flex;gap:24px;align-items:center;flex-wrap:wrap">
+          <div style="font-weight:700;color:var(--text);display:flex;align-items:center;gap:8px">
+            🔗 <span>Match Result</span>
+            <span style="font-size:.72rem;color:var(--text3);font-weight:400">· รัน ${ranStr}</span>
+          </div>
+          <div style="display:flex;gap:18px;flex-wrap:wrap">
+            <span style="color:var(--success);font-weight:700">✓ Matched: <span style="font-size:1.1rem">${ms.matched}</span></span>
+            <span style="color:var(--danger);font-weight:700">✗ No match: <span style="font-size:1.1rem">${ms.noMatch}</span></span>
+            <span style="color:var(--text2)">⊘ Skip (N): ${ms.skipped}</span>
+            <span style="color:var(--info);font-weight:700">success rate: ${pct}%</span>
+          </div>
+          <div style="flex:1"></div>
+          <button class="btn btn-outline btn-sm" id="spv2-btn-clear-match" style="font-size:.7rem;padding:4px 10px">ล้างผล</button>
+        </div>
+        
+        <div class="flex gap-2 flex-wrap items-center" style="margin-bottom:12px">
+          <span style="font-size:.78rem;color:var(--text2);font-weight:600">กรองผลการ Match:</span>
+          <button class="pill ${spV2State.filterMatchStmt==='ALL'?'active':''}" data-fmatch="ALL">ทั้งหมด</button>
+          <button class="pill ${spV2State.filterMatchStmt==='matched'?'active':''}" data-fmatch="matched"
+            style="${spV2State.filterMatchStmt==='matched'?'background:rgba(63,196,143,.2);border-color:var(--success);color:var(--success)':''}">✓ Matched (${ms.matched})</button>
+          <button class="pill ${spV2State.filterMatchStmt==='no_match'?'active':''}" data-fmatch="no_match"
+            style="${spV2State.filterMatchStmt==='no_match'?'background:rgba(239,87,87,.15);border-color:var(--danger);color:var(--danger)':''}">✗ No match (${ms.noMatch}) ← ตรวจ!</button>
+        </div>
+        `;
+      })() : ''}
       
       <!-- Table -->
       <div class="card" style="padding:0;overflow:auto;max-height:70vh">
@@ -30700,21 +30755,29 @@ async function renderSpRecon(el) {
     toast('✓ Export Main (เลขเดิม) สำเร็จ', 'success', 3000);
   });
   
-  // ⭐ 8/5/26 — Save SP Recon to Google Sheet (replace-all per year)
+  // ⭐ 8/5/26 — Save SP Recon to Google Sheet (selective UPSERT — เร็วเหมือนหน้า main)
+  //   ใช้ sp_uuid เป็น PK → upsert by uuid
+  //   ครั้งแรก = upsert ทั้งหมด · ครั้งถัดไป = upsert เฉพาะที่แก้ (dirty tracking)
+  //   Speed: 9000 rows × 0.6s/100 ~ 50s แทนที่จะเป็น 5+ นาทีแบบ replace-all
   document.getElementById('spv2-btn-save-cloud')?.addEventListener('click', async () => {
     if (!spV2State.mainRows || spV2State.mainRows.length === 0) {
       toast('⚠ ยังไม่มีข้อมูลให้บันทึก', 'warn', 4000);
       return;
     }
     
-    // Detect years from data
-    const years = new Set();
+    // ⭐ Ensure all rows have sp_uuid + assign year tag
+    const groupYearMap = {};
     spV2State.mainRows.forEach(r => {
+      if (!r.sp_uuid) r.sp_uuid = (crypto.randomUUID ? crypto.randomUUID() : 
+        'sp-' + Date.now() + '-' + Math.random().toString(36).substring(2, 9));
       if (r._is_header && r.pay_date) {
-        const y = String(r.pay_date).substring(0, 4);
-        if (/^\d{4}$/.test(y)) years.add(parseInt(y));
+        const y = parseInt(String(r.pay_date).substring(0, 4));
+        if (!isNaN(y)) groupYearMap[r._group_id] = y;
       }
     });
+    
+    // Detect years from headers
+    const years = new Set(Object.values(groupYearMap));
     const yearList = [...years].sort();
     
     if (yearList.length === 0) {
@@ -30724,61 +30787,79 @@ async function renderSpRecon(el) {
     
     const headerCount = spV2State.mainRows.filter(r => r._is_header).length;
     const billCount = spV2State.mainRows.length - headerCount;
-    const yearStr = yearList.length === 1 ? `ปี ${yearList[0]}` : `${yearList.length} ปี (${yearList.join(', ')})`;
+    
+    // ⭐ Check dirty rows — เฉพาะ rows ที่มี _dirty = true จะถูก push
+    //    ถ้าครั้งแรก (ทั้งหมด dirty=undefined) → push ทั้งหมด
+    //    ถ้าหลังครั้งแรก → push เฉพาะที่แก้
+    const allDirty = !spV2State.mainRows.some(r => r._dirty === false);
+    const dirtyRows = allDirty 
+      ? spV2State.mainRows.slice() 
+      : spV2State.mainRows.filter(r => r._dirty);
+    
+    if (dirtyRows.length === 0) {
+      toast('ℹ️ ไม่มีข้อมูลที่แก้ไข — ไม่ต้องบันทึก', 'info', 3000);
+      return;
+    }
+    
+    const isFirstSave = allDirty;
+    const action = isFirstSave 
+      ? `บันทึกทั้งหมด ${spV2State.mainRows.length} แถว (${headerCount} SP + ${billCount} bills)` 
+      : `บันทึกเฉพาะที่แก้ ${dirtyRows.length} แถว (เร็วกว่าเดิม ~10x)`;
     
     if (!confirm(
       `☁️ บันทึก SP Recon ขึ้น Google Sheet?\n\n` +
-      `ข้อมูล: ${headerCount} SP + ${billCount} bills (รวม ${spV2State.mainRows.length} แถว)\n` +
+      `${action}\n` +
       `เก็บใน: sp_recon_${yearList[0]}${yearList.length>1?` ถึง sp_recon_${yearList[yearList.length-1]}`:''}\n\n` +
-      `⚠️ ข้อมูล SP Recon เดิมใน ${yearStr} จะถูก <b>ลบทิ้ง</b> แล้วทับด้วยของใหม่\n\n` +
       `ดำเนินการต่อ?`
     )) return;
     
-    toast('☁️ กำลังบันทึก...', 'info', 30000);
+    toast(`☁️ กำลังบันทึก ${dirtyRows.length} แถว...`, 'info', 30000);
     let totalSaved = 0;
     let errors = [];
+    const tStart = Date.now();
     
     try {
-      // Group rows by year of pay_date (header) — bills inherit year from their group's header
+      // Group dirty rows by year (using header's _group_id → year map)
       const byYear = {};
       yearList.forEach(y => byYear[y] = []);
       
-      // First pass: assign year to each header
-      const groupYearMap = {}; // _group_id -> year
-      spV2State.mainRows.forEach(r => {
-        if (r._is_header && r.pay_date) {
-          const y = parseInt(String(r.pay_date).substring(0, 4));
-          if (!isNaN(y)) groupYearMap[r._group_id] = y;
-        }
-      });
-      
-      // Second pass: route rows to year buckets
-      spV2State.mainRows.forEach(r => {
+      dirtyRows.forEach(r => {
         const y = groupYearMap[r._group_id];
         if (y && byYear[y]) byYear[y].push(r);
       });
-      
-      const by = (window.currentUser?.display_name) || 'Admin';
       
       for (const year of yearList) {
         const rows = byYear[year];
         if (!rows || rows.length === 0) continue;
         
-        const r = await api('saveSpRecon', { year: year, rows: rows, by: by });
+        // ⭐ Use upsertSpRecon (selective by sp_uuid) — เร็วเทียบเท่า upsertBills
+        const r = await api('upsertSpRecon', { 
+          year: year, 
+          records: rows.map(rr => {
+            // Map _is_header → 'Y'/'N' for sheet (string-safe)
+            return Object.assign({}, rr, { _is_header: rr._is_header ? 'Y' : 'N' });
+          }), 
+          deletes: [] 
+        });
         if (r?.success === false) {
           errors.push(`ปี ${year}: ${r.error || 'unknown'}`);
         } else {
-          totalSaved += (r?.saved || rows.length);
+          totalSaved += (r?.upserted || r?.saved || rows.length);
         }
       }
       
+      const elapsed = ((Date.now() - tStart) / 1000).toFixed(1);
+      
       if (errors.length > 0) {
-        toast(`⚠ บันทึกบางส่วน — ${totalSaved} แถว · errors: ${errors.join('; ')}`, 'warn', 8000);
+        toast(`⚠ บันทึกบางส่วน — ${totalSaved} แถว (${elapsed}s) · errors: ${errors.join('; ')}`, 'warn', 8000);
       } else {
-        toast(`✅ บันทึกสำเร็จ — ${totalSaved} แถว ใน ${yearList.length} ปี`, 'success', 5000);
+        // ⭐ Clear dirty flags หลัง save success
+        spV2State.mainRows.forEach(r => { r._dirty = false; });
+        persistSpV2();
+        toast(`✅ บันทึกสำเร็จ — ${totalSaved} แถว · ${elapsed}s`, 'success', 5000);
       }
     } catch(err) {
-      console.error('[saveSpRecon] error:', err);
+      console.error('[upsertSpRecon] error:', err);
       toast(`❌ บันทึกล้มเหลว: ${err.message || err}`, 'error', 8000);
     }
   });
@@ -30816,6 +30897,8 @@ async function renderSpRecon(el) {
       }
       
       spV2State.mainRows = rows;
+      // ⭐ 8/5/26 — Mark all rows clean หลัง load (ไม่ต้อง re-push ทันที)
+      spV2State.mainRows.forEach(r => { r._dirty = false; });
       spV2State.reportGenerated = rows.some(r => r._is_header && r.sp_number && r.sp_number.startsWith('SP' + year));
       persistSpV2();
       
@@ -30872,6 +30955,28 @@ async function renderSpRecon(el) {
   el.querySelectorAll('[data-fpaid]').forEach(b => b.addEventListener('click', () => {
     spV2State.filterPaid = b.dataset.fpaid; renderSpRecon(el);
   }));
+  
+  // ⭐ 8/5/26 — Match status filter
+  el.querySelectorAll('[data-fmatch]').forEach(b => b.addEventListener('click', () => {
+    spV2State.filterMatchStmt = b.dataset.fmatch;
+    renderSpRecon(el);
+  }));
+  
+  // ⭐ 8/5/26 — Clear match results
+  document.getElementById('spv2-btn-clear-match')?.addEventListener('click', () => {
+    if (!confirm('ล้างผลการ Match ทั้งหมด? (ข้อมูลอื่นยังอยู่)')) return;
+    spV2State.matchSummary = null;
+    spV2State.filterMatchStmt = 'ALL';
+    spV2State.mainRows.forEach(r => {
+      if (r._is_header) {
+        r._match_status = '';
+        r._matched_stmt_uuid = '';
+      }
+    });
+    persistSpV2();
+    toast('✓ ล้างผลการ Match แล้ว', 'success');
+    renderSpRecon(el);
+  });
   
   // ⭐ Month filter wire (5/6/26)
   el.querySelectorAll('.spv2-month-btn').forEach(b => b.addEventListener('click', () => {
@@ -31015,11 +31120,21 @@ function spV2RenderMainTable(rows) {
       : '';
     
     // Match status badge for header rows (Y only — N rows skipped during match)
+    //   ⭐ 8/5/26 — bigger badge + tooltip with stmt details
     const matchBadge = (isHdr && r._match_status) ? (
       r._match_status === 'matched'
-        ? `<span title="match กับ statement (cross-check)" style="display:inline-block;padding:2px 6px;background:rgba(63,196,143,.18);color:var(--success);border:1px solid var(--success);border-radius:3px;font-size:.65rem;font-weight:700;margin-right:3px">✓</span>`
-        : `<span title="ไม่ตรง statement" style="display:inline-block;padding:2px 6px;background:rgba(239,87,87,.12);color:var(--danger);border:1px solid var(--danger);border-radius:3px;font-size:.65rem;font-weight:700;margin-right:3px">✗</span>`
+        ? `<span title="✓ ตรงกับ Bank Statement (uuid: ${r._matched_stmt_uuid || 'N/A'})" 
+            style="display:inline-block;padding:3px 10px;background:rgba(63,196,143,.22);color:var(--success);border:1.5px solid var(--success);border-radius:12px;font-size:.72rem;font-weight:700;margin-right:6px;letter-spacing:.5px">✓ MATCHED</span>`
+        : `<span title="✗ ไม่พบ Bank Statement ที่ตรง — ตรวจดูว่าได้รับเงินจริงไหม / amount ตรงไหม / วันใกล้เคียงไหม" 
+            style="display:inline-block;padding:3px 10px;background:rgba(239,87,87,.18);color:var(--danger);border:1.5px solid var(--danger);border-radius:12px;font-size:.72rem;font-weight:700;margin-right:6px;letter-spacing:.5px;animation:spv2-pulse-warn 2s ease-in-out infinite">✗ NO MATCH</span>`
     ) : '';
+    
+    // ⭐ 8/5/26 — Tint entire row by match status (Y headers only)
+    let matchRowTint = '';
+    if (isHdr && r.vat_flag === 'Y' && r._match_status) {
+      if (r._match_status === 'matched') matchRowTint = 'border-left:4px solid var(--success);';
+      else if (r._match_status === 'no_match') matchRowTint = 'border-left:4px solid var(--danger);background:rgba(239,87,87,.05) !important;';
+    }
     
     // Action buttons
     const actionCell = isHdr 
@@ -31027,7 +31142,7 @@ function spV2RenderMainTable(rows) {
       : `<button class="spv2-bill-edit" data-idx="${origIdx}" title="แก้บิล" style="background:transparent;border:1px solid var(--border);padding:2px 6px;border-radius:3px;cursor:pointer;font-size:.7rem;margin-right:2px">✏️</button><button class="spv2-bill-delete" data-idx="${origIdx}" title="ลบบิล" style="background:transparent;border:1px solid var(--danger);color:var(--danger);padding:2px 6px;border-radius:3px;cursor:pointer;font-size:.7rem">🗑</button>`;
     
     const rowHtml = `
-      <tr style="font-size:.75rem;${rowBg};${isHdr?'font-weight:600':''}">
+      <tr style="font-size:.75rem;${rowBg};${matchRowTint}${isHdr?'font-weight:600':''}">
         <td style="text-align:center;padding:4px 6px">${chevron} ${r.seq}</td>
         <td style="text-align:center;padding:4px 6px">
           <span class="spv2-vat-cell" data-idx="${origIdx}" 
@@ -31414,6 +31529,12 @@ function spV2MatchWithStatements() {
       noMatch++;
     }
   });
+  
+  // ⭐ 8/5/26 — Save summary for display
+  spV2State.matchSummary = {
+    matched: matched, noMatch: noMatch, skipped: skipped,
+    ranAt: new Date().toISOString(),
+  };
   
   persistSpV2();
   toast(`✓ Match สำเร็จ — ตรง ${matched} ใบ · ไม่ตรง ${noMatch} ใบ · ข้าม N ${skipped} ใบ`, matched > 0 ? 'success' : 'warn', 6000);
