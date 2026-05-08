@@ -31237,6 +31237,13 @@ function spV2RenderMainTable(rows) {
         return `<span title="⚠️ SP มี OS/SS/JS ปนกับ OR/SR/JR (ซื้อสด+ซื้อเชื่อ) — ผิดปกติ ตรวจสอบ! (${detail})" 
             style="display:inline-block;padding:3px 10px;background:rgba(245,158,11,.18);color:var(--warn);border:1.5px solid var(--warn);border-radius:12px;font-size:.72rem;font-weight:700;margin-right:6px;letter-spacing:.5px;animation:spv2-pulse-warn 2s ease-in-out infinite">⚠️ MIXED</span>`;
       }
+      // no_match — ตรวจ uuid ว่าเป็น data_error ไหม
+      const isDataError = String(r._matched_stmt_uuid || '').startsWith('data_error:');
+      if (isDataError) {
+        const detail = String(r._matched_stmt_uuid).replace(/^data_error:/, '');
+        return `<span title="🐛 ข้อมูลผิดใน Smart software: ${detail} — ยอดโอน > รวมชำระจริง ต้องแก้ใน Smart แล้ว export ใหม่" 
+            style="display:inline-block;padding:3px 10px;background:rgba(245,158,11,.18);color:var(--warn);border:1.5px solid var(--warn);border-radius:12px;font-size:.72rem;font-weight:700;margin-right:6px;letter-spacing:.5px;animation:spv2-pulse-warn 2s ease-in-out infinite">🐛 DATA ERROR</span>`;
+      }
       return `<span title="✗ ไม่พบ Bank Statement ที่ตรง — ตรวจดูว่าได้รับเงินจริงไหม / amount ตรงไหม / วันใกล้เคียงไหม" 
             style="display:inline-block;padding:3px 10px;background:rgba(239,87,87,.18);color:var(--danger);border:1.5px solid var(--danger);border-radius:12px;font-size:.72rem;font-weight:700;margin-right:6px;letter-spacing:.5px;animation:spv2-pulse-warn 2s ease-in-out infinite">✗ NO MATCH</span>`;
     })() : '';
@@ -31636,6 +31643,17 @@ function spV2MatchWithStatements() {
       r._match_status = '';
       r._matched_stmt_uuid = '';
       skipped++;
+      return;
+    }
+    
+    // ⭐ 8/5/26 — Data integrity check: transfer_amt ต้อง ≤ pay_total
+    //   เคส SP00126-000785: pay_total=14,929 แต่ transfer_amt=71,271.50 → ลง Smart ผิด
+    //   ถ้า transfer > pay_total + ค่า fudge เล็กๆ (1 บาท กัน rounding) → no_match
+    //   Toppy ต้องไปแก้ใน Smart software → re-export → re-match
+    if (transferAmt > payTotal + 1) {
+      r._match_status = 'no_match';
+      r._matched_stmt_uuid = `data_error:transfer(${transferAmt.toFixed(2)})>total(${payTotal.toFixed(2)})`;
+      noMatch++;
       return;
     }
     
