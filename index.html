@@ -2988,7 +2988,7 @@ const syncManager = {
                         (b.due_date || '');
           }
           const fp = this._fp(billList.length + ':' + fpParts.join(';'));
-          if (fp === this._fpCache.bills) { results.skipped++; continue; }
+          if (fp === this._fpCache.bills) { results.skipped++; this.dirty.delete('bills'); continue; }
           
           // ── UUID-based upsert (ไม่ทำให้ sheet บวม) ──
           // Gen uuid ให้บิลที่ยังไม่มี (บิลใหม่ที่เพิ่งเพิ่ม)
@@ -3180,7 +3180,7 @@ const syncManager = {
                         (s.match_method || '');
           }
           const fp = this._fp(allStmts.length + ':' + fpParts.join(';'));
-          if (fp === this._fpCache.stmts) { results.skipped++; continue; }
+          if (fp === this._fpCache.stmts) { results.skipped++; this.dirty.delete('stmts'); continue; }
           
           // ── UUID-based upsert ──
           allStmts.forEach(s => {
@@ -3311,7 +3311,7 @@ const syncManager = {
         } else if (type === 'payments') {
           if (paymentList.length === 0) continue;
           const fp = this._fp({n: paymentList.length, first: paymentList[0]?.sp_no, last: paymentList[paymentList.length-1]?.sp_no});
-          if (fp === this._fpCache.payments) { results.skipped++; continue; }
+          if (fp === this._fpCache.payments) { results.skipped++; this.dirty.delete('payments'); continue; }
           const r = await api('savePayments', { payments: paymentList, created_by: by });
           if (r?.success === false) throw new Error(r.error || 'API error');
           this._fpCache.payments = fp;
@@ -3342,6 +3342,7 @@ const syncManager = {
           if (fp === this._fpCache.sp_temps) { 
             console.log('[sp_temps push] SKIPPED — fp matches cache');
             results.skipped++; 
+            this.dirty.delete('sp_temps');
             continue; 
           }
           
@@ -3368,7 +3369,7 @@ const syncManager = {
         } else if (type === 'cashflow') {
           if (cashflowList.length === 0) continue;
           const fp = this._fp({n: cashflowList.length, first: cashflowList[0]?.id, last: cashflowList[cashflowList.length-1]?.id});
-          if (fp === this._fpCache.cashflow) { results.skipped++; continue; }
+          if (fp === this._fpCache.cashflow) { results.skipped++; this.dirty.delete('cashflow'); continue; }
           const r = await api('saveCashflow', { records: cashflowList, created_by: by });
           if (r?.success === false) throw new Error(r.error || 'API error');
           this._fpCache.cashflow = fp;
@@ -3376,7 +3377,7 @@ const syncManager = {
           this._emit();
         } else if (type === 'suppliers') {
           const fp = this._fp({sup: supplierList.length, pay: supplierPayments.length});
-          if (fp === this._fpCache.suppliers) { results.skipped++; continue; }
+          if (fp === this._fpCache.suppliers) { results.skipped++; this.dirty.delete('suppliers'); continue; }
           if (supplierList.length > 0) {
             const r = await api('saveSuppliers', { records: supplierList, created_by: by });
             if (r?.success === false) throw new Error(r.error || 'API error');
@@ -3398,6 +3399,7 @@ const syncManager = {
           if (fp === this._fpCache.meta) {
             console.log('[meta push] SKIPPED — fp matches cache (no changes detected)');
             results.skipped++;
+            this.dirty.delete('meta');
             continue;
           }
           
