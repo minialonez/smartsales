@@ -2811,6 +2811,48 @@ const syncManager = {
       }
       return this._fp(allStmts.length + ':' + fpParts.join(';'));
     }
+    // ⭐ 12/5/26 Round 7 (CIC P7 final fix): support 5 remaining types
+    //    เก่า: return null → fpAndMark fallback to markDirty (causes leak)
+    //    ใหม่: ใช้ logic เดียวกับใน _flushPush fp checks → fpAndMark detect ได้
+    if (type === 'payments') {
+      return this._fp({
+        n: paymentList.length,
+        first: paymentList[0]?.sp_no,
+        last: paymentList[paymentList.length-1]?.sp_no
+      });
+    }
+    if (type === 'sp_temps') {
+      const delNos = window.deletedSpTempNos ? [...window.deletedSpTempNos] : [];
+      return this._fp({
+        n: spTempList.length,
+        billHash: spTempList.map(t => (t.bills||[]).map(b => 
+          `${b.sb_no||''}|${b.bill_no||''}|${b.bill_type||''}|${b.bill_amount||0}`
+        ).sort().join(',')),
+        partialHash: spTempList.map(t => 
+          (t.partials||[]).map(p => 
+            `${p.partial_uuid||''}|${p.sb_no||''}|${p.amount||0}|${p.pay_date||''}|${p.type||''}|${p.match_status||''}|${p.matched_stmt_uuid||''}`
+          ).sort().join(',')
+        ),
+        master: spTempList.map(t => `${t.no}|${t.customer||''}|${t.expected_total||0}|${t.status||''}|${t.linked_sp||''}|${t.notes||''}`),
+        del: delNos
+      });
+    }
+    if (type === 'cashflow') {
+      return this._fp({
+        n: cashflowList.length,
+        first: cashflowList[0]?.id,
+        last: cashflowList[cashflowList.length-1]?.id
+      });
+    }
+    if (type === 'suppliers') {
+      return this._fp({
+        sup: supplierList.length,
+        pay: supplierPayments.length
+      });
+    }
+    if (type === 'meta') {
+      return this._fp({ summary: mainSummary, cash_count: cashCount });
+    }
     return null;
   },
   
