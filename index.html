@@ -18648,24 +18648,49 @@ async function loadAllFromCloud(opts) {
     //    เดิม: threshold 10% ของ before — drop 28 ใบจาก 10715 = 0.26% → ผ่าน → ข้อมูลหาย
     //    ใหม่: ตรวจ drop จาก high-water ด้วย — drop > 5 ใบ → ABORT swap (เหมือน _flushPush guard)
     //    +95% threshold เพื่อกัน swap ตอน cloud ยังไม่ propagate ข้อมูลใหม่
+    // ⭐ 11/5/26 — Patch 5 (CIA): ATOMIC + STRICT drop threshold
+    //    CIA observed live: bills drop=1 ผ่าน (≤5) → 160 bills' match_status cleared (data loss)
+    //    Fix: drop≥1 on EITHER bills OR stmts → ABORT BOTH (atomic — bills/stmts mutate together)
+    //    Tradeoff: false-positive abort หลัง user delete bills (highWater monotonic)
+    //              → acceptable เพราะ skip swap = local intact (no data loss)
+    //              → resolve ได้ผ่าน manual reload (mode='force', reason='manual-*')
     const highWaterBills = window._billsPushHighWater || 0;
     const highWaterStmts = window._stmtsPushHighWater || 0;
     const dropFromHighBills = highWaterBills - tempBills.length;
     const dropFromHighStmts = highWaterStmts - totalStmts;
     
-    const swapBills = (beforeBillsCount === 0) 
-      || (dropFromHighBills <= 5 && tempBills.length >= beforeBillsCount * 0.95);
-    const swapStmts = (beforeStmtsCount === 0) 
-      || (dropFromHighStmts <= 5 && totalStmts >= beforeStmtsCount * 0.95);
+    // First-load case: never pushed yet (highWater still 0) — must allow initial seed
+    const isFirstLoad = highWaterBills === 0 && highWaterStmts === 0;
+    
+    // ⭐ STRICT: any drop ≥1 = stale cloud snapshot (Google Apps Script propagation lag)
+    const STALE_DROP_THRESHOLD = 1;
+    const billsStale = !isFirstLoad && dropFromHighBills >= STALE_DROP_THRESHOLD;
+    const stmtsStale = !isFirstLoad && dropFromHighStmts >= STALE_DROP_THRESHOLD;
+    
+    // ⭐ ATOMIC: ถ้า bills หรือ stmts stale → ABORT BOTH (bills/stmts mutate together
+    //          เช่น match operation อัปเดต stmts.match_bill + bills.matched_stmt_uuid ทั้งคู่)
+    const atomicStale = billsStale || stmtsStale;
+    
+    // 95% threshold ยังอยู่ — defense in depth (กัน massive cloud failure)
+    const swapBills = !atomicStale && (beforeBillsCount === 0 || tempBills.length >= beforeBillsCount * 0.95);
+    const swapStmts = !atomicStale && (beforeStmtsCount === 0 || totalStmts >= beforeStmtsCount * 0.95);
     
     const skipReasons = [];
-    if (!swapBills) {
-      skipReasons.push(`Bills ${tempBills.length} (high-water ${highWaterBills}, drop ${dropFromHighBills})`);
-      console.warn(`[loadAllFromCloud] ABORT bills swap: tempBills=${tempBills.length} highWater=${highWaterBills} drop=${dropFromHighBills} before=${beforeBillsCount}`);
-    }
-    if (!swapStmts) {
-      skipReasons.push(`Stmts ${totalStmts} (high-water ${highWaterStmts}, drop ${dropFromHighStmts})`);
-      console.warn(`[loadAllFromCloud] ABORT stmts swap: tempStmts=${totalStmts} highWater=${highWaterStmts} drop=${dropFromHighStmts} before=${beforeStmtsCount}`);
+    if (atomicStale) {
+      const reasons = [];
+      if (billsStale) reasons.push(`bills drop=${dropFromHighBills} (${tempBills.length}/${highWaterBills})`);
+      if (stmtsStale) reasons.push(`stmts drop=${dropFromHighStmts} (${totalStmts}/${highWaterStmts})`);
+      skipReasons.push(`ATOMIC ABORT (stale cloud): ${reasons.join(' · ')}`);
+      console.warn(`🚨 [loadAllFromCloud] ATOMIC ABORT both swaps — STALE cloud snapshot detected: ${reasons.join(' | ')} · reason=${reason}`);
+    } else {
+      if (!swapBills) {
+        skipReasons.push(`Bills ${tempBills.length} < 95% of before ${beforeBillsCount}`);
+        console.warn(`[loadAllFromCloud] ABORT bills swap (95% rule): tempBills=${tempBills.length} before=${beforeBillsCount}`);
+      }
+      if (!swapStmts) {
+        skipReasons.push(`Stmts ${totalStmts} < 95% of before ${beforeStmtsCount}`);
+        console.warn(`[loadAllFromCloud] ABORT stmts swap (95% rule): tempStmts=${totalStmts} before=${beforeStmtsCount}`);
+      }
     }
     
     if (skipReasons.length > 0 && !silent) {
