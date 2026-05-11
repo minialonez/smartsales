@@ -4305,16 +4305,27 @@ function persistMainState() {
           }
           if (fp !== sm._fpCache[type]) {
             sm.markDirty(type);
+          } else {
+            // ⭐ 12/5/26 Round 6 fix (CIA P7 leak):
+            //    data == last pushed fp → ไม่มีอะไรเปลี่ยน → clear stale dirty
+            //    เคสนี้เกิดเมื่อ persistMainState ถูกเรียกซ้ำๆ (render, เปลี่ยนวันที่ดู ฯลฯ)
+            //    โดย data ไม่เปลี่ยน — ก่อนหน้านี้ stale dirty ค้างไว้ทำให้ P1 guard DEFERRED pull
+            if (sm.dirty.has(type)) {
+              sm.dirty.delete(type);
+            }
           }
-          // ถ้า fp เท่าเดิม → ไม่ mark (data unchanged)
         } catch(e) {
           sm.markDirty(type); // fallback safe
         }
       };
       
-      // bills + stmts ใช้ uuid tracking → safe ที่จะ mark (uuid set จะบอกว่ามีอะไรเปลี่ยนจริง)
-      sm.markDirty('bills');
-      sm.markDirty('stmts');
+      // ⭐ 12/5/26 Round 6 fix: bills/stmts ก็ใช้ fp check แทน unconditional mark
+      //    เก่า: sm.markDirty('bills') + sm.markDirty('stmts') — ทุก render → stale dirty
+      //    P1 guard `billsHasRealDirty = dirty.has('bills') && dirtyBillUuidsCount > 0`
+      //    เคยกันได้ — แต่ otherDirty (payments/sp_temps/etc.) ไม่มี uuid check → leak
+      //    ใหม่: bills/stmts ก็ใช้ fp check → no spurious mark
+      fpAndMark('bills');
+      fpAndMark('stmts');
       // type อื่น ใช้ fp check เพื่อกัน stale
       ['payments', 'sp_temps', 'cashflow', 'suppliers', 'meta'].forEach(fpAndMark);
     }
