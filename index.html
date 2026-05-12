@@ -3936,6 +3936,8 @@ const syncManager = {
         let healedBills = 0;
         billList.forEach(b => {
           if (!b.bill_no) return;
+          // ⭐ 12/5/26 — Skip SP-prefix bills (SP recon manages match data independently)
+          if (/^SP/i.test(b.bill_no)) return;
           const stmt = stmtByBillNo[b.bill_no];
           if (stmt && b.match_status !== 'paid' && b.match_status !== 'void') {
             b.match_status = 'paid';
@@ -5194,6 +5196,12 @@ async function restoreMainState() {
       //   - Refund: user ต้องกรอกเองเพื่อบอกวิธีคืน (Cash/KTB/KBANK/etc.)
       if (b.type === 'Cash' || b.type === 'Refund') return;
       
+      // ⭐ 12/5/26 — Skip SP-prefix bills (SP recon manages match data independently)
+      //   Bug: stmt อาจมี match_bill='SP00126-XXXX' จาก SP recon flow
+      //         → auto-sync เขียน confirmation เอง โดยไม่จำเป็น (SP recon ตั้ง confirmation เอง)
+      //   Fix: skip SP-prefix bills — preserves any blank confirmation that SP flow intentionally left blank
+      if (/^SP/i.test(String(b.bill_no || ''))) return;
+      
       // ถ้าบิลยัง pending แต่ statement บอก matched → sync
       if (b.match_status !== 'paid' && b.match_status !== 'void') {
         b.match_status = 'paid';
@@ -5294,6 +5302,8 @@ async function restoreMainState() {
           //    Fix: ใช้ array + iterate ทุก row + skip Cash/Refund
           matchingBills.forEach(b => {
           if (b.type === 'Cash' || b.type === 'Refund') return;
+          // ⭐ 12/5/26 — Skip SP-prefix bills (SP recon manages match data independently)
+          if (/^SP/i.test(String(b.bill_no || ''))) return;
           let touched = false;
           
           // Backfill match_status
