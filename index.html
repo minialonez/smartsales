@@ -18268,6 +18268,11 @@ function showApp() {
   //    No localStorage persistence for bills/stmts/meta — เปิดเว็บ = load fresh
   loadAllFromCloud({ silent: false, reason: 'login' });
   
+  // ⭐ 12/5/26 — Load company info from Sheet (cached for session)
+  if (typeof _loadCompanyInfo === 'function') {
+    _loadCompanyInfo();
+  }
+  
   // ⭐ Auto-load customer master (cache 24h, lightweight + ไม่กระทบ matching)
   (async () => {
     try {
@@ -20746,21 +20751,37 @@ async function renderBilling(el) {
   // ════════════════════════════════════════════════════════════════════
   // Print: Single SB (ใบวางบิล 1 ใบ)
   // ════════════════════════════════════════════════════════════════════
+  // ⭐ 12/5/26 — Company Info now backed by Sheet (persistent across users)
+  //    Cached in memory after first load — refreshed when user saves
+  let _companyInfoCache = null;
+  
   function _getCompanyInfo() {
-    try {
-      const raw = localStorage.getItem('sf_company_info');
-      if (raw) {
-        const c = JSON.parse(raw);
-        if (c && typeof c === 'object') return c;
-      }
-    } catch (_) {}
+    // Return cached version if available
+    if (_companyInfoCache && typeof _companyInfoCache === 'object') {
+      return _companyInfoCache;
+    }
+    // Fallback defaults — used only if cache is empty (before async load completes)
     return {
-      name: 'ตั้งค่าชื่อบริษัทใน "จัดการข้อมูล"',
-      address: 'ที่อยู่บริษัท',
-      phone: 'เบอร์โทรศัพท์',
-      tax_id: 'เลขผู้เสียภาษี',
-      bank_account: 'เลขบัญชีธนาคาร',
+      name: 'บริษัท จงกลณี การไฟฟ้า จำกัด',
+      address: '',
+      phone: '',
+      tax_id: '',
+      bank_vat: '909-0773029 กรุงไทย — บริษัท จงกลณี การไฟฟ้า จำกัด',
+      bank_novat: '266-4414113 กรุงเทพ — ณัฐพงค์ วรศักตยานันต์',
     };
+  }
+  
+  async function _loadCompanyInfo() {
+    try {
+      const r = await api('getCompanyInfo', {});
+      if (r?.success && r.data && typeof r.data === 'object') {
+        _companyInfoCache = r.data;
+        return r.data;
+      }
+    } catch (e) {
+      console.warn('[loadCompanyInfo] failed:', e?.message || e);
+    }
+    return _getCompanyInfo();
   }
   
   function _printHtml(bodyHtml, title) {
@@ -20897,8 +20918,32 @@ ${bodyHtml}
       </table>
       
       <div class="note">
-        กรุณาชำระเงินภายในวันที่ครบกำหนด · เลขบัญชีรับชำระ: ${co.bank_account}
+        กรุณาชำระเงินภายในวันที่ครบกำหนด
       </div>
+      
+      ${(() => {
+        // ⭐ 12/5/26 — Smart payment instructions (silent VAT/NOVAT detection)
+        //   Internal logic: SR/SC → bank_vat ; OR/JR → bank_novat
+        //   Customer-facing: ไม่บอกว่า VAT/NOVAT — แสดงเฉพาะเลขบัญชีที่ตรง logic
+        const hasVat = bills.some(b => /^(SR|SC)/i.test(String(b.bill_no || '')));
+        const hasNovat = bills.some(b => /^(OR|JR)/i.test(String(b.bill_no || '')));
+        
+        if (!hasVat && !hasNovat) return '';
+        
+        const accounts = [];
+        if (hasVat && co.bank_vat) accounts.push(co.bank_vat);
+        if (hasNovat && co.bank_novat) accounts.push(co.bank_novat);
+        if (accounts.length === 0) return '';
+        
+        return `
+          <div style="margin-top:16px;page-break-inside:avoid;border:1.5px solid #000;border-radius:6px;padding:12px 14px;background:#fafafa">
+            <div style="font-size:13px;font-weight:700;color:#000;margin-bottom:8px">💳 บัญชีรับโอน</div>
+            ${accounts.map(acc => `
+              <div style="font-size:14px;font-weight:700;color:#000;letter-spacing:0.3px;padding:4px 0">${acc}</div>
+            `).join('')}
+          </div>
+        `;
+      })()}
       
       <div class="footer">
         <div class="signature">
@@ -21000,9 +21045,37 @@ ${bodyHtml}
       </table>
       
       <div class="note">
-        เอกสารฉบับนี้ใช้สำหรับสรุปยอดค้างชำระ ณ วันที่ออกเอกสาร · กรุณาชำระเงินตามใบวางบิลแต่ละใบ<br>
-        เลขบัญชีรับชำระ: ${co.bank_account}
+        เอกสารฉบับนี้ใช้สำหรับสรุปยอดค้างชำระ ณ วันที่ออกเอกสาร · กรุณาชำระเงินตามใบวางบิลแต่ละใบ
       </div>
+      
+      ${(() => {
+        // ⭐ 12/5/26 — Smart bank logic for summary (analyze ALL SBs' bills_snapshot)
+        //   Internal logic: SR/SC → bank_vat ; OR/JR → bank_novat
+        //   Customer-facing: no VAT/NOVAT mention
+        let hasVat = false, hasNovat = false;
+        sbs.forEach(sb => {
+          const sbBills = Array.isArray(sb.bills_snapshot) ? sb.bills_snapshot : [];
+          sbBills.forEach(b => {
+            const bn = String(b.bill_no || '');
+            if (/^(SR|SC)/i.test(bn)) hasVat = true;
+            if (/^(OR|JR)/i.test(bn)) hasNovat = true;
+          });
+        });
+        
+        const accounts = [];
+        if (hasVat && co.bank_vat) accounts.push(co.bank_vat);
+        if (hasNovat && co.bank_novat) accounts.push(co.bank_novat);
+        if (accounts.length === 0) return '';
+        
+        return `
+          <div style="margin-top:16px;page-break-inside:avoid;border:1.5px solid #000;border-radius:6px;padding:12px 14px;background:#fafafa">
+            <div style="font-size:13px;font-weight:700;color:#000;margin-bottom:8px">💳 บัญชีรับโอน</div>
+            ${accounts.map(acc => `
+              <div style="font-size:14px;font-weight:700;color:#000;letter-spacing:0.3px;padding:4px 0">${acc}</div>
+            `).join('')}
+          </div>
+        `;
+      })()}
       
       <div class="footer">
         <div class="signature">
@@ -25437,40 +25510,6 @@ function renderData(el) {
         ${statCard('Statement', totalStmts, '', 'var(--purple)', ICONS.file)}
       </div>
       
-      <!-- Sync from Cloud Section (รวม Rebuild mode ผ่าน checkbox) -->
-      <div class="card mb-3" style="border:1.5px solid var(--success);background:rgba(45,212,160,.04)">
-        <div class="flex justify-between items-center">
-          <div>
-            <div class="font-semi" style="color:var(--success)">☁️ Sync ข้อมูลจาก Cloud (Google Sheet)</div>
-            <div class="text-xs text-muted mt-1">ดึง bills + statements + SP + cashflow + suppliers กลับมาที่ browser เครื่องนี้ · <strong>ใช้เมื่อเปิดเครื่องใหม่ หรือ browser ใหม่</strong></div>
-          </div>
-          <div class="flex gap-2 items-center">
-            <select class="select" id="sync-years" style="width:110px">
-              <option value="1">ปีนี้</option>
-              <option value="2" selected>2 ปี</option>
-              <option value="3">3 ปี</option>
-              <option value="5">5 ปี</option>
-            </select>
-            <button class="btn btn-primary btn-sm" id="btn-sync-cloud">☁️ ดึงข้อมูล</button>
-          </div>
-        </div>
-        <!-- Rebuild mode toggle (advanced) -->
-        <div style="margin-top:10px;padding-top:10px;border-top:1px dashed var(--border)">
-          <label class="flex items-center gap-2" style="cursor:pointer">
-            <input type="checkbox" id="chk-sync-rebuild" style="cursor:pointer;width:16px;height:16px">
-            <span class="text-xs">
-              <strong style="color:var(--danger)">🔄 ล้าง local ก่อน Sync (Rebuild mode)</strong>
-              — ใช้เมื่อข้อมูล local <strong>ซ้ำ</strong> หรือ <strong>พัง</strong> · 
-              <strong style="color:var(--warn)">⚠️ ข้อมูลที่ยังไม่ sync จะหาย — Backup JSON ก่อนทำ</strong>
-            </span>
-          </label>
-        </div>
-        <div id="sync-status" class="text-xs text-muted mt-2" style="display:none"></div>
-        <!-- Hidden Rebuild button (เก็บไว้ให้ event handler เดิมทำงาน — chk-sync-rebuild จะ trigger ผ่าน .click()) -->
-        <button id="btn-rebuild-local" style="display:none">hidden</button>
-        <div id="rebuild-status" class="text-xs text-muted mt-2" style="display:none;font-family:monospace;max-height:250px;overflow-y:auto;padding:10px;background:var(--surface2);border-radius:6px;white-space:pre-wrap"></div>
-      </div>
-      
       <!-- Daily Import Section -->
       <div class="card mb-3" style="border:1.5px solid var(--primary);background:rgba(91,124,250,.04)">
         <div class="flex justify-between items-center mb-3">
@@ -25492,84 +25531,6 @@ function renderData(el) {
         </p>
       </div>
       
-      <!-- Statements Reset Section -->
-      <div class="card mb-3" style="border:1.5px solid var(--warn);background:rgba(245,166,35,.04)">
-        <div class="flex justify-between items-center mb-3">
-          <div>
-            <div class="font-semi" style="color:var(--warn)">🏦 จัดการ Statements (Bank)</div>
-            <div class="text-xs text-muted mt-1">
-              จำนวนปัจจุบัน: <strong id="stmts-count-display">${(typeof getAllStatements==='function'?getAllStatements().length:0).toLocaleString()}</strong> รายการ
-              · ใช้ <strong>"ล้าง Statements ทั้งหมด"</strong> เมื่อข้อมูล <strong>ซ้ำ/บวม/พัง</strong> หรืออยาก <strong>เริ่มใหม่</strong>
-            </div>
-          </div>
-          <div class="flex gap-2">
-            <button class="btn btn-outline btn-sm" id="btn-compact-stmts" title="ลบ ghost empty rows ออกจากทุก stmts sheet">🔧 ซ่อม Sheet</button>
-            <button class="btn btn-sm" id="btn-clear-stmts-all" style="background:var(--warn);color:#1a1d27;border:none;font-weight:700">🗑 ล้าง Statements ทั้งหมด</button>
-          </div>
-        </div>
-        <p class="text-xs text-dim" style="padding:10px;background:rgba(239,87,87,.08);border-radius:6px;border-left:3px solid var(--danger)">
-          ⚠️ <strong>ล้างทั้ง Local + Sheet</strong> — Sheet stmts_YYYY (legacy) + stmts_&lt;BANK&gt;_YYYY (KTB/KBANK/BBL/BBL_NW/TTB) <strong>ทุกปี</strong> จะถูก delete (เก็บ header)<br>
-          ✅ ไม่แตะ: Bills, Daily, Cashflow, SP/PP, Match Log<br>
-          💡 <strong>"ซ่อม Sheet"</strong> = ลบเฉพาะ rows ว่าง (ghost) ที่ทำให้ append เพี้ยน — ไม่แตะข้อมูลจริง<br>
-          💡 หลังล้าง — ไปหน้า <strong>Matching</strong> → upload bank statement files ใหม่
-        </p>
-      </div>
-      
-      <!-- Match Integrity Repair Section -->
-      <div class="card mb-3" style="border:1.5px solid var(--info);background:rgba(91,124,250,.04)">
-        <div class="flex justify-between items-center mb-3">
-          <div>
-            <div class="font-semi" style="color:var(--info)">🔗 ตรวจสอบความตรงกัน Match (Bill ↔ Statement)</div>
-            <div class="text-xs text-muted mt-1">
-              ใช้เมื่อ <strong>ข้อมูลใน Sheet ไม่ตรงกัน</strong> เช่น bill says "paid" แต่ stmt says "unpaid"<br>
-              เกิดจาก match/unmatch ครั้งเก่าที่ push ไม่ครบ → ฝั่งหนึ่งเก่า ฝั่งหนึ่งใหม่
-            </div>
-          </div>
-          <div class="flex gap-2">
-            <button class="btn btn-outline btn-sm" id="btn-backfill-match-uuid" style="border-color:var(--success);color:var(--success)" title="Backfill matched_stmt_uuid จาก stmt — สำหรับ bills paid ที่ขาด FK link">🔗 Backfill Match UUID</button>
-            <button class="btn btn-outline btn-sm" id="btn-scan-match-integrity" style="border-color:var(--info);color:var(--info)">🔍 ตรวจสอบ</button>
-          </div>
-        </div>
-        <p class="text-xs text-dim" style="padding:10px;background:rgba(91,124,250,.08);border-radius:6px;border-left:3px solid var(--info)">
-          ✅ <strong>Scan-only</strong> — รายงานก่อน ไม่แก้อัตโนมัติ — ผู้ใช้เลือกได้ว่าจะ repair แบบไหน<br>
-          🔧 ตัวเลือก repair: <strong>Unlink ทั้งคู่</strong> (กลับเป็น unpaid) หรือ <strong>Sync ทั้งคู่ไป paid</strong> (ถือว่า match แล้ว)<br>
-          ☁️ หลัง repair ต้องกด "บันทึก" เพื่อ push ขึ้น cloud
-        </p>
-      </div>
-      
-      <!-- ⭐ Company Info (5/6/26) — สำหรับ letterhead ใบวางบิล -->
-      <div class="card mb-3" style="border:1px solid var(--border)">
-        <div class="font-semi mb-2" style="color:var(--info)">🏢 ข้อมูลบริษัท (สำหรับ letterhead ใบวางบิล)</div>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
-          <div class="input-group" style="margin:0">
-            <label style="font-size:.8rem">ชื่อบริษัท</label>
-            <input class="input" id="ci-name" placeholder="บริษัท ตัวอย่าง จำกัด">
-          </div>
-          <div class="input-group" style="margin:0">
-            <label style="font-size:.8rem">เลขผู้เสียภาษี</label>
-            <input class="input" id="ci-tax-id" placeholder="0-0000-00000-00-0">
-          </div>
-          <div class="input-group" style="margin:0;grid-column:1/-1">
-            <label style="font-size:.8rem">ที่อยู่</label>
-            <input class="input" id="ci-address" placeholder="123 ถ.ตัวอย่าง อ.เมือง จ.นราธิวาส 96000">
-          </div>
-          <div class="input-group" style="margin:0">
-            <label style="font-size:.8rem">เบอร์โทรศัพท์</label>
-            <input class="input" id="ci-phone" placeholder="073-xxx-xxxx">
-          </div>
-          <div class="input-group" style="margin:0">
-            <label style="font-size:.8rem">เลขบัญชีรับชำระ</label>
-            <input class="input" id="ci-bank" placeholder="KBANK xxx-x-xxxxx-x">
-          </div>
-        </div>
-        <div style="display:flex;gap:8px;margin-top:10px;justify-content:flex-end">
-          <button type="button" class="btn btn-primary btn-sm" id="btn-save-company">💾 บันทึก</button>
-        </div>
-        <p class="text-xs text-dim" style="margin-top:8px">
-          ข้อมูลนี้บันทึกใน browser นี้เท่านั้น (ไม่ sync) — ต้องตั้งใหม่หากเปลี่ยน device
-        </p>
-      </div>
-      
       <!-- 🚫 Excluded from Sales (7/5/26) -->
       <div class="card mb-3" style="border:1.5px solid var(--warn);background:rgba(245,158,11,.04)">
         <div class="font-semi mb-2" style="color:var(--warn)">🚫 ลูกค้าที่ไม่นับยอดขาย</div>
@@ -25583,27 +25544,6 @@ function renderData(el) {
           <button type="button" class="btn btn-sm" id="btn-add-excl-cust" style="background:var(--warn);color:#000;border:none;font-weight:700">➕ เพิ่ม</button>
         </div>
         <div id="excl-cust-list" style="margin-top:10px;display:flex;flex-direction:column;gap:6px"></div>
-      </div>
-      
-      <!-- Meta Reset Section -->
-      <div class="card mb-3" style="border:1.5px solid var(--purple);background:rgba(165,134,255,.04)">
-        <div class="flex justify-between items-center mb-3">
-          <div>
-            <div class="font-semi" style="color:var(--purple)">🧾 จัดการ Meta (Daily Summary / Cash Count / Locks)</div>
-            <div class="text-xs text-muted mt-1">
-              ใช้เมื่อ <strong>ลบ rows ใน Sheet เองแล้ว data กลับมาเอง</strong> (เพราะ local-first sync UPSERT push เก่ากลับ)
-            </div>
-          </div>
-          <div class="flex gap-2">
-            <button class="btn btn-outline btn-sm" id="btn-fix-meta-uuids" style="border-color:var(--info);color:var(--info)" title="ซ่อม day↔month swap ใน meta (uuid_swap, col_swap, ghost rows)">🔧 ซ่อม Meta Swap</button>
-            <button class="btn btn-sm" id="btn-clear-meta-all" style="background:var(--purple);color:#fff;border:none;font-weight:700">🗑 ล้าง Meta ทั้งหมด</button>
-          </div>
-        </div>
-        <p class="text-xs text-dim" style="padding:10px;background:rgba(239,87,87,.08);border-radius:6px;border-left:3px solid var(--danger)">
-          ⚠️ <strong>ล้างทั้ง Local + Sheet</strong> — meta_YYYY ทุกปี (cash_count + summary + locks) จะถูก delete<br>
-          ⚠️ จะลบ: <strong>mainSummary, cashCount, locks (วัน lock ทั้งหมด)</strong> ใน local ด้วย<br>
-          ✅ ไม่แตะ: Bills, Statements, SP/PP, Cashflow, Suppliers
-        </p>
       </div>
       
       <!-- Backup Section -->
@@ -27794,39 +27734,9 @@ function renderData(el) {
       $input.onkeydown = (e) => { if (e.key === 'Enter') $btnAdd.click(); };
     })();
     
-    // ⭐ Company Info (5/6/26) — load + save
-    (function wireCompanyInfo() {
-      const fields = ['name','tax-id','address','phone','bank'];
-      const fieldKeys = { 'name':'name', 'tax-id':'tax_id', 'address':'address', 'phone':'phone', 'bank':'bank_account' };
-      // Load existing
-      let saved = {};
-      try { saved = JSON.parse(localStorage.getItem('sf_company_info') || '{}'); } catch(_) {}
-      fields.forEach(f => {
-        const inp = document.getElementById('ci-' + f);
-        if (inp && saved[fieldKeys[f]]) inp.value = saved[fieldKeys[f]];
-      });
-      // Save handler
-      const $save = document.getElementById('btn-save-company');
-      if ($save) {
-        $save.onclick = () => {
-          const data = {};
-          fields.forEach(f => {
-            const inp = document.getElementById('ci-' + f);
-            if (inp) data[fieldKeys[f]] = inp.value.trim();
-          });
-          if (!data.name) {
-            toast('⚠️ กรอกชื่อบริษัทก่อน', 'warn', 3000);
-            return;
-          }
-          try {
-            localStorage.setItem('sf_company_info', JSON.stringify(data));
-            toast('✅ บันทึกข้อมูลบริษัทแล้ว — ใช้ใน letterhead ใบวางบิล', 'success', 3000);
-          } catch (e) {
-            toast('❌ บันทึกไม่สำเร็จ: ' + e.message, 'error', 4000);
-          }
-        };
-      }
-    })();
+    // ⭐ Company Info (12/5/26): UI section removed — set directly in Sheet 'company_info' or code defaults
+    //   Backend endpoints (getCompanyInfo/saveCompanyInfo) ยังคงไว้ — print PDF ยังต้องใช้
+    
     
     // ── ซ่อม Meta UUID Swap (day↔month swap from Apps Script coercion) ──
     document.getElementById('btn-fix-meta-uuids')?.addEventListener('click', async () => {
