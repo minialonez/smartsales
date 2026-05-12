@@ -22003,101 +22003,215 @@ ${bodyHtml}
     const n = billingNotes.find(x => x.billing_uuid === uuid);
     if (!n) return;
     const today = todayISO();
+    const outstanding = Number(n.outstanding) || 0;
+    
+    // ⭐ 12/5/26 — Bulk payment: ลูกค้าจ่ายหลายงวด → บันทึก N rows ในครั้งเดียว
+    // Installment state: array of payment rows
+    let installments = [
+      { date: today, method: 'Cash', amount: outstanding, wht: 0, fee: 0, ref: '', remark: '' }
+    ];
+    
+    function renderInstallment(inst, idx) {
+      return `
+        <div class="bp-inst" data-idx="${idx}" style="padding:10px 12px;${idx > 0 ? 'border-top:1px solid var(--border);' : ''}">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+            <span style="font-size:12px;font-weight:500;color:var(--muted)">งวดที่ ${idx + 1}</span>
+            ${installments.length > 1 ? `<button class="bp-del" data-idx="${idx}" style="background:none;border:none;cursor:pointer;color:var(--muted);font-size:14px" title="ลบงวด">🗑</button>` : ''}
+          </div>
+          <div style="display:grid;grid-template-columns:120px 110px 1fr 90px 90px;gap:6px;align-items:center">
+            <input class="input bp-date" data-idx="${idx}" type="date" value="${inst.date}" style="font-size:12px;padding:4px 8px;height:30px">
+            <select class="input bp-method" data-idx="${idx}" style="font-size:12px;padding:4px 8px;height:30px">
+              <option value="Cash"${inst.method==='Cash'?' selected':''}>เงินสด</option>
+              <option value="Transfer"${inst.method==='Transfer'?' selected':''}>โอนเงิน</option>
+              <option value="Cheque"${inst.method==='Cheque'?' selected':''}>เช็ค</option>
+              <option value="Card"${inst.method==='Card'?' selected':''}>บัตร</option>
+            </select>
+            <input class="input bp-amount" data-idx="${idx}" type="number" placeholder="ยอด" value="${inst.amount}" step="0.01" style="font-size:12px;padding:4px 8px;height:30px;text-align:right">
+            <input class="input bp-wht" data-idx="${idx}" type="number" placeholder="WHT" value="${inst.wht}" step="0.01" style="font-size:12px;padding:4px 8px;height:30px;text-align:right">
+            <input class="input bp-fee" data-idx="${idx}" type="number" placeholder="ค่าธรรม" value="${inst.fee}" step="0.01" style="font-size:12px;padding:4px 8px;height:30px;text-align:right">
+          </div>
+          <input class="input bp-ref" data-idx="${idx}" placeholder="ref / remark (เช่น KTB 002-1234)" value="${inst.ref || ''}" style="font-size:12px;padding:4px 8px;height:28px;width:100%;margin-top:6px">
+        </div>
+      `;
+    }
+    
+    function totalsHtml() {
+      const sumAmount = installments.reduce((s, x) => s + (Number(x.amount) || 0), 0);
+      const sumWht = installments.reduce((s, x) => s + (Number(x.wht) || 0), 0);
+      const sumFee = installments.reduce((s, x) => s + (Number(x.fee) || 0), 0);
+      const sumPaid = sumAmount + sumWht + sumFee;
+      const newPaid = (n.paid_amount || 0) + sumPaid;
+      const newOut = Math.max(0, (n.total_amount || 0) - newPaid);
+      const status = newPaid >= (n.total_amount || 0) - 0.01 ? '✅ ชำระครบ' : (newPaid > 0 ? '🔵 ชำระบางส่วน' : '⏳ รอชำระ');
+      const isOverpay = sumPaid > outstanding + 0.01;
+      const isFull = newOut < 0.01;
+      
+      return `
+        <div style="background:${isOverpay ? 'rgba(239,68,68,0.1)' : 'rgba(91,124,250,0.08)'};border-radius:6px;padding:10px 12px;font-size:13px">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <span>รวมจ่ายครั้งนี้ (${installments.length} งวด)</span>
+            <strong>฿${fmtNum(sumPaid)}</strong>
+          </div>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-top:4px">
+            <span>คงเหลือหลังบันทึก</span>
+            <strong style="color:${isFull ? '#16a34a' : '#ef4444'}">฿${fmtNum(newOut)} (${status})</strong>
+          </div>
+          ${isOverpay ? `<div style="margin-top:6px;color:#ef4444;font-size:12px">⚠️ รวมเกินยอดคงเหลือ (฿${fmtNum(outstanding)}) — ตรวจสอบยอด</div>` : ''}
+        </div>
+      `;
+    }
+    
+    function listHtml() {
+      return installments.map(renderInstallment).join('');
+    }
     
     openModal('💵 รับชำระ — ' + n.billing_no, `
-      <div style="background:var(--bg-elev);padding:12px;border-radius:6px;margin-bottom:16px">
-        <div><strong>${n.cust_name}</strong></div>
-        <div style="margin-top:8px;display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;font-size:13px">
+      <div style="background:var(--bg-elev);padding:12px;border-radius:6px;margin-bottom:12px">
+        <div style="font-weight:500;margin-bottom:6px">${n.cust_name || ''}</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;font-size:13px">
           <div>ยอดรวม: <strong>฿${fmtNum(n.total_amount)}</strong></div>
-          <div>ชำระแล้ว: <strong style="color:#16a34a">฿${fmtNum(n.paid_amount)}</strong></div>
-          <div>คงเหลือ: <strong style="color:#ef4444">฿${fmtNum(n.outstanding)}</strong></div>
+          <div>จ่ายแล้ว: <strong style="color:#16a34a">฿${fmtNum(n.paid_amount)}</strong></div>
+          <div>คงเหลือ: <strong style="color:#ef4444">฿${fmtNum(outstanding)}</strong></div>
         </div>
       </div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">
-        <div>
-          <label style="font-size:12px;color:var(--muted)">วันที่รับชำระ</label>
-          <input class="input" type="date" id="pay-date" value="${today}" style="width:100%">
-        </div>
-        <div>
-          <label style="font-size:12px;color:var(--muted)">วิธีรับ</label>
-          <select class="input" id="pay-method" style="width:100%">
-            <option value="Cash">เงินสด</option>
-            <option value="Transfer">โอนเงิน</option>
-            <option value="Cheque">เช็ค</option>
-            <option value="Card">บัตรเครดิต</option>
-          </select>
-        </div>
-        <div>
-          <label style="font-size:12px;color:var(--muted)">ยอดที่รับ</label>
-          <input class="input" type="number" id="pay-amount" value="${n.outstanding}" step="0.01" style="width:100%">
-        </div>
-        <div>
-          <label style="font-size:12px;color:var(--muted)">WHT (หัก ณ ที่จ่าย)</label>
-          <input class="input" type="number" id="pay-wht" value="0" step="0.01" style="width:100%">
-        </div>
-        <div>
-          <label style="font-size:12px;color:var(--muted)">ค่าธรรมเนียม</label>
-          <input class="input" type="number" id="pay-fee" value="0" step="0.01" style="width:100%">
-        </div>
-        <div>
-          <label style="font-size:12px;color:var(--muted)">เลขอ้างอิง</label>
-          <input class="input" id="pay-ref" placeholder="เลขเช็ค / Ref no." style="width:100%">
-        </div>
-        <div style="grid-column:span 2">
-          <label style="font-size:12px;color:var(--muted)">หมายเหตุ</label>
-          <input class="input" id="pay-remarks" placeholder="" style="width:100%">
-        </div>
+      
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <span style="font-weight:500;font-size:13px">📋 รายการจ่าย</span>
+        <button class="btn btn-outline btn-sm" id="bp-add-inst">➕ เพิ่มงวด</button>
       </div>
-      <div id="pay-preview" style="background:var(--bg-elev);padding:8px;border-radius:4px;font-size:13px;margin-bottom:12px"></div>
+      
+      <div id="bp-list" style="border:1px solid var(--border);border-radius:6px;margin-bottom:12px;max-height:380px;overflow-y:auto">
+        ${listHtml()}
+      </div>
+      
+      <div id="bp-totals" style="margin-bottom:12px">${totalsHtml()}</div>
+      
       <div style="display:flex;gap:8px;justify-content:flex-end">
         <button class="btn btn-outline" onclick="closeModal()">ยกเลิก</button>
-        <button class="btn btn-primary" id="pay-submit">💾 บันทึกการชำระ</button>
+        <button class="btn btn-primary" id="bp-submit">💾 บันทึก <span id="bp-submit-count">${installments.length}</span> งวด</button>
       </div>
     `);
     
-    setTimeout(() => {
-      function updatePreview() {
-        const a = Number(document.getElementById('pay-amount').value) || 0;
-        const w = Number(document.getElementById('pay-wht').value) || 0;
-        const f = Number(document.getElementById('pay-fee').value) || 0;
-        const total = a + w + f;
-        const newPaid = (n.paid_amount||0) + total;
-        const newOut = Math.max(0, n.total_amount - newPaid);
-        const status = newPaid >= n.total_amount - 0.01 ? '✅ ชำระครบ' : (newPaid > 0 ? '🔵 ชำระบางส่วน' : '⏳ รอชำระ');
-        document.getElementById('pay-preview').innerHTML = `
-          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px">
-            <div>รวมรับ: <strong>฿${fmtNum(total)}</strong></div>
-            <div>คงเหลือใหม่: <strong style="color:${newOut>0?'#ef4444':'#16a34a'}">฿${fmtNum(newOut)}</strong></div>
-            <div>สถานะใหม่: <strong>${status}</strong></div>
-          </div>
-        `;
-      }
-      ['pay-amount','pay-wht','pay-fee'].forEach(id => {
-        const e = document.getElementById(id);
-        if (e) e.oninput = updatePreview;
-      });
-      updatePreview();
+    function wireRows() {
+      const list = document.getElementById('bp-list');
+      if (!list) return;
       
-      document.getElementById('pay-submit').onclick = async () => {
-        const amount = Number(document.getElementById('pay-amount').value) || 0;
-        if (amount <= 0) { toast('กรุณาใส่ยอดที่ชำระ', 'error'); return; }
-        const r = await api('recordBillingPayment', {
-          billing_uuid: uuid,
-          amount,
-          wht_amount: Number(document.getElementById('pay-wht').value) || 0,
-          fee_amount: Number(document.getElementById('pay-fee').value) || 0,
-          payment_date: document.getElementById('pay-date').value,
-          payment_method: document.getElementById('pay-method').value,
-          reference: document.getElementById('pay-ref').value,
-          remarks: document.getElementById('pay-remarks').value,
-          action_by: currentUser?.username || 'system',
+      // Input handlers — sync state from inputs
+      list.querySelectorAll('.bp-date, .bp-method, .bp-amount, .bp-wht, .bp-fee, .bp-ref').forEach(el => {
+        el.addEventListener('input', () => {
+          const idx = Number(el.dataset.idx);
+          if (idx < 0 || idx >= installments.length) return;
+          const inst = installments[idx];
+          if (el.classList.contains('bp-date'))    inst.date = el.value;
+          if (el.classList.contains('bp-method'))  inst.method = el.value;
+          if (el.classList.contains('bp-amount'))  inst.amount = Number(el.value) || 0;
+          if (el.classList.contains('bp-wht'))     inst.wht = Number(el.value) || 0;
+          if (el.classList.contains('bp-fee'))     inst.fee = Number(el.value) || 0;
+          if (el.classList.contains('bp-ref'))     inst.ref = el.value;
+          // Refresh totals only (don't re-render rows — keeps focus)
+          const totEl = document.getElementById('bp-totals');
+          if (totEl) totEl.innerHTML = totalsHtml();
         });
-        if (r && r.success) {
-          toast(`✅ บันทึกการชำระ ฿${fmtNum(amount)} — ${r.data.new_status==='paid'?'ครบแล้ว':'คงเหลือ ฿'+fmtNum(r.data.outstanding)}`, 'success');
-          closeModal();
-          await refresh();
-        } else {
-          toast(r?.error || 'บันทึกไม่สำเร็จ', 'error');
+      });
+      
+      // Delete row handlers
+      list.querySelectorAll('.bp-del').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const idx = Number(btn.dataset.idx);
+          if (idx < 0 || idx >= installments.length) return;
+          installments.splice(idx, 1);
+          rerender();
+        });
+      });
+    }
+    
+    function rerender() {
+      const list = document.getElementById('bp-list');
+      if (list) list.innerHTML = listHtml();
+      const tot = document.getElementById('bp-totals');
+      if (tot) tot.innerHTML = totalsHtml();
+      const cnt = document.getElementById('bp-submit-count');
+      if (cnt) cnt.textContent = installments.length;
+      wireRows();
+    }
+    
+    setTimeout(() => {
+      wireRows();
+      
+      // Add installment button
+      const addBtn = document.getElementById('bp-add-inst');
+      if (addBtn) addBtn.onclick = () => {
+        // Auto-fill: new row inherits previous date, method='Transfer', amount=remaining
+        const last = installments[installments.length - 1] || {};
+        const sumSoFar = installments.reduce((s, x) => s + (Number(x.amount) || 0) + (Number(x.wht) || 0) + (Number(x.fee) || 0), 0);
+        const remaining = Math.max(0, outstanding - sumSoFar);
+        installments.push({
+          date: last.date || today,
+          method: 'Transfer',
+          amount: remaining,
+          wht: 0, fee: 0, ref: '', remark: '',
+        });
+        rerender();
+      };
+      
+      // Submit handler
+      const submitBtn = document.getElementById('bp-submit');
+      if (submitBtn) submitBtn.onclick = async () => {
+        // Validate: filter rows with amount > 0
+        const validRows = installments.filter(x => (Number(x.amount) || 0) > 0);
+        if (validRows.length === 0) {
+          toast('ไม่มีงวดที่มียอด > 0', 'error');
+          return;
+        }
+        
+        // Disable button + show progress
+        submitBtn.disabled = true;
+        const origText = submitBtn.innerHTML;
+        submitBtn.textContent = '⏳ กำลังบันทึก...';
+        
+        let okCount = 0;
+        let lastResp = null;
+        let firstError = null;
+        try {
+          // Loop sequentially (preserves order + status accumulation)
+          for (let i = 0; i < validRows.length; i++) {
+            const x = validRows[i];
+            const r = await api('recordBillingPayment', {
+              billing_uuid: uuid,
+              amount: Number(x.amount) || 0,
+              wht_amount: Number(x.wht) || 0,
+              fee_amount: Number(x.fee) || 0,
+              payment_date: x.date,
+              payment_method: x.method,
+              reference: x.ref || '',
+              remarks: x.remark || '',
+              action_by: currentUser?.username || 'system',
+            });
+            if (r && r.success) {
+              okCount++;
+              lastResp = r.data;
+            } else if (!firstError) {
+              firstError = r?.error || 'unknown error';
+              break; // stop on first failure
+            }
+          }
+          
+          if (okCount === validRows.length) {
+            const statusTxt = lastResp?.new_status === 'paid' ? 'ครบแล้ว ✅' : `คงเหลือ ฿${fmtNum(lastResp?.outstanding || 0)}`;
+            toast(`✅ บันทึก ${okCount} งวด สำเร็จ — ${statusTxt}`, 'success', 5000);
+            closeModal();
+            await refresh();
+          } else {
+            toast(`⚠️ บันทึกได้ ${okCount}/${validRows.length} — ${firstError || 'มี error'}`, 'error', 6000);
+            await refresh();
+            // Re-enable button (modal stays open for retry of remaining)
+            submitBtn.disabled = false;
+            submitBtn.innerHTML = origText;
+          }
+        } catch (err) {
+          toast(`❌ Error: ${err.message}`, 'error', 6000);
+          submitBtn.disabled = false;
+          submitBtn.innerHTML = origText;
         }
       };
     }, 50);
@@ -25428,37 +25542,6 @@ function renderData(el) {
         </p>
       </div>
       
-      <!-- ⭐ SB Auto-Aggregate Section (Phase 2 — 4/5/26) -->
-      <div class="card mb-3" style="border:1.5px solid var(--warn);background:rgba(245,158,11,.04)">
-        <div class="flex justify-between items-center mb-3">
-          <div>
-            <div class="font-semi" style="color:var(--warn)">📋 SB Auto-Aggregate (รวบบิลเป็นใบวางบิล)</div>
-            <div class="text-xs text-muted mt-1">
-              รวมบิล SR/SC/OR/JR ของแต่ละลูกค้า/เดือน → สร้าง/อัปเดต SB อัตโนมัติ<br>
-              ทำงานอัตโนมัติทุกครั้งที่กด "บันทึก" หน้า Main แต่ใช้ปุ่มนี้สำหรับ <strong>full re-aggregate</strong> ได้
-            </div>
-          </div>
-          <div class="flex gap-2 items-center">
-            <select class="select select-sm" id="sb-aggregate-month" style="font-size:.8rem">
-              <option value="">เดือนปัจจุบัน</option>
-              <option value="1">มกราคม</option><option value="2">กุมภาพันธ์</option>
-              <option value="3">มีนาคม</option><option value="4">เมษายน</option>
-              <option value="5">พฤษภาคม</option><option value="6">มิถุนายน</option>
-              <option value="7">กรกฎาคม</option><option value="8">สิงหาคม</option>
-              <option value="9">กันยายน</option><option value="10">ตุลาคม</option>
-              <option value="11">พฤศจิกายน</option><option value="12">ธันวาคม</option>
-            </select>
-            <button class="btn btn-outline btn-sm" id="btn-sb-aggregate" style="border-color:var(--warn);color:var(--warn)">🔄 Re-aggregate</button>
-          </div>
-        </div>
-        <p class="text-xs text-dim" style="padding:10px;background:rgba(245,158,11,.08);border-radius:6px;border-left:3px solid var(--warn)">
-          📋 <strong>Composite key:</strong> 1 SB / 1 ลูกค้า / 1 เดือน — รวมทุก type (SR+SC+OR+JR)<br>
-          🔴 <strong>VAT bills (SR+SC):</strong> เก็บแยก total_vat / paid_vat / outstanding_vat<br>
-          🔵 <strong>NO_VAT bills (OR+JR):</strong> เก็บแยก total_novat / paid_novat / outstanding_novat<br>
-          ⚠️ ลูกค้าที่ไม่มี cust_code ใน remarks1 → จะถูก skip (รายงานใน console log)
-        </p>
-      </div>
-      
       <!-- ⭐ Company Info (5/6/26) — สำหรับ letterhead ใบวางบิล -->
       <div class="card mb-3" style="border:1px solid var(--border)">
         <div class="font-semi mb-2" style="color:var(--info)">🏢 ข้อมูลบริษัท (สำหรับ letterhead ใบวางบิล)</div>
@@ -25492,54 +25575,6 @@ function renderData(el) {
         </p>
       </div>
       
-      <!-- ⭐ Bulk Historic Payment Migration (5/6/26) -->
-      <div class="card mb-3" style="border:1.5px solid var(--purple);background:rgba(168,85,247,.04)">
-        <div class="font-semi mb-2" style="color:var(--purple)">📥 Bulk Historic Payment Migration</div>
-        <div class="text-xs text-muted" style="line-height:1.6">
-          Import ข้อมูลตัดจ่ายย้อนหลังจากไฟล์ JSON (สำหรับ migrate ข้อมูล Smart software เก่า)<br>
-          → Update <strong>billing_notes</strong>: paid_amount + outstanding + status<br>
-          → Insert <strong>billing_payments</strong>: 1 row ต่อ SP/method (audit trail)<br>
-          🛡 <strong>Safe:</strong> ข้าม SB ที่มี paid_amount > 0 (ป้องกัน double migration)
-        </div>
-        <div style="display:flex;gap:8px;align-items:center;margin-top:10px;flex-wrap:wrap">
-          <input type="file" id="hm-file" accept=".json" style="flex:1;min-width:240px;padding:6px;border:1px solid var(--border);border-radius:6px">
-          <button type="button" class="btn btn-outline btn-sm" id="btn-hm-dry" style="border-color:var(--info);color:var(--info)">🔍 Scan (Dry-run)</button>
-          <button type="button" class="btn btn-sm" id="btn-hm-apply" style="background:var(--purple);color:#fff;border:none;font-weight:700">⚡ Apply Migration</button>
-          <button type="button" class="btn btn-sm" id="btn-hm-force" style="background:var(--danger);color:#fff;border:none;font-weight:700" title="Re-migrate ทับของเก่า — ลบ payments เก่า (ref MIGRATION:) แล้วใส่ใหม่">🔄 Re-migrate (force)</button>
-        </div>
-        <div id="hm-status" style="margin-top:10px;font-size:.85rem;color:var(--muted)"></div>
-        
-        <!-- ⭐ Cleanup orphan payment by ref (5/6/26) -->
-        <div style="margin-top:14px;padding-top:12px;border-top:1px dashed var(--border)">
-          <div style="font-weight:600;font-size:.85rem;margin-bottom:6px;color:var(--warn)">🔧 Cleanup orphan payment by reference</div>
-          <div class="text-xs text-muted" style="margin-bottom:8px;line-height:1.5">
-            ลบ payment records ใน <code>billing_payments</code> ที่ <code>reference</code> ตรงตามที่ระบุ + คืนยอด <code>paid_amount</code> ของ SB ที่กระทบ<br>
-            ใช้สำหรับลบ orphan payment รุ่นเก่าที่ทำให้ตัวเลข double count
-          </div>
-          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-            <input type="text" id="hm-orphan-ref" class="input" placeholder="reference (เช่น 5693346e-d202-4f5b-84dd-46cbf2fa3483)" style="flex:1;min-width:280px;font-family:monospace;font-size:.85rem">
-            <button type="button" class="btn btn-sm" id="btn-hm-cleanup-orphan" style="background:var(--warn);color:#000;border:none;font-weight:700">🔧 Cleanup orphan</button>
-          </div>
-          <div id="hm-orphan-status" style="margin-top:8px;font-size:.85rem;color:var(--muted)"></div>
-        </div>
-      </div>
-      
-      <!-- 🔄 Reset All SB Payments (7/5/26) -->
-      <div class="card mb-3" style="border:1.5px solid var(--danger);background:rgba(239,68,68,.04)">
-        <div class="font-semi mb-2" style="color:var(--danger)">🔄 Reset ใบวางบิลทั้งหมด (Undo Migration)</div>
-        <div class="text-xs text-muted" style="line-height:1.6">
-          ⚠️ <strong>Destructive:</strong> ลบ payment records ทุกใบ + reset ทุก SB กลับเป็น <strong>open</strong><br>
-          → ลบ <strong>billing_payments</strong> ทั้ง sheet (migration + manual)<br>
-          → Reset <strong>billing_notes</strong>: paid_amount=0, outstanding=total, status=open<br>
-          🛡 ไม่แตะ: SB ที่ <code>status='cancelled'</code><br>
-          ใช้กรณี migration ไม่ตรง — Reset แล้วรับชำระจริงทีละใบใน drawer
-        </div>
-        <div style="display:flex;gap:8px;margin-top:10px">
-          <button type="button" class="btn btn-sm" id="btn-reset-all-sb-pay" style="background:var(--danger);color:#fff;border:none;font-weight:700">🔄 Reset ทุกใบวางบิล</button>
-        </div>
-        <div id="reset-sb-status" style="margin-top:10px;font-size:.85rem;color:var(--muted)"></div>
-      </div>
-      
       <!-- 🚫 Excluded from Sales (7/5/26) -->
       <div class="card mb-3" style="border:1.5px solid var(--warn);background:rgba(245,158,11,.04)">
         <div class="font-semi mb-2" style="color:var(--warn)">🚫 ลูกค้าที่ไม่นับยอดขาย</div>
@@ -25553,30 +25588,6 @@ function renderData(el) {
           <button type="button" class="btn btn-sm" id="btn-add-excl-cust" style="background:var(--warn);color:#000;border:none;font-weight:700">➕ เพิ่ม</button>
         </div>
         <div id="excl-cust-list" style="margin-top:10px;display:flex;flex-direction:column;gap:6px"></div>
-      </div>
-      
-      <!-- ⭐ Phase 4 Migration Section (5/5/26) -->
-      <div class="card mb-3" style="border:1.5px solid var(--accent);background:rgba(91,124,250,.04)">
-        <div class="flex justify-between items-center mb-3">
-          <div>
-            <div class="font-semi" style="color:var(--accent)">🔄 Phase 4 Migration — SP-PENDING (Match-first SB Payment)</div>
-            <div class="text-xs text-muted mt-1">
-              สำหรับ SP-PENDING <strong>เก่า</strong> (สร้างก่อน Phase 4 deploy) ที่ยังเป็น Transfer/Cheque/Card<br>
-              <strong>Revert</strong> SP-PENDING ที่ <strong>unmatched</strong> → คืน SB ค้าง — รับชำระใหม่ตาม Phase 4 flow
-            </div>
-          </div>
-          <div class="flex gap-2">
-            <button type="button" class="btn btn-outline btn-sm" id="btn-backfill-paidby-dry" style="border-color:var(--purple);color:var(--purple)" title="Dry-run: scan + report paid_by_sp ที่ต้อง backfill">🔍 Backfill paid_by_sp</button>
-            <button type="button" class="btn btn-outline btn-sm" id="btn-migrate-phase4-dry" style="border-color:var(--info);color:var(--info)" title="Dry-run: scan + report เท่านั้น ไม่เปลี่ยนข้อมูล">🔍 Scan (Dry-run)</button>
-            <button type="button" class="btn btn-sm" id="btn-migrate-phase4-apply" style="background:var(--accent);color:#fff;border:none;font-weight:700" title="Apply: revert SP-PENDING ที่ unmatched">⚡ Apply Migration</button>
-          </div>
-        </div>
-        <p class="text-xs text-dim" style="padding:10px;background:rgba(91,124,250,.08);border-radius:6px;border-left:3px solid var(--accent)">
-          ✅ <strong>Scan-only ก่อน</strong> เสมอ — รายงานก่อน apply เพื่อยืนยัน<br>
-          🔧 Migration จะ <strong>revert</strong> เฉพาะ SP-PENDING <strong>unmatched (Transfer/Cheque/Card)</strong> → SB คืนค้าง + ลบ payments<br>
-          ✅ ไม่แตะ: Cash SP-PENDING (apply แล้ว), SP-PENDING ที่ matched แล้ว (apply แล้ว)<br>
-          ☁️ หลัง apply ต้อง <strong>refresh from cloud</strong> เพื่อ reload SB list (เพราะ backend แก้ตรง Sheet)
-        </p>
       </div>
       
       <!-- Meta Reset Section -->
