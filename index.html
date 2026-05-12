@@ -8960,45 +8960,11 @@ async function renderMain(el) {
           toast(`⚠️ บันทึก ${pushed} ประเภท แต่มี error ${errors} (ดู console)`, 'warn', 6000);
         } else {
           toast(`✅ บันทึกสำเร็จ — push ${pushed} ประเภท${skipped > 0 ? ` (skip ${skipped})` : ''}`, 'success', 4000);
-          
-          // ⭐ Phase 2 (4/5/26): Trigger SB auto-aggregate หลัง save bills สำเร็จ
-          //    Run in background — ไม่ block UI, ไม่กระทบ flow ปกติถ้า fail
-          //    Aggregate เดือนปัจจุบัน + เดือนของ selectedDate (ถ้าต่างกัน)
-          try {
-            const today = new Date();
-            const cy = today.getFullYear();
-            const cm = today.getMonth() + 1;
-            
-            // เดือนของ selectedDate (อาจเป็นเดือนก่อน — เช่นแก้ย้อนหลัง)
-            let selY = cy, selM = cm;
-            if (typeof selectedDate === 'string' && /^\d{4}-\d{2}/.test(selectedDate)) {
-              selY = Number(selectedDate.substring(0, 4));
-              selM = Number(selectedDate.substring(5, 7));
-            }
-            
-            // Aggregate (async — ไม่รอ result)
-            const months = (selY === cy && selM === cm) 
-              ? [{ year: cy, month: cm }] 
-              : [{ year: cy, month: cm }, { year: selY, month: selM }];
-            
-            (async () => {
-              for (const m of months) {
-                try {
-                  const r = await api('aggregateSB', { year: m.year, month: m.month });
-                  if (r?.success && r.data) {
-                    const s = r.data;
-                    if (s.created > 0 || s.updated > 0) {
-                      console.log(`[SB aggregate] ${m.year}-${String(m.month).padStart(2,'0')}: created=${s.created} updated=${s.updated} no_change=${s.no_change} skipped_no_cust=${s.skipped_no_cust}`);
-                    }
-                  }
-                } catch(e) {
-                  console.warn(`[SB aggregate] ${m.year}-${m.month} failed:`, e?.message || e);
-                }
-              }
-            })();
-          } catch(e) {
-            console.warn('[SB aggregate] init error:', e?.message || e);
-          }
+          // ⭐ 12/5/26 — Removed auto-aggregate trigger (ซ้ำซ้อน + race condition)
+          //    เก่า: ทุกครั้งที่ save Main → trigger aggregateSB เดือนปัจจุบัน + เดือนที่ดูอยู่
+          //          ทำให้ aggregate ทำงานบ่อยเกินโดยไม่จำเป็น + race กับ user editing
+          //    ใหม่: ใช้ manual button "🔄 รวบใหม่จาก Main" ในหน้า Billing
+          //          Toppy คุมเองว่าจะรวบเมื่อไหร่ → ไม่ duplicate work
         }
       } catch (err) {
         console.error('Save error:', err);
@@ -20070,10 +20036,29 @@ async function renderBilling(el) {
     }
     const creditWarnTotal = creditWarnedCusts.size + creditCriticalCusts.size;
 
+    // ⭐ 12/5/26 — Auto-generate monthly options (ย้ายมาจาก Create tab)
+    const today = new Date();
+    const curYear = today.getFullYear();
+    const curMonth = today.getMonth() + 1;
+    let agMonth = curMonth - 1, agYear = curYear;
+    if (agMonth < 1) { agMonth = 12; agYear -= 1; }
+    const monthOpts = [];
+    for (let i = 0; i < 6; i++) {
+      let m = curMonth - i, y = curYear;
+      while (m < 1) { m += 12; y -= 1; }
+      monthOpts.push({ value: `${y}-${m}`, label: `${m}/${y + 543}`, year: y, month: m });
+    }
+    
     el.innerHTML = `
       <div class="page-header">
         <h2>📋 ใบวางบิล + ติดตามหนี้</h2>
-        <button class="btn btn-outline btn-sm" id="bn-refresh">🔄 Refresh</button>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <select class="input" id="bn-auto-month" style="padding:6px 10px;font-size:13px;height:34px">
+            ${monthOpts.map(o => `<option value="${o.value}" ${o.year===agYear && o.month===agMonth ? 'selected' : ''}>${o.label}</option>`).join('')}
+          </select>
+          <button class="btn btn-primary btn-sm" id="bn-auto-gen" title="รวบใบวางบิลของเดือนที่เลือก — 1 ใบ/ลูกค้า สำหรับลูกค้าทุกคน">⚡ รวบจาก Daily</button>
+          <button class="btn btn-outline btn-sm" id="bn-refresh" title="โหลดรายการใหม่จาก cloud">🔄 Refresh</button>
+        </div>
       </div>
 
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:16px">
@@ -20120,6 +20105,39 @@ async function renderBilling(el) {
     document.querySelectorAll('.bn-tab').forEach(b => {
       b.onclick = () => { activeTab = b.dataset.tab; refresh(); };
     });
+    
+    // ⭐ 12/5/26 — Auto-gen monthly button (page header)
+    const autoBtn = document.getElementById('bn-auto-gen');
+    const autoSel = document.getElementById('bn-auto-month');
+    if (autoBtn && autoSel) {
+      autoBtn.onclick = async () => {
+        const [y, m] = autoSel.value.split('-').map(Number);
+        if (!y || !m) { toast('เลือกเดือนก่อน', 'error'); return; }
+        const thaiYear = y + 543;
+        if (!confirm(`รวบใบวางบิลของเดือน ${m}/${thaiYear} จาก Daily?\n\nระบบจะ:\n• ดึงบิลเครดิต SR/SC/OR/JR ของเดือน ${m}/${thaiYear}\n• Group by ลูกค้า\n• สร้าง/อัปเดต SB อัตโนมัติ (1 ใบ/ลูกค้า)\n• แยก totals: VAT (SR+SC) vs NOVAT (OR+JR)\n\n* ใบที่มีอยู่แล้วจะถูก update ยอด — ไม่สร้างซ้ำ`)) return;
+        
+        const orig = autoBtn.innerHTML;
+        autoBtn.disabled = true;
+        autoBtn.textContent = '⏳ กำลังรวบ...';
+        try {
+          const r = await api('aggregateSB', { year: y, month: m });
+          if (r?.success && r.data) {
+            const s = r.data;
+            toast(`✅ รวบสำเร็จ — สร้างใหม่ ${s.created} ใบ, อัปเดต ${s.updated} ใบ`, 'success', 6000);
+            activeTab = 'list';
+            await refresh();
+          } else {
+            toast(`❌ รวบล้มเหลว: ${r?.error || 'unknown'}`, 'error', 5000);
+          }
+        } catch (err) {
+          toast(`❌ Error: ${err.message}`, 'error', 5000);
+          console.error('[bn-auto-gen] error:', err);
+        } finally {
+          autoBtn.disabled = false;
+          autoBtn.innerHTML = orig;
+        }
+      };
+    }
     
     // ⭐ Credit warn stat card → toggle filter
     const $statCredit = document.getElementById('stat-credit-warn');
@@ -21232,59 +21250,23 @@ ${bodyHtml}
   }
 
   // ══════════════════════════════════════════════════════════════
-  // TAB 2: CREATE
+  // TAB 2: CREATE (manual — สำหรับ edge case)
   // ══════════════════════════════════════════════════════════════
   function renderCreateTab() {
     const unpaidBills = getUnpaidCreditBills();
-    // Group by customer (จาก remarks หรือ keys ที่มี)
     const cs = createState;
     const sel = cs.selectedBills;
     const selectedTotal = unpaidBills.filter(b => sel.has(b.bill_uuid)).reduce((s, b) => s + Number(b.amount||0), 0);
-    
-    // ⭐ 12/5/26 — Auto-generate monthly options
-    const today = new Date();
-    const curYear = today.getFullYear();
-    const curMonth = today.getMonth() + 1;
-    // Default to previous month (ทำใบวางบิลของเดือนที่แล้ว)
-    let agMonth = curMonth - 1, agYear = curYear;
-    if (agMonth < 1) { agMonth = 12; agYear -= 1; }
-    
-    // Build month options for last 6 months
-    const monthOpts = [];
-    for (let i = 0; i < 6; i++) {
-      let m = curMonth - i, y = curYear;
-      while (m < 1) { m += 12; y -= 1; }
-      const label = `${m}/${y + 543}`; // Thai year
-      monthOpts.push({ value: `${y}-${m}`, label, year: y, month: m });
-    }
 
     return `
       <div style="display:grid;grid-template-columns:1fr;gap:16px;max-width:1200px;margin:0 auto">
-        <!-- ⭐ Auto-generate monthly banner -->
-        <div style="background:linear-gradient(135deg,var(--accent-soft) 0%,var(--bg-elev) 100%);padding:16px;border-radius:8px;border:1px solid var(--accent)">
-          <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
-            <div>
-              <h3 style="margin:0 0 4px 0;font-size:15px">🤖 รวบใบวางบิลอัตโนมัติ (รายเดือน)</h3>
-              <div style="font-size:12px;color:var(--muted)">
-                ดึงบิลเครดิต SR/SC/OR/JR ของเดือนที่เลือก → สร้าง SB 1 ใบ/ลูกค้า อัตโนมัติ
-              </div>
-            </div>
-            <div style="display:flex;gap:8px;align-items:center">
-              <select class="input" id="bn-auto-month" style="padding:6px 10px;font-size:14px">
-                ${monthOpts.map(o => `<option value="${o.value}" ${o.year===agYear && o.month===agMonth ? 'selected' : ''}>${o.label}</option>`).join('')}
-              </select>
-              <button class="btn btn-primary" id="bn-auto-gen" style="white-space:nowrap">⚡ รวบเลย</button>
-            </div>
-          </div>
+        <!-- Info banner -->
+        <div style="background:rgba(91,124,250,0.08);padding:12px 16px;border-radius:6px;border-left:3px solid var(--accent);font-size:13px">
+          💡 <strong>โหมด Manual:</strong> สำหรับสร้างใบเฉพาะกิจ — เลือกบิล + ลูกค้าเอง<br>
+          <span style="color:var(--muted)">โดยปกติให้ใช้ปุ่ม "⚡ รวบจาก Daily" ที่ด้านบนของหน้า (auto สร้าง 1 ใบ/ลูกค้า/เดือน)</span>
         </div>
         
-        <!-- Manual create section (collapsible) -->
-        <details ${unpaidBills.length === 0 ? '' : 'open'} style="background:var(--bg-elev);padding:0;border-radius:8px;border:1px solid var(--border)">
-          <summary style="padding:12px 16px;cursor:pointer;user-select:none;font-weight:600;font-size:14px;list-style:none;display:flex;align-items:center;gap:8px">
-            <span style="font-size:11px;opacity:0.6">▼</span>
-            ✍️ สร้างเฉพาะลูกค้า (manual select)
-          </summary>
-          <div style="padding:0 16px 16px 16px;display:grid;grid-template-columns:1fr;gap:16px">
+        <div style="background:var(--bg-elev);padding:16px;border-radius:8px;border:1px solid var(--border);display:grid;grid-template-columns:1fr;gap:16px">
         
         <!-- Header info -->
         <div style="background:var(--bg-elev);padding:16px;border-radius:8px;border:1px solid var(--border)">
@@ -21389,8 +21371,7 @@ ${bodyHtml}
             ${cs.saving ? '⏳ กำลังบันทึก...' : '💾 บันทึกใบวางบิล'}
           </button>
         </div>
-          </div>
-        </details>
+        </div>
       </div>
     `;
   }
@@ -21415,39 +21396,7 @@ ${bodyHtml}
   function wireCreateTab() {
     const cs = createState;
     
-    // ⭐ 12/5/26 — Auto-generate monthly button
-    const autoBtn = document.getElementById('bn-auto-gen');
-    const autoSel = document.getElementById('bn-auto-month');
-    if (autoBtn && autoSel) {
-      autoBtn.onclick = async () => {
-        const [y, m] = autoSel.value.split('-').map(Number);
-        if (!y || !m) { toast('เลือกเดือนก่อน', 'error'); return; }
-        const thaiYear = y + 543;
-        if (!confirm(`รวบใบวางบิลของเดือน ${m}/${thaiYear}?\n\nระบบจะ:\n• ดึงบิลเครดิต SR/SC/OR/JR ของเดือน ${m}/${thaiYear}\n• Group by ลูกค้า\n• สร้าง/อัปเดต SB อัตโนมัติ (1 ใบ/ลูกค้า)\n• แยก totals: VAT (SR+SC) vs NOVAT (OR+JR)\n\n* ใบที่มีอยู่แล้วจะถูก update ยอด — ไม่สร้างซ้ำ`)) return;
-        
-        const orig = autoBtn.textContent;
-        autoBtn.disabled = true;
-        autoBtn.textContent = '⏳ กำลังรวบ...';
-        try {
-          const r = await api('aggregateSB', { year: y, month: m });
-          if (r?.success && r.data) {
-            const s = r.data;
-            toast(`✅ รวบสำเร็จ — สร้างใหม่ ${s.created} ใบ, อัปเดต ${s.updated} ใบ`, 'success', 6000);
-            await loadNotes();
-            activeTab = 'list';
-            refresh();
-          } else {
-            toast(`❌ รวบล้มเหลว: ${r?.error || 'unknown'}`, 'error', 5000);
-          }
-        } catch (err) {
-          toast(`❌ Error: ${err.message}`, 'error', 5000);
-          console.error('[bn-auto-gen] error:', err);
-        } finally {
-          autoBtn.disabled = false;
-          autoBtn.textContent = orig;
-        }
-      };
-    }
+    // ⭐ 12/5/26 — bn-auto-gen ปุ่มอยู่ที่ page header (wireListTab จัดการ) — ไม่ต้อง wire ใน wireCreateTab
     
     // Customer picker — wire autocomplete แบบมาตรฐาน
     const search = document.getElementById('bn-cust-search');
@@ -22007,30 +21956,33 @@ ${bodyHtml}
     
     // ⭐ 12/5/26 — Bulk payment: ลูกค้าจ่ายหลายงวด → บันทึก N rows ในครั้งเดียว
     // Installment state: array of payment rows
+    // ⭐ Helper: format number to 2 decimals (consistent with Main page)
+    const r2 = (x) => Math.round((Number(x) || 0) * 100) / 100;
+    
     let installments = [
-      { date: today, method: 'Cash', amount: outstanding, wht: 0, fee: 0, ref: '', remark: '' }
+      { date: today, method: 'Cash', amount: r2(outstanding), wht: 0, fee: 0, ref: '', remark: '' }
     ];
     
     function renderInstallment(inst, idx) {
       return `
         <div class="bp-inst" data-idx="${idx}" style="padding:10px 12px;${idx > 0 ? 'border-top:1px solid var(--border);' : ''}">
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
             <span style="font-size:12px;font-weight:500;color:var(--muted)">งวดที่ ${idx + 1}</span>
             ${installments.length > 1 ? `<button class="bp-del" data-idx="${idx}" style="background:none;border:none;cursor:pointer;color:var(--muted);font-size:14px" title="ลบงวด">🗑</button>` : ''}
           </div>
-          <div style="display:grid;grid-template-columns:120px 110px 1fr 90px 90px;gap:6px;align-items:center">
-            <input class="input bp-date" data-idx="${idx}" type="date" value="${inst.date}" style="font-size:12px;padding:4px 8px;height:30px">
-            <select class="input bp-method" data-idx="${idx}" style="font-size:12px;padding:4px 8px;height:30px">
-              <option value="Cash"${inst.method==='Cash'?' selected':''}>เงินสด</option>
-              <option value="Transfer"${inst.method==='Transfer'?' selected':''}>โอนเงิน</option>
-              <option value="Cheque"${inst.method==='Cheque'?' selected':''}>เช็ค</option>
-              <option value="Card"${inst.method==='Card'?' selected':''}>บัตร</option>
+          <div style="display:grid;grid-template-columns:140px 110px 1fr 100px 100px;gap:8px;align-items:center">
+            <input class="input bp-date" data-idx="${idx}" type="date" value="${inst.date}" style="font-size:13px;padding:6px 8px;height:34px">
+            <select class="input bp-method" data-idx="${idx}" style="font-size:13px;padding:6px 8px;height:34px">
+              <option value="Cash"${inst.method==='Cash'?' selected':''}>Cash</option>
+              <option value="Transfer"${inst.method==='Transfer'?' selected':''}>Transfer</option>
+              <option value="Cheque"${inst.method==='Cheque'?' selected':''}>Cheque</option>
+              <option value="Card"${inst.method==='Card'?' selected':''}>Card</option>
             </select>
-            <input class="input bp-amount" data-idx="${idx}" type="number" placeholder="ยอด" value="${inst.amount}" step="0.01" style="font-size:12px;padding:4px 8px;height:30px;text-align:right">
-            <input class="input bp-wht" data-idx="${idx}" type="number" placeholder="WHT" value="${inst.wht}" step="0.01" style="font-size:12px;padding:4px 8px;height:30px;text-align:right">
-            <input class="input bp-fee" data-idx="${idx}" type="number" placeholder="ค่าธรรม" value="${inst.fee}" step="0.01" style="font-size:12px;padding:4px 8px;height:30px;text-align:right">
+            <input class="input bp-amount" data-idx="${idx}" type="number" inputmode="decimal" placeholder="0.00" value="${r2(inst.amount).toFixed(2)}" step="0.01" style="font-size:13px;padding:6px 8px;height:34px;text-align:right">
+            <input class="input bp-wht" data-idx="${idx}" type="number" inputmode="decimal" placeholder="0.00" value="${r2(inst.wht).toFixed(2)}" step="0.01" style="font-size:13px;padding:6px 8px;height:34px;text-align:right">
+            <input class="input bp-fee" data-idx="${idx}" type="number" inputmode="decimal" placeholder="0.00" value="${r2(inst.fee).toFixed(2)}" step="0.01" style="font-size:13px;padding:6px 8px;height:34px;text-align:right">
           </div>
-          <input class="input bp-ref" data-idx="${idx}" placeholder="ref / remark (เช่น KTB 002-1234)" value="${inst.ref || ''}" style="font-size:12px;padding:4px 8px;height:28px;width:100%;margin-top:6px">
+          <input class="input bp-ref" data-idx="${idx}" placeholder="ref / remark (เช่น KTB 002-1234)" value="${inst.ref || ''}" style="font-size:13px;padding:6px 8px;height:32px;width:100%;margin-top:6px">
         </div>
       `;
     }
@@ -22039,9 +21991,9 @@ ${bodyHtml}
       const sumAmount = installments.reduce((s, x) => s + (Number(x.amount) || 0), 0);
       const sumWht = installments.reduce((s, x) => s + (Number(x.wht) || 0), 0);
       const sumFee = installments.reduce((s, x) => s + (Number(x.fee) || 0), 0);
-      const sumPaid = sumAmount + sumWht + sumFee;
-      const newPaid = (n.paid_amount || 0) + sumPaid;
-      const newOut = Math.max(0, (n.total_amount || 0) - newPaid);
+      const sumPaid = r2(sumAmount + sumWht + sumFee);
+      const newPaid = r2((n.paid_amount || 0) + sumPaid);
+      const newOut = r2(Math.max(0, (n.total_amount || 0) - newPaid));
       const status = newPaid >= (n.total_amount || 0) - 0.01 ? '✅ ชำระครบ' : (newPaid > 0 ? '🔵 ชำระบางส่วน' : '⏳ รอชำระ');
       const isOverpay = sumPaid > outstanding + 0.01;
       const isFull = newOut < 0.01;
@@ -22050,13 +22002,13 @@ ${bodyHtml}
         <div style="background:${isOverpay ? 'rgba(239,68,68,0.1)' : 'rgba(91,124,250,0.08)'};border-radius:6px;padding:10px 12px;font-size:13px">
           <div style="display:flex;justify-content:space-between;align-items:center">
             <span>รวมจ่ายครั้งนี้ (${installments.length} งวด)</span>
-            <strong>฿${fmtNum(sumPaid)}</strong>
+            <strong>฿${sumPaid.toFixed(2)}</strong>
           </div>
           <div style="display:flex;justify-content:space-between;align-items:center;margin-top:4px">
             <span>คงเหลือหลังบันทึก</span>
-            <strong style="color:${isFull ? '#16a34a' : '#ef4444'}">฿${fmtNum(newOut)} (${status})</strong>
+            <strong style="color:${isFull ? '#16a34a' : '#ef4444'}">฿${newOut.toFixed(2)} (${status})</strong>
           </div>
-          ${isOverpay ? `<div style="margin-top:6px;color:#ef4444;font-size:12px">⚠️ รวมเกินยอดคงเหลือ (฿${fmtNum(outstanding)}) — ตรวจสอบยอด</div>` : ''}
+          ${isOverpay ? `<div style="margin-top:6px;color:#ef4444;font-size:12px">⚠️ รวมเกินยอดคงเหลือ (฿${outstanding.toFixed(2)}) — ตรวจสอบยอด</div>` : ''}
         </div>
       `;
     }
@@ -22065,32 +22017,52 @@ ${bodyHtml}
       return installments.map(renderInstallment).join('');
     }
     
+    // ⭐ 12/5/26 fix: ขยาย modal ให้กว้างพอเห็นทุก column + เพิ่ม header labels
     openModal('💵 รับชำระ — ' + n.billing_no, `
-      <div style="background:var(--bg-elev);padding:12px;border-radius:6px;margin-bottom:12px">
-        <div style="font-weight:500;margin-bottom:6px">${n.cust_name || ''}</div>
-        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;font-size:13px">
-          <div>ยอดรวม: <strong>฿${fmtNum(n.total_amount)}</strong></div>
-          <div>จ่ายแล้ว: <strong style="color:#16a34a">฿${fmtNum(n.paid_amount)}</strong></div>
-          <div>คงเหลือ: <strong style="color:#ef4444">฿${fmtNum(outstanding)}</strong></div>
+      <div style="min-width:720px;max-width:880px">
+        <div style="background:var(--bg-elev);padding:12px;border-radius:6px;margin-bottom:12px">
+          <div style="font-weight:500;margin-bottom:6px;font-size:14px">${n.cust_name || ''}</div>
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;font-size:13px">
+            <div>ยอดรวม: <strong>฿${Number(n.total_amount||0).toFixed(2)}</strong></div>
+            <div>จ่ายแล้ว: <strong style="color:#16a34a">฿${Number(n.paid_amount||0).toFixed(2)}</strong></div>
+            <div>คงเหลือ: <strong style="color:#ef4444">฿${outstanding.toFixed(2)}</strong></div>
+          </div>
+        </div>
+        
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <span style="font-weight:500;font-size:13px">📋 รายการจ่าย</span>
+          <button class="btn btn-outline btn-sm" id="bp-add-inst">➕ เพิ่มงวด</button>
+        </div>
+        
+        <!-- ⭐ Column headers (sticky on scroll) -->
+        <div style="border:1px solid var(--border);border-radius:6px;margin-bottom:12px;overflow:hidden">
+          <div style="background:var(--bg-elev);padding:8px 12px;border-bottom:1px solid var(--border);display:grid;grid-template-columns:140px 110px 1fr 100px 100px;gap:8px;font-size:11px;color:var(--muted);font-weight:500;letter-spacing:0.3px;text-transform:uppercase">
+            <div>วันที่จ่าย</div>
+            <div>ประเภท</div>
+            <div style="text-align:right">ยอด (฿)</div>
+            <div style="text-align:right">WHT (฿)</div>
+            <div style="text-align:right">ค่าธรรมเนียม (฿)</div>
+          </div>
+          <div id="bp-list" style="max-height:420px;overflow-y:auto">
+            ${listHtml()}
+          </div>
+        </div>
+        
+        <div id="bp-totals" style="margin-bottom:12px">${totalsHtml()}</div>
+        
+        <div style="display:flex;gap:8px;justify-content:flex-end">
+          <button class="btn btn-outline" onclick="closeModal()">ยกเลิก</button>
+          <button class="btn btn-primary" id="bp-submit">💾 บันทึก <span id="bp-submit-count">${installments.length}</span> งวด</button>
         </div>
       </div>
-      
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-        <span style="font-weight:500;font-size:13px">📋 รายการจ่าย</span>
-        <button class="btn btn-outline btn-sm" id="bp-add-inst">➕ เพิ่มงวด</button>
-      </div>
-      
-      <div id="bp-list" style="border:1px solid var(--border);border-radius:6px;margin-bottom:12px;max-height:380px;overflow-y:auto">
-        ${listHtml()}
-      </div>
-      
-      <div id="bp-totals" style="margin-bottom:12px">${totalsHtml()}</div>
-      
-      <div style="display:flex;gap:8px;justify-content:flex-end">
-        <button class="btn btn-outline" onclick="closeModal()">ยกเลิก</button>
-        <button class="btn btn-primary" id="bp-submit">💾 บันทึก <span id="bp-submit-count">${installments.length}</span> งวด</button>
-      </div>
     `);
+    
+    // ⭐ 12/5/26 fix: ขยาย modal-card ให้กว้างพอ (เหมือน PC preview)
+    const modalEl = document.getElementById('modal-card');
+    if (modalEl) {
+      modalEl.style.width = 'min(900px, 95vw)';
+      modalEl.style.maxWidth = '95vw';
+    }
     
     function wireRows() {
       const list = document.getElementById('bp-list');
@@ -22141,10 +22113,10 @@ ${bodyHtml}
       // Add installment button
       const addBtn = document.getElementById('bp-add-inst');
       if (addBtn) addBtn.onclick = () => {
-        // Auto-fill: new row inherits previous date, method='Transfer', amount=remaining
+        // Auto-fill: new row inherits previous date, method='Transfer', amount=remaining (2 decimals)
         const last = installments[installments.length - 1] || {};
         const sumSoFar = installments.reduce((s, x) => s + (Number(x.amount) || 0) + (Number(x.wht) || 0) + (Number(x.fee) || 0), 0);
-        const remaining = Math.max(0, outstanding - sumSoFar);
+        const remaining = r2(Math.max(0, outstanding - sumSoFar));
         installments.push({
           date: last.date || today,
           method: 'Transfer',
@@ -22173,14 +22145,23 @@ ${bodyHtml}
         let lastResp = null;
         let firstError = null;
         try {
+          // ⭐ 12/5/26 CIC P1 fix: track ORIGINAL installments[] indices to remove committed rows
+          //    เก่า: validRows = filter(...) — POST success rows อยู่ใน installments เดิม
+          //          → user retry → POST ซ้ำ → double-charge
+          //    ใหม่: track committedIndices → splice หลัง partial fail → re-submit ไม่ POST ซ้ำ
+          const validIndices = [];
+          installments.forEach((x, j) => { if ((Number(x.amount) || 0) > 0) validIndices.push(j); });
+          const committedIndices = []; // ORIGINAL installments[] indices that succeeded
+          
           // Loop sequentially (preserves order + status accumulation)
-          for (let i = 0; i < validRows.length; i++) {
-            const x = validRows[i];
+          for (let i = 0; i < validIndices.length; i++) {
+            const origIdx = validIndices[i];
+            const x = installments[origIdx];
             const r = await api('recordBillingPayment', {
               billing_uuid: uuid,
-              amount: Number(x.amount) || 0,
-              wht_amount: Number(x.wht) || 0,
-              fee_amount: Number(x.fee) || 0,
+              amount: r2(x.amount),
+              wht_amount: r2(x.wht),
+              fee_amount: r2(x.fee),
               payment_date: x.date,
               payment_method: x.method,
               reference: x.ref || '',
@@ -22190,21 +22171,35 @@ ${bodyHtml}
             if (r && r.success) {
               okCount++;
               lastResp = r.data;
+              committedIndices.push(origIdx);
             } else if (!firstError) {
               firstError = r?.error || 'unknown error';
               break; // stop on first failure
             }
           }
           
-          if (okCount === validRows.length) {
-            const statusTxt = lastResp?.new_status === 'paid' ? 'ครบแล้ว ✅' : `คงเหลือ ฿${fmtNum(lastResp?.outstanding || 0)}`;
+          if (okCount === validIndices.length) {
+            // ALL success — close modal
+            const statusTxt = lastResp?.new_status === 'paid' ? 'ครบแล้ว ✅' : `คงเหลือ ฿${Number(lastResp?.outstanding || 0).toFixed(2)}`;
             toast(`✅ บันทึก ${okCount} งวด สำเร็จ — ${statusTxt}`, 'success', 5000);
             closeModal();
             await refresh();
           } else {
-            toast(`⚠️ บันทึกได้ ${okCount}/${validRows.length} — ${firstError || 'มี error'}`, 'error', 6000);
+            // PARTIAL fail — remove committed rows from state to prevent double-charge
+            if (committedIndices.length > 0) {
+              // Splice in reverse order (preserve earlier indices)
+              committedIndices.sort((a, b) => b - a).forEach(idx => {
+                installments.splice(idx, 1);
+              });
+              // If all removed, push fresh row so UI not empty
+              if (installments.length === 0) {
+                installments.push({ date: today, method: 'Cash', amount: 0, wht: 0, fee: 0, ref: '', remark: '' });
+              }
+            }
+            toast(`⚠️ บันทึกได้ ${okCount}/${validIndices.length} — ${firstError || 'มี error'} (งวดที่ commit แล้วถูกลบจากรายการ)`, 'error', 7000);
             await refresh();
-            // Re-enable button (modal stays open for retry of remaining)
+            // Re-render UI with remaining rows
+            rerender();
             submitBtn.disabled = false;
             submitBtn.innerHTML = origText;
           }
