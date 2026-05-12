@@ -19866,11 +19866,10 @@ async function renderBilling(el) {
   let activeTab = 'list'; // list | create | aging | payments
   let billingNotes = [];
   let billingPayments = [];
-  let aging = null;
   let loading = false;
 
-  // List tab filters
-  let listFilter = { status: 'ALL', search: '', cust: '', creditOnly: false, month: 'ALL' };
+  // List tab filters (aging filter integrated 12/5/26)
+  let listFilter = { status: 'ALL', search: '', cust: '', creditOnly: false, month: 'ALL', aging: 'ALL' };
 
   // Create tab state
   let createState = {
@@ -19882,9 +19881,6 @@ async function renderBilling(el) {
     nextNo: '',
     saving: false,
   };
-
-  // Aging tab
-  let agingState = { asOf: todayISO(), expandedCust: new Set() };
 
   // Status colors
   const STATUS_INFO = {
@@ -19968,10 +19964,6 @@ async function renderBilling(el) {
     const r = await api('getBillingPayments', {});
     billingPayments = (r && r.success && Array.isArray(r.data)) ? r.data : [];
   }
-  async function loadAging() {
-    const r = await api('getBillingDebtAging', { as_of_date: agingState.asOf });
-    aging = (r && r.success) ? r.data : null;
-  }
   async function loadNextNo() {
     const year = createState.billingDate.split('-')[0];
     const r = await api('getNextBillingNo', { year });
@@ -19990,11 +19982,10 @@ async function renderBilling(el) {
     render();
     try {
       await loadNotes();
-      // ⭐ Load customerList ทุกครั้ง (สำหรับ credit warning ใน list/aging tabs)
+      // ⭐ Load customerList ทุกครั้ง (สำหรับ credit warning + aging stats)
       await loadCustomerListIfNeeded();
       // ⭐ Load payments เสมอ (7/5/26) — view modal ต้องใช้ดูประวัติ
       await loadPayments();
-      if (activeTab === 'aging') await loadAging();
       if (activeTab === 'create') {
         await loadNextNo();
       }
@@ -20012,7 +20003,6 @@ async function renderBilling(el) {
     if (typeof currentPage !== 'undefined' && (currentPage === 'debt' || currentPage === 'billing')) {
       try {
         await loadNotes();
-        if (activeTab === 'aging') await loadAging();
         render();
       } catch (e) {
         console.warn('[_reloadBillingNotesIfOpen] failed:', e?.message || e);
@@ -20031,6 +20021,47 @@ async function renderBilling(el) {
     const totalOutstanding = billingNotes
       .filter(n => n.status === 'pending' || n.status === 'partial')
       .reduce((s, n) => s + (Number(n.outstanding)||0), 0);
+    
+    // ⭐ 12/5/26 — Aging buckets (merged from old Aging tab — Phase A)
+    //   Compute client-side from due_date + outstanding (mirrors backend getBillingDebtAging)
+    //   Bucket: current (ยังไม่ครบ), 0-30, 31-60, 61-90, 90+
+    const _todayISO = todayISO();
+    const _todayDate = new Date(_todayISO + 'T00:00:00');
+    function _computeAgingBucket(n) {
+      if (n.status !== 'pending' && n.status !== 'partial') return null;
+      const due = n.due_date ? new Date(n.due_date + 'T00:00:00') : _todayDate;
+      const days = Math.floor((_todayDate - due) / 86400000);
+      if (days < 0) return 'current';
+      if (days <= 30) return 'b_0_30';
+      if (days <= 60) return 'b_31_60';
+      if (days <= 90) return 'b_61_90';
+      return 'b_90_plus';
+    }
+    // Compute days overdue (negative = days until due)
+    function _agingDays(n) {
+      const due = n.due_date ? new Date(n.due_date + 'T00:00:00') : _todayDate;
+      return Math.floor((_todayDate - due) / 86400000);
+    }
+    // Attach aging info to each note (cached on the note object — used in List render)
+    billingNotes.forEach(n => {
+      n._agingBucket = _computeAgingBucket(n);
+      n._agingDays = _agingDays(n);
+    });
+    // Sum outstanding per bucket
+    const agingStats = {
+      current: { amt: 0, cnt: 0 },
+      b_0_30:  { amt: 0, cnt: 0 },
+      b_31_60: { amt: 0, cnt: 0 },
+      b_61_90: { amt: 0, cnt: 0 },
+      b_90_plus: { amt: 0, cnt: 0 },
+    };
+    billingNotes.forEach(n => {
+      const b = n._agingBucket;
+      if (b && agingStats[b]) {
+        agingStats[b].amt += Number(n.outstanding) || 0;
+        agingStats[b].cnt += 1;
+      }
+    });
     
     // ⭐ Credit Warning stats — นับจำนวน "ลูกค้า" (unique cust_code) ที่ใกล้เต็มวงเงิน
     const creditWarnedCusts = new Set();
@@ -20076,7 +20107,7 @@ async function renderBilling(el) {
         </div>
       </div>
 
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:16px">
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:10px">
         <div class="stat-card" style="border-left:4px solid #f59e0b">
           <div class="stat-label">รอชำระ</div>
           <div class="stat-value">${pendingCount} <span style="font-size:13px;color:var(--muted)">ใบ</span></div>
@@ -20089,10 +20120,6 @@ async function renderBilling(el) {
           <div class="stat-label">ชำระครบ</div>
           <div class="stat-value">${paidCount} <span style="font-size:13px;color:var(--muted)">ใบ</span></div>
         </div>
-        <div class="stat-card" style="border-left:4px solid #ef4444">
-          <div class="stat-label">หนี้คงค้างทั้งหมด</div>
-          <div class="stat-value" style="color:#ef4444">฿${fmtNum(totalOutstanding)}</div>
-        </div>
         <div class="stat-card" style="border-left:4px solid ${creditCriticalCusts.size>0?'#ef4444':(creditWarnedCusts.size>0?'#f59e0b':'#6b7280')};${creditWarnTotal>0?'cursor:pointer':''}" 
              id="stat-credit-warn" 
              title="${creditWarnTotal>0?'คลิกเพื่อแสดงเฉพาะลูกค้าใกล้เต็มวงเงิน':'ไม่มีลูกค้าใกล้เต็มวงเงิน'}">
@@ -20104,11 +20131,38 @@ async function renderBilling(el) {
         </div>
       </div>
 
+      <!-- ⭐ Aging buckets (merged from old Aging tab) -->
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:16px">
+        <div class="stat-card bn-aging-card" data-bucket="current" style="border-left:4px solid #16a34a;cursor:pointer" title="คลิกเพื่อ filter">
+          <div class="stat-label">ยังไม่ครบ <span style="color:var(--muted)">(${agingStats.current.cnt})</span></div>
+          <div class="stat-value" style="font-size:18px">฿${fmtNum(agingStats.current.amt)}</div>
+        </div>
+        <div class="stat-card bn-aging-card" data-bucket="b_0_30" style="border-left:4px solid #f59e0b;cursor:pointer" title="คลิกเพื่อ filter">
+          <div class="stat-label">เกิน 0-30 วัน <span style="color:var(--muted)">(${agingStats.b_0_30.cnt})</span></div>
+          <div class="stat-value" style="font-size:18px">฿${fmtNum(agingStats.b_0_30.amt)}</div>
+        </div>
+        <div class="stat-card bn-aging-card" data-bucket="b_31_60" style="border-left:4px solid #f97316;cursor:pointer" title="คลิกเพื่อ filter">
+          <div class="stat-label">31-60 วัน <span style="color:var(--muted)">(${agingStats.b_31_60.cnt})</span></div>
+          <div class="stat-value" style="font-size:18px">฿${fmtNum(agingStats.b_31_60.amt)}</div>
+        </div>
+        <div class="stat-card bn-aging-card" data-bucket="b_61_90" style="border-left:4px solid #ef4444;cursor:pointer" title="คลิกเพื่อ filter">
+          <div class="stat-label">61-90 วัน <span style="color:var(--muted)">(${agingStats.b_61_90.cnt})</span></div>
+          <div class="stat-value" style="font-size:18px">฿${fmtNum(agingStats.b_61_90.amt)}</div>
+        </div>
+        <div class="stat-card bn-aging-card" data-bucket="b_90_plus" style="border-left:4px solid #991b1b;cursor:pointer" title="คลิกเพื่อ filter">
+          <div class="stat-label">90+ วัน <span style="color:var(--muted)">(${agingStats.b_90_plus.cnt})</span></div>
+          <div class="stat-value" style="font-size:18px;color:#991b1b">฿${fmtNum(agingStats.b_90_plus.amt)}</div>
+        </div>
+        <div class="stat-card" style="border-left:4px solid var(--accent);background:var(--bg-elev)">
+          <div class="stat-label">รวมหนี้คงค้าง</div>
+          <div class="stat-value" style="font-size:18px;color:var(--accent)">฿${fmtNum(totalOutstanding)}</div>
+        </div>
+      </div>
+
       <div class="tab-nav" style="display:flex;gap:4px;border-bottom:1px solid var(--border);margin-bottom:16px;overflow-x:auto">
         ${tabBtn('list',     '📄 รายการใบวางบิล')}
         ${tabBtn('customers','👥 ลูกหนี้รายบุคคล')}
         ${tabBtn('create',   '➕ สร้างใบใหม่')}
-        ${tabBtn('aging',    '⏰ ติดตามหนี้ (Aging)')}
       </div>
 
       <div id="bn-body" style="min-height:400px">
@@ -20177,6 +20231,30 @@ async function renderBilling(el) {
       }
     }
     
+    // ⭐ 12/5/26 — Aging cards as filter (click to filter list by bucket)
+    document.querySelectorAll('.bn-aging-card').forEach(card => {
+      const bucket = card.dataset.bucket;
+      card.onclick = () => {
+        if (listFilter.aging === bucket) {
+          // Toggle off — reset to ALL
+          listFilter.aging = 'ALL';
+          toast('ยกเลิก filter aging', 'info', 2000);
+        } else {
+          listFilter.aging = bucket;
+          const lbl = {current:'ยังไม่ครบ', b_0_30:'0-30 วัน', b_31_60:'31-60 วัน', b_61_90:'61-90 วัน', b_90_plus:'90+ วัน'}[bucket] || bucket;
+          // ไป list tab ทันที
+          if (activeTab !== 'list') activeTab = 'list';
+          toast(`🔍 กรอง: ${lbl}`, 'info', 3000);
+        }
+        refresh();
+      };
+      // Highlight active aging card
+      if (listFilter.aging === bucket) {
+        card.style.outline = '2px solid var(--accent)';
+        card.style.outlineOffset = '2px';
+      }
+    });
+    
     wireTabHandlers();
   }
 
@@ -20189,7 +20267,6 @@ async function renderBilling(el) {
     if (activeTab === 'list')      return renderListTab();
     if (activeTab === 'customers') return renderCustomersTab();
     if (activeTab === 'create')    return renderCreateTab();
-    if (activeTab === 'aging')     return renderAgingTab();
     return '';
   }
 
@@ -20197,7 +20274,6 @@ async function renderBilling(el) {
     if (activeTab === 'list')      wireListTab();
     if (activeTab === 'customers') wireCustomersTab();
     if (activeTab === 'create')    wireCreateTab();
-    if (activeTab === 'aging')     wireAgingTab();
   }
 
   // ⭐ Phase 4 (5/5/26) — Helper: หา SP-PENDING bills ที่ "รอ match" (in-flight) สำหรับ SB ใบหนึ่ง
@@ -21130,6 +21206,10 @@ ${bodyHtml}
         return u.level === 'critical' || u.level === 'warn';
       });
     }
+    // ⭐ 12/5/26 — Aging filter (Phase A merge)
+    if (listFilter.aging && listFilter.aging !== 'ALL') {
+      rows = rows.filter(n => n._agingBucket === listFilter.aging);
+    }
     // ⭐ Credit Warning sort (5/5/26):
     //   1. Critical (≥90%) → top, sorted by ratio desc
     //   2. Warn (≥70%) → next, sorted by ratio desc
@@ -21172,6 +21252,21 @@ ${bodyHtml}
             const s = STATUS_INFO[n.status] || { label: n.status, color:'#888', emoji:'?' };
             const overdue = (n.status === 'pending' || n.status === 'partial') && n.due_date && n.due_date < todayISO();
             const billCount = Array.isArray(n.bills_snapshot) ? n.bills_snapshot.length : 0;
+            // ⭐ 12/5/26 — Aging badge (Phase A merge from old Aging tab)
+            //   Show bucket badge below due date for unpaid SBs
+            let agingBadge = '';
+            if (n._agingBucket) {
+              const cfg = {
+                current:   { txt: 'ยังไม่ครบ',                     bg:'#16a34a', dark:'#fff' },
+                b_0_30:    { txt: `เกิน ${n._agingDays}d`,         bg:'#f59e0b', dark:'#fff' },
+                b_31_60:   { txt: `เกิน ${n._agingDays}d`,         bg:'#f97316', dark:'#fff' },
+                b_61_90:   { txt: `เกิน ${n._agingDays}d`,         bg:'#ef4444', dark:'#fff' },
+                b_90_plus: { txt: `เกิน ${n._agingDays}d 🚨`,      bg:'#991b1b', dark:'#fff' },
+              }[n._agingBucket];
+              if (cfg) {
+                agingBadge = `<div style="margin-top:3px"><span style="display:inline-block;padding:2px 7px;border-radius:8px;background:${cfg.bg};color:${cfg.dark};font-size:10px;font-weight:600;letter-spacing:0.2px">${cfg.txt}</span></div>`;
+              }
+            }
             // ⭐ Phase 4 — SP-PENDING in-flight (รอ match)
             const inFlight = getInFlightSP(n.billing_uuid);
             const inFlightAmt = inFlight.reduce((s2, x) => s2 + x.amount, 0);
@@ -21194,7 +21289,7 @@ ${bodyHtml}
               <tr style="border-top:1px solid var(--border);${rowBg};${leftBorder}">
                 <td><strong>${n.billing_no||'-'}</strong></td>
                 <td>${fmtThaiDate(n.billing_date)}</td>
-                <td style="${overdue?'color:#ef4444;font-weight:600':''}">${fmtThaiDate(n.due_date)}${overdue?' ⚠️':''}</td>
+                <td style="${overdue?'color:#ef4444;font-weight:600':''}">${fmtThaiDate(n.due_date)}${agingBadge}</td>
                 <td>
                   <div style="font-weight:500">${n.cust_name||'-'}</div>
                   ${n.cust_code?`<div style="font-size:11px;color:var(--muted)">${n.cust_code}</div>`:''}
@@ -21725,143 +21820,6 @@ ${bodyHtml}
       cs.saving = false;
       render(); wireCreateTab();
     }
-  }
-
-  // ══════════════════════════════════════════════════════════════
-  // TAB 3: AGING
-  // ══════════════════════════════════════════════════════════════
-  function renderAgingTab() {
-    if (!aging) {
-      return '<div style="text-align:center;padding:40px;color:var(--muted)">กำลังโหลดข้อมูล Aging Report...</div>';
-    }
-    const g = aging.grand;
-    const cs = aging.customers;
-
-    return `
-      <div style="display:flex;gap:12px;align-items:center;margin-bottom:16px;flex-wrap:wrap">
-        <label style="color:var(--muted)">ณ วันที่:</label>
-        <input class="input" type="date" id="bn-aging-date" value="${agingState.asOf}" style="width:160px">
-        <button class="btn btn-outline btn-sm" id="bn-aging-refresh">🔄 อัพเดต</button>
-        <span style="margin-left:auto;color:var(--muted)">ลูกค้าที่มีหนี้ค้าง: <strong>${g.customers}</strong> ราย</span>
-      </div>
-
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;margin-bottom:16px">
-        <div class="stat-card" style="border-left:4px solid #16a34a">
-          <div class="stat-label">ยังไม่ครบกำหนด</div>
-          <div class="stat-value" style="font-size:18px">฿${fmtNum(g.current)}</div>
-        </div>
-        <div class="stat-card" style="border-left:4px solid #f59e0b">
-          <div class="stat-label">เกิน 0-30 วัน</div>
-          <div class="stat-value" style="font-size:18px">฿${fmtNum(g.b_0_30)}</div>
-        </div>
-        <div class="stat-card" style="border-left:4px solid #f97316">
-          <div class="stat-label">เกิน 31-60 วัน</div>
-          <div class="stat-value" style="font-size:18px">฿${fmtNum(g.b_31_60)}</div>
-        </div>
-        <div class="stat-card" style="border-left:4px solid #ef4444">
-          <div class="stat-label">เกิน 61-90 วัน</div>
-          <div class="stat-value" style="font-size:18px">฿${fmtNum(g.b_61_90)}</div>
-        </div>
-        <div class="stat-card" style="border-left:4px solid #991b1b">
-          <div class="stat-label">เกิน 90 วัน+</div>
-          <div class="stat-value" style="font-size:18px;color:#991b1b">฿${fmtNum(g.b_90_plus)}</div>
-        </div>
-        <div class="stat-card" style="border-left:4px solid var(--accent);background:var(--bg-elev)">
-          <div class="stat-label">รวมหนี้คงค้าง</div>
-          <div class="stat-value" style="font-size:18px;color:var(--accent)">฿${fmtNum(g.total)}</div>
-        </div>
-      </div>
-
-      ${cs.length === 0 ? `
-        <div style="text-align:center;padding:60px;color:var(--muted);background:var(--bg-elev);border-radius:8px">
-          <div style="font-size:48px;margin-bottom:12px">🎉</div>
-          <div>ไม่มีลูกค้าที่ค้างชำระ ณ วันที่นี้</div>
-        </div>
-      ` : `
-        <div style="overflow-x:auto;border:1px solid var(--border);border-radius:8px">
-        <table class="table" style="width:100%;font-size:13px">
-          <thead>
-            <tr style="background:var(--bg-elev)">
-              <th>ลูกค้า</th>
-              <th style="text-align:center">จำนวนใบ</th>
-              <th style="text-align:right">ยังไม่ครบ</th>
-              <th style="text-align:right">0-30</th>
-              <th style="text-align:right">31-60</th>
-              <th style="text-align:right">61-90</th>
-              <th style="text-align:right">90+</th>
-              <th style="text-align:right;background:rgba(239,68,68,0.08)">รวมค้าง</th>
-              <th style="text-align:center">เก่าสุด</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody>
-            ${cs.map(c => {
-              const key = c.cust_code || c.cust_name;
-              const exp = agingState.expandedCust.has(key);
-              return `
-                <tr class="bn-aging-row" data-key="${key}" style="border-top:1px solid var(--border);cursor:pointer">
-                  <td>
-                    <div style="font-weight:500">${c.cust_name}</div>
-                    ${c.cust_code?`<div style="font-size:11px;color:var(--muted)">${c.cust_code}</div>`:''}
-                    ${c.cust_phone?`<div style="font-size:11px;color:var(--muted)">📞 ${c.cust_phone}</div>`:''}
-                  </td>
-                  <td style="text-align:center">${c.notes.length}</td>
-                  <td style="text-align:right;color:#16a34a">${c.b_current>0?'฿'+fmtNum(c.b_current):'-'}</td>
-                  <td style="text-align:right;color:${c.b_0_30>0?'#f59e0b':'var(--muted)'}">${c.b_0_30>0?'฿'+fmtNum(c.b_0_30):'-'}</td>
-                  <td style="text-align:right;color:${c.b_31_60>0?'#f97316':'var(--muted)'}">${c.b_31_60>0?'฿'+fmtNum(c.b_31_60):'-'}</td>
-                  <td style="text-align:right;color:${c.b_61_90>0?'#ef4444':'var(--muted)'}">${c.b_61_90>0?'฿'+fmtNum(c.b_61_90):'-'}</td>
-                  <td style="text-align:right;color:${c.b_90_plus>0?'#991b1b':'var(--muted)'};font-weight:${c.b_90_plus>0?'600':'normal'}">${c.b_90_plus>0?'฿'+fmtNum(c.b_90_plus):'-'}</td>
-                  <td style="text-align:right;font-weight:600;background:rgba(239,68,68,0.04)">฿${fmtNum(c.total)}</td>
-                  <td style="text-align:center;font-size:12px">${c.oldest_days>0?c.oldest_days+' วัน':'-'}</td>
-                  <td style="text-align:center">${exp?'▼':'▶'}</td>
-                </tr>
-                ${exp ? `
-                  <tr><td colspan="10" style="background:var(--bg);padding:0">
-                    <div style="padding:12px 24px">
-                      <table class="table" style="width:100%;font-size:12px;background:var(--bg-elev);border-radius:4px">
-                        <thead>
-                          <tr><th>เลขใบ</th><th>วันออก</th><th>ครบกำหนด</th><th style="text-align:right">ยอด</th><th style="text-align:right">ชำระ</th><th style="text-align:right">คงเหลือ</th><th>เกิน</th><th>สถานะ</th></tr>
-                        </thead>
-                        <tbody>
-                          ${c.notes.map(n => `
-                            <tr style="border-top:1px solid var(--border)">
-                              <td><strong>${n.billing_no}</strong></td>
-                              <td>${fmtThaiDate(n.billing_date)}</td>
-                              <td>${fmtThaiDate(n.due_date)}</td>
-                              <td style="text-align:right">฿${fmtNum(n.total_amount)}</td>
-                              <td style="text-align:right">${n.paid_amount>0?'฿'+fmtNum(n.paid_amount):'-'}</td>
-                              <td style="text-align:right;font-weight:600;color:#ef4444">฿${fmtNum(n.outstanding)}</td>
-                              <td style="${n.days_overdue>0?'color:#ef4444':'color:var(--muted)'}">${n.days_overdue>0?n.days_overdue+' วัน':'-'}</td>
-                              <td><span style="color:${(STATUS_INFO[n.status]||{}).color||'#888'}">${(STATUS_INFO[n.status]||{}).emoji||''} ${(STATUS_INFO[n.status]||{}).label||n.status}</span></td>
-                            </tr>
-                          `).join('')}
-                        </tbody>
-                      </table>
-                    </div>
-                  </td></tr>
-                ` : ''}
-              `;
-            }).join('')}
-          </tbody>
-        </table>
-        </div>
-      `}
-    `;
-  }
-
-  function wireAgingTab() {
-    const dt = document.getElementById('bn-aging-date');
-    if (dt) dt.onchange = e => { agingState.asOf = e.target.value; refresh(); };
-    const r = document.getElementById('bn-aging-refresh');
-    if (r) r.onclick = () => refresh();
-    document.querySelectorAll('.bn-aging-row').forEach(row => {
-      row.onclick = () => {
-        const k = row.dataset.key;
-        if (agingState.expandedCust.has(k)) agingState.expandedCust.delete(k);
-        else agingState.expandedCust.add(k);
-        render();
-      };
-    });
   }
 
 
