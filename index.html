@@ -21106,7 +21106,7 @@ ${bodyHtml}
                 <td style="text-align:center"><span style="color:${s.color};font-weight:500">${s.emoji} ${s.label}</span></td>
                 <td style="text-align:center;white-space:nowrap">
                   <button class="btn btn-outline btn-sm bn-view" data-uuid="${n.billing_uuid}" title="ดู">👁</button>
-                  <button class="btn btn-outline btn-sm bn-print" data-uuid="${n.billing_uuid}" title="พิมพ์">🖨</button>
+                  <button class="btn btn-outline btn-sm bn-print" data-uuid="${n.billing_uuid}" title="พิมพ์ / บันทึกเป็น PDF">📄 PDF</button>
                   ${n.status !== 'cancelled' ? `<button class="btn btn-outline btn-sm bn-refresh" data-uuid="${n.billing_uuid}" data-cust="${n.cust_code||''}" data-y="${n.cycle_year||''}" data-m="${n.cycle_month||''}" title="🔄 Refresh ยอดจากบิลปัจจุบัน — กรณียอดบิลผิด/แก้บิลย้อนหลัง" style="color:var(--warn)">🔄</button>` : ''}
                   ${n.status !== 'paid' && n.status !== 'cancelled' ? `<button class="btn btn-primary btn-sm bn-pay" data-uuid="${n.billing_uuid}" title="รับชำระ">💵</button>` : ''}
                   ${n.paid_amount === 0 && n.status !== 'cancelled' ? `<button class="btn btn-outline btn-sm bn-edit" data-uuid="${n.billing_uuid}" title="แก้ไข">✏</button>` : ''}
@@ -21240,9 +21240,52 @@ ${bodyHtml}
     const cs = createState;
     const sel = cs.selectedBills;
     const selectedTotal = unpaidBills.filter(b => sel.has(b.bill_uuid)).reduce((s, b) => s + Number(b.amount||0), 0);
+    
+    // ⭐ 12/5/26 — Auto-generate monthly options
+    const today = new Date();
+    const curYear = today.getFullYear();
+    const curMonth = today.getMonth() + 1;
+    // Default to previous month (ทำใบวางบิลของเดือนที่แล้ว)
+    let agMonth = curMonth - 1, agYear = curYear;
+    if (agMonth < 1) { agMonth = 12; agYear -= 1; }
+    
+    // Build month options for last 6 months
+    const monthOpts = [];
+    for (let i = 0; i < 6; i++) {
+      let m = curMonth - i, y = curYear;
+      while (m < 1) { m += 12; y -= 1; }
+      const label = `${m}/${y + 543}`; // Thai year
+      monthOpts.push({ value: `${y}-${m}`, label, year: y, month: m });
+    }
 
     return `
       <div style="display:grid;grid-template-columns:1fr;gap:16px;max-width:1200px;margin:0 auto">
+        <!-- ⭐ Auto-generate monthly banner -->
+        <div style="background:linear-gradient(135deg,var(--accent-soft) 0%,var(--bg-elev) 100%);padding:16px;border-radius:8px;border:1px solid var(--accent)">
+          <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
+            <div>
+              <h3 style="margin:0 0 4px 0;font-size:15px">🤖 รวบใบวางบิลอัตโนมัติ (รายเดือน)</h3>
+              <div style="font-size:12px;color:var(--muted)">
+                ดึงบิลเครดิต SR/SC/OR/JR ของเดือนที่เลือก → สร้าง SB 1 ใบ/ลูกค้า อัตโนมัติ
+              </div>
+            </div>
+            <div style="display:flex;gap:8px;align-items:center">
+              <select class="input" id="bn-auto-month" style="padding:6px 10px;font-size:14px">
+                ${monthOpts.map(o => `<option value="${o.value}" ${o.year===agYear && o.month===agMonth ? 'selected' : ''}>${o.label}</option>`).join('')}
+              </select>
+              <button class="btn btn-primary" id="bn-auto-gen" style="white-space:nowrap">⚡ รวบเลย</button>
+            </div>
+          </div>
+        </div>
+        
+        <!-- Manual create section (collapsible) -->
+        <details ${unpaidBills.length === 0 ? '' : 'open'} style="background:var(--bg-elev);padding:0;border-radius:8px;border:1px solid var(--border)">
+          <summary style="padding:12px 16px;cursor:pointer;user-select:none;font-weight:600;font-size:14px;list-style:none;display:flex;align-items:center;gap:8px">
+            <span style="font-size:11px;opacity:0.6">▼</span>
+            ✍️ สร้างเฉพาะลูกค้า (manual select)
+          </summary>
+          <div style="padding:0 16px 16px 16px;display:grid;grid-template-columns:1fr;gap:16px">
+        
         <!-- Header info -->
         <div style="background:var(--bg-elev);padding:16px;border-radius:8px;border:1px solid var(--border)">
           <h3 style="margin:0 0 12px 0;font-size:15px">📋 ข้อมูลใบวางบิล</h3>
@@ -21346,6 +21389,8 @@ ${bodyHtml}
             ${cs.saving ? '⏳ กำลังบันทึก...' : '💾 บันทึกใบวางบิล'}
           </button>
         </div>
+          </div>
+        </details>
       </div>
     `;
   }
@@ -21369,6 +21414,40 @@ ${bodyHtml}
 
   function wireCreateTab() {
     const cs = createState;
+    
+    // ⭐ 12/5/26 — Auto-generate monthly button
+    const autoBtn = document.getElementById('bn-auto-gen');
+    const autoSel = document.getElementById('bn-auto-month');
+    if (autoBtn && autoSel) {
+      autoBtn.onclick = async () => {
+        const [y, m] = autoSel.value.split('-').map(Number);
+        if (!y || !m) { toast('เลือกเดือนก่อน', 'error'); return; }
+        const thaiYear = y + 543;
+        if (!confirm(`รวบใบวางบิลของเดือน ${m}/${thaiYear}?\n\nระบบจะ:\n• ดึงบิลเครดิต SR/SC/OR/JR ของเดือน ${m}/${thaiYear}\n• Group by ลูกค้า\n• สร้าง/อัปเดต SB อัตโนมัติ (1 ใบ/ลูกค้า)\n• แยก totals: VAT (SR+SC) vs NOVAT (OR+JR)\n\n* ใบที่มีอยู่แล้วจะถูก update ยอด — ไม่สร้างซ้ำ`)) return;
+        
+        const orig = autoBtn.textContent;
+        autoBtn.disabled = true;
+        autoBtn.textContent = '⏳ กำลังรวบ...';
+        try {
+          const r = await api('aggregateSB', { year: y, month: m });
+          if (r?.success && r.data) {
+            const s = r.data;
+            toast(`✅ รวบสำเร็จ — สร้างใหม่ ${s.created} ใบ, อัปเดต ${s.updated} ใบ`, 'success', 6000);
+            await loadNotes();
+            activeTab = 'list';
+            refresh();
+          } else {
+            toast(`❌ รวบล้มเหลว: ${r?.error || 'unknown'}`, 'error', 5000);
+          }
+        } catch (err) {
+          toast(`❌ Error: ${err.message}`, 'error', 5000);
+          console.error('[bn-auto-gen] error:', err);
+        } finally {
+          autoBtn.disabled = false;
+          autoBtn.textContent = orig;
+        }
+      };
+    }
     
     // Customer picker — wire autocomplete แบบมาตรฐาน
     const search = document.getElementById('bn-cust-search');
@@ -22146,9 +22225,10 @@ ${bodyHtml}
   @media print { .no-print { display:none !important; } body { margin:0; } }
 </style>
 </head><body>
-<div class="no-print" style="text-align:right;margin-bottom:12px">
-  <button onclick="window.print()" style="padding:6px 14px;font-size:14px">🖨 พิมพ์</button>
-  <button onclick="window.close()" style="padding:6px 14px;font-size:14px">ปิด</button>
+<div class="no-print" style="text-align:right;margin-bottom:12px;display:flex;gap:8px;justify-content:flex-end;align-items:center;flex-wrap:wrap;background:#fef3c7;padding:10px;border-radius:6px;border:1px solid #fbbf24">
+  <span style="font-size:13px;color:#78350f;margin-right:auto">💡 กดปุ่ม "บันทึกเป็น PDF" แล้วเลือก <strong>Save as PDF</strong> ใน dialog</span>
+  <button onclick="window.print()" style="padding:8px 16px;font-size:14px;background:#2563eb;color:white;border:none;border-radius:4px;cursor:pointer;font-weight:600">📄 บันทึกเป็น PDF / พิมพ์</button>
+  <button onclick="window.close()" style="padding:8px 16px;font-size:14px;background:#e5e7eb;color:#374151;border:none;border-radius:4px;cursor:pointer">ปิด</button>
 </div>
 <div class="header">
   <div>
