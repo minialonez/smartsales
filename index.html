@@ -952,9 +952,13 @@ if (typeof window !== 'undefined') {
 })();
 
 // ── Excel / CSV File Parser ──
-function parseExcelFile(file) {
+// ⭐ 13/5/26 — preferFormatted=true → raw:false → preserve leading zeros (string values from .w property)
+//   ใช้สำหรับ statement parser (description ที่มีเลขบัญชีขึ้นต้น 0)
+//   Daily/PC/SP/etc. ใช้ default (raw:true) เพื่อไม่กระทบ amount parsing เดิม
+function parseExcelFile(file, preferFormatted) {
   const name = (file.name || '').toLowerCase();
   const isCsv = name.endsWith('.csv');
+  const raw = !preferFormatted;
   
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -972,7 +976,13 @@ function parseExcelFile(file) {
           
           // ตัด BOM ก่อน detect (UTF-8 BOM = EF BB BF)
           let trimmedBytes = bytes;
-          if (bytes.length >= 3 && bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF) {
+          // ⭐ 13/5/26 — BOM check first: UTF-8 BOM = unambiguous UTF-8 signal
+          //   เก่า: หลัง strip BOM ก็ยัง guess Win-874 vs UTF-8 ตาม Thai count
+          //         → Thai bytes E0 BX BX ใน UTF-8 decode เป็น Win-874 ก็ได้ Thai chars (garbage)
+          //         → count Win-874 ชนะเสมอ → mojibake
+          //   ใหม่: ถ้ามี BOM → forced UTF-8 ไม่ต้อง guess
+          const hasBom = bytes.length >= 3 && bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF;
+          if (hasBom) {
             trimmedBytes = bytes.subarray(3);
           }
           
@@ -994,17 +1004,20 @@ function parseExcelFile(file) {
             thaiUtf8 = countThaiChars(textUtf8);
           } catch(_) {}
           
-          // ลอง Windows-874 (TIS-620 superset)
-          try {
-            textWin874 = new TextDecoder('windows-874').decode(trimmedBytes);
-            thaiWin874 = countThaiChars(textWin874);
-          } catch(_) {}
+          // ลอง Windows-874 (TIS-620 superset) — เฉพาะถ้าไม่มี BOM
+          if (!hasBom) {
+            try {
+              textWin874 = new TextDecoder('windows-874').decode(trimmedBytes);
+              thaiWin874 = countThaiChars(textWin874);
+            } catch(_) {}
+          }
           
-          // เลือกตัวที่ Thai chars เยอะกว่า
-          //   ถ้าเสมอ → UTF-8 (default มาตรฐานปัจจุบัน)
-          //   ถ้าไม่มี Thai เลยทั้ง 2 → UTF-8 (ไฟล์อาจเป็น English)
+          // ⭐ Selection: BOM = forced UTF-8; ไม่มี BOM = guess by Thai char count
           let text;
-          if (thaiWin874 > thaiUtf8 * 1.5) {
+          if (hasBom) {
+            text = textUtf8;
+            console.log(`[parseExcelFile] ${file.name} → UTF-8 (BOM detected, Thai: ${thaiUtf8})`);
+          } else if (thaiWin874 > thaiUtf8 * 1.5) {
             text = textWin874;
             console.log(`[parseExcelFile] ${file.name} → Windows-874 (Thai: ${thaiWin874} vs UTF-8: ${thaiUtf8})`);
           } else {
@@ -1018,10 +1031,10 @@ function parseExcelFile(file) {
           if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
           
           // Parse CSV
-          const workbook = XLSX.read(text, { type: 'string', cellDates: false, raw: true });
+          const workbook = XLSX.read(text, { type: 'string', cellDates: false, raw: raw });
           const result = {};
           workbook.SheetNames.forEach(nm => {
-            result[nm] = XLSX.utils.sheet_to_json(workbook.Sheets[nm], { header: 1, defval: '', raw: true });
+            result[nm] = XLSX.utils.sheet_to_json(workbook.Sheets[nm], { header: 1, defval: '', raw: raw });
           });
           resolve({ sheets: result, sheetNames: workbook.SheetNames, isCsv: true, rawText: text });
           return;
@@ -1032,7 +1045,7 @@ function parseExcelFile(file) {
         const workbook = XLSX.read(data, { type: 'array', cellDates: true, cellNF: false, cellText: false });
         const result = {};
         workbook.SheetNames.forEach(nm => {
-          result[nm] = XLSX.utils.sheet_to_json(workbook.Sheets[nm], { header: 1, defval: '', raw: true });
+          result[nm] = XLSX.utils.sheet_to_json(workbook.Sheets[nm], { header: 1, defval: '', raw: raw });
         });
         resolve({ sheets: result, sheetNames: workbook.SheetNames });
       } catch (err) {
@@ -1044,14 +1057,14 @@ function parseExcelFile(file) {
   });
 }
 
-function triggerFileUpload(inputId, callback) {
+function triggerFileUpload(inputId, callback, preferFormatted) {
   const inp = document.getElementById(inputId);
   inp.value = '';
   inp.onchange = async () => {
     if (!inp.files[0]) return;
     try {
       toast('กำลังอ่านไฟล์...', 'info');
-      const result = await parseExcelFile(inp.files[0]);
+      const result = await parseExcelFile(inp.files[0], preferFormatted);
       callback(result, inp.files[0].name);
     } catch (err) {
       toast('อ่านไฟล์ไม่สำเร็จ: ' + err.message, 'error');
@@ -1063,7 +1076,8 @@ function triggerFileUpload(inputId, callback) {
 // ── Multi-file upload (สำหรับ statement หลายไฟล์พร้อมกัน) ──
 // callback(result, fileName, meta) โดย meta = { index, total, isLast }
 // Caller รับผิดชอบ accumulate + final toast/persist/render เองผ่าน meta.isLast
-function triggerMultiFileUpload(inputId, callback) {
+// ⭐ preferFormatted=true → preserve leading zeros (use สำหรับ statement)
+function triggerMultiFileUpload(inputId, callback, preferFormatted) {
   const inp = document.getElementById(inputId);
   inp.value = '';
   inp.onchange = async () => {
@@ -1075,7 +1089,7 @@ function triggerMultiFileUpload(inputId, callback) {
     for (let i = 0; i < files.length; i++) {
       const meta = { index: i, total: files.length, isLast: i === files.length - 1 };
       try {
-        const result = await parseExcelFile(files[i]);
+        const result = await parseExcelFile(files[i], preferFormatted);
         await callback(result, files[i].name, meta);
       } catch (err) {
         toast(`❌ ${files[i].name}: ${err.message}`, 'error', 5000);
@@ -1572,8 +1586,9 @@ function handleStmtUpload(result, fileName, opts = {}) {
       for (let i = hRow + 1; i < sheet.length; i++) {
         const r = sheet[i];
         const dateVal = r[1];
-        const credit = Number(r[4]) || 0;
-        const debit = Number(r[3]) || 0;
+        // ⭐ 13/5/26 — Handle both raw (number) and formatted (string "1,638.00") forms
+        const credit = Number(String(r[4]||'').replace(/,/g,'')) || 0;
+        const debit = Number(String(r[3]||'').replace(/,/g,'')) || 0;
         if (!dateVal || (!credit && !debit)) continue;
         if (String(r[2]||'').includes('ยอดรวม') || String(r[0]||'').includes('หมายเหตุ')) continue;
         rows.push({ bank, date: convertDate(dateVal), time: extractTimeStr(dateVal), ref_no: String(r[7]||''), description: String(r[2]||''), amount: credit || -debit, match_status: 'unpaid', match_station: '', match_bill: '' });
@@ -1641,7 +1656,9 @@ function handleStmtUpload(result, fileName, opts = {}) {
     const sheet = firstSheet;
     for (let i = 1; i < sheet.length; i++) {
       const r = sheet[i];
-      rows.push({ bank, date: convertDate(r[0]), time: String(r[1]||''), ref_no: String(r[2]||''), description: String(r[3]||''), amount: Number(r[4])||0, match_status: 'unpaid', match_station: '', match_bill: '' });
+      // ⭐ 13/5/26 — Handle both raw and formatted amount
+      const amt = Number(String(r[4]||'').replace(/,/g,'')) || 0;
+      rows.push({ bank, date: convertDate(r[0]), time: String(r[1]||''), ref_no: String(r[2]||''), description: String(r[3]||''), amount: amt, match_status: 'unpaid', match_station: '', match_bill: '' });
     }
   }
 
@@ -23822,7 +23839,7 @@ async function renderMatching(el) {
           render();
           batch = null;
         }
-      });
+      }, true); // ⭐ 13/5/26 preferFormatted=true → preserve leading zeros in description
     });
     
     // ── Dedup Statement (manual, safe — preview before delete) ──
