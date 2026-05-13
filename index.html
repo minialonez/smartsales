@@ -18246,6 +18246,7 @@ const NAV_ITEMS = [
   { id:'monthly',   icon:'file',    label:'📅 รายงานรายเดือน' },
   { id:'pc_sales',  icon:'file',    label:'📊 ยอด PC' },
   { id:'users',     icon:'users',   label:'จัดการผู้ใช้' },
+  { id:'customers_mgmt', icon:'users', label:'👥 จัดการลูกค้า' },  // ⭐ 13/5/26
 ];
 
 const ICONS = {
@@ -19048,6 +19049,7 @@ const PAGE_RENDERERS = {
   monthly: renderMonthly,
   pc_sales: renderPcSales,
   users: renderUsers,
+  customers_mgmt: renderCustomersMgmt,  // ⭐ 13/5/26
   sp_recon: renderSpRecon,
   pp_recon: renderPpRecon,
 };
@@ -30783,15 +30785,16 @@ async function renderSpRecon(el) {
         
         <div class="flex gap-2 flex-wrap items-center" style="margin-bottom:12px">
           <span style="font-size:.78rem;color:var(--text2);font-weight:600">กรองผลการ Match:</span>
-          <button class="pill ${spV2State.filterMatchStmt==='ALL'?'active':''}" data-fmatch="ALL">ทั้งหมด</button>
-          <button class="pill ${spV2State.filterMatchStmt==='matched'?'active':''}" data-fmatch="matched"
+          <button class="pill" data-fmatch="ALL"
+            style="${spV2State.filterMatchStmt==='ALL'?'background:var(--primary-bg);border-color:var(--primary);color:var(--primary)':''}">ทั้งหมด</button>
+          <button class="pill" data-fmatch="matched"
             style="${spV2State.filterMatchStmt==='matched'?'background:rgba(63,196,143,.2);border-color:var(--success);color:var(--success)':''}">✓ Matched (${ms.matched})</button>
-          <button class="pill ${spV2State.filterMatchStmt==='no_match'?'active':''}" data-fmatch="no_match"
-            style="${spV2State.filterMatchStmt==='no_match'?'background:rgba(239,87,87,.15);border-color:var(--danger);color:var(--danger)':''}">✗ No match (${ms.noMatch})${ms.noMatch>0?' ← ตรวจ!':''}</button>
-          <button class="pill ${spV2State.filterMatchStmt==='warn_mixed'?'active':''}" data-fmatch="warn_mixed"
-            style="${spV2State.filterMatchStmt==='warn_mixed'?'background:rgba(245,158,11,.18);border-color:var(--warn);color:var(--warn)':(ms.warnMixed>0?'background:rgba(245,158,11,.08);border-color:var(--warn);color:var(--warn)':'')}">⚠️ Mixed (${ms.warnMixed||0})${ms.warnMixed>0?' ← ผิดปกติ!':''}</button>
-          <button class="pill ${spV2State.filterMatchStmt==='skipped'?'active':''}" data-fmatch="skipped"
-            style="${spV2State.filterMatchStmt==='skipped'?'background:rgba(128,128,128,.18);border-color:var(--text2);color:var(--text2)':''}" title="SP ที่ระบบยังไม่ได้ classify (pay_total=0 หรือ transfer_amt=0 หรือยังไม่กดปุ่ม Match)">⊘ Skipped (${ms.skipped})</button>
+          <button class="pill" data-fmatch="no_match"
+            style="${spV2State.filterMatchStmt==='no_match'?'background:rgba(239,87,87,.18);border-color:var(--danger);color:var(--danger)':''}">✗ No match (${ms.noMatch})${ms.noMatch>0?' ← ตรวจ!':''}</button>
+          <button class="pill" data-fmatch="warn_mixed"
+            style="${spV2State.filterMatchStmt==='warn_mixed'?'background:rgba(245,158,11,.2);border-color:var(--warn);color:var(--warn)':(ms.warnMixed>0?'background:rgba(245,158,11,.06);border-color:var(--warn);color:var(--warn)':'')}">⚠️ Mixed (${ms.warnMixed||0})${ms.warnMixed>0?' ← ผิดปกติ!':''}</button>
+          <button class="pill" data-fmatch="skipped"
+            style="${spV2State.filterMatchStmt==='skipped'?'background:rgba(128,128,128,.22);border-color:var(--text2);color:var(--text)':''}" title="SP ที่ระบบยังไม่ได้ classify (pay_total=0 หรือ transfer_amt=0 หรือยังไม่กดปุ่ม Match)">⊘ Skipped (${ms.skipped})</button>
         </div>
         `;
       })() : ''}
@@ -31495,7 +31498,7 @@ function spV2RenderMainTable(rows) {
           </span>
         </td>
         <td style="padding:4px 6px;font-family:monospace">${r.bill_no}</td>
-        <td style="padding:4px 6px;font-size:.7rem">${fmtD(r.ref_doc)}</td>
+        <td style="padding:4px 6px;font-size:.7rem;font-family:monospace">${r.ref_doc || ''}</td>
         <td style="padding:4px 6px">${String(r.sale_date || '').substring(0, 40)}</td>
         <td style="padding:4px 6px;font-size:.7rem">${r.note1 || ''}</td>
         <td style="text-align:right;padding:4px 6px">${fmt(r.amount)}</td>
@@ -31629,7 +31632,7 @@ function spV2RenderReportView(rows) {
     html += `
       <tr style="${rowColor};font-weight:600;border-top:2px solid var(--border)">
         <td style="padding:6px;font-family:monospace">${header.sp_number || header.bill_no}</td>
-        <td style="padding:6px">${fmtD(header.ref_doc)}</td>
+        <td style="padding:6px;font-family:monospace;font-size:.75rem">${header.ref_doc || ''}</td>
         <td style="padding:6px">${String(header.sale_date||'').substring(0,35)}</td>
         <td style="padding:6px;text-align:right">${fmt(header.pay_total)}</td>
         <td style="padding:6px">${fmtD(header.cash_date)}</td>
@@ -31696,7 +31699,7 @@ function spV2DownloadXlsx(opts) {
     const headerSpDisplay = useOriginal ? header.bill_no : (header.sp_number || header.bill_no);
     
     aoa.push([
-      headerSpDisplay, fmtD(header.ref_doc), header.sale_date, '',
+      headerSpDisplay, header.ref_doc || '', header.sale_date, '',
       Number(header.pay_total)||0, fmtD(header.cash_date), Number(header.cash_amt)||0,
       fmtD(header.transfer_date), Number(header.transfer_amt)||0,
       fmtD(header.cheque_date), paid ? 'Paid' : 'Unpaid'
@@ -38289,6 +38292,307 @@ async function renderUsers(el) {
       openUserModal(u);
     });
   });
+}
+
+// ⭐ 13/5/26 — Customer Management page (admin CRUD on customers master)
+async function renderCustomersMgmt(el) {
+  el.innerHTML = `<div class="card"><p class="text-dim">กำลังโหลด...</p></div>`;
+  
+  let customers = [];
+  try {
+    const res = await api('getCustomers', {});
+    if (res?.success && Array.isArray(res.data)) {
+      customers = res.data;
+      // Update global cache
+      if (typeof customerList !== 'undefined') {
+        customerList = customers;
+        try { safeStorage.set('sf_customers_cache', JSON.stringify(customers)); } catch(_) {}
+      }
+    }
+  } catch (e) {
+    el.innerHTML = `<div class="card"><p style="color:var(--danger)">โหลดข้อมูลล้มเหลว: ${e.message}</p></div>`;
+    return;
+  }
+  
+  // Local state for filtering
+  if (!window._cmgmtState) {
+    window._cmgmtState = { search: '', filterVat: 'ALL', filterStatus: 'ALL' };
+  }
+  const st = window._cmgmtState;
+  
+  function applyFilter(list) {
+    const q = String(st.search || '').trim().toLowerCase();
+    return list.filter(c => {
+      if (st.filterVat !== 'ALL' && String(c.vat_status||'') !== st.filterVat) return false;
+      if (st.filterStatus !== 'ALL' && String(c.credit_status||'').toLowerCase() !== st.filterStatus) return false;
+      if (q) {
+        const hit = String(c.cust_name||'').toLowerCase().includes(q) ||
+                    String(c.cust_id||'').toLowerCase().includes(q) ||
+                    String(c.phone||'').toLowerCase().includes(q) ||
+                    String(c.contact_person||'').toLowerCase().includes(q);
+        if (!hit) return false;
+      }
+      return true;
+    });
+  }
+  
+  function renderTable() {
+    const filtered = applyFilter(customers);
+    const total = customers.length;
+    const showing = filtered.length;
+    
+    el.innerHTML = `
+      <div class="flex justify-between items-center mb-4">
+        <div>
+          <div class="page-title">👥 จัดการลูกค้า</div>
+          <p class="text-xs text-dim" style="margin-top:4px">รายการลูกค้าทั้งหมด <strong>${total}</strong> ราย${showing!==total?` (แสดง ${showing} ราย)`:''}</p>
+        </div>
+        <button class="btn btn-primary btn-sm" id="btn-add-customer">${ICONS.plus} เพิ่มลูกค้า</button>
+      </div>
+      
+      <div class="card-flat" style="margin-bottom:12px">
+        <div style="display:grid;grid-template-columns:1fr 140px 140px;gap:8px">
+          <input class="input" id="cmgmt-search" placeholder="🔍 ค้นหา (ชื่อ / รหัส / เบอร์ / ผู้ติดต่อ)" value="${st.search}">
+          <select class="input" id="cmgmt-fvat">
+            <option value="ALL" ${st.filterVat==='ALL'?'selected':''}>VAT: ทั้งหมด</option>
+            <option value="VAT" ${st.filterVat==='VAT'?'selected':''}>VAT</option>
+            <option value="NOVAT" ${st.filterVat==='NOVAT'?'selected':''}>NOVAT</option>
+          </select>
+          <select class="input" id="cmgmt-fstatus">
+            <option value="ALL" ${st.filterStatus==='ALL'?'selected':''}>สถานะ: ทั้งหมด</option>
+            <option value="active" ${st.filterStatus==='active'?'selected':''}>Active</option>
+            <option value="inactive" ${st.filterStatus==='inactive'?'selected':''}>Inactive</option>
+            <option value="suspended" ${st.filterStatus==='suspended'?'selected':''}>Suspended</option>
+          </select>
+        </div>
+      </div>
+      
+      <div class="card-flat" style="overflow:auto">
+        <table style="width:100%;font-size:.85rem">
+          <thead><tr style="background:var(--surface2)">
+            <th style="text-align:left;padding:8px">รหัส</th>
+            <th style="text-align:left;padding:8px">ชื่อลูกค้า</th>
+            <th style="text-align:left;padding:8px">ผู้ติดต่อ</th>
+            <th style="text-align:left;padding:8px">เบอร์</th>
+            <th style="text-align:center;padding:8px">VAT</th>
+            <th style="text-align:right;padding:8px">วงเงิน</th>
+            <th style="text-align:center;padding:8px">สถานะ</th>
+            <th style="text-align:center;padding:8px;width:100px">จัดการ</th>
+          </tr></thead>
+          <tbody>
+            ${filtered.length === 0 ? `
+              <tr><td colspan="8" style="padding:30px;text-align:center;color:var(--text2)">${total===0?'ยังไม่มีข้อมูลลูกค้า':'ไม่พบลูกค้าตามที่ค้นหา'}</td></tr>
+            ` : filtered.map(c => {
+              const vatLbl = c.vat_status === 'VAT' 
+                ? '<span class="badge badge-info">VAT</span>'
+                : c.vat_status === 'NOVAT' 
+                ? '<span class="badge badge-warn">NOVAT</span>'
+                : '<span class="text-xs text-dim">-</span>';
+              const statusLbl = c.credit_status === 'active'
+                ? '<span class="badge badge-success">active</span>'
+                : c.credit_status === 'inactive'
+                ? '<span class="badge badge-muted">inactive</span>'
+                : c.credit_status === 'suspended'
+                ? '<span class="badge badge-danger">suspended</span>'
+                : '<span class="text-xs text-dim">-</span>';
+              const limit = Number(c.credit_limit||0);
+              return `<tr style="border-top:1px solid var(--border)">
+                <td style="padding:6px 8px;font-family:monospace;font-size:.78rem">${c.cust_id||'-'}</td>
+                <td style="padding:6px 8px;font-weight:500">${c.cust_name||'-'}</td>
+                <td style="padding:6px 8px;font-size:.78rem;color:var(--text2)">${c.contact_person||'-'}</td>
+                <td style="padding:6px 8px;font-family:monospace;font-size:.78rem">${c.phone||'-'}</td>
+                <td style="text-align:center;padding:6px 8px">${vatLbl}</td>
+                <td style="text-align:right;padding:6px 8px;font-size:.78rem">${limit>0?'฿'+fmtNum(limit):'-'}</td>
+                <td style="text-align:center;padding:6px 8px">${statusLbl}</td>
+                <td style="text-align:center;padding:6px 8px;white-space:nowrap">
+                  <button class="btn btn-ghost btn-icon btn-edit-cust" data-cid="${c.cust_id}" title="แก้ไข">${ICONS.edit}</button>
+                  <button class="btn btn-ghost btn-icon btn-del-cust" data-cid="${c.cust_id}" data-cname="${(c.cust_name||'').replace(/"/g, '&quot;')}" title="ลบ" style="color:var(--danger)">🗑</button>
+                </td>
+              </tr>`;
+            }).join('')}
+          </tbody>
+        </table>
+      </div>
+    `;
+    
+    // Wire filter inputs
+    document.getElementById('cmgmt-search')?.addEventListener('input', e => {
+      st.search = e.target.value;
+      renderTable();
+    });
+    document.getElementById('cmgmt-fvat')?.addEventListener('change', e => {
+      st.filterVat = e.target.value;
+      renderTable();
+    });
+    document.getElementById('cmgmt-fstatus')?.addEventListener('change', e => {
+      st.filterStatus = e.target.value;
+      renderTable();
+    });
+    
+    // Wire add button
+    document.getElementById('btn-add-customer')?.addEventListener('click', () => openCustomerModal(null));
+    
+    // Wire edit + delete buttons
+    el.querySelectorAll('.btn-edit-cust').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const cid = btn.dataset.cid;
+        const c = customers.find(x => x.cust_id === cid);
+        if (!c) { toast('ไม่พบข้อมูลลูกค้า', 'error'); return; }
+        openCustomerModal(c);
+      });
+    });
+    el.querySelectorAll('.btn-del-cust').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const cid = btn.dataset.cid;
+        const cname = btn.dataset.cname;
+        if (!confirm(`ลบลูกค้า "${cname}" (${cid})?\n\n⚠️ การลบนี้ไม่กระทบบิลที่มีอยู่แล้ว — แต่จะไม่สามารถเลือกลูกค้านี้ในบิลใหม่ได้`)) return;
+        try {
+          const r = await api('deleteCustomer', { cust_id: cid });
+          if (r?.success) {
+            toast(`✅ ลบ "${cname}" สำเร็จ`, 'success', 3000);
+            // Reload list
+            customers = customers.filter(x => x.cust_id !== cid);
+            if (typeof customerList !== 'undefined') {
+              customerList = customers;
+              try { safeStorage.set('sf_customers_cache', JSON.stringify(customers)); } catch(_) {}
+            }
+            renderTable();
+          } else {
+            toast(`❌ ลบไม่สำเร็จ: ${r?.error || 'unknown'}`, 'error', 4000);
+          }
+        } catch (e) {
+          toast(`❌ Error: ${e.message}`, 'error', 4000);
+        }
+      });
+    });
+  }
+  
+  function openCustomerModal(existing) {
+    const isEdit = !!existing;
+    const c = existing || {
+      cust_id: '', cust_name: '', contact_person: '', phone: '', email: '',
+      address: '', vat_status: '', credit_limit: 0, credit_status: 'active',
+      payment_terms: '', notes: '',
+    };
+    
+    openModal(`${isEdit?'✏️ แก้ไข':ICONS.plus+' เพิ่ม'} ลูกค้า`, `
+      <div class="flex-col gap-3">
+        <div class="input-group">
+          <label>รหัสลูกค้า ${isEdit?'<span class="text-xs text-dim">(แก้ไม่ได้)</span>':'<span class="text-xs text-dim">(เช่น 00126 — ห้ามว่าง)</span>'}</label>
+          <input class="input" id="cm-cust_id" value="${c.cust_id||''}" ${isEdit?'readonly style="background:rgba(255,255,255,.02)"':''} placeholder="เช่น 00126">
+        </div>
+        <div class="input-group">
+          <label>ชื่อลูกค้า <span style="color:var(--danger)">*</span></label>
+          <input class="input" id="cm-cust_name" value="${(c.cust_name||'').replace(/"/g, '&quot;')}" placeholder="เช่น บริษัท ตัวอย่าง จำกัด">
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+          <div class="input-group">
+            <label>ผู้ติดต่อ</label>
+            <input class="input" id="cm-contact_person" value="${(c.contact_person||'').replace(/"/g, '&quot;')}" placeholder="ชื่อผู้ติดต่อ">
+          </div>
+          <div class="input-group">
+            <label>เบอร์โทรศัพท์</label>
+            <input class="input" id="cm-phone" value="${c.phone||''}" placeholder="073-xxx-xxxx">
+          </div>
+        </div>
+        <div class="input-group">
+          <label>Email</label>
+          <input class="input" id="cm-email" value="${c.email||''}" placeholder="example@email.com">
+        </div>
+        <div class="input-group">
+          <label>ที่อยู่</label>
+          <input class="input" id="cm-address" value="${(c.address||'').replace(/"/g, '&quot;')}" placeholder="ที่อยู่">
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px">
+          <div class="input-group">
+            <label>VAT Status</label>
+            <select class="input" id="cm-vat_status">
+              <option value="" ${!c.vat_status?'selected':''}>-</option>
+              <option value="VAT" ${c.vat_status==='VAT'?'selected':''}>VAT (มี vat)</option>
+              <option value="NOVAT" ${c.vat_status==='NOVAT'?'selected':''}>NOVAT (ไม่มี vat)</option>
+            </select>
+          </div>
+          <div class="input-group">
+            <label>วงเงินเครดิต (฿)</label>
+            <input class="input" id="cm-credit_limit" type="number" step="0.01" value="${c.credit_limit||0}" placeholder="0">
+          </div>
+          <div class="input-group">
+            <label>สถานะ</label>
+            <select class="input" id="cm-credit_status">
+              <option value="active" ${c.credit_status==='active'?'selected':''}>Active</option>
+              <option value="inactive" ${c.credit_status==='inactive'?'selected':''}>Inactive</option>
+              <option value="suspended" ${c.credit_status==='suspended'?'selected':''}>Suspended</option>
+            </select>
+          </div>
+        </div>
+        <div class="input-group">
+          <label>เงื่อนไขการชำระ</label>
+          <input class="input" id="cm-payment_terms" value="${(c.payment_terms||'').replace(/"/g, '&quot;')}" placeholder="เช่น 30 วัน, สิ้นเดือน">
+        </div>
+        <div class="input-group">
+          <label>หมายเหตุ</label>
+          <input class="input" id="cm-notes" value="${(c.notes||'').replace(/"/g, '&quot;')}" placeholder="">
+        </div>
+      </div>
+      <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">
+        <button class="btn btn-outline" onclick="closeModal()">ยกเลิก</button>
+        <button class="btn btn-primary" id="btn-save-customer">${isEdit?'💾 บันทึก':'➕ เพิ่ม'}</button>
+      </div>
+    `);
+    
+    setTimeout(() => {
+      document.getElementById('btn-save-customer').onclick = async () => {
+        const data = {
+          cust_id: document.getElementById('cm-cust_id').value.trim(),
+          cust_name: document.getElementById('cm-cust_name').value.trim(),
+          contact_person: document.getElementById('cm-contact_person').value.trim(),
+          phone: document.getElementById('cm-phone').value.trim(),
+          email: document.getElementById('cm-email').value.trim(),
+          address: document.getElementById('cm-address').value.trim(),
+          vat_status: document.getElementById('cm-vat_status').value,
+          credit_limit: Number(document.getElementById('cm-credit_limit').value) || 0,
+          credit_status: document.getElementById('cm-credit_status').value,
+          payment_terms: document.getElementById('cm-payment_terms').value.trim(),
+          notes: document.getElementById('cm-notes').value.trim(),
+        };
+        if (!data.cust_id) { toast('กรอกรหัสลูกค้า', 'error', 3000); return; }
+        if (!data.cust_name) { toast('กรอกชื่อลูกค้า', 'error', 3000); return; }
+        
+        const $save = document.getElementById('btn-save-customer');
+        $save.disabled = true;
+        const orig = $save.innerHTML;
+        $save.textContent = '⏳ บันทึก...';
+        try {
+          const action = isEdit ? 'updateCustomer' : 'createCustomer';
+          const r = await api(action, data);
+          if (r?.success) {
+            toast(`✅ ${isEdit?'อัปเดต':'เพิ่ม'}ลูกค้าสำเร็จ`, 'success', 3000);
+            closeModal();
+            // Reload list from cloud (always fresh after CRUD)
+            const res2 = await api('getCustomers', {});
+            if (res2?.success && Array.isArray(res2.data)) {
+              customers = res2.data;
+              if (typeof customerList !== 'undefined') {
+                customerList = customers;
+                try { safeStorage.set('sf_customers_cache', JSON.stringify(customers)); } catch(_) {}
+              }
+            }
+            renderTable();
+          } else {
+            toast(`❌ ${r?.error || 'ไม่สำเร็จ'}`, 'error', 4000);
+            $save.disabled = false;
+            $save.innerHTML = orig;
+          }
+        } catch (e) {
+          toast(`❌ Error: ${e.message}`, 'error', 4000);
+          $save.disabled = false;
+          $save.innerHTML = orig;
+        }
+      };
+    }, 50);
+  }
+  
+  renderTable();
 }
 
 // ── Initialize after all declarations are ready ──
