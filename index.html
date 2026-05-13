@@ -20575,11 +20575,29 @@ async function renderBilling(el) {
                 
                 const ageColor = c.max_age_days > 60 ? '#ef4444' : c.max_age_days > 30 ? '#f59e0b' : 'var(--muted)';
                 
+                // ⭐ 13/5/26 — Contact lookup (live from master)
+                const cMaster = (typeof customerList !== 'undefined' && Array.isArray(customerList))
+                  ? customerList.find(x => String(x.cust_id||'').trim() === String(c.cust_code||'').trim())
+                  : null;
+                const cContact = (cMaster && cMaster.contact_person) || '';
+                const cPhone = (cMaster && cMaster.phone) || '';
+                let cContactHtml = '';
+                if (cContact || cPhone) {
+                  const parts = [];
+                  if (cContact) parts.push(`👤 ${cContact}`);
+                  if (cPhone) {
+                    const tel = String(cPhone).replace(/[^0-9+]/g, '');
+                    parts.push(`<a href="tel:${tel}" style="color:var(--info);text-decoration:none;font-family:monospace">📞 ${cPhone}</a>`);
+                  }
+                  cContactHtml = `<div style="font-size:11px;color:var(--muted);margin-top:3px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">${parts.join('<span style="color:var(--border)">·</span>')}</div>`;
+                }
+                
                 return `
                   <tr style="border-top:1px solid var(--border);${rowBg};${leftBorder}">
                     <td>
                       <div style="font-weight:500">${c.cust_name||'-'}</div>
                       ${c.cust_code?`<div style="font-size:11px;color:var(--muted)">${c.cust_code}</div>`:''}
+                      ${cContactHtml}
                     </td>
                     <td>${creditBlock}</td>
                     <td style="text-align:right;font-weight:600;color:#ef4444">฿${fmtNum(c.outstanding)}</td>
@@ -21300,6 +21318,27 @@ ${bodyHtml}
             // ⭐ Credit Warning bar — แสดงใน column ลูกค้า
             const usage = getCreditUsage(n.cust_code);
             const creditBar = renderCreditBar(usage);
+            // ⭐ 13/5/26 — Contact info: live lookup จาก master, fallback ไปที่ snapshot ใน SB
+            //   Priority: customer master (เบอร์ใหม่เสมอ) → SB snapshot (ของเก่า) → ไม่มี
+            let contactHtml = '';
+            const masterCust = (typeof customerList !== 'undefined' && Array.isArray(customerList))
+              ? customerList.find(c => String(c.cust_id||'').trim() === String(n.cust_code||'').trim())
+              : null;
+            const contactName = (masterCust && masterCust.contact_person) || '';
+            const contactPhone = (masterCust && masterCust.phone) || n.cust_phone || '';
+            if (contactName || contactPhone) {
+              const parts = [];
+              if (contactName) parts.push(`<span title="ผู้ติดต่อ (จาก customer master)">👤 ${contactName}</span>`);
+              if (contactPhone) {
+                // Strip non-digits for tel: link
+                const telDigits = String(contactPhone).replace(/[^0-9+]/g, '');
+                parts.push(`<a href="tel:${telDigits}" style="color:var(--info);text-decoration:none;font-family:monospace" title="คลิกเพื่อโทร">📞 ${contactPhone}</a>`);
+              }
+              contactHtml = `<div style="font-size:11px;color:var(--muted);margin-top:3px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">${parts.join('<span style="color:var(--border)">·</span>')}</div>`;
+            } else if (n.status !== 'paid' && n.status !== 'cancelled') {
+              // เฉพาะใบที่ยังไม่ชำระ — แสดง placeholder ให้ Toppy รู้ว่าต้องเพิ่มเบอร์
+              contactHtml = `<div style="font-size:11px;color:var(--muted);margin-top:3px;font-style:italic">— ไม่มีเบอร์ติดต่อ —</div>`;
+            }
             // ⭐ Row highlight ตาม credit level
             let rowBg = '';
             if (usage.level === 'critical') rowBg = 'background:rgba(239,68,68,0.10)';
@@ -21317,6 +21356,7 @@ ${bodyHtml}
                 <td>
                   <div style="font-weight:500">${n.cust_name||'-'}</div>
                   ${n.cust_code?`<div style="font-size:11px;color:var(--muted)">${n.cust_code}</div>`:''}
+                  ${contactHtml}
                   ${creditBar}
                 </td>
                 <td style="text-align:center">${billCount}</td>
