@@ -20593,8 +20593,9 @@ async function renderBilling(el) {
                 const ageColor = c.max_age_days > 60 ? '#ef4444' : c.max_age_days > 30 ? '#f59e0b' : 'var(--muted)';
                 
                 // ⭐ 13/5/26 — Contact lookup (live from master)
+                //   ⭐ R18 polish: toUpperCase() match existing pattern
                 const cMaster = (typeof customerList !== 'undefined' && Array.isArray(customerList))
-                  ? customerList.find(x => String(x.cust_id||'').trim() === String(c.cust_code||'').trim())
+                  ? customerList.find(x => String(x.cust_id||'').trim().toUpperCase() === String(c.cust_code||'').trim().toUpperCase())
                   : null;
                 const cContact = (cMaster && cMaster.contact_person) || '';
                 const cPhone = (cMaster && cMaster.phone) || '';
@@ -21337,9 +21338,10 @@ ${bodyHtml}
             const creditBar = renderCreditBar(usage);
             // ⭐ 13/5/26 — Contact info: live lookup จาก master, fallback ไปที่ snapshot ใน SB
             //   Priority: customer master (เบอร์ใหม่เสมอ) → SB snapshot (ของเก่า) → ไม่มี
+            //   ⭐ R18 polish: toUpperCase() match existing customer lookup pattern (case-insensitive)
             let contactHtml = '';
             const masterCust = (typeof customerList !== 'undefined' && Array.isArray(customerList))
-              ? customerList.find(c => String(c.cust_id||'').trim() === String(n.cust_code||'').trim())
+              ? customerList.find(c => String(c.cust_id||'').trim().toUpperCase() === String(n.cust_code||'').trim().toUpperCase())
               : null;
             const contactName = (masterCust && masterCust.contact_person) || '';
             const contactPhone = (masterCust && masterCust.phone) || n.cust_phone || '';
