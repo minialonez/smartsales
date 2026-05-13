@@ -18283,6 +18283,28 @@ function showApp() {
     _loadCompanyInfo();
   }
   
+  // ⭐ 13/5/26 — Auto-load SP Recon ของปีปัจจุบันจาก Sheet
+  //    เก่า: ต้องกดปุ่ม "📥 โหลดจาก Cloud" เอง
+  //    ใหม่: auto-load หลัง login → ข้อมูล match status พร้อมแสดง filter pills ทันที
+  //    ไม่ block UI — ถ้า fail เงียบ ๆ → user กดโหลดเองได้
+  (async function _autoLoadSpReconOnLogin() {
+    try {
+      const year = new Date().getFullYear();
+      const r = await api('getSpRecon', { year: year });
+      if (r?.success && r.data && Array.isArray(r.data.rows) && r.data.rows.length > 0) {
+        if (typeof spV2State !== 'undefined') {
+          spV2State.mainRows = r.data.rows;
+          spV2State.mainRows.forEach(row => { row._dirty = false; });
+          spV2State.reportGenerated = r.data.rows.some(row => row._is_header && row.sp_number && row.sp_number.startsWith('SP' + year));
+          if (typeof persistSpV2 === 'function') persistSpV2();
+          console.log(`[SP Recon auto-load] ${r.data.rows.filter(row => row._is_header).length} SP + ${r.data.rows.filter(row => !row._is_header).length} bills`);
+        }
+      }
+    } catch (e) {
+      console.warn('[SP Recon auto-load] failed:', e?.message || e);
+    }
+  })();
+  
   // ⭐ Auto-load customer master (cache 24h, lightweight + ไม่กระทบ matching)
   (async () => {
     try {
@@ -30518,6 +30540,8 @@ function spV2FilterRows() {
         if (filterMatchStmt === 'matched' && r._match_status !== 'matched') keep = false;
         if (filterMatchStmt === 'no_match' && r._match_status !== 'no_match') keep = false;
         if (filterMatchStmt === 'warn_mixed' && r._match_status !== 'warn_mixed') keep = false;
+        // ⭐ 13/5/26 — Skipped = rows ที่ไม่ใช่ 3 status ข้างบน (blank/undefined)
+        if (filterMatchStmt === 'skipped' && (r._match_status === 'matched' || r._match_status === 'no_match' || r._match_status === 'warn_mixed')) keep = false;
       }
       if (keep) groupsMatch.add(r._group_id);
     }
@@ -30699,21 +30723,54 @@ async function renderSpRecon(el) {
         ${view === 'report' ? `<button class="btn btn-success btn-sm" id="spv2-btn-download">⬇️ Download Report</button>` : ''}
       </div>
       
-      ${view === 'main' && spV2State.matchSummary ? (() => {
-        const ms = spV2State.matchSummary;
+      ${view === 'main' && spV2State.mainRows && spV2State.mainRows.filter(r => r._is_header).length > 0 ? (() => {
+        // ⭐ 13/5/26 — Always compute matchSummary from mainRows
+        //    เก่า: pills แสดงเฉพาะหลังกด Match (matchSummary มี value)
+        //          → load จาก Sheet → matchSummary = null → pills หาย ❌
+        //    ใหม่: re-derive from mainRows._match_status ทุกครั้ง render
+        //          → pills เห็นเสมอ ถ้ามี data ✓
+        const headerRows = spV2State.mainRows.filter(r => r._is_header);
+        let matched = 0, noMatch = 0, warnMixed = 0, skipped = 0, autoCash = 0, stmtMatched = 0, forceMatched = 0;
+        headerRows.forEach(r => {
+          const st = r._match_status;
+          if (st === 'matched') {
+            matched++;
+            const uuidStr = String(r._matched_stmt_uuid || '');
+            if (uuidStr.startsWith('auto_')) autoCash++;
+            else if (uuidStr.startsWith('force:')) forceMatched++;
+            else stmtMatched++;
+          } else if (st === 'no_match') {
+            noMatch++;
+          } else if (st === 'warn_mixed') {
+            warnMixed++;
+          } else {
+            skipped++;
+          }
+        });
+        // Use saved summary's metadata (ranAt) when available, else fall back to derived
+        const savedMs = spV2State.matchSummary || {};
+        const ms = {
+          matched, noMatch, warnMixed, skipped, autoCash, stmtMatched, forceMatched,
+          ranAt: savedMs.ranAt || null,
+        };
+        // ⭐ 13/5/26 fix: แสดง pills เสมอเมื่อมี header rows (ไม่รอ classified > 0)
+        //    เก่า: ถ้าโหลดมาแล้วทุก row ยังไม่ match → pills หาย → Toppy งง
+        //    ใหม่: แสดงเสมอ — เห็นปุ่ม Match (X) เป็น 0 → Toppy รู้ต้องกดปุ่ม "🔗 Match Statement"
+        // (no early return)
+        
         const ranDate = ms.ranAt ? new Date(ms.ranAt) : null;
-        const ranStr = ranDate ? ranDate.toLocaleString('th-TH', {hour:'2-digit',minute:'2-digit',day:'2-digit',month:'short'}) : '';
+        const ranStr = ranDate ? ranDate.toLocaleString('th-TH', {hour:'2-digit',minute:'2-digit',day:'2-digit',month:'short'}) : 'จาก Sheet';
         const total = ms.matched + ms.noMatch;
         const pct = total > 0 ? Math.round(ms.matched / total * 100) : 0;
         return `
         <div style="background:linear-gradient(90deg,rgba(63,196,143,.08),rgba(239,87,87,.08));border:1px solid var(--border);border-radius:8px;padding:12px 16px;margin-bottom:12px;display:flex;gap:24px;align-items:center;flex-wrap:wrap">
           <div style="font-weight:700;color:var(--text);display:flex;align-items:center;gap:8px">
             🔗 <span>Match Result</span>
-            <span style="font-size:.72rem;color:var(--text3);font-weight:400">· รัน ${ranStr}</span>
+            <span style="font-size:.72rem;color:var(--text3);font-weight:400">· ${ranStr}</span>
           </div>
           <div style="display:flex;gap:18px;flex-wrap:wrap">
             <span style="color:var(--success);font-weight:700">✓ Matched: <span style="font-size:1.1rem">${ms.matched}</span>
-              ${(ms.autoCash || ms.stmtMatched) ? `<span style="font-size:.72rem;color:var(--text2);font-weight:400">(💵 ซื้อสด ${ms.autoCash||0} · 🏦 ซื้อเชื่อ ${ms.stmtMatched||0})</span>` : ''}
+              ${(ms.autoCash || ms.stmtMatched || ms.forceMatched) ? `<span style="font-size:.72rem;color:var(--text2);font-weight:400">(💵 ซื้อสด ${ms.autoCash||0} · 🏦 ซื้อเชื่อ ${ms.stmtMatched||0}${ms.forceMatched ? ` · ✓ force ${ms.forceMatched}` : ''})</span>` : ''}
             </span>
             <span style="color:var(--danger);font-weight:700">✗ No match: <span style="font-size:1.1rem">${ms.noMatch}</span></span>
             ${ms.warnMixed ? `<span style="color:var(--warn);font-weight:700" title="SP ที่มี OS/OR หรือ SS/SR ปนกัน — ผิดปกติ ตรวจสอบ">⚠️ Mixed: <span style="font-size:1.1rem">${ms.warnMixed}</span></span>` : ''}
@@ -30733,6 +30790,8 @@ async function renderSpRecon(el) {
             style="${spV2State.filterMatchStmt==='no_match'?'background:rgba(239,87,87,.15);border-color:var(--danger);color:var(--danger)':''}">✗ No match (${ms.noMatch})${ms.noMatch>0?' ← ตรวจ!':''}</button>
           <button class="pill ${spV2State.filterMatchStmt==='warn_mixed'?'active':''}" data-fmatch="warn_mixed"
             style="${spV2State.filterMatchStmt==='warn_mixed'?'background:rgba(245,158,11,.18);border-color:var(--warn);color:var(--warn)':(ms.warnMixed>0?'background:rgba(245,158,11,.08);border-color:var(--warn);color:var(--warn)':'')}">⚠️ Mixed (${ms.warnMixed||0})${ms.warnMixed>0?' ← ผิดปกติ!':''}</button>
+          <button class="pill ${spV2State.filterMatchStmt==='skipped'?'active':''}" data-fmatch="skipped"
+            style="${spV2State.filterMatchStmt==='skipped'?'background:rgba(128,128,128,.18);border-color:var(--text2);color:var(--text2)':''}" title="SP ที่ระบบยังไม่ได้ classify (pay_total=0 หรือ transfer_amt=0 หรือยังไม่กดปุ่ม Match)">⊘ Skipped (${ms.skipped})</button>
         </div>
         `;
       })() : ''}
@@ -31129,6 +31188,50 @@ async function renderSpRecon(el) {
     });
   });
   
+  // ⭐ 13/5/26 — Force match button (override match status to 'matched')
+  el.querySelectorAll('.spv2-force-match').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const gid = btn.dataset.gid;
+      const header = spV2State.mainRows.find(r => r._is_header && r._group_id === gid);
+      if (!header) { toast('ไม่พบ SP นี้', 'error', 3000); return; }
+      const spNum = header.sp_number || header.bill_no || gid;
+      const reason = prompt(
+        `✓ บังคับ matched สำหรับ ${spNum}?\n\n` +
+        `ใช้กรณีตรวจสอบเองว่า SP นี้ตรงกับ Bank Statement แล้ว\n` +
+        `แต่ระบบ auto-match หาไม่เจอ (เช่น ยอดต่างเพราะค่าธรรมเนียม, วันต่างเพราะ batch)\n\n` +
+        `หมายเหตุ (optional — สำหรับ trace ภายหลัง):`,
+        ''
+      );
+      if (reason === null) return; // user cancelled
+      const detail = String(reason || 'manual override').trim().substring(0, 100);
+      header._match_status = 'matched';
+      header._matched_stmt_uuid = 'force:' + detail;
+      header._dirty = true;
+      if (typeof persistSpV2 === 'function') persistSpV2();
+      toast(`✓ Force matched ${spNum} — กดบันทึกเพื่อ push ขึ้น cloud`, 'success', 5000);
+      renderSpRecon(el);
+    });
+  });
+  
+  // ⭐ 13/5/26 — Unforce match button (revert to no_match)
+  el.querySelectorAll('.spv2-unforce-match').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const gid = btn.dataset.gid;
+      const header = spV2State.mainRows.find(r => r._is_header && r._group_id === gid);
+      if (!header) { toast('ไม่พบ SP นี้', 'error', 3000); return; }
+      const spNum = header.sp_number || header.bill_no || gid;
+      if (!confirm(`↩ ยกเลิก force match ของ ${spNum}?\n\nสถานะจะกลับเป็น no_match`)) return;
+      header._match_status = 'no_match';
+      header._matched_stmt_uuid = '';
+      header._dirty = true;
+      if (typeof persistSpV2 === 'function') persistSpV2();
+      toast(`↩ Unforced ${spNum} — กดบันทึกเพื่อ push ขึ้น cloud`, 'info', 4000);
+      renderSpRecon(el);
+    });
+  });
+  
   el.querySelectorAll('[data-view]').forEach(b => b.addEventListener('click', () => {
     spV2State.view = b.dataset.view; renderSpRecon(el);
   }));
@@ -31302,11 +31405,35 @@ function spV2RenderMainTable(rows) {
       ? `<span class="spv2-toggle-expand" data-gid="${r._group_id}" title="${groupCollapsed?'แสดงบิล':'ซ่อนบิล'}" style="display:inline-block;cursor:pointer;width:16px;text-align:center;color:var(--text2);user-select:none">${groupCollapsed?'▶':'▼'}</span>` 
       : '';
     
-    // Match status badge for header rows (Y only — N rows skipped during match)
-    //   ⭐ 8/5/26 — bigger badge + tooltip with stmt details
-    const matchBadge = (isHdr && r._match_status) ? (() => {
+    // Match status badge for header rows
+    //   ⭐ 13/5/26 — Always show badge for header rows (even blank status — shows "⊘ SKIPPED")
+    //   เก่า: rows ที่ _match_status='' ไม่มี badge → Toppy งง ว่าทำไมไม่ขึ้นอะไรเลย
+    //   ใหม่: แสดง "⊘ SKIPPED" + tooltip บอกเหตุผล (จาก payTotal=0 หรือ transfer_amt=0)
+    const matchBadge = isHdr ? (() => {
+      if (!r._match_status) {
+        // Blank status — determine reason
+        const payTotal = Number(r.pay_total) || 0;
+        const transferAmt = Number(r.transfer_amt) || 0;
+        let reason = '';
+        if (payTotal === 0) {
+          reason = 'ยังไม่ชำระ (pay_total = 0)';
+        } else if (transferAmt === 0) {
+          reason = 'จ่ายเงินสด/เช็ค ไม่มียอดโอน — กดปุ่ม Match ไม่ได้';
+        } else {
+          reason = 'ยังไม่ได้กดปุ่ม "🔗 Match Statement" — กดเพื่อตรวจ';
+        }
+        return `<span title="${reason}" 
+            style="display:inline-block;padding:3px 10px;background:rgba(128,128,128,.12);color:var(--text2);border:1.5px dashed var(--text3);border-radius:12px;font-size:.72rem;font-weight:600;margin-right:6px;letter-spacing:.5px">⊘ SKIPPED</span>`;
+      }
       if (r._match_status === 'matched') {
-        const isAuto = String(r._matched_stmt_uuid || '').startsWith('auto_');
+        const uuidStr = String(r._matched_stmt_uuid || '');
+        const isForce = uuidStr.startsWith('force:');
+        const isAuto = uuidStr.startsWith('auto_');
+        if (isForce) {
+          const detail = uuidStr.replace(/^force:/, '');
+          return `<span title="✓ บังคับ matched โดยผู้ใช้ (${detail || 'no detail'}) — กดปุ่ม ↩ Unforce เพื่อยกเลิก" 
+            style="display:inline-block;padding:3px 10px;background:rgba(91,124,250,.18);color:var(--info);border:1.5px solid var(--info);border-radius:12px;font-size:.72rem;font-weight:700;margin-right:6px;letter-spacing:.5px">✓ FORCE</span>`;
+        }
         if (isAuto) {
           return `<span title="✓ ซื้อสด (OS/SS/JS) — match จาก Daily แล้ว ไม่ต้องตรวจ bank stmt" 
             style="display:inline-block;padding:3px 10px;background:rgba(63,196,143,.22);color:var(--success);border:1.5px solid var(--success);border-radius:12px;font-size:.72rem;font-weight:700;margin-right:6px;letter-spacing:.5px">✓ MATCHED</span>`;
@@ -31329,7 +31456,6 @@ function spV2RenderMainTable(rows) {
       return `<span title="✗ ไม่พบ Bank Statement ที่ตรง — ตรวจดูว่าได้รับเงินจริงไหม / amount ตรงไหม / วันใกล้เคียงไหม" 
             style="display:inline-block;padding:3px 10px;background:rgba(239,87,87,.18);color:var(--danger);border:1.5px solid var(--danger);border-radius:12px;font-size:.72rem;font-weight:700;margin-right:6px;letter-spacing:.5px;animation:spv2-pulse-warn 2s ease-in-out infinite">✗ NO MATCH</span>`;
     })() : '';
-    
     // ⭐ 8/5/26 — Tint entire row by match status (Y headers only)
     let matchRowTint = '';
     if (isHdr && r._match_status) {
@@ -31343,8 +31469,20 @@ function spV2RenderMainTable(rows) {
     }
     
     // Action buttons
+    // ⭐ 13/5/26 — Force-match button: อนุญาตให้ผู้ใช้ override match status เป็น matched
+    //    ใช้กรณี: SP ที่ระบบ flag เป็น no_match/warn_mixed แต่ Toppy ตรวจสอบเองแล้วว่าถูก
+    //    เงื่อนไข: แสดงเฉพาะ header rows ที่ยังไม่ matched (no_match / warn_mixed / blank)
+    let forceMatchBtn = '';
+    if (isHdr && r._match_status !== 'matched') {
+      forceMatchBtn = `<button class="spv2-force-match" data-gid="${r._group_id}" title="✓ บังคับ matched — ใช้กรณีตรวจสอบเองว่าถูกต้องแล้ว" style="background:rgba(63,196,143,.15);border:1px solid var(--success);color:var(--success);padding:3px 8px;border-radius:4px;cursor:pointer;font-size:.75rem;margin-right:4px;font-weight:600">✓ Force match</button>`;
+    }
+    // ⭐ Unmatch button: ถ้าเป็น force-matched อยู่แล้ว → อนุญาตให้ revert (ใช้ flag ใน _matched_stmt_uuid)
+    let unforceMatchBtn = '';
+    if (isHdr && r._match_status === 'matched' && String(r._matched_stmt_uuid || '').startsWith('force:')) {
+      unforceMatchBtn = `<button class="spv2-unforce-match" data-gid="${r._group_id}" title="ยกเลิก force match — กลับเป็น no_match" style="background:transparent;border:1px solid var(--warn);color:var(--warn);padding:3px 8px;border-radius:4px;cursor:pointer;font-size:.75rem;margin-right:4px">↩ Unforce</button>`;
+    }
     const actionCell = isHdr 
-      ? `${matchBadge}<button class="spv2-edit-pay" data-gid="${r._group_id}" title="แก้วิธีชำระ" style="background:var(--info-bg);border:1px solid var(--info);color:var(--info);padding:3px 8px;border-radius:4px;cursor:pointer;font-size:.75rem">✏️</button>`
+      ? `${matchBadge}${forceMatchBtn}${unforceMatchBtn}<button class="spv2-edit-pay" data-gid="${r._group_id}" title="แก้วิธีชำระ" style="background:var(--info-bg);border:1px solid var(--info);color:var(--info);padding:3px 8px;border-radius:4px;cursor:pointer;font-size:.75rem">✏️</button>`
       : `<button class="spv2-bill-edit" data-idx="${origIdx}" title="แก้บิล" style="background:transparent;border:1px solid var(--border);padding:2px 6px;border-radius:3px;cursor:pointer;font-size:.7rem;margin-right:2px">✏️</button><button class="spv2-bill-delete" data-idx="${origIdx}" title="ลบบิล" style="background:transparent;border:1px solid var(--danger);color:var(--danger);padding:2px 6px;border-radius:3px;cursor:pointer;font-size:.7rem">🗑</button>`;
     
     const rowHtml = `
