@@ -39665,12 +39665,12 @@ function _pvParseVatRow(r, vatType) {
 
 // ── Initialize after all declarations are ready ──
 (async function() {
-  // ⭐ R21 BOOT BEACON — confirms fresh JS execution (not V8 cached old version)
-  //   If you see this in console, R21 code is active.
+  // ⭐ R22 BOOT BEACON — confirms fresh JS execution (not V8 cached old version)
+  //   If you see this in console, R22 code is active.
   //   If you don't see this, your browser is running cached old code → clear V8 cache.
   console.log('%c[SF R22] Active build: 2026-05-14-1430 — SB perf patches + pay modal expanded', 'color:#0c8;font-weight:bold;font-size:13px');
   console.log('%c[SF R22] recordBillingPayment batched, refresh parallel, createBillingNote year-scoped, pay modal full-screen', 'color:#888');
-  window.__SF_BUILD = 'R21-2026-05-14-1330';
+  window.__SF_BUILD = 'R22-2026-05-14-1430';
   
   await restoreMainState();
   checkSavedLogin();
