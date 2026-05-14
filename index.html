@@ -8006,6 +8006,11 @@ async function renderMain(el) {
         if (newTab === mainTab) return;
         mainTab = newTab;
         try { localStorage.setItem('sf_main_tab', mainTab); } catch(_) {}
+        // ⭐ R20 13/5/26 — Invalidate cache on tab switch
+        //   Bug: Auto Match in Statements tab mutates match_status (length unchanged)
+        //         → bills cache key (selectedDate + length) stale on Daily tab
+        //   Fix: invalidate before render — ensure fresh data on every tab switch
+        if (typeof invalidateBillsCache === 'function') invalidateBillsCache();
         render();
       });
     });
@@ -19041,6 +19046,10 @@ function navigateTo(page) {
   renderNav();
   const main = document.getElementById('main');
   main.scrollTop = 0;
+  // ⭐ R20 13/5/26 — Invalidate bills cache before re-render
+  //   Bug: mutation in one page (Auto Match) → cache stale in Main page
+  //   Fix: clear cache on every page navigation
+  if (typeof window.invalidateBillsCache === 'function') window.invalidateBillsCache();
   const renderer = PAGE_RENDERERS[page];
   if (renderer) renderer(main);
   else main.innerHTML = `<div class="card"><p class="text-dim">หน้า "${page}" กำลังพัฒนา</p></div>`;
@@ -25542,9 +25551,16 @@ async function renderMatching(el) {
           
           alert(msg);
           uploadedStatements = getAllStatements();
+          if (typeof window.invalidateBillsCache === 'function') window.invalidateBillsCache();
           render();
         }
       }
+      // ⭐ R20 13/5/26 — Invalidate bills cache before final render
+      //   Bug: Daily tab cache key = selectedDate + '|' + billList.length
+      //         Auto Match mutates match_status/matched_stmt_uuid (length unchanged)
+      //         → cache stale → Daily tab shows pre-match status until reload
+      //   Fix: invalidate cache so getBillsForSelectedDate() rebuilds
+      if (typeof window.invalidateBillsCache === 'function') window.invalidateBillsCache();
       render();
     }
 
