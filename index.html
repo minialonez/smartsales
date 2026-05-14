@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R22-2026-05-14-1430 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R23-2026-05-14-1530 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -7,7 +7,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>Smart Finance R22</title>
+<title>Smart Finance R23</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
@@ -20020,6 +20020,19 @@ async function renderBilling(el) {
     return Math.floor((new Date(toIso) - new Date(fromIso)) / 86400000);
   }
 
+  // ⭐ R23 14/5/26 — natural sort bills by bill_no (e.g. SR00126-000005 ก่อน SR00126-000139)
+  function _sortBillsByNo(bills) {
+    if (!Array.isArray(bills)) return [];
+    return [...bills].sort((a, b) => {
+      const an = String(a?.bill_no || '');
+      const bn = String(b?.bill_no || '');
+      if (!an && !bn) return 0;
+      if (!an) return 1;
+      if (!bn) return -1;
+      return an.localeCompare(bn, undefined, { numeric: true, sensitivity: 'base' });
+    });
+  }
+
   // กรอง bills ที่เป็นเครดิต + unpaid + ไม่อยู่ใน billing notes อื่น (ที่ไม่ cancelled)
   function getUnpaidCreditBills() {
     if (!Array.isArray(billList)) return [];
@@ -20051,7 +20064,31 @@ async function renderBilling(el) {
   // ══════════════════════════════════════════════════════════════
   // DATA LOADING
   // ══════════════════════════════════════════════════════════════
+  
+  // ⭐ R23 14/5/26 — localStorage cache for billingNotes (instant entry)
+  const BN_CACHE_KEY = 'sf_bn_cache_v1';
+  const BN_CACHE_TTL_MS = 300000;  // 5 min
+  function _loadCachedNotes() {
+    try {
+      const raw = localStorage.getItem(BN_CACHE_KEY);
+      if (!raw) return null;
+      const obj = JSON.parse(raw);
+      if (!obj || !obj.ts || !Array.isArray(obj.data)) return null;
+      if (Date.now() - obj.ts > BN_CACHE_TTL_MS) return null;
+      return obj.data;
+    } catch(e) { return null; }
+  }
+  function _saveCachedNotes(data) {
+    try {
+      localStorage.setItem(BN_CACHE_KEY, JSON.stringify({ ts: Date.now(), data }));
+    } catch(e) { /* quota — silent fail */ }
+  }
+  function _invalidateCachedNotes() {
+    try { localStorage.removeItem(BN_CACHE_KEY); } catch(e) {}
+  }
+  
   async function loadNotes() {
+    // ⭐ R23: omit bills_snapshot — saves 50-70% bandwidth
     const r = await api('getBillingNotes', {});
     billingNotes = (r && r.success && Array.isArray(r.data)) ? r.data : [];
     // ⭐ Normalize backend status → frontend canonical status (5/6/26)
@@ -20065,10 +20102,40 @@ async function renderBilling(el) {
       else if (s === 'complete') n.status = 'paid';
       // 'partial' / 'cancelled' / 'pending' / 'paid' pass through unchanged
     });
+    _saveCachedNotes(billingNotes);
   }
   async function loadPayments() {
     const r = await api('getBillingPayments', {});
     billingPayments = (r && r.success && Array.isArray(r.data)) ? r.data : [];
+  }
+  // ⭐ R23 — lazy load payments per SB (on-demand for view modal)
+  //   Cache per billing_uuid to avoid re-fetch on re-open
+  const _paymentsCache = new Map();  // billing_uuid → {ts, data}
+  const PAY_CACHE_TTL_MS = 60000;
+  async function loadPaymentsForSB(billing_uuid) {
+    const c = _paymentsCache.get(billing_uuid);
+    if (c && (Date.now() - c.ts) < PAY_CACHE_TTL_MS) return c.data;
+    const r = await api('getBillingPayments', { billing_uuid });
+    const data = (r && r.success && Array.isArray(r.data)) ? r.data : [];
+    _paymentsCache.set(billing_uuid, { ts: Date.now(), data });
+    // Merge into billingPayments array (for backward compat with existing code reading from there)
+    billingPayments = billingPayments.filter(p => p.billing_uuid !== billing_uuid).concat(data);
+    return data;
+  }
+  // ⭐ R23 — fetch single SB with bills_snapshot (for view modal)
+  async function loadNoteWithSnapshot(billing_uuid) {
+    const r = await api('getBillingNotes', { billing_uuid, include_snapshot: true });
+    if (r && r.success && Array.isArray(r.data) && r.data.length > 0) {
+      const fresh = r.data[0];
+      const s = String(fresh.status || '').toLowerCase();
+      if (s === 'open') fresh.status = 'pending';
+      else if (s === 'complete') fresh.status = 'paid';
+      // Patch into local list
+      const idx = billingNotes.findIndex(n => n.billing_uuid === billing_uuid);
+      if (idx >= 0) billingNotes[idx] = { ...billingNotes[idx], ...fresh };
+      return fresh;
+    }
+    return null;
   }
   async function loadNextNo() {
     const year = createState.billingDate.split('-')[0];
@@ -20084,11 +20151,34 @@ async function renderBilling(el) {
   }
 
   async function refresh() {
+    // ⭐ R23 14/5/26 — Cache-first: instant display, refresh in background
+    //   เก่า: blocking await loadNotes + loadPayments
+    //   ใหม่: cache → instant render, fresh data swap in background
+    const cached = _loadCachedNotes();
+    if (cached && cached.length > 0 && billingNotes.length === 0) {
+      billingNotes = cached;
+      loading = false;
+      render();  // instant display from cache
+      // Refresh in background
+      (async () => {
+        try {
+          const tasks = [loadNotes(), loadCustomerListIfNeeded()];
+          if (activeTab === 'create') tasks.push(loadNextNo());
+          await Promise.all(tasks);
+          render();
+        } catch (e) {
+          console.warn('[refresh bg] failed:', e?.message || e);
+        }
+      })();
+      return;
+    }
+    
+    // No cache — block load with loading state
     loading = true;
     render();
     try {
-      // ⭐ R22 14/5/26 — parallel load (เก่า: 3-4× sequential round-trip)
-      const tasks = [loadNotes(), loadPayments(), loadCustomerListIfNeeded()];
+      // ⭐ R22 — parallel load (skip loadPayments — lazy now)
+      const tasks = [loadNotes(), loadCustomerListIfNeeded()];
       if (activeTab === 'create') tasks.push(loadNextNo());
       await Promise.all(tasks);
     } catch (e) {
@@ -20116,40 +20206,12 @@ async function renderBilling(el) {
   // MAIN RENDER
   // ══════════════════════════════════════════════════════════════
   function render() {
-    const totalCount = billingNotes.length;
-    const pendingCount = billingNotes.filter(n => n.status === 'pending').length;
-    const partialCount = billingNotes.filter(n => n.status === 'partial').length;
-    const paidCount = billingNotes.filter(n => n.status === 'paid').length;
-    const totalOutstanding = billingNotes
-      .filter(n => n.status === 'pending' || n.status === 'partial')
-      .reduce((s, n) => s + (Number(n.outstanding)||0), 0);
-    
-    // ⭐ 12/5/26 — Aging buckets (merged from old Aging tab — Phase A)
-    //   Compute client-side from due_date + outstanding (mirrors backend getBillingDebtAging)
-    //   Bucket: current (ยังไม่ครบ), 0-30, 31-60, 61-90, 90+
+    // ⭐ R23 14/5/26 — single-pass aggregation (เก่า: 7-8 separate loops on billingNotes)
     const _todayISO = todayISO();
     const _todayDate = new Date(_todayISO + 'T00:00:00');
-    function _computeAgingBucket(n) {
-      if (n.status !== 'pending' && n.status !== 'partial') return null;
-      const due = n.due_date ? new Date(n.due_date + 'T00:00:00') : _todayDate;
-      const days = Math.floor((_todayDate - due) / 86400000);
-      if (days < 0) return 'current';
-      if (days <= 30) return 'b_0_30';
-      if (days <= 60) return 'b_31_60';
-      if (days <= 90) return 'b_61_90';
-      return 'b_90_plus';
-    }
-    // Compute days overdue (negative = days until due)
-    function _agingDays(n) {
-      const due = n.due_date ? new Date(n.due_date + 'T00:00:00') : _todayDate;
-      return Math.floor((_todayDate - due) / 86400000);
-    }
-    // Attach aging info to each note (cached on the note object — used in List render)
-    billingNotes.forEach(n => {
-      n._agingBucket = _computeAgingBucket(n);
-      n._agingDays = _agingDays(n);
-    });
-    // Sum outstanding per bucket
+    
+    let totalCount = 0, pendingCount = 0, partialCount = 0, paidCount = 0;
+    let totalOutstanding = 0;
     const agingStats = {
       current: { amt: 0, cnt: 0 },
       b_0_30:  { amt: 0, cnt: 0 },
@@ -20157,30 +20219,69 @@ async function renderBilling(el) {
       b_61_90: { amt: 0, cnt: 0 },
       b_90_plus: { amt: 0, cnt: 0 },
     };
-    billingNotes.forEach(n => {
-      const b = n._agingBucket;
-      if (b && agingStats[b]) {
-        agingStats[b].amt += Number(n.outstanding) || 0;
-        agingStats[b].cnt += 1;
-      }
-    });
+    const _custOutstanding = {};   // built inline (will replace _custOutstandingCache)
+    const seenCustCodes = new Set();
+    const custList = [];           // unique cust codes (for credit warn loop)
     
-    // ⭐ Credit Warning stats — นับจำนวน "ลูกค้า" (unique cust_code) ที่ใกล้เต็มวงเงิน
+    for (let i = 0; i < billingNotes.length; i++) {
+      const n = billingNotes[i];
+      totalCount++;
+      if (n.status === 'pending') pendingCount++;
+      else if (n.status === 'partial') partialCount++;
+      else if (n.status === 'paid') paidCount++;
+      
+      const isOutstanding = (n.status === 'pending' || n.status === 'partial');
+      if (isOutstanding) {
+        const out = Number(n.outstanding) || 0;
+        totalOutstanding += out;
+        // Aging
+        const due = n.due_date ? new Date(n.due_date + 'T00:00:00') : _todayDate;
+        const days = Math.floor((_todayDate - due) / 86400000);
+        n._agingDays = days;
+        let bucket;
+        if (days < 0) bucket = 'current';
+        else if (days <= 30) bucket = 'b_0_30';
+        else if (days <= 60) bucket = 'b_31_60';
+        else if (days <= 90) bucket = 'b_61_90';
+        else bucket = 'b_90_plus';
+        n._agingBucket = bucket;
+        agingStats[bucket].amt += out;
+        agingStats[bucket].cnt += 1;
+        // Cust outstanding map
+        const code = String(n.cust_code || '').trim().toUpperCase();
+        if (code) {
+          _custOutstanding[code] = (_custOutstanding[code] || 0) + out;
+          if (!seenCustCodes.has(code)) {
+            seenCustCodes.add(code);
+            custList.push(code);
+          }
+        }
+      } else {
+        n._agingBucket = null;
+        const due = n.due_date ? new Date(n.due_date + 'T00:00:00') : _todayDate;
+        n._agingDays = Math.floor((_todayDate - due) / 86400000);
+        // Still track for credit warn (paid customers don't count, but seenCustCodes used for dedup)
+        const code = String(n.cust_code || '').trim().toUpperCase();
+        if (code && !seenCustCodes.has(code)) {
+          seenCustCodes.add(code);
+          custList.push(code);
+        }
+      }
+    }
+    
+    // ⭐ R23: push pre-computed map into cache (skip rebuild in getCreditUsage)
+    _custOutstandingCache = _custOutstanding;
+    _custOutstandingCacheKey = String(billingNotes.length) + ':' + (billingNotes[0]?.updated_at || '');
+    
+    // Credit warning stats
     const creditWarnedCusts = new Set();
     const creditCriticalCusts = new Set();
     if (Array.isArray(customerList) && customerList.length > 0) {
-      // Reset cache before recalculating
-      _custOutstandingCache = null;
-      // Iterate unique cust_codes from billingNotes
-      const seenCodes = new Set();
-      billingNotes.forEach(n => {
-        const code = String(n.cust_code || '').trim().toUpperCase();
-        if (!code || seenCodes.has(code)) return;
-        seenCodes.add(code);
-        const u = getCreditUsage(code);
-        if (u.level === 'critical') creditCriticalCusts.add(code);
-        else if (u.level === 'warn') creditWarnedCusts.add(code);
-      });
+      for (let i = 0; i < custList.length; i++) {
+        const u = getCreditUsage(custList[i]);
+        if (u.level === 'critical') creditCriticalCusts.add(custList[i]);
+        else if (u.level === 'warn') creditWarnedCusts.add(custList[i]);
+      }
     }
     const creditWarnTotal = creditWarnedCusts.size + creditCriticalCusts.size;
 
@@ -20831,7 +20932,7 @@ async function renderBilling(el) {
                   const overdue = n.due_date && n.due_date < todayISO();
                   const ageDays = n.due_date ? Math.floor((Date.now() - new Date(n.due_date).getTime())/(1000*60*60*24)) : 0;
                   const statusColor = n.status === 'partial' ? '#3b82f6' : '#f59e0b';
-                  const bills = Array.isArray(n.bills_snapshot) ? n.bills_snapshot : [];
+                  const bills = _sortBillsByNo(n.bills_snapshot);
                   const billsCount = bills.length;
                   return `
                     <tr class="cdr-sb-row" data-idx="${idx}" data-uuid="${n.billing_uuid}" style="border-top:1px solid var(--border);${overdue?'background:rgba(239,68,68,0.04)':''};cursor:pointer" title="คลิกเพื่อดูรายละเอียดบิล">
@@ -21041,7 +21142,7 @@ ${bodyHtml}
   
   function printBillingNote(sb, cust) {
     const co = _getCompanyInfo();
-    const bills = Array.isArray(sb.bills_snapshot) ? sb.bills_snapshot : [];
+    const bills = _sortBillsByNo(sb.bills_snapshot);
     
     let billRowsHtml = '';
     let runningTotal = 0;
@@ -21970,10 +22071,24 @@ ${bodyHtml}
   // ══════════════════════════════════════════════════════════════
   // MODALS
   // ══════════════════════════════════════════════════════════════
-  function openViewModal(uuid) {
+  async function openViewModal(uuid) {
     const n = billingNotes.find(x => x.billing_uuid === uuid);
     if (!n) return;
     const s = STATUS_INFO[n.status] || { label: n.status, color:'#888' };
+    
+    // ⭐ R23 14/5/26 — lazy load payments + bills_snapshot in parallel (only when modal opens)
+    //   เก่า: pre-loaded ทุก SB upfront ใน refresh() — น้ำหนัก data ใหญ่
+    //   ใหม่: load on-demand → instant entry page, modal โหลด ~50-200ms
+    const loadPromise = Promise.all([
+      loadPaymentsForSB(uuid).catch(() => []),
+      (!n.bills_snapshot || !Array.isArray(n.bills_snapshot) || n.bills_snapshot.length === 0)
+        ? loadNoteWithSnapshot(uuid).catch(() => null)
+        : Promise.resolve(n),
+    ]);
+    await loadPromise;
+    // Re-resolve n in case bills_snapshot was just loaded
+    const fresh = billingNotes.find(x => x.billing_uuid === uuid) || n;
+    Object.assign(n, fresh);
     
     openModal('ใบวางบิล ' + n.billing_no, `
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
@@ -22007,7 +22122,7 @@ ${bodyHtml}
           <table class="table" style="width:100%;font-size:13px">
             <thead><tr style="background:var(--bg-elev)"><th>เลขบิล</th><th>วันที่</th><th>Station</th><th>ประเภท</th><th style="text-align:right">ยอด</th></tr></thead>
             <tbody>
-              ${(n.bills_snapshot||[]).map(b => `
+              ${_sortBillsByNo(n.bills_snapshot).map(b => `
                 <tr style="border-top:1px solid var(--border)">
                   <td>${b.bill_no||'-'}</td>
                   <td>${fmtThaiDate(b.date)}</td>
@@ -22121,7 +22236,10 @@ ${bodyHtml}
             const d = res.data || {};
             toast(`✓ ลบรายการชำระ — คืน ฿${fmtNum(d.removed_amount||0)} → ${d.new_status}`, 'success', 4000);
             closeModal();
-            await Promise.all([loadNotes(), loadPayments()]);
+            // ⭐ R23: invalidate cache + refresh only the affected SB
+            _invalidateCachedNotes();
+            _paymentsCache.delete(buid);
+            await loadNotes();
             setTimeout(() => openViewModal(buid), 200);
           } catch(err) {
             toast('ลบไม่สำเร็จ: ' + (err.message || err), 'error', 4000);
@@ -22390,8 +22508,11 @@ ${bodyHtml}
               _bn.updated_at = new Date().toISOString();
             }
             render();
-            // Background refresh payments (สำหรับ view modal ดูประวัติ) — ไม่ block UI
-            loadPayments().catch(() => {});
+            // ⭐ R23: invalidate cache + payments cache for this SB (next view modal re-fetches)
+            _invalidateCachedNotes();
+            _paymentsCache.delete(uuid);
+            // Re-cache with patched state
+            _saveCachedNotes(billingNotes);
           } else {
             // PARTIAL fail — remove committed rows from state to prevent double-charge
             if (committedIndices.length > 0) {
@@ -22510,7 +22631,7 @@ ${bodyHtml}
   function openPrintWindow(uuid) {
     const n = billingNotes.find(x => x.billing_uuid === uuid);
     if (!n) return;
-    const bills = n.bills_snapshot || [];
+    const bills = _sortBillsByNo(n.bills_snapshot);
     const w = window.open('', '_blank', 'width=900,height=1100');
     if (!w) { toast('โปรดอนุญาต popup เพื่อพิมพ์', 'error'); return; }
     const totalText = thaiBahtText(n.total_amount);
@@ -23026,7 +23147,7 @@ function wireReceivePaymentModal(state) {
     
     $billsContent.innerHTML = state.outstanding_sbs.map(sb => {
       const cycleLabel = `${monthNames[sb.cycle_month] || sb.cycle_month}/${(sb.cycle_year % 100).toString().padStart(2,'0')}`;
-      const billsHtml = (sb.bills_snapshot || []).map(b => {
+      const billsHtml = _sortBillsByNo(sb.bills_snapshot).map(b => {
         const billUuid = b.bill_uuid || '';
         const isPaid = b.match_status === 'paid' || b.paid_by_sp;
         const checked = state.selected_bills.has(billUuid);
@@ -39665,12 +39786,12 @@ function _pvParseVatRow(r, vatType) {
 
 // ── Initialize after all declarations are ready ──
 (async function() {
-  // ⭐ R22 BOOT BEACON — confirms fresh JS execution (not V8 cached old version)
-  //   If you see this in console, R22 code is active.
+  // ⭐ R23 BOOT BEACON — confirms fresh JS execution (not V8 cached old version)
+  //   If you see this in console, R23 code is active.
   //   If you don't see this, your browser is running cached old code → clear V8 cache.
-  console.log('%c[SF R22] Active build: 2026-05-14-1430 — SB perf patches + pay modal expanded', 'color:#0c8;font-weight:bold;font-size:13px');
-  console.log('%c[SF R22] recordBillingPayment batched, refresh parallel, createBillingNote year-scoped, pay modal full-screen', 'color:#888');
-  window.__SF_BUILD = 'R22-2026-05-14-1430';
+  console.log('%c[SF R23] Active build: 2026-05-14-1530 — SB cache-first + lazy payments + light backend', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R23] localStorage cache → instant entry; payments lazy per SB; render() single-pass', 'color:#888');
+  window.__SF_BUILD = 'R23-2026-05-14-1530';
   
   await restoreMainState();
   checkSavedLogin();
