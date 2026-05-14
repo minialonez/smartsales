@@ -3943,7 +3943,9 @@ const syncManager = {
       //    + bill ที่ stmt บอกว่า matched แต่ตัวเองยัง pending → sync ให้
       if (billList.length > 0 && uploadedStatements.length > 0) {
         const stmtByBillNo = {};
+        const stmtByUuid = {};
         uploadedStatements.forEach(s => {
+          if (s.stmt_uuid) stmtByUuid[s.stmt_uuid] = s;
           if ((s.match_status !== 'paid') || !s.match_bill) return;
           const billNos = Array.isArray(s.matched_bills) && s.matched_bills.length 
             ? s.matched_bills 
@@ -3951,20 +3953,62 @@ const syncManager = {
           billNos.forEach(bn => { stmtByBillNo[bn] = s; });
         });
         let healedBills = 0;
+        let healedStmts = 0;
         billList.forEach(b => {
           if (!b.bill_no) return;
-          // ⭐ 12/5/26 — Skip SP-prefix bills (SP recon manages match data independently)
-          if (/^SP/i.test(b.bill_no)) return;
+          // ⭐ R21 13/5/26 — REMOVED R12 SP-prefix skip in heal path
+          //   R12 (12/5/26) added `if (/^SP/i.test(b.bill_no)) return;` to prevent
+          //   auto-sync from overwriting SP recon's confirmation field. But heal path
+          //   only WRITES if confirmation is empty (line below), so the skip was unnecessary
+          //   and blocked legitimate Manual Match → bill propagation.
+          //   Result: 13 fresh Case A inconsistencies (8 SP prefix bills unmatch'd in Daily
+          //   despite stmt showing matched).
+          //   Fix: allow heal for all prefixes; confirmation/uuid only written if empty (safe).
+          //   The skip is KEPT in L5216 + L5322 auto-sync paths (different code path).
           const stmt = stmtByBillNo[b.bill_no];
           if (stmt && b.match_status !== 'paid' && b.match_status !== 'void') {
             b.match_status = 'paid';
             if (!b.matched_stmt_ref) { b.matched_stmt_ref = stmt.ref_no || ''; b.matched_stmt_uuid = stmt.stmt_uuid || ''; }
             if (!b.confirmation && stmt.ref_no) b.confirmation = stmt.ref_no;
+            // ⭐ R21 — mark dirty so next push includes the healed bill
+            if (b.bill_uuid && window.syncManager?.markDirty) {
+              window.syncManager.markDirty('bills', b.bill_uuid);
+            }
             healedBills++;
           }
         });
+        
+        // ⭐ R21 13/5/26 — REVERSE HEAL: Case B (bill matched + stmt unmatched)
+        //   Bill has match_status='paid' + matched_stmt_uuid pointing to existing stmt
+        //   BUT stmt.match_status != 'paid' (stale/desync from sync race)
+        //   → Propagate bill match to stmt (one-direction heal)
+        //   Fixes 5 historical Case B records from CIC scan.
+        billList.forEach(b => {
+          if (b.match_status !== 'paid') return;
+          if (!b.matched_stmt_uuid) return;
+          const stmt = stmtByUuid[b.matched_stmt_uuid];
+          if (!stmt) return;
+          if (stmt.match_status === 'paid' || stmt.match_status === 'void') return;
+          // Propagate
+          stmt.match_status = 'paid';
+          if (!stmt.match_bill) stmt.match_bill = b.bill_no;
+          if (!Array.isArray(stmt.matched_bills) || stmt.matched_bills.length === 0) {
+            stmt.matched_bills = [b.bill_no];
+          }
+          if (!stmt.matched_at) stmt.matched_at = b.matched_at || new Date().toISOString();
+          if (!stmt.match_method) stmt.match_method = 'heal_reverse';
+          // markDirty stmt
+          if (stmt.stmt_uuid && window.syncManager?.markDirty) {
+            window.syncManager.markDirty('stmts', stmt.stmt_uuid);
+          }
+          healedStmts++;
+        });
+        
         if (healedBills > 0) {
           console.log(`[sync heal bills] +${healedBills} bills marked matched (matched stmt found)`);
+        }
+        if (healedStmts > 0) {
+          console.log(`[R21 reverse heal] +${healedStmts} stmts marked matched (bill points to it)`);
         }
       }
       
@@ -24713,6 +24757,16 @@ async function renderMatching(el) {
                 match.matched_stmt_ref = stmt.ref_no || '';
                 match.matched_stmt_uuid = stmt.stmt_uuid || '';
                 match.matched_at = new Date().toISOString();
+                // ⭐ R21 13/5/26 — Explicit markDirty for Manual Match bill side
+                //   Bug fix: 13 bills paid via Manual Match but bill side never pushed to cloud
+                //   → on refresh, cloud sent old (pending) version, overwriting local 'paid'
+                //   → Daily tab showed unmatch'd bills even though stmt was matched
+                //   Root cause: persistMainState fingerprint may skip bills if other changes
+                //   trigger early-exit. Direct markDirty per bill_uuid = guaranteed push.
+                if (match.bill_uuid && window.syncManager?.markDirty) {
+                  window.syncManager.markDirty('bills', match.bill_uuid);
+                  if (window.syncManager._fpCache) window.syncManager._fpCache.bills = null;
+                }
               }
             });
             // ใช้บิลแรกเป็น primary reference
