@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R21-2026-05-14-1230 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R21-2026-05-14-1330 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -7,7 +7,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>Smart Finance R21</title>
+<title>Smart Finance R21+</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
@@ -39649,34 +39649,36 @@ function _pvParseVatRow(r, vatType) {
   // ⭐ R21 BOOT BEACON — confirms fresh JS execution (not V8 cached old version)
   //   If you see this in console, R21 code is active.
   //   If you don't see this, your browser is running cached old code → clear V8 cache.
-  console.log('%c[SF R21] Active build: 2026-05-14-1230 — heal logic loaded', 'color:#0c8;font-weight:bold;font-size:13px');
-  console.log('%c[SF R21] If you see this, R21 heal_reverse + markDirty fixes are running', 'color:#888');
-  window.__SF_BUILD = 'R21-2026-05-14-1230';
+  console.log('%c[SF R21] Active build: 2026-05-14-1330 — heal logic loaded (retry-enabled)', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R21] Retries @ 3s/10s/30s + post-login. heal_reverse + markDirty fixes are running', 'color:#888');
+  window.__SF_BUILD = 'R21-2026-05-14-1330';
   
   await restoreMainState();
   checkSavedLogin();
-  
-  // ⭐ R21 SAFETY NET — standalone heal runs 3s after boot
-  //   Even if V8 cached old loadAllFromCloud (without R21 inline heal),
-  //   this independent function will heal Case A + Case B inconsistencies.
-  //   Idempotent: only writes if status differs; safe to run repeatedly.
-  setTimeout(() => {
-    try { window.__SF_runR21Heal && window.__SF_runR21Heal(); } catch(e) { console.warn('[R21 safety net] failed:', e); }
-  }, 3000);
+  // Note: retry safety net runs via the [3000,10000,30000].forEach below
 })();
 
 // ⭐ R21 standalone heal function (independent of loadAllFromCloud)
 //   Exposed for both auto-run + manual debug via console: window.__SF_runR21Heal()
+//   FIX 14/5/26: billList/uploadedStatements เป็น module-scoped let, ไม่ใช่ window.X
+//                ใช้ try/catch direct access แทน window.X
 window.__SF_runR21Heal = function() {
-  if (!Array.isArray(window.billList) || !Array.isArray(window.uploadedStatements)) {
-    console.log('[R21 safety net] skip — data not loaded yet');
-    return;
+  let bills, stmts;
+  try {
+    bills = (typeof billList !== 'undefined') ? billList : window.billList;
+    stmts = (typeof uploadedStatements !== 'undefined') ? uploadedStatements : window.uploadedStatements;
+  } catch(e) {
+    console.log('[R21 safety net] skip — data not accessible:', e.message);
+    return { skipped: true, reason: 'access error' };
   }
-  const bills = window.billList;
-  const stmts = window.uploadedStatements;
+  
+  if (!Array.isArray(bills) || !Array.isArray(stmts)) {
+    console.log('[R21 safety net] skip — data not loaded yet');
+    return { skipped: true, reason: 'not loaded' };
+  }
   if (bills.length === 0 || stmts.length === 0) {
     console.log('[R21 safety net] skip — empty data');
-    return;
+    return { skipped: true, reason: 'empty' };
   }
   
   const stmtByBillNo = {};
@@ -39730,10 +39732,32 @@ window.__SF_runR21Heal = function() {
   if (healedBills > 0 || healedStmts > 0) {
     console.log(`%c[R21 safety net] healed bills=${healedBills} stmts=${healedStmts}`, 'color:#0c8;font-weight:bold');
     try { persistMainState && persistMainState(); } catch(_) {}
+    // Force push the dirty records
+    try { if (typeof window.syncManager?._flushPush === 'function') window.syncManager._flushPush(); } catch(_) {}
   } else {
     console.log('[R21 safety net] no inconsistencies — all healthy ✓');
   }
+  
+  return { healedBills, healedStmts, totalBills: bills.length, totalStmts: stmts.length };
 };
+
+// ⭐ R21 retry safety net — re-runs heal at 3s/10s/30s
+//   Boot timing race: first attempt @ 3s may find data not loaded (Toppy not logged in yet)
+//   Retry @ 10s: usually post-login data ready
+//   Retry @ 30s: after typical pullFromCloud completes
+//   Each retry is idempotent — only writes if status differs.
+[3000, 10000, 30000].forEach(delay => {
+  setTimeout(() => {
+    try {
+      const r = window.__SF_runR21Heal && window.__SF_runR21Heal();
+      if (r && !r.skipped && (r.healedBills > 0 || r.healedStmts > 0)) {
+        console.log(`%c[R21 retry @ ${delay}ms] healed`, 'color:#0c8', r);
+      }
+    } catch(e) {
+      console.warn(`[R21 retry @ ${delay}ms] failed:`, e);
+    }
+  }, delay);
+});
 </script>
 </body>
 </html>
