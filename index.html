@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R24.2-2026-05-14-2000 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R24.3-2026-05-14-2100 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -7,7 +7,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>Smart Finance R24.2</title>
+<title>Smart Finance R24.3</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
@@ -21553,8 +21553,7 @@ ${bodyHtml}
             <th style="min-width:220px">ลูกค้า / เครดิต</th>
             <th style="text-align:center">บิล</th>
             <th style="text-align:right">ยอดรวม</th>
-            <th style="text-align:right">ชำระแล้ว</th>
-            <th style="text-align:right">คงเหลือ</th>
+            <th style="text-align:right">ชำระแล้ว / ค้าง</th>
             <th style="text-align:center">สถานะ</th>
             <th style="text-align:center">จัดการ</th>
           </tr>
@@ -21632,8 +21631,27 @@ ${bodyHtml}
                 </td>
                 <td style="text-align:center">${billCount}</td>
                 <td style="text-align:right">฿${fmtNum(n.total_amount)}</td>
-                <td style="text-align:right;color:${n.paid_amount>0?'#16a34a':'var(--muted)'}">${n.paid_amount>0?'฿'+fmtNum(n.paid_amount):'-'}${inFlightPill}</td>
-                <td style="text-align:right;font-weight:600;color:${n.outstanding>0?'#ef4444':'#16a34a'}">${n.outstanding>0?'฿'+fmtNum(n.outstanding):'-'}${renderSbProgressBar(n)}</td>
+                <td style="text-align:right">
+                  ${(() => {
+                    if (n.status === 'paid') {
+                      return `<div style="color:#16a34a;font-weight:600">✓ ครบ ฿${fmtNum(n.paid_amount)}</div>`;
+                    }
+                    if (n.status === 'cancelled') {
+                      return `<div style="color:var(--muted)">— ยกเลิก —</div>`;
+                    }
+                    const paid = Number(n.paid_amount)||0;
+                    const outstanding = Number(n.outstanding)||Number(n.total_amount)||0;
+                    return `
+                      <div style="font-size:.85rem">
+                        <span style="color:#16a34a">฿${fmtNum(paid)}</span>
+                        <span style="color:var(--muted)"> · </span>
+                        <span style="color:#ef4444;font-weight:600">ค้าง ฿${fmtNum(outstanding)}</span>
+                      </div>
+                      ${inFlightPill}
+                      ${renderSbProgressBar(n)}
+                    `;
+                  })()}
+                </td>
                 <td style="text-align:center"><span style="color:${s.color};font-weight:500">${s.emoji} ${s.label}</span></td>
                 <td style="text-align:center;white-space:nowrap">
                   <button class="btn btn-outline btn-sm bn-view" data-uuid="${n.billing_uuid}" title="ดู">👁</button>
@@ -23021,6 +23039,16 @@ async function openReceivePaymentModal() {
     modalEl.style.overflowY = 'auto';
   }
 
+  // ⭐ R24.3 — Ensure customerList loaded (auto-fetch if empty)
+  if (!Array.isArray(customerList) || customerList.length === 0) {
+    (async () => {
+      try {
+        const r = await api('getCustomers', {});
+        if (r?.success && Array.isArray(r.data)) customerList = r.data;
+      } catch (e) { console.warn('[rp v2] customer load failed:', e); }
+    })();
+  }
+
   wireReceivePaymentModalV2(state);
 }
 
@@ -23064,22 +23092,28 @@ function wireReceivePaymentModalV2(state) {
 
   function showCustomerDropdown(q) {
     const qUp = q.toUpperCase();
-    const matched = (customerList || []).filter(c => 
-      String(c.cust_code||'').toUpperCase().includes(qUp) ||
-      String(c.cust_name||'').toUpperCase().includes(qUp)
-    ).slice(0, 50);
+    // ⭐ R24.3 — accept both cust_code + cust_id (customerList may use either field)
+    const matched = (customerList || []).filter(c => {
+      const code = String(c.cust_code || c.cust_id || '').toUpperCase();
+      const name = String(c.cust_name || '').toUpperCase();
+      return code.includes(qUp) || name.includes(qUp);
+    }).slice(0, 50);
     if (matched.length === 0) {
-      $dropdown.innerHTML = `<div style="padding:10px;color:var(--muted);font-size:.85rem">ไม่พบลูกค้า</div>`;
+      $dropdown.innerHTML = `<div style="padding:10px;color:var(--muted);font-size:.85rem">ไม่พบลูกค้า (มี ${customerList?.length||0} ราย ใน list)</div>`;
       $dropdown.style.display = 'block';
       return;
     }
-    $dropdown.innerHTML = matched.map(c => `
-      <div class="rp-cust-opt" data-code="${c.cust_code}" data-name="${escapeHtml(c.cust_name||'')}" 
-           style="padding:8px 12px;cursor:pointer;border-bottom:1px solid var(--border);font-size:.85rem">
-        <span style="font-family:var(--mono);color:var(--info)">${c.cust_code}</span>
-        <span style="margin-left:8px">${escapeHtml(c.cust_name||'')}</span>
-      </div>
-    `).join('');
+    $dropdown.innerHTML = matched.map(c => {
+      const code = c.cust_code || c.cust_id || '';
+      const name = c.cust_name || '';
+      return `
+        <div class="rp-cust-opt" data-code="${code}" data-name="${escapeHtml(name)}" 
+             style="padding:8px 12px;cursor:pointer;border-bottom:1px solid var(--border);font-size:.85rem">
+          <span style="font-family:var(--mono);color:var(--info)">${code}</span>
+          <span style="margin-left:8px">${escapeHtml(name)}</span>
+        </div>
+      `;
+    }).join('');
     $dropdown.style.display = 'block';
     $dropdown.querySelectorAll('.rp-cust-opt').forEach(el => {
       el.onmouseenter = () => el.style.background = 'var(--bg-elev)';
@@ -39921,10 +39955,10 @@ function _pvParseVatRow(r, vatType) {
 
 // ── Initialize after all declarations are ready ──
 (async function() {
-  // ⭐ R24.2 BOOT BEACON
-  console.log('%c[SF R24.2] Active build: 2026-05-14-2000 — CIC R24 fixes (sequential await + renderMain + neg block + orphan cleanup)', 'color:#0c8;font-weight:bold;font-size:13px');
-  console.log('%c[SF R24.2] R24.1 SB progress/overdue intact + 4 CIC critical fixes applied', 'color:#888');
-  window.__SF_BUILD = 'R24.2-2026-05-14-2000';
+  // ⭐ R24.3 BOOT BEACON
+  console.log('%c[SF R24.3] Active build: 2026-05-14-2100 — Customer search + merged paid/outstanding column', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R24.3] R24.2 CIC fixes intact + cust_id fallback + auto-load customerList + 1-col merged', 'color:#888');
+  window.__SF_BUILD = 'R24.3-2026-05-14-2100';
   
   await restoreMainState();
   checkSavedLogin();
