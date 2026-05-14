@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R23.3-2026-05-14-1730 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R24.1-2026-05-14-1900 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -7,7 +7,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>Smart Finance R23.3</title>
+<title>Smart Finance R24.1</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
@@ -20213,6 +20213,8 @@ async function renderBilling(el) {
     
     let totalCount = 0, pendingCount = 0, partialCount = 0, paidCount = 0;
     let totalOutstanding = 0;
+    // ⭐ R24.1 — overdue tracking
+    let overdueCount = 0, overdueAmt = 0;
     const agingStats = {
       current: { amt: 0, cnt: 0 },
       b_0_30:  { amt: 0, cnt: 0 },
@@ -20248,6 +20250,11 @@ async function renderBilling(el) {
         n._agingBucket = bucket;
         agingStats[bucket].amt += out;
         agingStats[bucket].cnt += 1;
+        // ⭐ R24.1 — overdue = days > 0 (อยู่ใน bucket b_0_30/b_31_60/b_61_90/b_90_plus)
+        if (days > 0) {
+          overdueCount++;
+          overdueAmt += out;
+        }
         // Cust outstanding map
         const code = String(n.cust_code || '').trim().toUpperCase();
         if (code) {
@@ -20337,6 +20344,10 @@ async function renderBilling(el) {
 
       <!-- ⭐ Aging buckets (merged from old Aging tab) -->
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:16px">
+        <div class="stat-card bn-overdue-card" style="border-left:4px solid #dc2626;cursor:pointer;background:${listFilter.status==='overdue'?'rgba(220,38,38,.08)':''}" title="คลิกเพื่อ filter เฉพาะ SB เกินกำหนด">
+          <div class="stat-label" style="color:#dc2626;font-weight:600">🚨 เกินกำหนด <span style="color:var(--muted);font-weight:400">(${overdueCount})</span></div>
+          <div class="stat-value" style="font-size:18px;color:#dc2626">฿${fmtNum(overdueAmt)}</div>
+        </div>
         <div class="stat-card bn-aging-card" data-bucket="current" style="border-left:4px solid #16a34a;cursor:pointer" title="คลิกเพื่อ filter">
           <div class="stat-label">ยังไม่ครบ <span style="color:var(--muted)">(${agingStats.current.cnt})</span></div>
           <div class="stat-value" style="font-size:18px">฿${fmtNum(agingStats.current.amt)}</div>
@@ -20458,6 +20469,27 @@ async function renderBilling(el) {
         card.style.outlineOffset = '2px';
       }
     });
+    
+    // ⭐ R24.1 — Overdue card → toggle status filter
+    const $overdueCard = document.querySelector('.bn-overdue-card');
+    if ($overdueCard) {
+      $overdueCard.onclick = () => {
+        if (listFilter.status === 'overdue') {
+          listFilter.status = 'ALL';
+          toast('ยกเลิก filter เกินกำหนด', 'info', 2000);
+        } else {
+          listFilter.status = 'overdue';
+          listFilter.aging = 'ALL';
+          if (activeTab !== 'list') activeTab = 'list';
+          toast(`🚨 กรองเฉพาะ SB เกินกำหนด`, 'info', 3000);
+        }
+        refresh();
+      };
+      if (listFilter.status === 'overdue') {
+        $overdueCard.style.outline = '2px solid #dc2626';
+        $overdueCard.style.outlineOffset = '2px';
+      }
+    }
     
     wireTabHandlers();
   }
@@ -20589,6 +20621,24 @@ async function renderBilling(el) {
         <div style="height:4px;background:var(--border);border-radius:2px;overflow:hidden;margin-top:2px">
           <div style="height:100%;width:${pct}%;background:${barColor};transition:width .3s"></div>
         </div>
+      </div>
+    `;
+  }
+
+  // ⭐ R24.1 14/5/26 — Per-SB progress bar (แสดงเฉพาะ pending/partial — paid/cancelled ไม่แสดง)
+  function renderSbProgressBar(n) {
+    if (n.status === 'paid' || n.status === 'cancelled') return '';
+    const total = Number(n.total_amount) || 0;
+    if (total < 0.01) return '';
+    const paid = Number(n.paid_amount) || 0;
+    const pct = Math.min(100, Math.max(0, (paid / total) * 100));
+    const barColor = pct >= 99.99 ? '#16a34a' : (pct > 0.01 ? '#378ADD' : '#9ca3af');
+    return `
+      <div style="margin-top:4px">
+        <div style="height:4px;background:var(--border);border-radius:2px;overflow:hidden">
+          <div style="height:100%;width:${pct}%;background:${barColor};transition:width .3s"></div>
+        </div>
+        <div style="font-size:10.5px;line-height:1.2;color:var(--muted);margin-top:2px;text-align:right">${pct.toFixed(0)}%</div>
       </div>
     `;
   }
@@ -21432,7 +21482,16 @@ ${bodyHtml}
   function renderListRows() {
     const q = listFilter.search.toLowerCase().trim();
     let rows = billingNotes.slice();
-    if (listFilter.status !== 'ALL') rows = rows.filter(n => n.status === listFilter.status);
+    // ⭐ R24.1 — "overdue" virtual status: pending/partial + past due_date
+    if (listFilter.status === 'overdue') {
+      const today = todayISO();
+      rows = rows.filter(n =>
+        (n.status === 'pending' || n.status === 'partial') &&
+        n.due_date && n.due_date < today
+      );
+    } else if (listFilter.status !== 'ALL') {
+      rows = rows.filter(n => n.status === listFilter.status);
+    }
     if (listFilter.month && listFilter.month !== 'ALL') {
       rows = rows.filter(n => Number(n.cycle_month) === Number(listFilter.month));
     }
@@ -21526,9 +21585,9 @@ ${bodyHtml}
             const inFlightPill = inFlight.length > 0 
               ? `<div style="font-size:10.5px;color:var(--warn);margin-top:2px" title="SP-PENDING รอ match: ${inFlight.map(x=>x.bill_no+' ฿'+fmtNum(x.amount)).join(', ')}">⏳ รอ match: ${inFlight.length} ใบ ฿${fmtNum(inFlightAmt)}</div>`
               : '';
-            // ⭐ Credit Warning bar — แสดงใน column ลูกค้า
+            // ⭐ Credit Warning bar — แสดงใน column ลูกค้า (R24.1: ซ่อนถ้า SB นี้ paid/cancelled)
             const usage = getCreditUsage(n.cust_code);
-            const creditBar = renderCreditBar(usage);
+            const creditBar = (n.status === 'paid' || n.status === 'cancelled') ? '' : renderCreditBar(usage);
             // ⭐ 13/5/26 — Contact info: live lookup จาก master, fallback ไปที่ snapshot ใน SB
             //   Priority: customer master (เบอร์ใหม่เสมอ) → SB snapshot (ของเก่า) → ไม่มี
             //   ⭐ R18 polish: toUpperCase() match existing customer lookup pattern (case-insensitive)
@@ -21574,7 +21633,7 @@ ${bodyHtml}
                 <td style="text-align:center">${billCount}</td>
                 <td style="text-align:right">฿${fmtNum(n.total_amount)}</td>
                 <td style="text-align:right;color:${n.paid_amount>0?'#16a34a':'var(--muted)'}">${n.paid_amount>0?'฿'+fmtNum(n.paid_amount):'-'}${inFlightPill}</td>
-                <td style="text-align:right;font-weight:600;color:${n.outstanding>0?'#ef4444':'#16a34a'}">${n.outstanding>0?'฿'+fmtNum(n.outstanding):'-'}</td>
+                <td style="text-align:right;font-weight:600;color:${n.outstanding>0?'#ef4444':'#16a34a'}">${n.outstanding>0?'฿'+fmtNum(n.outstanding):'-'}${renderSbProgressBar(n)}</td>
                 <td style="text-align:center"><span style="color:${s.color};font-weight:500">${s.emoji} ${s.label}</span></td>
                 <td style="text-align:center;white-space:nowrap">
                   <button class="btn btn-outline btn-sm bn-view" data-uuid="${n.billing_uuid}" title="ดู">👁</button>
@@ -21607,6 +21666,7 @@ ${bodyHtml}
           <option value="ALL"${listFilter.status==='ALL'?' selected':''}>ทุกสถานะ</option>
           <option value="pending"${listFilter.status==='pending'?' selected':''}>⏳ รอชำระ</option>
           <option value="partial"${listFilter.status==='partial'?' selected':''}>🔵 บางส่วน</option>
+          <option value="overdue"${listFilter.status==='overdue'?' selected':''}>🚨 เกินกำหนด</option>
           <option value="paid"${listFilter.status==='paid'?' selected':''}>✅ ชำระครบ</option>
           <option value="cancelled"${listFilter.status==='cancelled'?' selected':''}>⛔ ยกเลิก</option>
         </select>
@@ -22844,151 +22904,115 @@ ${n.remarks?`<div style="margin-top:12px;padding:8px;border-left:3px solid #888;
 // Phase 3 (5/5/26) — รับชำระลูกค้า + ตัดจ่าย SB (Modal)
 // ═══════════════════════════════════════════════════════════════════
 async function openReceivePaymentModal() {
-  // State
+  // ⭐ R24 — v2 state: 4-step structure + installments + per-bill allocation
   const state = {
     cust_code: '',
     cust_name: '',
-    outstanding_sbs: [],     // SBs ค้างของลูกค้า
-    credit_pending: [],      // SP-PENDING credit ค้าง
-    selected_bills: new Map(), // bill_uuid → { bill_uuid, bill_no, billing_uuid, billing_no, amount }
-    credit_used: new Map(),    // bill_uuid → { bill_uuid, amount }
-    type: 'Transfer',
-    pay_date: todayISO(),
-    due_date: '',
-    bank: '',
-    confirmation: '',
-    wht_enabled: false,
-    wht_amount: 0,
-    transfer_fee: 0,
-    card_fee: 0,
-    amount_paid: 0,           // ยอดที่ลูกค้าจ่าย (ก่อน WHT/fee)
-    wht_manually_edited: false,
-    amount_manually_edited: false,
+    outstanding_sbs: [],     // SBs ค้างของลูกค้า (จาก getOutstandingSBsByCust)
+    selected_sb_uuids: new Set(),  // SB billing_uuid ที่ user tick
+    // ⭐ Installments — แต่ละ row 1 งวด (multi-method per batch)
+    installments: [],        // [{ uuid, amount, method, pay_date, bank, reference, remarks }]
+    // ⭐ Allocations — bill_uuid → method → amount
+    allocations: {},         // { bill_uuid: { Cash: 0, Transfer: 0, Cheque: 0 } }
+    // ⭐ User overrides — bill_uuid|method → true (ไม่ auto-fill ทับ)
+    alloc_overrides: new Set(),
     loading: false,
   };
 
-  // Modal HTML
+  // ⭐ Helper: methods list (Refund หลังจาก Cheque)
+  state.METHODS = ['Cash', 'Transfer', 'Cheque'];
+
+  // Modal HTML — v2 4-step design
   openModal('💵 รับชำระลูกค้า', `
-    <div id="rp-modal" style="display:flex;flex-direction:column;gap:12px;max-height:88vh;overflow:hidden">
+    <div id="rp-modal" style="display:flex;flex-direction:column;gap:14px">
       
-      <!-- STEP 1: ลูกค้า (full width) -->
-      <div class="input-group" style="position:relative;margin:0">
-        <label>🔍 ค้นหาลูกค้า (รหัส / ชื่อ)</label>
-        <input class="input" id="rp-cust-search" placeholder="เช่น BE-00789 หรือ XYZ" autocomplete="off">
-        <div id="rp-cust-dropdown" style="display:none;position:absolute;top:100%;left:0;right:0;background:var(--bg);border:1px solid var(--border);border-radius:6px;max-height:280px;overflow-y:auto;z-index:99999;box-shadow:0 4px 16px rgba(0,0,0,0.25);margin-top:2px"></div>
+      <!-- STEP 1: ลูกค้า -->
+      <div>
+        <div style="font-size:.78rem;color:var(--muted);margin-bottom:6px">STEP 1 — เลือกลูกค้า</div>
+        <div class="input-group" style="position:relative;margin:0">
+          <input class="input" id="rp-cust-search" placeholder="🔍 ค้นรหัส / ชื่อลูกค้า เช่น BE-00789" autocomplete="off">
+          <div id="rp-cust-dropdown" style="display:none;position:absolute;top:100%;left:0;right:0;background:var(--bg);border:1px solid var(--border);border-radius:6px;max-height:280px;overflow-y:auto;z-index:99999;box-shadow:0 4px 16px rgba(0,0,0,0.25);margin-top:2px"></div>
+        </div>
+        <div id="rp-cust-info" style="display:none;margin-top:8px;padding:8px 12px;background:var(--bg-elev);border:1px solid var(--border);border-radius:6px;font-size:.85rem"></div>
       </div>
       
-      <!-- เครดิตค้าง (full width) -->
-      <div id="rp-credit-section" style="display:none;background:rgba(245,158,11,.08);border:1px solid var(--warn);border-radius:6px;padding:10px"></div>
+      <!-- STEP 2: SBs ค้าง -->
+      <div id="rp-step2" style="display:none">
+        <div style="font-size:.78rem;color:var(--muted);margin-bottom:6px">STEP 2 — เลือก SB ค้างชำระ <span style="color:var(--info)">(เลือกหลายใบได้)</span></div>
+        <div id="rp-sbs-list" style="background:var(--bg-elev);border:1px solid var(--border);border-radius:6px;max-height:35vh;overflow-y:auto"></div>
+      </div>
       
-      <!-- ⭐ 2-col layout: Step 2 (bills) ซ้าย | Step 3 (payment) ขวา -->
-      <div id="rp-2col-grid" style="display:grid;grid-template-columns:1.4fr 1fr;gap:14px;flex:1;min-height:0;overflow:hidden">
-        
-        <!-- STEP 2: บิลค้างชำระ -->
-        <div id="rp-bills-section" style="display:none;flex-direction:column;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:12px;background:var(--bg-elev);min-height:420px;max-height:75vh">
-          <div id="rp-bills-content"></div>
+      <!-- STEP 3: Installments -->
+      <div id="rp-step3" style="display:none">
+        <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px">
+          <div style="font-size:.78rem;color:var(--muted)">STEP 3 — งวดการชำระ <span style="color:var(--info)">(จ่ายหลายครั้งใน 1 ตัดจ่าย)</span></div>
+          <button class="btn btn-ghost" id="rp-add-installment" style="font-size:.8rem;padding:4px 10px">+ เพิ่มงวด</button>
         </div>
-        
-        <!-- STEP 3: ข้อมูลรับชำระ -->
-        <div id="rp-payment-section" style="display:none;flex-direction:column;overflow-y:auto;background:var(--bg-elev);border:1px solid var(--border);border-radius:6px;padding:14px;min-height:420px;max-height:75vh">
-          <div id="rp-payment-fields-row" style="display:grid;grid-template-columns:110px 130px 1fr;gap:8px;margin-bottom:10px">
-            <div class="input-group" style="margin:0">
-              <label style="font-size:.78rem">Type</label>
-              <select class="select" id="rp-type">
-                <option value="Cash">Cash</option>
-                <option value="Transfer" selected>Transfer</option>
-                <option value="Cheque">Cheque</option>
-                <option value="Card">Card</option>
-              </select>
-            </div>
-            <div class="input-group" style="margin:0">
-              <label style="font-size:.78rem" id="rp-pay-date-label">วันที่</label>
-              <input type="date" class="input" id="rp-pay-date" value="${todayISO()}">
-            </div>
-            <div class="input-group" id="rp-cheque-due-group" style="margin:0;display:none">
-              <label style="font-size:.78rem">วันขึ้นเช็ค *</label>
-              <input type="date" class="input" id="rp-due-date">
-            </div>
-            <div class="input-group" id="rp-bank-group" style="margin:0">
-              <label style="font-size:.78rem">ธนาคาร</label>
-              <input class="input" id="rp-bank" placeholder="KBANK / SCB ...">
-            </div>
-            <div class="input-group" style="margin:0;grid-column:1 / -1">
-              <label style="font-size:.78rem" id="rp-conf-label">Confirmation</label>
-              <input class="input" id="rp-conf" placeholder="รหัสโอน / ref">
-            </div>
+        <div style="background:var(--bg-elev);border:1px solid var(--border);border-radius:6px;overflow:hidden">
+          <div id="rp-install-header" style="display:grid;grid-template-columns:30px 130px 110px 130px 120px 1fr 30px;gap:8px;padding:8px 12px;font-size:.72rem;color:var(--muted);background:var(--bg);border-bottom:1px solid var(--border)">
+            <div>#</div><div>จำนวน</div><div>วิธี</div><div>วันที่</div><div>ธนาคาร</div><div>เลขอ้างอิง / หมายเหตุ</div><div></div>
           </div>
-          
-          <!-- ⭐ Phase 4 (5/5/26) — Match-first SB Payment Info Box -->
-          <div id="rp-phase4-info" style="display:none;margin:6px 0 10px;padding:8px 12px;border-radius:6px;font-size:.82rem;line-height:1.45;border:1px solid"></div>
-          
-          <!-- ยอดบิลที่เลือก + WHT/fee -->
-          <div style="border-top:1px solid var(--border);padding-top:10px;margin-top:4px">
-            <div style="display:flex;justify-content:space-between;font-size:.9rem;margin-bottom:6px">
-              <span style="color:var(--muted)">ยอดบิลที่เลือก:</span>
-              <span id="rp-sum-selected" style="font-weight:700;font-size:1rem">฿0.00</span>
-            </div>
-            <div id="rp-fee-rows" style="display:none">
-              <div style="display:flex;align-items:center;gap:8px;margin:6px 0">
-                <input type="checkbox" id="rp-wht-enable" style="margin:0;width:18px;height:18px;cursor:pointer">
-                <label for="rp-wht-enable" style="font-size:.85rem;cursor:pointer;flex:1">หัก ณ ที่จ่าย 1%</label>
-                <input type="number" class="input" id="rp-wht" step="0.01" placeholder="0.00" 
-                       style="width:120px;font-size:.85rem;color:var(--purple);text-align:right" disabled>
-              </div>
-              <div style="display:flex;align-items:center;gap:8px;margin:6px 0" id="rp-tf-row">
-                <label style="font-size:.85rem;flex:1">ค่าธรรมเนียมโอน/เช็ค</label>
-                <input type="number" class="input" id="rp-tf" step="0.01" placeholder="0.00" value="12" 
-                       style="width:120px;font-size:.85rem;text-align:right">
-              </div>
-              <div style="align-items:center;gap:8px;margin:6px 0;display:none" id="rp-cf-row">
-                <label style="font-size:.85rem;flex:1">ค่าธรรมเนียมบัตร</label>
-                <input type="number" class="input" id="rp-cf" step="0.01" placeholder="0.00" 
-                       style="width:120px;font-size:.85rem;text-align:right">
-              </div>
-            </div>
-            <div style="display:flex;justify-content:space-between;font-size:.9rem;margin-top:8px;padding-top:8px;border-top:1px dashed var(--border)">
-              <span style="color:var(--muted)">สุทธิเข้าบัญชี (net):</span>
-              <span id="rp-net" style="font-weight:700;color:var(--success);font-size:1rem">฿0.00</span>
-            </div>
-            
-            <!-- ⭐ Breakdown — ใช้เครดิต + ต้องจ่ายเพิ่ม -->
-            <div id="rp-credit-deduct-row" style="display:none;justify-content:space-between;font-size:.85rem;margin-top:4px;color:var(--warn)">
-              <span>ใช้ partial ที่ค้างไว้:</span>
-              <span id="rp-credit-deduct">−฿0.00</span>
-            </div>
-            <div id="rp-need-pay-row" style="display:flex;justify-content:space-between;align-items:center;font-size:1rem;margin-top:8px;padding:10px 12px;background:rgba(245,158,11,.1);border:2px solid var(--warn);border-radius:6px">
-              <span style="font-weight:700">💸 ต้องจ่ายเพิ่ม:</span>
-              <span id="rp-need-pay" style="font-weight:800;color:var(--warn);font-size:1.1rem">฿0.00</span>
-            </div>
-            
-            <div style="display:flex;justify-content:space-between;align-items:center;font-size:.95rem;margin-top:8px;padding:8px 10px;background:var(--bg);border-radius:6px;border:1px solid var(--border)">
-              <span style="font-weight:600">💰 ยอดที่ลูกค้าจ่ายจริง:</span>
-              <input type="number" class="input" id="rp-amount-paid" step="0.01" placeholder="0.00" 
-                     style="width:160px;text-align:right;font-weight:700;font-size:1rem">
-            </div>
-            <div id="rp-overflow-row" style="display:none;color:var(--warn);font-size:.85rem;margin-top:6px;text-align:right;padding:6px 10px;background:rgba(245,158,11,.08);border-radius:4px"></div>
+          <div id="rp-install-rows"></div>
+          <div style="padding:8px 12px;display:flex;justify-content:space-between;font-size:.85rem;background:var(--bg);border-top:1px solid var(--border)">
+            <span style="color:var(--muted)">รวม installments:</span>
+            <span id="rp-install-sum" style="font-weight:700">฿0.00</span>
           </div>
         </div>
       </div>
       
-      <!-- Submit (full width) -->
+      <!-- STEP 4: จัดสรรลงรายบิล -->
+      <div id="rp-step4" style="display:none">
+        <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px">
+          <div style="font-size:.78rem;color:var(--muted)">STEP 4 — จัดสรรลงรายบิล <span style="color:var(--info)">(auto-FIFO, แก้ในตารางได้)</span></div>
+          <button class="btn btn-ghost" id="rp-auto-fifo" style="font-size:.8rem;padding:4px 10px" title="คำนวณ FIFO ใหม่ ล้าง override ทั้งหมด">⟳ Auto-FIFO ใหม่</button>
+        </div>
+        <div style="background:var(--bg-elev);border:1px solid var(--border);border-radius:6px;overflow:hidden">
+          <div id="rp-alloc-header" style="display:grid;grid-template-columns:1.4fr 90px 90px 100px 90px 90px 100px;gap:6px;padding:8px 10px;font-size:.72rem;color:var(--muted);background:var(--bg);border-bottom:1px solid var(--border)">
+            <div>บิล</div>
+            <div>วันที่</div>
+            <div style="text-align:right">Cash</div>
+            <div style="text-align:right">Transfer</div>
+            <div style="text-align:right">Cheque</div>
+            <div style="text-align:right">ค้างเดิม</div>
+            <div style="text-align:right">ค้างใหม่</div>
+          </div>
+          <div id="rp-alloc-rows" style="max-height:30vh;overflow-y:auto"></div>
+        </div>
+      </div>
+      
+      <!-- Progress Bar Summary -->
+      <div id="rp-progress" style="display:none;background:var(--bg-elev);border:1px solid var(--border);border-radius:6px;padding:12px 14px">
+        <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px">
+          <span style="font-size:.85rem;color:var(--muted)">ยอดทั้งหมด</span>
+          <span id="rp-prog-total" style="font-weight:700;font-size:1rem">฿0.00</span>
+        </div>
+        <div style="height:10px;background:var(--bg);border-radius:5px;overflow:hidden;margin-bottom:8px;border:1px solid var(--border)">
+          <div id="rp-prog-bar" style="width:0%;height:100%;background:#378ADD;transition:width .3s"></div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;font-size:.85rem">
+          <div>
+            <div style="color:var(--muted);font-size:.78rem">✓ จ่ายแล้ว (ในบีตช์)</div>
+            <div id="rp-prog-paid" style="font-weight:700;color:var(--success);margin-top:2px">฿0.00 · 0%</div>
+          </div>
+          <div>
+            <div style="color:var(--muted);font-size:.78rem">⏳ ค้าง</div>
+            <div id="rp-prog-due" style="font-weight:700;color:var(--warn);margin-top:2px">฿0.00</div>
+          </div>
+          <div>
+            <div style="color:var(--muted);font-size:.78rem">⚠ ยังไม่ allocate</div>
+            <div id="rp-prog-unalloc" style="font-weight:700;color:var(--text);margin-top:2px">฿0.00</div>
+          </div>
+        </div>
+      </div>
+      
+      <!-- Submit -->
       <div style="display:flex;gap:10px;justify-content:flex-end;border-top:1px solid var(--border);padding-top:12px">
         <button class="btn btn-ghost" id="rp-cancel">ยกเลิก</button>
-        <button class="btn btn-primary" id="rp-submit" disabled style="font-size:.95rem;padding:10px 24px">💾 บันทึกการรับชำระ</button>
+        <button class="btn btn-primary" id="rp-submit" disabled style="font-size:.95rem;padding:10px 24px">💾 บันทึก batch</button>
       </div>
     </div>
-    <style>
-      /* ⭐ Phase 4 — responsive: < 900px → กลับ stacked (มือถือ/tablet) */
-      @media (max-width: 900px) {
-        #rp-2col-grid { grid-template-columns: 1fr !important; }
-        #rp-bills-section, #rp-payment-section { max-height: 50vh !important; }
-      }
-    </style>
   `);
 
-  // ⭐ R23.2 14/5/26 — openModal รับแค่ (title, html) — options ที่ 3 ถูก ignore
-  //   เก่า: openModal(..., { width: '1280px' }) → ไม่มีผล → modal default แคบ ~500px
-  //   ใหม่: manual style override หลัง openModal (เหมือน Pay Modal R22)
   const modalEl = document.getElementById('modal-card');
   if (modalEl) {
     modalEl.style.width = 'min(1400px, 96vw)';
@@ -22997,504 +23021,540 @@ async function openReceivePaymentModal() {
     modalEl.style.overflowY = 'auto';
   }
 
-  // Wire modal
-  wireReceivePaymentModal(state);
+  wireReceivePaymentModalV2(state);
 }
 
-function wireReceivePaymentModal(state) {
+// ⭐ R24 14/5/26 — Receive Payment v2 (4-step + multi-installment + FIFO allocation)
+function wireReceivePaymentModalV2(state) {
   const $search = document.getElementById('rp-cust-search');
   const $dropdown = document.getElementById('rp-cust-dropdown');
-  const $billsSection = document.getElementById('rp-bills-section');
-  const $billsContent = document.getElementById('rp-bills-content');
-  const $paymentSection = document.getElementById('rp-payment-section');
-  const $creditSection = document.getElementById('rp-credit-section');
-  const $type = document.getElementById('rp-type');
-  const $payDate = document.getElementById('rp-pay-date');
-  const $bank = document.getElementById('rp-bank');
-  const $conf = document.getElementById('rp-conf');
-  const $dueDate = document.getElementById('rp-due-date');
-  const $chequeDueRow = document.getElementById('rp-cheque-due-group');
-  const $bankGroup = document.getElementById('rp-bank-group');
-  const $sumSelected = document.getElementById('rp-sum-selected');
-  const $feeRows = document.getElementById('rp-fee-rows');
-  const $whtEnable = document.getElementById('rp-wht-enable');
-  const $wht = document.getElementById('rp-wht');
-  const $tf = document.getElementById('rp-tf');
-  const $tfRow = document.getElementById('rp-tf-row');
-  const $cf = document.getElementById('rp-cf');
-  const $cfRow = document.getElementById('rp-cf-row');
-  const $net = document.getElementById('rp-net');
-  const $amountPaid = document.getElementById('rp-amount-paid');
-  const $overflowRow = document.getElementById('rp-overflow-row');
-  const $submit = document.getElementById('rp-submit');
-  const $cancel = document.getElementById('rp-cancel');
-  
-  // ⭐ Cancel button — wire ผ่าน addEventListener (กัน scope issue ของ inline onclick)
-  $cancel?.addEventListener('click', (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    if (typeof closeModal === 'function') closeModal();
-    else if (typeof window.closeModal === 'function') window.closeModal();
-  });
+  const $custInfo = document.getElementById('rp-cust-info');
+  const $step2 = document.getElementById('rp-step2');
+  const $step3 = document.getElementById('rp-step3');
+  const $step4 = document.getElementById('rp-step4');
+  const $progress = document.getElementById('rp-progress');
+  const $sbsList = document.getElementById('rp-sbs-list');
+  const $installRows = document.getElementById('rp-install-rows');
+  const $installSum = document.getElementById('rp-install-sum');
+  const $allocRows = document.getElementById('rp-alloc-rows');
+  const $progTotal = document.getElementById('rp-prog-total');
+  const $progBar = document.getElementById('rp-prog-bar');
+  const $progPaid = document.getElementById('rp-prog-paid');
+  const $progDue = document.getElementById('rp-prog-due');
+  const $progUnalloc = document.getElementById('rp-prog-unalloc');
+  const $btnAddInst = document.getElementById('rp-add-installment');
+  const $btnAutoFifo = document.getElementById('rp-auto-fifo');
+  const $btnCancel = document.getElementById('rp-cancel');
+  const $btnSubmit = document.getElementById('rp-submit');
 
-  // ── Customer search autocomplete ──
-  let searchTimer = null;
-  $search?.addEventListener('input', () => {
+  // ───────────────────────────────────────────────
+  // STEP 1: customer search + dropdown
+  // ───────────────────────────────────────────────
+  let searchTimer;
+  $search.oninput = () => {
     clearTimeout(searchTimer);
-    searchTimer = setTimeout(() => doCustSearch($search.value), 200);
-  });
-  $search?.addEventListener('focus', () => {
-    if ($dropdown.children.length > 0) $dropdown.style.display = 'block';
-  });
-  document.addEventListener('click', (e) => {
-    if (!$search.contains(e.target) && !$dropdown.contains(e.target)) {
-      $dropdown.style.display = 'none';
-    }
+    const q = $search.value.trim();
+    if (q.length < 1) { $dropdown.style.display = 'none'; return; }
+    searchTimer = setTimeout(() => showCustomerDropdown(q), 150);
+  };
+  $search.onfocus = () => { if ($search.value.trim()) showCustomerDropdown($search.value.trim()); };
+  document.addEventListener('click', e => {
+    if (!$search.contains(e.target) && !$dropdown.contains(e.target)) $dropdown.style.display = 'none';
   });
 
-  function doCustSearch(query) {
-    const q = query.trim().toLowerCase();
-    if (!q || q.length < 2) {
-      $dropdown.style.display = 'none';
-      return;
-    }
-    if (!Array.isArray(customerList)) {
-      $dropdown.innerHTML = '<div style="padding:8px;color:var(--muted)">ยังไม่มีข้อมูลลูกค้า</div>';
+  function showCustomerDropdown(q) {
+    const qUp = q.toUpperCase();
+    const matched = (customerList || []).filter(c => 
+      String(c.cust_code||'').toUpperCase().includes(qUp) ||
+      String(c.cust_name||'').toUpperCase().includes(qUp)
+    ).slice(0, 50);
+    if (matched.length === 0) {
+      $dropdown.innerHTML = `<div style="padding:10px;color:var(--muted);font-size:.85rem">ไม่พบลูกค้า</div>`;
       $dropdown.style.display = 'block';
       return;
     }
-    
-    // ⭐ Dedup by cust_code (ลูกค้าอาจซ้ำใน customers sheet)
-    const seen = new Set();
-    const matches = [];
-    customerList.forEach(c => {
-      const code = String(c.cust_id || c.cust_code || '').trim().toUpperCase();
-      const id = code.toLowerCase();
-      const name = String(c.cust_name || '').toLowerCase();
-      if (!id.includes(q) && !name.includes(q)) return;
-      if (!code || seen.has(code)) return;  // skip duplicate cust_code
-      seen.add(code);
-      matches.push(c);
-    });
-    const top = matches.slice(0, 20);
-    
-    if (top.length === 0) {
-      $dropdown.innerHTML = '<div style="padding:8px;color:var(--muted)">ไม่พบลูกค้า</div>';
-    } else {
-      $dropdown.innerHTML = top.map(c => {
-        const code = c.cust_id || c.cust_code || '';
-        const name = c.cust_name || '';
-        return `<div class="rp-cust-item" data-code="${code}" data-name="${name}" 
-                style="padding:8px 10px;cursor:pointer;border-bottom:1px solid var(--border);font-size:.85rem"
-                onmouseover="this.style.background='var(--surface2)'" 
-                onmouseout="this.style.background='var(--bg)'">
-                <strong>${code}</strong> ${name}
-              </div>`;
-      }).join('');
-      // ⭐ Show count if dedup happened
-      const totalMatched = customerList.filter(c => {
-        const id = String(c.cust_id || c.cust_code || '').toLowerCase();
-        const name = String(c.cust_name || '').toLowerCase();
-        return id.includes(q) || name.includes(q);
-      }).length;
-      if (totalMatched > top.length) {
-        $dropdown.innerHTML += `<div style="padding:6px;color:var(--muted);font-size:.75rem;text-align:center;background:var(--bg-elev)">แสดง ${top.length} จาก ${matches.length} ราย (ลบซ้ำ ${totalMatched - matches.length} ใบ)</div>`;
-      }
-      $dropdown.querySelectorAll('.rp-cust-item').forEach(item => {
-        item.onclick = () => {
-          state.cust_code = item.dataset.code;
-          state.cust_name = item.dataset.name;
-          $search.value = state.cust_code + ' ' + state.cust_name;
-          $dropdown.style.display = 'none';
-          loadCustomerData();
-        };
-      });
-    }
+    $dropdown.innerHTML = matched.map(c => `
+      <div class="rp-cust-opt" data-code="${c.cust_code}" data-name="${escapeHtml(c.cust_name||'')}" 
+           style="padding:8px 12px;cursor:pointer;border-bottom:1px solid var(--border);font-size:.85rem">
+        <span style="font-family:var(--mono);color:var(--info)">${c.cust_code}</span>
+        <span style="margin-left:8px">${escapeHtml(c.cust_name||'')}</span>
+      </div>
+    `).join('');
     $dropdown.style.display = 'block';
+    $dropdown.querySelectorAll('.rp-cust-opt').forEach(el => {
+      el.onmouseenter = () => el.style.background = 'var(--bg-elev)';
+      el.onmouseleave = () => el.style.background = '';
+      el.onclick = () => selectCustomer(el.dataset.code, el.dataset.name);
+    });
   }
 
-  // ── Load customer SBs + credit ──
-  async function loadCustomerData() {
-    state.selected_bills.clear();
-    state.credit_used.clear();
-    $billsContent.innerHTML = '<div style="text-align:center;padding:20px;color:var(--muted)">กำลังโหลด...</div>';
-    $billsSection.style.display = 'flex';
-    $paymentSection.style.display = 'flex';
+  async function selectCustomer(code, name) {
+    state.cust_code = code;
+    state.cust_name = name;
+    $search.value = `${code} — ${name}`;
+    $dropdown.style.display = 'none';
+    $custInfo.style.display = 'block';
+    $custInfo.innerHTML = `<span style="color:var(--muted)">กำลังโหลด SBs ค้างของ <b>${code}</b>…</span>`;
+    
+    // Reset state
+    state.outstanding_sbs = [];
+    state.selected_sb_uuids = new Set();
+    state.installments = [];
+    state.allocations = {};
+    state.alloc_overrides = new Set();
     
     try {
-      const [sbsR, creditR] = await Promise.all([
-        api('getOutstandingSBsByCust', { cust_code: state.cust_code }),
-        api('getCreditPending', { cust_code: state.cust_code }),
-      ]);
-      state.outstanding_sbs = (sbsR && sbsR.success) ? (sbsR.data || []) : [];
-      state.credit_pending = (creditR && creditR.success) ? (creditR.data || []) : [];
+      const r = await api('getOutstandingSBsByCust', { cust_code: code });
+      state.outstanding_sbs = (r && r.success) ? (r.data || []) : [];
+      const totalOut = state.outstanding_sbs.reduce((s, sb) => s + (Number(sb.outstanding)||0), 0);
+      $custInfo.innerHTML = state.outstanding_sbs.length === 0
+        ? `<span style="color:var(--success)">✓ <b>${escapeHtml(name)}</b> — ไม่มี SB ค้างชำระ</span>`
+        : `<b>${escapeHtml(name)}</b> · SB ค้าง <b>${state.outstanding_sbs.length}</b> ใบ · รวม <b style="color:var(--warn)">฿${fmtNum(totalOut)}</b>`;
       
-      renderCreditSection();
-      renderBillsList();
-      updateSummary();
+      if (state.outstanding_sbs.length > 0) {
+        renderSBsList();
+        $step2.style.display = 'block';
+      } else {
+        $step2.style.display = 'none';
+        $step3.style.display = 'none';
+        $step4.style.display = 'none';
+        $progress.style.display = 'none';
+      }
     } catch (e) {
-      console.error('[receive payment] load error:', e);
-      $billsContent.innerHTML = '<div style="text-align:center;padding:20px;color:var(--danger)">❌ โหลดข้อมูลไม่สำเร็จ</div>';
+      $custInfo.innerHTML = `<span style="color:var(--danger)">❌ โหลดล้มเหลว: ${e.message||e}</span>`;
     }
   }
 
-  function renderCreditSection() {
-    if (state.credit_pending.length === 0) {
-      $creditSection.style.display = 'none';
-      return;
-    }
-    const total = state.credit_pending.reduce((s, c) => s + Number(c.amount || 0), 0);
-    $creditSection.style.display = 'block';
-    $creditSection.innerHTML = `
-      <div style="font-size:.9rem;font-weight:600;color:var(--warn);margin-bottom:8px">
-        💰 ${state.cust_code} มี <span style="background:var(--warn);color:#fff;padding:2px 8px;border-radius:4px">partial</span> ค้างจ่าย ${state.credit_pending.length} ใบ รวม ฿${fmtNum(total)}
-      </div>
-      <div style="font-size:.78rem;color:var(--muted);margin-bottom:6px">เลือกใบที่ต้องการนำมาตัดจ่ายในรอบนี้:</div>
-      <div style="display:flex;flex-direction:column;gap:4px;max-height:140px;overflow-y:auto">
-        ${state.credit_pending.map(c => {
-          const used = state.credit_used.has(c.bill_uuid);
-          return `
-            <label style="display:flex;align-items:center;gap:8px;padding:6px 8px;background:var(--bg);border-radius:4px;cursor:pointer;font-size:.82rem;border:1px solid ${used?'var(--warn)':'transparent'}">
-              <input type="checkbox" class="rp-credit-cb" data-uuid="${c.bill_uuid}" data-amount="${c.amount}" ${used ? 'checked' : ''} style="width:16px;height:16px;cursor:pointer">
-              <span style="font-family:var(--mono);font-size:.75rem">${c.bill_no}</span>
-              <span style="color:var(--muted);font-size:.75rem">${fmtDate(c.date)}</span>
-              <span style="margin-left:auto;font-weight:600;color:var(--warn)">฿${fmtNum(c.amount)}</span>
-            </label>
-          `;
-        }).join('')}
-      </div>
-    `;
-    $creditSection.querySelectorAll('.rp-credit-cb').forEach(cb => {
-      cb.onchange = () => {
-        const uuid = cb.dataset.uuid;
-        const amt = Number(cb.dataset.amount);
-        if (cb.checked) {
-          state.credit_used.set(uuid, { bill_uuid: uuid, amount: amt });
-        } else {
-          state.credit_used.delete(uuid);
-        }
-        renderCreditSection();  // re-render to update border style
-        updateSummary();
-      };
-    });
-  }
-
-  function renderBillsList() {
-    if (state.outstanding_sbs.length === 0) {
-      $billsContent.innerHTML = '<div style="text-align:center;padding:20px;color:var(--muted)">✅ ลูกค้านี้ไม่มี SB ค้างชำระ</div>';
-      return;
-    }
-    
-    const monthNames = ['','ม.ค.','ก.พ.','มี.ค.','เม.ย.','พ.ค.','มิ.ย.','ก.ค.','ส.ค.','ก.ย.','ต.ค.','พ.ย.','ธ.ค.'];
-    
-    $billsContent.innerHTML = state.outstanding_sbs.map(sb => {
-      const cycleLabel = `${monthNames[sb.cycle_month] || sb.cycle_month}/${(sb.cycle_year % 100).toString().padStart(2,'0')}`;
-      const billsHtml = _sortBillsByNo(sb.bills_snapshot).map(b => {
-        const billUuid = b.bill_uuid || '';
-        const isPaid = b.match_status === 'paid' || b.paid_by_sp;
-        const checked = state.selected_bills.has(billUuid);
-        return `
-          <label style="display:grid;grid-template-columns:24px 110px 80px 1fr 100px;gap:6px;align-items:center;padding:4px 6px;font-size:.78rem;cursor:${isPaid?'not-allowed':'pointer'};border-radius:4px;background:${isPaid?'rgba(34,197,94,.05)':checked?'rgba(59,130,246,.1)':'var(--bg)'};${isPaid?'opacity:0.55':''}"
-                 onmouseover="this.style.background='${isPaid?'rgba(34,197,94,.05)':'var(--surface2)'}'" 
-                 onmouseout="this.style.background='${isPaid?'rgba(34,197,94,.05)':checked?'rgba(59,130,246,.1)':'var(--bg)'}'">
-            <input type="checkbox" class="rp-bill-cb" data-uuid="${billUuid}" 
-                   data-bill-no="${b.bill_no||''}" data-billing-uuid="${sb.billing_uuid}" 
-                   data-billing-no="${sb.billing_no||''}" data-amount="${b.amount||0}" 
-                   ${checked?'checked':''} ${isPaid?'disabled':''}>
-            <span style="font-family:var(--mono);font-size:.72rem">${b.bill_no || '(no bill_no)'}</span>
-            <span style="color:var(--muted);font-size:.72rem">${fmtDate(b.date)}</span>
-            <span style="font-size:.72rem;color:${isPaid?'var(--success)':'inherit'}">${isPaid?'✅ จ่ายแล้ว':''}</span>
-            <span style="text-align:right;font-weight:500">฿${fmtNum(b.amount)}</span>
-          </label>
-        `;
-      }).join('');
-      
+  // ───────────────────────────────────────────────
+  // STEP 2: SBs list + selection
+  // ───────────────────────────────────────────────
+  function renderSBsList() {
+    if (state.outstanding_sbs.length === 0) { $sbsList.innerHTML = ''; return; }
+    const monthNames = {1:'ม.ค.',2:'ก.พ.',3:'มี.ค.',4:'เม.ย.',5:'พ.ค.',6:'มิ.ย.',7:'ก.ค.',8:'ส.ค.',9:'ก.ย.',10:'ต.ค.',11:'พ.ย.',12:'ธ.ค.'};
+    $sbsList.innerHTML = state.outstanding_sbs.map(sb => {
+      const selected = state.selected_sb_uuids.has(sb.billing_uuid);
+      const cycle = `${monthNames[sb.cycle_month] || sb.cycle_month}/${(sb.cycle_year % 100).toString().padStart(2,'0')}`;
+      const sortedBills = _sortBillsByNo(sb.bills_snapshot);
       return `
-        <details open style="margin-bottom:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg)">
-          <summary style="cursor:pointer;padding:8px 10px;font-size:.85rem;font-weight:600;background:var(--bg-elev);border-radius:6px 6px 0 0;display:flex;justify-content:space-between;align-items:center">
-            <div>
-              <span>${sb.billing_no} — ${cycleLabel}</span>
-              <span style="font-weight:400;color:var(--muted);margin-left:8px;font-size:.78rem">${(sb.bills_snapshot||[]).length} บิล</span>
-            </div>
-            <span style="color:var(--danger)">ค้าง ฿${fmtNum(sb.outstanding)}</span>
-          </summary>
-          <div style="padding:6px 8px;display:flex;flex-direction:column;gap:2px">
-            <div style="padding:4px 6px;font-size:.75rem;color:var(--muted);border-bottom:1px solid var(--border)">
-              <a href="javascript:void(0)" class="rp-select-all" data-billing-uuid="${sb.billing_uuid}">✓ เลือกทั้งหมดที่ยังไม่จ่าย</a>
-            </div>
-            ${billsHtml}
+        <div class="rp-sb-card" data-uuid="${sb.billing_uuid}" style="border-bottom:1px solid var(--border);padding:10px 12px;cursor:pointer;background:${selected?'rgba(55,138,221,.08)':'transparent'}">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:${selected?'8px':'0'}">
+            <input type="checkbox" class="rp-sb-cb" data-uuid="${sb.billing_uuid}" ${selected?'checked':''} style="width:16px;height:16px;cursor:pointer">
+            <span style="font-family:var(--mono);font-weight:600;font-size:.85rem">${sb.billing_no}</span>
+            <span style="color:var(--muted);font-size:.78rem">${cycle} · ${sortedBills.length} บิล</span>
+            <span style="margin-left:auto;font-weight:700;color:var(--warn);font-size:.9rem">ค้าง ฿${fmtNum(sb.outstanding)}</span>
           </div>
-        </details>
+          ${selected ? `
+            <div style="padding-left:24px;font-size:.78rem;color:var(--muted);display:flex;flex-direction:column;gap:3px">
+              ${sortedBills.map(b => {
+                const billOut = _getBillOutstanding(sb, b);
+                return `<div style="display:flex;justify-content:space-between">
+                  <span><span style="font-family:var(--mono)">${b.bill_no}</span> · ${fmtDate(b.date)}</span>
+                  <span>ค้าง ฿${fmtNum(billOut)}</span>
+                </div>`;
+              }).join('')}
+            </div>
+          ` : ''}
+        </div>
       `;
     }).join('');
     
-    // Wire bill checkboxes
-    $billsContent.querySelectorAll('.rp-bill-cb').forEach(cb => {
-      cb.onchange = () => {
-        const uuid = cb.dataset.uuid;
-        if (cb.checked) {
-          state.selected_bills.set(uuid, {
-            bill_uuid: uuid,
-            bill_no: cb.dataset.billNo,
-            billing_uuid: cb.dataset.billingUuid,
-            billing_no: cb.dataset.billingNo,
-            amount: Number(cb.dataset.amount),
-          });
-        } else {
-          state.selected_bills.delete(uuid);
-        }
-        updateSummary();
-        // Update row background
-        const label = cb.closest('label');
-        if (label) label.style.background = cb.checked ? 'rgba(59,130,246,.1)' : 'var(--bg)';
+    $sbsList.querySelectorAll('.rp-sb-cb').forEach(cb => {
+      cb.onclick = e => { e.stopPropagation(); toggleSB(cb.dataset.uuid, cb.checked); };
+    });
+    $sbsList.querySelectorAll('.rp-sb-card').forEach(card => {
+      card.onclick = () => {
+        const cb = card.querySelector('.rp-sb-cb');
+        cb.checked = !cb.checked;
+        toggleSB(cb.dataset.uuid, cb.checked);
       };
     });
-    // Select all per SB
-    $billsContent.querySelectorAll('.rp-select-all').forEach(link => {
-      link.onclick = () => {
-        const sbUuid = link.dataset.billingUuid;
-        $billsContent.querySelectorAll(`.rp-bill-cb[data-billing-uuid="${sbUuid}"]`).forEach(cb => {
-          if (!cb.disabled && !cb.checked) {
-            cb.checked = true;
-            cb.dispatchEvent(new Event('change'));
-          }
+  }
+
+  // ⭐ Compute bill outstanding: bill_amount − already-paid amount across all rows for this bill_uuid
+  //   Phase 1 limitation: backend doesn't track per-bill payment. ใช้ amount เต็มก่อน (ตัวเลขค้างเดิม = amount)
+  //   หลังจาก Phase 2 จะ track per bill_uuid ผ่าน billing_payments.bill_uuid column
+  function _getBillOutstanding(sb, bill) {
+    // Phase 1: approximate from SB-level paid_amount proportionally
+    const billAmt = Number(bill.amount) || 0;
+    const sbTotal = Number(sb.total_amount) || 0;
+    const sbPaid = Number(sb.paid_amount) || 0;
+    if (sbTotal <= 0.01) return billAmt;
+    // Proportional: ถ้า SB จ่ายไป x% บิลนี้ก็ถือว่าจ่ายไป x% ของ amount เช่นกัน
+    const ratio = sbPaid / sbTotal;
+    return Math.max(0, billAmt - billAmt * ratio);
+  }
+
+  function toggleSB(uuid, checked) {
+    if (checked) state.selected_sb_uuids.add(uuid);
+    else state.selected_sb_uuids.delete(uuid);
+    
+    if (state.selected_sb_uuids.size > 0) {
+      // First time → add 1 installment row
+      if (state.installments.length === 0) addInstallmentRow();
+      $step3.style.display = 'block';
+      $step4.style.display = 'block';
+      $progress.style.display = 'block';
+      autoFifoAllocate();
+    } else {
+      $step3.style.display = 'none';
+      $step4.style.display = 'none';
+      $progress.style.display = 'none';
+    }
+    renderSBsList();
+    renderInstallments();
+    renderAllocations();
+    updateProgress();
+  }
+
+  // ───────────────────────────────────────────────
+  // STEP 3: Installments
+  // ───────────────────────────────────────────────
+  function addInstallmentRow(presetAmt) {
+    state.installments.push({
+      uuid: 'inst-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7),
+      amount: presetAmt || 0,
+      method: 'Transfer',
+      pay_date: todayISO(),
+      bank: '',
+      reference: '',
+    });
+    renderInstallments();
+    autoFifoAllocate();
+    renderAllocations();
+    updateProgress();
+  }
+
+  function renderInstallments() {
+    $installRows.innerHTML = state.installments.map((row, idx) => `
+      <div class="rp-inst-row" data-uuid="${row.uuid}" 
+           style="display:grid;grid-template-columns:30px 130px 110px 130px 120px 1fr 30px;gap:8px;padding:8px 12px;border-bottom:1px solid var(--border);align-items:center">
+        <div style="color:var(--muted);font-size:.85rem">${idx + 1}</div>
+        <input type="number" class="input rp-inst-amount" data-uuid="${row.uuid}" step="0.01" value="${row.amount}" 
+               style="font-size:.85rem;text-align:right;padding:5px 8px" placeholder="0.00">
+        <select class="select rp-inst-method" data-uuid="${row.uuid}" style="font-size:.8rem;padding:5px 6px">
+          <option value="Cash" ${row.method==='Cash'?'selected':''}>Cash</option>
+          <option value="Transfer" ${row.method==='Transfer'?'selected':''}>Transfer</option>
+          <option value="Cheque" ${row.method==='Cheque'?'selected':''}>Cheque</option>
+        </select>
+        <input type="date" class="input rp-inst-date" data-uuid="${row.uuid}" value="${row.pay_date}" 
+               style="font-size:.8rem;padding:5px 6px">
+        <input class="input rp-inst-bank" data-uuid="${row.uuid}" value="${escapeHtml(row.bank||'')}" 
+               placeholder="KBANK..." style="font-size:.8rem;padding:5px 8px">
+        <input class="input rp-inst-ref" data-uuid="${row.uuid}" value="${escapeHtml(row.reference||'')}" 
+               placeholder="เลขอ้างอิง / หมายเหตุ" style="font-size:.8rem;padding:5px 8px">
+        <button class="rp-inst-del" data-uuid="${row.uuid}" title="ลบงวด" 
+                style="background:none;border:none;color:var(--danger);cursor:pointer;font-size:1.1rem;padding:0">×</button>
+      </div>
+    `).join('');
+    
+    $installSum.textContent = '฿' + fmtNum(state.installments.reduce((s, r) => s + (Number(r.amount)||0), 0));
+    
+    // Wire events
+    $installRows.querySelectorAll('.rp-inst-amount').forEach(inp => {
+      inp.oninput = () => {
+        const row = state.installments.find(r => r.uuid === inp.dataset.uuid);
+        if (row) row.amount = Number(inp.value) || 0;
+        $installSum.textContent = '฿' + fmtNum(state.installments.reduce((s, r) => s + (Number(r.amount)||0), 0));
+        autoFifoAllocate();
+        renderAllocations();
+        updateProgress();
+      };
+    });
+    $installRows.querySelectorAll('.rp-inst-method').forEach(sel => {
+      sel.onchange = () => {
+        const row = state.installments.find(r => r.uuid === sel.dataset.uuid);
+        if (row) row.method = sel.value;
+        autoFifoAllocate();
+        renderAllocations();
+        updateProgress();
+      };
+    });
+    $installRows.querySelectorAll('.rp-inst-date').forEach(inp => {
+      inp.onchange = () => {
+        const row = state.installments.find(r => r.uuid === inp.dataset.uuid);
+        if (row) row.pay_date = inp.value;
+      };
+    });
+    $installRows.querySelectorAll('.rp-inst-bank').forEach(inp => {
+      inp.oninput = () => {
+        const row = state.installments.find(r => r.uuid === inp.dataset.uuid);
+        if (row) row.bank = inp.value;
+      };
+    });
+    $installRows.querySelectorAll('.rp-inst-ref').forEach(inp => {
+      inp.oninput = () => {
+        const row = state.installments.find(r => r.uuid === inp.dataset.uuid);
+        if (row) row.reference = inp.value;
+      };
+    });
+    $installRows.querySelectorAll('.rp-inst-del').forEach(btn => {
+      btn.onclick = () => {
+        state.installments = state.installments.filter(r => r.uuid !== btn.dataset.uuid);
+        if (state.installments.length === 0) state.installments.push({
+          uuid: 'inst-' + Date.now(), amount: 0, method: 'Transfer', pay_date: todayISO(), bank: '', reference: '',
         });
+        renderInstallments();
+        autoFifoAllocate();
+        renderAllocations();
+        updateProgress();
       };
     });
   }
 
-  // ── Type/WHT/fee logic ──
-  function updateTypeUI() {
-    const t = $type.value;
-    const isCash = t === 'Cash';
-    const isCheque = t === 'Cheque';
-    const isCard = t === 'Card';
-    const hasFee = !isCash;  // Cash ไม่มี WHT/fee
+  $btnAddInst.onclick = () => addInstallmentRow();
+
+  // ───────────────────────────────────────────────
+  // STEP 4: Allocation grid + Auto-FIFO
+  // ───────────────────────────────────────────────
+  function _getSelectedBills() {
+    // Return [{ sb, bill, outstanding }] for all bills in selected SBs, FIFO sort (by date)
+    const out = [];
+    state.outstanding_sbs.forEach(sb => {
+      if (!state.selected_sb_uuids.has(sb.billing_uuid)) return;
+      const sortedBills = _sortBillsByNo(sb.bills_snapshot);
+      sortedBills.forEach(bill => {
+        const billOut = _getBillOutstanding(sb, bill);
+        if (billOut > 0.01) {
+          out.push({ sb, bill, outstanding: billOut, key: bill.bill_uuid || bill.bill_no });
+        }
+      });
+    });
+    // Sort by bill_date FIFO
+    out.sort((a, b) => String(a.bill.date||'').localeCompare(String(b.bill.date||'')));
+    return out;
+  }
+
+  function autoFifoAllocate() {
+    // Sum installments per method → distribute FIFO across selected bills (skip overrides)
+    const methodPools = {};  // method → remaining amount to allocate
+    state.installments.forEach(r => {
+      const m = r.method;
+      const amt = Number(r.amount) || 0;
+      methodPools[m] = (methodPools[m] || 0) + amt;
+    });
     
-    $feeRows.style.display = hasFee ? 'block' : 'none';
-    $bankGroup.style.display = isCash ? 'none' : 'block';
-    $chequeDueRow.style.display = isCheque ? 'block' : 'none';
-    $cfRow.style.display = isCard ? 'flex' : 'none';
-    $tfRow.style.display = (isCheque || $type.value === 'Transfer') ? 'flex' : 'none';
+    // Build fresh allocations preserving overrides
+    const newAlloc = {};
+    const selectedBills = _getSelectedBills();
     
-    // ⭐ Phase 4 — Match-first info box
-    const $info = document.getElementById('rp-phase4-info');
-    if ($info) {
-      if (isCash) {
-        $info.style.display = 'block';
-        $info.style.background = 'rgba(34,197,94,.08)';
-        $info.style.borderColor = 'var(--success)';
-        $info.style.color = 'var(--fg)';
-        $info.innerHTML = '<strong style="color:var(--success)">✓ Cash</strong> — ระบบจะตัดยอด SB ทันทีหลังบันทึก';
-      } else {
-        $info.style.display = 'block';
-        $info.style.background = 'rgba(245,158,11,.08)';
-        $info.style.borderColor = 'var(--warn)';
-        $info.style.color = 'var(--fg)';
-        const tName = isCheque ? 'Cheque' : (isCard ? 'Card' : 'Transfer');
-        $info.innerHTML = '<strong style="color:var(--warn)">⏳ ' + tName + '</strong> — สร้าง SP-PENDING เพื่อรอ <strong>match กับ statement</strong> ก่อน · ' +
-                          'SB ยังคง <strong>ค้าง</strong> จนกว่าจะ match (ตัดยอดอัตโนมัติ)';
+    // Initialize all bills with zero per method
+    selectedBills.forEach(({ key }) => {
+      newAlloc[key] = { Cash: 0, Transfer: 0, Cheque: 0 };
+    });
+    
+    // Subtract overrides from pools first
+    state.alloc_overrides.forEach(overrideKey => {
+      const [bk, m] = overrideKey.split('|');
+      const v = Number((state.allocations[bk] || {})[m]) || 0;
+      if (newAlloc[bk]) newAlloc[bk][m] = v;
+      methodPools[m] = (methodPools[m] || 0) - v;
+    });
+    
+    // FIFO fill remaining per method
+    Object.keys(methodPools).forEach(method => {
+      let pool = Math.max(0, methodPools[method]);
+      if (pool < 0.01) return;
+      for (const sb of selectedBills) {
+        if (pool < 0.01) break;
+        const bk = sb.key;
+        if (state.alloc_overrides.has(`${bk}|${method}`)) continue;
+        // remaining outstanding considering already-allocated (other methods in this batch)
+        const allocSoFar = Object.values(newAlloc[bk] || {}).reduce((s, x) => s + (Number(x)||0), 0);
+        const remain = Math.max(0, sb.outstanding - allocSoFar);
+        if (remain < 0.01) continue;
+        const take = Math.min(pool, remain);
+        newAlloc[bk][method] = (newAlloc[bk][method] || 0) + take;
+        pool -= take;
       }
-    }
+    });
     
-    // ⭐ Adjust grid columns when Cheque (5 cols visible) vs others (4 cols + 1 hidden = visually 4)
-    const $fieldsRow = document.getElementById('rp-payment-fields-row');
-    if ($fieldsRow) {
-      $fieldsRow.style.gridTemplateColumns = isCheque
-        ? '120px 130px 130px 130px 1fr'   // Cheque: type / pay_date / due_date / bank / conf
-        : isCash
-          ? '130px 145px 1fr'             // Cash: type / pay_date / conf (no bank/due)
-          : '130px 145px 145px 1fr';      // Transfer/Card: type / pay_date / bank / conf
-    }
-    
-    // Pay date label change for Cheque
-    const $payDateLabel = document.getElementById('rp-pay-date-label');
-    if ($payDateLabel) $payDateLabel.textContent = isCheque ? 'วันรับเช็ค' : 'วันที่';
-    
-    // ⭐ Update Conf label ตาม type
-    const $confLabel = document.getElementById('rp-conf-label');
-    const $confInput = document.getElementById('rp-conf');
-    if ($confLabel && $confInput) {
-      if (isCheque) {
-        $confLabel.textContent = 'เลขที่เช็ค *';
-        $confInput.placeholder = 'เลขเช็ค (จำเป็น)';
-      } else if (t === 'Transfer') {
-        $confLabel.textContent = 'Confirmation';
-        $confInput.placeholder = 'รหัสโอน / ref';
-      } else if (isCard) {
-        $confLabel.textContent = 'เลขสลิปบัตร';
-        $confInput.placeholder = 'slip number';
-      } else {
-        $confLabel.textContent = 'หมายเหตุ';
-        $confInput.placeholder = '(ไม่จำเป็น)';
-      }
-    }
-    
-    if (isCard) {
-      $tf.value = '0';
-    } else if (isCheque || t === 'Transfer') {
-      if ($tf.value === '' || Number($tf.value) === 0) $tf.value = '12';
-    }
-    
-    updateSummary();
+    state.allocations = newAlloc;
   }
 
-  function updateWHT() {
-    if (state.wht_manually_edited) return;
-    const sumSel = Array.from(state.selected_bills.values()).reduce((s, b) => s + b.amount, 0);
-    if ($whtEnable.checked && sumSel > 0) {
-      // ROUND(amount/1.07 × 0.01, 2)
-      const wht = Math.round((sumSel / 1.07) * 0.01 * 100) / 100;
-      $wht.value = wht.toFixed(2);
-    } else {
-      $wht.value = '';
-    }
+  function renderAllocations() {
+    const selectedBills = _getSelectedBills();
+    if (selectedBills.length === 0) { $allocRows.innerHTML = '<div style="padding:14px;color:var(--muted);text-align:center;font-size:.85rem">ไม่มีบิลให้จัดสรร</div>'; return; }
+    
+    $allocRows.innerHTML = selectedBills.map(({ sb, bill, outstanding, key }) => {
+      const alloc = state.allocations[key] || { Cash: 0, Transfer: 0, Cheque: 0 };
+      const sumAlloc = (Number(alloc.Cash)||0) + (Number(alloc.Transfer)||0) + (Number(alloc.Cheque)||0);
+      const newOut = Math.max(0, outstanding - sumAlloc);
+      const isPaid = newOut < 0.01;
+      const isPartial = sumAlloc > 0.01 && !isPaid;
+      const bgColor = isPaid ? 'rgba(99,153,34,.08)' : isPartial ? 'rgba(186,117,23,.08)' : 'transparent';
+      const newOutColor = isPaid ? 'var(--success)' : isPartial ? 'var(--warn)' : 'var(--danger)';
+      
+      return `
+        <div class="rp-alloc-row" data-key="${key}" 
+             style="display:grid;grid-template-columns:1.4fr 90px 90px 100px 90px 90px 100px;gap:6px;padding:8px 10px;border-bottom:1px solid var(--border);font-size:.82rem;align-items:center;background:${bgColor}">
+          <div>
+            <div style="font-family:var(--mono);font-weight:600;font-size:.8rem">${bill.bill_no}</div>
+            <div style="color:var(--muted);font-size:.7rem">${sb.billing_no}</div>
+          </div>
+          <div style="color:var(--muted);font-size:.78rem">${fmtDate(bill.date)}</div>
+          <input type="number" class="input rp-alloc-cell" data-key="${key}" data-method="Cash" 
+                 step="0.01" value="${(alloc.Cash||0)===0?'':alloc.Cash}" 
+                 style="font-size:.8rem;text-align:right;padding:4px 6px;${(alloc.Cash||0)===0?'color:var(--muted)':''}">
+          <input type="number" class="input rp-alloc-cell" data-key="${key}" data-method="Transfer" 
+                 step="0.01" value="${(alloc.Transfer||0)===0?'':alloc.Transfer}" 
+                 style="font-size:.8rem;text-align:right;padding:4px 6px;${(alloc.Transfer||0)===0?'color:var(--muted)':''}">
+          <input type="number" class="input rp-alloc-cell" data-key="${key}" data-method="Cheque" 
+                 step="0.01" value="${(alloc.Cheque||0)===0?'':alloc.Cheque}" 
+                 style="font-size:.8rem;text-align:right;padding:4px 6px;${(alloc.Cheque||0)===0?'color:var(--muted)':''}">
+          <div style="text-align:right;color:var(--muted)">฿${fmtNum(outstanding)}</div>
+          <div style="text-align:right;color:${newOutColor};font-weight:600">${isPaid?'✓ 0':'฿'+fmtNum(newOut)}</div>
+        </div>
+      `;
+    }).join('');
+    
+    $allocRows.querySelectorAll('.rp-alloc-cell').forEach(inp => {
+      inp.oninput = () => {
+        const key = inp.dataset.key, m = inp.dataset.method;
+        const v = Number(inp.value) || 0;
+        if (!state.allocations[key]) state.allocations[key] = { Cash: 0, Transfer: 0, Cheque: 0 };
+        state.allocations[key][m] = v;
+        state.alloc_overrides.add(`${key}|${m}`);
+        updateProgress();
+        // Re-render this row's new outstanding only (avoid full re-render to keep cursor)
+        const row = inp.closest('.rp-alloc-row');
+        const sumAlloc = (Number(state.allocations[key].Cash)||0) + (Number(state.allocations[key].Transfer)||0) + (Number(state.allocations[key].Cheque)||0);
+        const bills = _getSelectedBills();
+        const bInfo = bills.find(b => b.key === key);
+        if (bInfo && row) {
+          const newOut = Math.max(0, bInfo.outstanding - sumAlloc);
+          const isPaid = newOut < 0.01;
+          const cells = row.querySelectorAll('div');
+          const lastCell = cells[cells.length - 1];
+          lastCell.style.color = isPaid ? 'var(--success)' : (sumAlloc > 0.01 ? 'var(--warn)' : 'var(--danger)');
+          lastCell.textContent = isPaid ? '✓ 0' : '฿' + fmtNum(newOut);
+          row.style.background = isPaid ? 'rgba(99,153,34,.08)' : sumAlloc > 0.01 ? 'rgba(186,117,23,.08)' : 'transparent';
+        }
+      };
+    });
   }
 
-  function updateSummary() {
-    const sumSel = Array.from(state.selected_bills.values()).reduce((s, b) => s + b.amount, 0);
-    const sumCredit = Array.from(state.credit_used.values()).reduce((s, c) => s + c.amount, 0);
+  $btnAutoFifo.onclick = () => {
+    state.alloc_overrides.clear();
+    autoFifoAllocate();
+    renderAllocations();
+    updateProgress();
+    toast('คำนวณ FIFO ใหม่แล้ว', 'success', 1500);
+  };
+
+  // ───────────────────────────────────────────────
+  // Progress + Submit
+  // ───────────────────────────────────────────────
+  function updateProgress() {
+    const totalSB = state.outstanding_sbs.filter(sb => state.selected_sb_uuids.has(sb.billing_uuid))
+      .reduce((s, sb) => s + (Number(sb.outstanding)||0), 0);
+    const totalInst = state.installments.reduce((s, r) => s + (Number(r.amount)||0), 0);
     
-    $sumSelected.textContent = '฿' + fmtNum(sumSel);
+    // Sum allocations across all bills
+    let totalAlloc = 0;
+    Object.values(state.allocations).forEach(a => {
+      totalAlloc += (Number(a.Cash)||0) + (Number(a.Transfer)||0) + (Number(a.Cheque)||0);
+    });
     
-    const t = $type.value;
-    const whtOn = $whtEnable.checked && (t === 'Transfer' || t === 'Cheque');
+    const due = Math.max(0, totalSB - totalAlloc);
+    const unalloc = Math.max(0, totalInst - totalAlloc);
+    const pct = totalSB > 0 ? Math.min(100, (totalAlloc / totalSB) * 100) : 0;
     
-    $wht.disabled = !whtOn;
-    if (whtOn && !state.wht_manually_edited) updateWHT();
-    if (!whtOn) $wht.value = '';
+    $progTotal.textContent = '฿' + fmtNum(totalSB);
+    $progBar.style.width = pct + '%';
+    $progBar.style.background = pct >= 99.99 ? '#639922' : pct > 0.01 ? '#378ADD' : '#666';
+    $progPaid.textContent = `฿${fmtNum(totalAlloc)} · ${pct.toFixed(1)}%`;
+    $progDue.textContent = '฿' + fmtNum(due);
+    $progUnalloc.textContent = '฿' + fmtNum(unalloc);
+    $progUnalloc.style.color = unalloc > 0.01 ? 'var(--warn)' : 'var(--text)';
     
-    const wht = Number($wht.value) || 0;
-    const tf = (t !== 'Cash' && t !== 'Card') ? (Number($tf.value) || 0) : 0;
-    const cf = (t === 'Card') ? (Number($cf.value) || 0) : 0;
-    const net = sumSel - wht - tf - cf;
-    $net.textContent = '฿' + fmtNum(net);
-    
-    // ⭐ "ต้องจ่ายเพิ่ม" = ยอดบิลที่เลือก − partial ที่ใช้
-    const $creditDeductRow = document.getElementById('rp-credit-deduct-row');
-    const $creditDeduct = document.getElementById('rp-credit-deduct');
-    const $needPay = document.getElementById('rp-need-pay');
-    const $needPayRow = document.getElementById('rp-need-pay-row');
-    
-    if (sumCredit > 0) {
-      if ($creditDeductRow) $creditDeductRow.style.display = 'flex';
-      if ($creditDeduct) $creditDeduct.textContent = '−฿' + fmtNum(sumCredit);
-    } else {
-      if ($creditDeductRow) $creditDeductRow.style.display = 'none';
-    }
-    
-    const needPay = Math.max(0, sumSel - sumCredit);
-    if ($needPay) $needPay.textContent = '฿' + fmtNum(needPay);
-    
-    // ซ่อน "ต้องจ่ายเพิ่ม" ถ้า sumSel = 0 และ sumCredit = 0 (ยังไม่เลือกอะไร)
-    if ($needPayRow) {
-      $needPayRow.style.display = (sumSel > 0 || sumCredit > 0) ? 'flex' : 'none';
-    }
-    
-    // ⭐ Auto-set amount_paid = needPay (default จ่ายเฉพาะส่วนที่ต้องจ่ายเพิ่ม)
-    // ถ้า user แก้แล้ว (state.amount_manually_edited) ไม่ override
-    if (!state.amount_manually_edited) {
-      $amountPaid.value = needPay.toFixed(2);
-    }
-    
-    const amountPaid = Number($amountPaid.value) || 0;
-    const totalCovered = amountPaid + sumCredit;
-    const overflow = totalCovered - sumSel;
-    
-    if (overflow > 0.01) {
-      $overflowRow.style.display = 'block';
-      $overflowRow.style.color = 'var(--warn)';
-      $overflowRow.textContent = `ส่วนเกิน ฿${fmtNum(overflow)} → จะเก็บเป็น partial รอตัดจ่ายภายหลัง`;
-    } else if (overflow < -0.01) {
-      $overflowRow.style.display = 'block';
-      $overflowRow.style.color = 'var(--danger)';
-      $overflowRow.textContent = `❌ ยังขาดอีก ฿${fmtNum(Math.abs(overflow))}`;
-    } else {
-      $overflowRow.style.display = 'none';
-    }
-    
-    // Submit enable: ต้องมียอดอย่างใดอย่างหนึ่ง (sel หรือ amount_paid > 0)
-    // และ amountPaid + creditUsed ≥ sumSel (ครอบบิลที่เลือก)
-    const canSubmit = (sumSel > 0 || amountPaid > 0) && totalCovered >= sumSel - 0.01;
-    $submit.disabled = !canSubmit;
+    // Submit ready conditions
+    const canSubmit = totalInst > 0.01 && totalAlloc > 0.01 && unalloc < 0.01;
+    $btnSubmit.disabled = !canSubmit;
+    $btnSubmit.title = canSubmit ? '' : 'ใส่งวด + จัดสรรให้ครบ (unallocated ต้อง = 0)';
   }
 
-  // Wire fee inputs
-  $type?.addEventListener('change', updateTypeUI);
-  $whtEnable?.addEventListener('change', () => {
-    state.wht_manually_edited = false;
-    updateSummary();
-  });
-  $wht?.addEventListener('input', () => {
-    state.wht_manually_edited = true;
-    updateSummary();
-  });
-  $tf?.addEventListener('input', updateSummary);
-  $cf?.addEventListener('input', updateSummary);
-  $amountPaid?.addEventListener('input', () => {
-    state.amount_manually_edited = true;
-    updateSummary();
-  });
-  $amountPaid?.addEventListener('focus', () => {
-    state.amount_manually_edited = true;
-  });
-  
-  // Init UI
-  updateTypeUI();
+  $btnCancel.onclick = () => closeModal();
 
-  // ── Submit ──
-  $submit.onclick = async () => {
-    if ($submit.disabled) return;
-    $submit.disabled = true;
-    $submit.textContent = 'กำลังบันทึก...';
+  $btnSubmit.onclick = async () => {
+    if ($btnSubmit.disabled) return;
+    $btnSubmit.disabled = true;
+    $btnSubmit.textContent = '⏳ กำลังบันทึก...';
     
     try {
-      const sumSel = Array.from(state.selected_bills.values()).reduce((s, b) => s + b.amount, 0);
-      const t = $type.value;
-      const wht = ($whtEnable.checked && (t === 'Transfer' || t === 'Cheque')) ? (Number($wht.value) || 0) : 0;
-      const tf = (t !== 'Cash' && t !== 'Card') ? (Number($tf.value) || 0) : 0;
-      const cf = (t === 'Card') ? (Number($cf.value) || 0) : 0;
+      const batchId = 'BAT-' + todayISO().replace(/-/g,'') + '-' + Math.random().toString(36).slice(2, 7).toUpperCase();
       
-      const req = {
-        cust_code: state.cust_code,
-        cust_name: state.cust_name,
-        amount: Number($amountPaid.value) || sumSel,
-        wht_amount: wht,
-        transfer_fee: tf,
-        card_fee: cf,
-        type: t,
-        pay_date: $payDate.value,
-        due_date: t === 'Cheque' ? $dueDate.value : '',
-        bank: $bank.value,
-        confirmation: $conf.value,
-        selected_bills: Array.from(state.selected_bills.values()),
-        credit_used: Array.from(state.credit_used.values()),
-        action_by: (window.currentUser?.display_name) || 'Admin',
-      };
+      // For each selected SB → call recordBillingPayment with amount per method
+      const selectedSBs = state.outstanding_sbs.filter(sb => state.selected_sb_uuids.has(sb.billing_uuid));
+      const totalsBySB = {};  // sb_uuid → { method → { amount, date, bank, ref } }
       
-      const r = await api('recordSBPayment', req);
+      // Build per-SB aggregate by walking allocations + matching installments by method
+      // For each bill_uuid, allocations[key].method = X → contribute to SB containing this bill
+      // Pick installment date/bank/ref of FIRST installment matching method (best-effort attribution)
+      const methodFirstInst = {};
+      state.installments.forEach(r => {
+        if (!methodFirstInst[r.method] && (Number(r.amount)||0) > 0.01) methodFirstInst[r.method] = r;
+      });
       
-      if (r?.success && r.data) {
-        toast('✅ บันทึกการรับชำระสำเร็จ', 'success', 3000);
-        // Reload data + refresh main page
-        if (typeof loadAllFromCloud === 'function') {
-          await loadAllFromCloud({ years: [Number(req.pay_date.substring(0,4))], mode: 'force' });
-        }
-        if (typeof render === 'function') render();
-        closeModal();
+      selectedSBs.forEach(sb => { totalsBySB[sb.billing_uuid] = {}; });
+      
+      const bills = _getSelectedBills();
+      bills.forEach(({ sb, key }) => {
+        const a = state.allocations[key] || {};
+        ['Cash','Transfer','Cheque'].forEach(m => {
+          const v = Number(a[m]) || 0;
+          if (v < 0.01) return;
+          if (!totalsBySB[sb.billing_uuid][m]) totalsBySB[sb.billing_uuid][m] = 0;
+          totalsBySB[sb.billing_uuid][m] += v;
+        });
+      });
+      
+      // Send 1 recordBillingPayment per (SB × method) combination
+      const calls = [];
+      Object.entries(totalsBySB).forEach(([billing_uuid, byMethod]) => {
+        Object.entries(byMethod).forEach(([method, amt]) => {
+          if (amt < 0.01) return;
+          const inst = methodFirstInst[method] || { pay_date: todayISO(), bank: '', reference: '' };
+          calls.push(api('recordBillingPayment', {
+            billing_uuid,
+            amount: amt,
+            payment_method: method,
+            payment_date: inst.pay_date || todayISO(),
+            reference: inst.reference ? `[${batchId}] ${inst.reference}` : `[${batchId}]`,
+            remarks: inst.bank ? `${method} via ${inst.bank}` : method,
+            wht_amount: 0,
+            fee_amount: 0,
+          }));
+        });
+      });
+      
+      const results = await Promise.all(calls);
+      const failed = results.filter(r => !r || !r.success);
+      
+      if (failed.length > 0) {
+        const errs = failed.map(r => r?.message || r?.error || 'unknown').join('\n');
+        toast('บางรายการล้มเหลว: ' + errs, 'error', 6000);
       } else {
-        toast('❌ ' + (r?.error || 'บันทึกไม่สำเร็จ'), 'error', 5000);
-        $submit.disabled = false;
-        $submit.textContent = '💾 บันทึกการรับชำระ';
+        toast(`✓ บันทึก batch ${batchId} สำเร็จ (${calls.length} รายการ)`, 'success', 4000);
+      }
+      
+      closeModal();
+      
+      // Invalidate cache + reload Main
+      try {
+        if (typeof _invalidateCachedNotes === 'function') _invalidateCachedNotes();
+      } catch(e) {}
+      // Trigger Main refresh if available
+      if (typeof renderMain === 'function') {
+        try { renderMain(); } catch(e) {}
       }
     } catch (e) {
-      console.error('[receive payment] submit error:', e);
-      toast('❌ Error: ' + e.message, 'error', 5000);
-      $submit.disabled = false;
-      $submit.textContent = '💾 บันทึกการรับชำระ';
+      toast('บันทึกล้มเหลว: ' + (e.message||e), 'error', 4000);
+      $btnSubmit.disabled = false;
+      $btnSubmit.textContent = '💾 บันทึก batch';
     }
   };
 }
+
 
 window.openReceivePaymentModal = openReceivePaymentModal;
 
@@ -39828,10 +39888,10 @@ function _pvParseVatRow(r, vatType) {
 
 // ── Initialize after all declarations are ready ──
 (async function() {
-  // ⭐ R23.3 BOOT BEACON — confirms fresh JS execution
-  console.log('%c[SF R23.3] Active build: 2026-05-14-1730 — _sortBillsByNo moved to top-level (fix scope bug)', 'color:#0c8;font-weight:bold;font-size:13px');
-  console.log('%c[SF R23.3] R23.2 modal sizing + scope fix for wireReceivePaymentModal', 'color:#888');
-  window.__SF_BUILD = 'R23.3-2026-05-14-1730';
+  // ⭐ R24.1 BOOT BEACON
+  console.log('%c[SF R24.1] Active build: 2026-05-14-1900 — SB progress bar + overdue filter', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R24.1] Per-SB progress bar (paid hidden), overdue stat card, status filter overdue option', 'color:#888');
+  window.__SF_BUILD = 'R24.1-2026-05-14-1900';
   
   await restoreMainState();
   checkSavedLogin();
