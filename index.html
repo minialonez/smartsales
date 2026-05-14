@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R23.1-2026-05-14-1600 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R23.3-2026-05-14-1730 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -7,7 +7,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>Smart Finance R23.1</title>
+<title>Smart Finance R23.3</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
@@ -19964,6 +19964,20 @@ function statCard(label, value, sub, color, icon) {
   </div>`;
 }
 
+// ⭐ R23.2 14/5/26 — Top-level helper (used by renderBilling + wireReceivePaymentModal)
+//   Previously inside renderBilling() → ReferenceError in receive payment modal
+function _sortBillsByNo(bills) {
+  if (!Array.isArray(bills)) return [];
+  return [...bills].sort((a, b) => {
+    const an = String(a?.bill_no || '');
+    const bn = String(b?.bill_no || '');
+    if (!an && !bn) return 0;
+    if (!an) return 1;
+    if (!bn) return -1;
+    return an.localeCompare(bn, undefined, { numeric: true, sensitivity: 'base' });
+  });
+}
+
 // ── Billing Notes (ใบวางบิล + หนี้) ─────────────────────────
 async function renderBilling(el) {
   // ══════════════════════════════════════════════════════════════
@@ -20018,19 +20032,6 @@ async function renderBilling(el) {
   function daysDiff(fromIso, toIso) {
     if (!fromIso || !toIso) return 0;
     return Math.floor((new Date(toIso) - new Date(fromIso)) / 86400000);
-  }
-
-  // ⭐ R23 14/5/26 — natural sort bills by bill_no (e.g. SR00126-000005 ก่อน SR00126-000139)
-  function _sortBillsByNo(bills) {
-    if (!Array.isArray(bills)) return [];
-    return [...bills].sort((a, b) => {
-      const an = String(a?.bill_no || '');
-      const bn = String(b?.bill_no || '');
-      if (!an && !bn) return 0;
-      if (!an) return 1;
-      if (!bn) return -1;
-      return an.localeCompare(bn, undefined, { numeric: true, sensitivity: 'base' });
-    });
   }
 
   // กรอง bills ที่เป็นเครดิต + unpaid + ไม่อยู่ใน billing notes อื่น (ที่ไม่ cancelled)
@@ -22884,12 +22885,12 @@ async function openReceivePaymentModal() {
       <div id="rp-2col-grid" style="display:grid;grid-template-columns:1.4fr 1fr;gap:14px;flex:1;min-height:0;overflow:hidden">
         
         <!-- STEP 2: บิลค้างชำระ -->
-        <div id="rp-bills-section" style="display:none;flex-direction:column;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:12px;background:var(--bg-elev);min-height:340px;max-height:65vh">
+        <div id="rp-bills-section" style="display:none;flex-direction:column;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:12px;background:var(--bg-elev);min-height:420px;max-height:75vh">
           <div id="rp-bills-content"></div>
         </div>
         
         <!-- STEP 3: ข้อมูลรับชำระ -->
-        <div id="rp-payment-section" style="display:none;flex-direction:column;overflow-y:auto;background:var(--bg-elev);border:1px solid var(--border);border-radius:6px;padding:14px;min-height:340px;max-height:65vh">
+        <div id="rp-payment-section" style="display:none;flex-direction:column;overflow-y:auto;background:var(--bg-elev);border:1px solid var(--border);border-radius:6px;padding:14px;min-height:420px;max-height:75vh">
           <div id="rp-payment-fields-row" style="display:grid;grid-template-columns:110px 130px 1fr;gap:8px;margin-bottom:10px">
             <div class="input-group" style="margin:0">
               <label style="font-size:.78rem">Type</label>
@@ -22983,7 +22984,18 @@ async function openReceivePaymentModal() {
         #rp-bills-section, #rp-payment-section { max-height: 50vh !important; }
       }
     </style>
-  `, { width: '1280px', maxWidth: '96vw' });
+  `);
+
+  // ⭐ R23.2 14/5/26 — openModal รับแค่ (title, html) — options ที่ 3 ถูก ignore
+  //   เก่า: openModal(..., { width: '1280px' }) → ไม่มีผล → modal default แคบ ~500px
+  //   ใหม่: manual style override หลัง openModal (เหมือน Pay Modal R22)
+  const modalEl = document.getElementById('modal-card');
+  if (modalEl) {
+    modalEl.style.width = 'min(1400px, 96vw)';
+    modalEl.style.maxWidth = '96vw';
+    modalEl.style.maxHeight = '92vh';
+    modalEl.style.overflowY = 'auto';
+  }
 
   // Wire modal
   wireReceivePaymentModal(state);
@@ -39816,12 +39828,10 @@ function _pvParseVatRow(r, vatType) {
 
 // ── Initialize after all declarations are ready ──
 (async function() {
-  // ⭐ R23.1 BOOT BEACON — confirms fresh JS execution (not V8 cached old version)
-  //   If you see this in console, R23.1 code is active.
-  //   If you don't see this, your browser is running cached old code → clear V8 cache.
-  console.log('%c[SF R23.1] Active build: 2026-05-14-1600 — Customer drawer E6 fix (snapshot lazy fetch)', 'color:#0c8;font-weight:bold;font-size:13px');
-  console.log('%c[SF R23.1] R23 perf intact + customer drawer fetches snapshots per cust on open', 'color:#888');
-  window.__SF_BUILD = 'R23.1-2026-05-14-1600';
+  // ⭐ R23.3 BOOT BEACON — confirms fresh JS execution
+  console.log('%c[SF R23.3] Active build: 2026-05-14-1730 — _sortBillsByNo moved to top-level (fix scope bug)', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R23.3] R23.2 modal sizing + scope fix for wireReceivePaymentModal', 'color:#888');
+  window.__SF_BUILD = 'R23.3-2026-05-14-1730';
   
   await restoreMainState();
   checkSavedLogin();
