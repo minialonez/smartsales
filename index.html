@@ -20855,7 +20855,7 @@ async function renderBilling(el) {
   // ════════════════════════════════════════════════════════════════════
   // Customer Drawer — แสดง SB ทุกใบ + ประวัติชำระ + ปุ่มพิมพ์
   // ════════════════════════════════════════════════════════════════════
-  function openCustomerDrawer(custCode, custName) {
+  async function openCustomerDrawer(custCode, custName) {
     const all = _aggregateCustomerDebts();
     const cust = all.find(c => 
       (custCode && c.cust_code === custCode) || 
@@ -20864,6 +20864,36 @@ async function renderBilling(el) {
     if (!cust) {
       toast('ไม่พบข้อมูลลูกค้า', 'error');
       return;
+    }
+    
+    // ⭐ R23+ 14/5/26 — Customer drawer ต้องการ bills_snapshot (light mode ไม่มี)
+    //   Fetch SBs ของลูกค้านี้พร้อม snapshot → patch ลง billingNotes → drawer render ครบ
+    const needSnapshot = cust.sbs.some(sb => !Array.isArray(sb.bills_snapshot) || sb.bills_snapshot.length === 0);
+    if (needSnapshot && custCode) {
+      try {
+        const r = await api('getBillingNotes', { cust_code: custCode, include_snapshot: true });
+        if (r && r.success && Array.isArray(r.data)) {
+          // Patch into billingNotes
+          r.data.forEach(fresh => {
+            const idx = billingNotes.findIndex(n => n.billing_uuid === fresh.billing_uuid);
+            if (idx >= 0) {
+              // Normalize status (same as loadNotes)
+              const s = String(fresh.status || '').toLowerCase();
+              if (s === 'open') fresh.status = 'pending';
+              else if (s === 'complete') fresh.status = 'paid';
+              billingNotes[idx] = { ...billingNotes[idx], ...fresh };
+            }
+          });
+          // Re-aggregate after patch
+          const updated = _aggregateCustomerDebts().find(c =>
+            (custCode && c.cust_code === custCode) || (!custCode && c.cust_name === custName)
+          );
+          if (updated) cust.sbs = updated.sbs;
+        }
+      } catch (e) {
+        console.warn('[openCustomerDrawer] snapshot fetch failed:', e?.message || e);
+        // Continue rendering — drawer shows what it can (may show 0 bills)
+      }
     }
     
     const u = getCreditUsage(custCode);
