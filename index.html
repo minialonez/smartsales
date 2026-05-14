@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R24.5-2026-05-14-2200 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R24.6-2026-05-14-2230 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -7,7 +7,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>Smart Finance R24.5</title>
+<title>Smart Finance R24.6</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
@@ -21640,7 +21640,7 @@ ${bodyHtml}
                       return `<div style="color:var(--muted)">— ยกเลิก —</div>`;
                     }
                     const paid = Number(n.paid_amount)||0;
-                    const outstanding = Number(n.outstanding)||Number(n.total_amount)||0;
+                    const outstanding = Number(n.outstanding) || 0;
                     return `
                       <div style="font-size:.85rem">
                         <span style="color:#16a34a">฿${fmtNum(paid)}</span>
@@ -39981,10 +39981,10 @@ function _pvParseVatRow(r, vatType) {
 
 // ── Initialize after all declarations are ready ──
 (async function() {
-  // ⭐ R24.5 BOOT BEACON
-  console.log('%c[SF R24.5] Active build: 2026-05-14-2200 — Search using proven v1 pattern (addEventListener no debounce)', 'color:#0c8;font-weight:bold;font-size:13px');
-  console.log('%c[SF R24.5] Copy of Add Bill modal search logic — same matching + dedup + 20 cap', 'color:#888');
-  window.__SF_BUILD = 'R24.5-2026-05-14-2200';
+  // ⭐ R24.6 BOOT BEACON
+  console.log('%c[SF R24.6] Active build: 2026-05-14-2230 — R24.5 search fix + CIC outstanding fallback fix', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R24.6] Drop total_amount fallback in outstanding display (was misleading on edge data)', 'color:#888');
+  window.__SF_BUILD = 'R24.6-2026-05-14-2230';
   
   await restoreMainState();
   checkSavedLogin();
