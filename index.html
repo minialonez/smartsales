@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R24.3-2026-05-14-2100 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R24.5-2026-05-14-2200 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -7,7 +7,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>Smart Finance R24.3</title>
+<title>Smart Finance R24.5</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
@@ -23039,17 +23039,33 @@ async function openReceivePaymentModal() {
     modalEl.style.overflowY = 'auto';
   }
 
-  // ⭐ R24.3 — Ensure customerList loaded (auto-fetch if empty)
-  if (!Array.isArray(customerList) || customerList.length === 0) {
-    (async () => {
-      try {
-        const r = await api('getCustomers', {});
-        if (r?.success && Array.isArray(r.data)) customerList = r.data;
-      } catch (e) { console.warn('[rp v2] customer load failed:', e); }
-    })();
-  }
-
   wireReceivePaymentModalV2(state);
+
+  // ⭐ R24.4 — Ensure customerList loaded (block search until ready)
+  if (!Array.isArray(customerList) || customerList.length === 0) {
+    const $search = document.getElementById('rp-cust-search');
+    if ($search) {
+      $search.placeholder = '⏳ กำลังโหลดรายชื่อลูกค้า...';
+      $search.disabled = true;
+    }
+    try {
+      const r = await api('getCustomers', {});
+      if (r?.success && Array.isArray(r.data)) {
+        customerList = r.data;
+        console.log('[rp v2] customers loaded:', customerList.length);
+      } else {
+        console.warn('[rp v2] getCustomers failed:', r?.error || r?.message);
+        toast('โหลดรายชื่อลูกค้าล้มเหลว', 'error', 4000);
+      }
+    } catch (e) {
+      console.warn('[rp v2] customer load error:', e);
+      toast('โหลดรายชื่อลูกค้าล้มเหลว: ' + (e.message||e), 'error', 4000);
+    }
+    if ($search) {
+      $search.placeholder = '🔍 ค้นรหัส / ชื่อลูกค้า เช่น BE-00789';
+      $search.disabled = false;
+    }
+  }
 }
 
 // ⭐ R24 14/5/26 — Receive Payment v2 (4-step + multi-installment + FIFO allocation)
@@ -23077,50 +23093,60 @@ function wireReceivePaymentModalV2(state) {
 
   // ───────────────────────────────────────────────
   // STEP 1: customer search + dropdown
+  // ⭐ R24.5 — ใช้ pattern เดียวกับ Add Bill modal (addEventListener + ไม่ debounce)
   // ───────────────────────────────────────────────
-  let searchTimer;
-  $search.oninput = () => {
-    clearTimeout(searchTimer);
-    const q = $search.value.trim();
-    if (q.length < 1) { $dropdown.style.display = 'none'; return; }
-    searchTimer = setTimeout(() => showCustomerDropdown(q), 150);
-  };
-  $search.onfocus = () => { if ($search.value.trim()) showCustomerDropdown($search.value.trim()); };
-  document.addEventListener('click', e => {
-    if (!$search.contains(e.target) && !$dropdown.contains(e.target)) $dropdown.style.display = 'none';
-  });
-
   function showCustomerDropdown(q) {
-    const qUp = q.toUpperCase();
-    // ⭐ R24.3 — accept both cust_code + cust_id (customerList may use either field)
-    const matched = (customerList || []).filter(c => {
-      const code = String(c.cust_code || c.cust_id || '').toUpperCase();
-      const name = String(c.cust_name || '').toUpperCase();
-      return code.includes(qUp) || name.includes(qUp);
-    }).slice(0, 50);
-    if (matched.length === 0) {
-      $dropdown.innerHTML = `<div style="padding:10px;color:var(--muted);font-size:.85rem">ไม่พบลูกค้า (มี ${customerList?.length||0} ราย ใน list)</div>`;
+    q = String(q||'').toLowerCase().trim();
+    if (!q) { $dropdown.style.display = 'none'; return; }
+    
+    const list = (typeof customerList !== 'undefined' && Array.isArray(customerList)) ? customerList : [];
+    if (list.length === 0) {
+      $dropdown.innerHTML = '<div style="padding:10px;color:var(--muted);font-size:.85rem">⏳ ยังโหลด customerList ไม่เสร็จ — รอสักครู่</div>';
       $dropdown.style.display = 'block';
       return;
     }
-    $dropdown.innerHTML = matched.map(c => {
-      const code = c.cust_code || c.cust_id || '';
+    
+    const seen = new Set();
+    const matches = [];
+    for (const c of list) {
+      const code = String(c.cust_id||c.cust_code||'').toLowerCase();
+      const name = String(c.cust_name||'').toLowerCase();
+      if (!code.includes(q) && !name.includes(q)) continue;
+      const key = code || name;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      matches.push(c);
+      if (matches.length >= 20) break;
+    }
+    
+    if (matches.length === 0) {
+      $dropdown.innerHTML = `<div style="padding:10px 12px;color:var(--muted);font-size:.85rem">ไม่พบลูกค้า (มี ${list.length} ราย)</div>`;
+      $dropdown.style.display = 'block';
+      return;
+    }
+    
+    $dropdown.innerHTML = matches.map(c => {
+      const code = c.cust_id || c.cust_code || '';
       const name = c.cust_name || '';
-      return `
-        <div class="rp-cust-opt" data-code="${code}" data-name="${escapeHtml(name)}" 
-             style="padding:8px 12px;cursor:pointer;border-bottom:1px solid var(--border);font-size:.85rem">
-          <span style="font-family:var(--mono);color:var(--info)">${code}</span>
-          <span style="margin-left:8px">${escapeHtml(name)}</span>
-        </div>
-      `;
+      return `<div class="rp-cust-opt" data-code="${code}" data-name="${escapeHtml(name)}"
+              style="padding:8px 12px;cursor:pointer;border-bottom:1px solid var(--border);font-size:.85rem">
+              <span style="font-family:monospace;color:var(--info)">${code}</span> · ${escapeHtml(name)}
+              </div>`;
     }).join('');
     $dropdown.style.display = 'block';
-    $dropdown.querySelectorAll('.rp-cust-opt').forEach(el => {
-      el.onmouseenter = () => el.style.background = 'var(--bg-elev)';
-      el.onmouseleave = () => el.style.background = '';
-      el.onclick = () => selectCustomer(el.dataset.code, el.dataset.name);
+    
+    $dropdown.querySelectorAll('.rp-cust-opt').forEach(opt => {
+      opt.addEventListener('mouseenter', () => opt.style.background = 'var(--bg-elev)');
+      opt.addEventListener('mouseleave', () => opt.style.background = '');
+      opt.addEventListener('click', () => selectCustomer(opt.dataset.code, opt.dataset.name));
     });
   }
+  
+  $search.addEventListener('input', () => showCustomerDropdown($search.value));
+  $search.addEventListener('focus', () => { if ($search.value) showCustomerDropdown($search.value); });
+  document.addEventListener('click', e => {
+    if (!$search.contains(e.target) && !$dropdown.contains(e.target)) $dropdown.style.display = 'none';
+  });
 
   async function selectCustomer(code, name) {
     state.cust_code = code;
@@ -39955,10 +39981,10 @@ function _pvParseVatRow(r, vatType) {
 
 // ── Initialize after all declarations are ready ──
 (async function() {
-  // ⭐ R24.3 BOOT BEACON
-  console.log('%c[SF R24.3] Active build: 2026-05-14-2100 — Customer search + merged paid/outstanding column', 'color:#0c8;font-weight:bold;font-size:13px');
-  console.log('%c[SF R24.3] R24.2 CIC fixes intact + cust_id fallback + auto-load customerList + 1-col merged', 'color:#888');
-  window.__SF_BUILD = 'R24.3-2026-05-14-2100';
+  // ⭐ R24.5 BOOT BEACON
+  console.log('%c[SF R24.5] Active build: 2026-05-14-2200 — Search using proven v1 pattern (addEventListener no debounce)', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R24.5] Copy of Add Bill modal search logic — same matching + dedup + 20 cap', 'color:#888');
+  window.__SF_BUILD = 'R24.5-2026-05-14-2200';
   
   await restoreMainState();
   checkSavedLogin();
