@@ -7277,17 +7277,18 @@ async function renderMain(el) {
       const sa = stationRank(a.station);
       const sb = stationRank(b.station);
       if (sa !== sb) return sa - sb;
-      // 3) station เดียวกัน → บิลที่มี created_at (เพิ่งเพิ่มใหม่) อยู่บนสุด
-      //    - บิลใหม่มี created_at (ISO timestamp), บิลเก่ามักไม่มี → ใหม่ก่อนเก่าเสมอ
-      //    - บิลใหม่หลายใบ → newer-first (descending timestamp)
+      // ⭐ R20 13/5/26 — เรียงตาม bill_no เสมอ (ทั้ง station เดียวกัน)
+      //   เก่า: ใช้ created_at preference → บิลใหม่เด้งบนสุด, แก้ type แล้วย้ายตำแหน่ง
+      //   ใหม่: เรียง bill_no natural order ตามตัวเลข — ใบเดียวกัน adjacent กัน
+      const noA = String(a.bill_no || '');
+      const noB = String(b.bill_no || '');
+      // natural sort: เปรียบเทียบเลขใน string (OS00126-003206 < OS00126-003207)
+      const cmp = noA.localeCompare(noB, undefined, { numeric: true, sensitivity: 'base' });
+      if (cmp !== 0) return _billOrder === 'asc' ? cmp : -cmp;
+      // 4) bill_no เดียวกัน (split payment) → fallback created_at เพื่อความ stable
       const ca = a.created_at || '';
       const cb = b.created_at || '';
-      if (ca && cb) return cb.localeCompare(ca);   // ใหม่ทั้งคู่ → ใหม่กว่าขึ้นก่อน
-      if (ca) return -1;                            // a ใหม่, b เก่า → a ขึ้นก่อน
-      if (cb) return 1;                             // b ใหม่, a เก่า → b ขึ้นก่อน
-      // 4) ทั้งคู่ไม่มี created_at → เรียงตาม bill_no
-      const cmp = String(a.bill_no || '').localeCompare(String(b.bill_no || ''));
-      return _billOrder === 'asc' ? cmp : -cmp;
+      return ca.localeCompare(cb);
     });
     
     // ── PERF: Cap table rendering to first 500 rows to prevent lag on massive datasets ──
@@ -8441,9 +8442,15 @@ async function renderMain(el) {
               <input type="date" class="input" id="ab-due">
             </div>
           </div>
-          <div class="input-group">
-            <label>Remarks</label>
-            <input class="input" id="ab-remarks" placeholder="หมายเหตุ">
+          <div class="flex gap-2">
+            <div class="input-group flex-1">
+              <label>Remarks 1</label>
+              <input class="input" id="ab-remarks" placeholder="หมายเหตุ 1">
+            </div>
+            <div class="input-group flex-1">
+              <label>Remarks 2</label>
+              <input class="input" id="ab-remarks2" placeholder="หมายเหตุ 2">
+            </div>
           </div>
           <div class="flex gap-2 mt-2">
             <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ยกเลิก</button>
@@ -8629,7 +8636,7 @@ async function renderMain(el) {
           pay_date: isCash ? document.getElementById('ab-date').value 
                     : (confirmation ? document.getElementById('ab-date').value : ''),
           remarks1: document.getElementById('ab-remarks').value,
-          remarks2: '',
+          remarks2: document.getElementById('ab-remarks2').value || '',
           bank: '', // ช่อง manual ปล่อยว่าง
           due_date: document.getElementById('ab-due').value,
           match_status: isCash ? 'matched' : (confirmation ? 'matched' : 'pending'),  // Cash → matched auto
@@ -18252,7 +18259,7 @@ const NAV_ITEMS = [
   { id:'dashboard', icon:'home',    label:'แดชบอร์ด' },
   { id:'main',      icon:'dollar',  label:'Main' },
   { id:'payments',  icon:'card',    label:'Payments (SP)' },
-  { id:'transferlog', icon:'pulse', label:'Transfer Log' },
+  { id:'payment_voucher', icon:'dollar', label:'💰 ใบสำคัญจ่าย' },  // ⭐ R19 13/5/26 (replaces transferlog)
   { id:'sp_recon',  icon:'check',   label:'📥 ตรวจ SP (ลูกหนี้)' },
   { id:'pp_recon',  icon:'check',   label:'📤 ตรวจ PP (เจ้าหนี้)' },
   { id:'billing',   icon:'card',    label:'📋 ใบวางบิล + หนี้' },
@@ -19054,7 +19061,8 @@ const PAGE_RENDERERS = {
   cashflow: renderCashflow,
   supplier: renderSupplier,
   pprpt: renderPPReport,
-  transferlog: renderTransferLog,
+  transferlog: renderTransferLog,  // legacy — keep mapped for backward compat
+  payment_voucher: renderPaymentVoucher,  // ⭐ R19 13/5/26 — ใบสำคัญจ่าย
   debt: () => navigateTo('billing'), // ⭐ legacy redirect → ใบวางบิล + หนี้
   billing: renderBilling,
   sales: renderSales,
@@ -38652,6 +38660,914 @@ async function renderCustomersMgmt(el) {
   }
   
   renderTable();
+}
+
+// ══════════════════════════════════════════════════════════════════
+// ⭐ R19 13/5/26 — Payment Voucher V3 (ใบสำคัญจ่าย)
+//   2-tier tabs: VAT/NOVAT × รอจ่าย/จ่ายแล้ว/ทั้งหมด
+//   Replaces Transfer Log workflow — sees same data
+// ══════════════════════════════════════════════════════════════════
+
+const _pvState = {
+  vat: 'VAT',           // 'VAT' or 'NOVAT'
+  sub: 'all',           // 'pending' / 'paid' / 'all'
+  search: '',
+  list: [],             // PV array from cloud
+  loading: false,
+};
+
+async function renderPaymentVoucher(el) {
+  el.innerHTML = `<div class="card"><p class="text-dim">กำลังโหลด...</p></div>`;
+  
+  // Load PV list
+  _pvState.loading = true;
+  try {
+    const res = await api('pv_getList', { year: new Date().getFullYear() });
+    if (res?.success) {
+      _pvState.list = res.data || [];
+    } else {
+      el.innerHTML = `<div class="card"><p style="color:var(--danger)">โหลดล้มเหลว: ${res?.error || 'unknown'}</p></div>`;
+      return;
+    }
+  } catch (e) {
+    el.innerHTML = `<div class="card"><p style="color:var(--danger)">Error: ${e.message}</p></div>`;
+    return;
+  } finally {
+    _pvState.loading = false;
+  }
+  
+  _pvRender(el);
+}
+
+function _pvFilter() {
+  const st = _pvState;
+  return st.list.filter(pv => {
+    if (pv.vat_type !== st.vat) return false;
+    
+    // Sub-tab: pending = no matched_at AND pay_method !== Cash AND match_status !== matched/migrated
+    //          paid    = matched_at OR Cash OR match_status in (matched, migrated, matched_cash)
+    const isPaid = pv.match_status === 'matched' 
+                || pv.match_status === 'matched_cash' 
+                || pv.match_status === 'migrated'
+                || pv.pay_method === 'เงินสด'
+                || !!pv.matched_at;
+    
+    if (st.sub === 'pending' && isPaid) return false;
+    if (st.sub === 'paid' && !isPaid) return false;
+    
+    if (st.search) {
+      const q = String(st.search).toLowerCase();
+      const hit = String(pv.supplier_name||'').toLowerCase().includes(q)
+               || String(pv.pv_number||'').toLowerCase().includes(q)
+               || String(pv.supplier_nickname||'').toLowerCase().includes(q)
+               || (Array.isArray(pv.bills) && pv.bills.some(b => String(b.bill_no||'').toLowerCase().includes(q)));
+      if (!hit) return false;
+    }
+    return true;
+  });
+}
+
+function _pvCounts() {
+  const st = _pvState;
+  const counts = { vat: 0, novat: 0, vatPending: 0, vatPaid: 0, novatPending: 0, novatPaid: 0 };
+  st.list.forEach(pv => {
+    const isPaid = pv.match_status === 'matched' 
+                || pv.match_status === 'matched_cash' 
+                || pv.match_status === 'migrated'
+                || pv.pay_method === 'เงินสด'
+                || !!pv.matched_at;
+    if (pv.vat_type === 'VAT') {
+      counts.vat++;
+      if (isPaid) counts.vatPaid++; else counts.vatPending++;
+    } else {
+      counts.novat++;
+      if (isPaid) counts.novatPaid++; else counts.novatPending++;
+    }
+  });
+  return counts;
+}
+
+function _pvRender(el) {
+  const st = _pvState;
+  const filtered = _pvFilter();
+  const counts = _pvCounts();
+  
+  // Sum stats for current tab
+  const pendingSum = filtered.filter(pv => {
+    return !(pv.match_status === 'matched' || pv.match_status === 'matched_cash' || pv.match_status === 'migrated' || pv.pay_method === 'เงินสด' || !!pv.matched_at);
+  }).reduce((s, pv) => s + (Number(pv.net_amount) || 0), 0);
+  const paidSum = filtered.filter(pv => {
+    return (pv.match_status === 'matched' || pv.match_status === 'matched_cash' || pv.match_status === 'migrated' || pv.pay_method === 'เงินสด' || !!pv.matched_at);
+  }).reduce((s, pv) => s + (Number(pv.net_amount) || 0), 0);
+  
+  el.innerHTML = `
+    <div class="flex justify-between items-center mb-4">
+      <div>
+        <div class="page-title">💰 ใบสำคัญจ่าย</div>
+        <p class="text-xs text-dim" style="margin-top:4px">บันทึก/ปริ้น ใบสำคัญจ่ายแยก VAT/NOVAT · auto-sync Transfer Log</p>
+      </div>
+      <div class="flex gap-2">
+        <button class="btn btn-outline btn-sm" id="pv-btn-migrate" title="Migrate จากไฟล์ Excel เก่า">📥 Migrate</button>
+        <button class="btn btn-primary btn-sm" id="pv-btn-new">${ICONS.plus} สร้างใบใหม่</button>
+      </div>
+    </div>
+    
+    <!-- TIER 1: VAT / NOVAT -->
+    <div style="display:flex;gap:0;background:var(--surface2);padding:4px;border-radius:8px;margin-bottom:14px;width:fit-content">
+      <button id="pv-tab-vat" style="background:${st.vat==='VAT'?'var(--primary)':'transparent'};color:${st.vat==='VAT'?'#fff':'var(--text2)'};border:none;padding:8px 24px;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer">📊 VAT (${counts.vat})</button>
+      <button id="pv-tab-novat" style="background:${st.vat==='NOVAT'?'var(--primary)':'transparent'};color:${st.vat==='NOVAT'?'#fff':'var(--text2)'};border:none;padding:8px 24px;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer">📋 NOVAT (${counts.novat})</button>
+    </div>
+    
+    <!-- TIER 2: รอจ่าย / จ่ายแล้ว / ทั้งหมด -->
+    <div style="display:flex;gap:0;border-bottom:1px solid var(--border);margin-bottom:14px;align-items:center">
+      <div id="pv-sub-pending" style="padding:8px 18px;border-bottom:2px solid ${st.sub==='pending'?'var(--warn)':'transparent'};color:${st.sub==='pending'?'var(--warn)':'var(--text2)'};font-size:12px;font-weight:${st.sub==='pending'?'600':'400'};cursor:pointer">⏳ รอจ่าย (${st.vat==='VAT'?counts.vatPending:counts.novatPending})</div>
+      <div id="pv-sub-paid" style="padding:8px 18px;border-bottom:2px solid ${st.sub==='paid'?'var(--success)':'transparent'};color:${st.sub==='paid'?'var(--success)':'var(--text2)'};font-size:12px;font-weight:${st.sub==='paid'?'600':'400'};cursor:pointer">✓ จ่ายแล้ว (${st.vat==='VAT'?counts.vatPaid:counts.novatPaid})</div>
+      <div id="pv-sub-all" style="padding:8px 18px;border-bottom:2px solid ${st.sub==='all'?'var(--primary)':'transparent'};color:${st.sub==='all'?'var(--primary)':'var(--text2)'};font-size:12px;font-weight:${st.sub==='all'?'600':'400'};cursor:pointer">📜 ทั้งหมด (${st.vat==='VAT'?counts.vat:counts.novat})</div>
+      <div style="margin-left:auto;font-size:11px;color:var(--text2)">
+        <span style="color:var(--warn)">฿${fmtNum(pendingSum)}</span> รอจ่าย
+        <span style="color:var(--border);margin:0 6px">·</span>
+        <span style="color:var(--success)">฿${fmtNum(paidSum)}</span> จ่ายแล้ว
+      </div>
+    </div>
+    
+    <!-- Search -->
+    <input class="input" id="pv-search" placeholder="🔍 ค้นหา supplier / PV number / bill no" value="${st.search}" style="margin-bottom:12px">
+    
+    <!-- Table -->
+    <div class="card-flat" style="overflow:auto">
+      <table style="width:100%;font-size:.85rem">
+        <thead>
+          <tr style="background:var(--surface2)">
+            <th style="text-align:left;padding:8px">เลขที่ตัดชำระ</th>
+            <th style="text-align:left;padding:8px">วันที่ออกใบ</th>
+            <th style="text-align:left;padding:8px;min-width:180px">Supplier</th>
+            <th style="text-align:right;padding:8px">ยอดแจ้ง</th>
+            <th style="text-align:right;padding:8px">หัก</th>
+            <th style="text-align:right;padding:8px">ยอดจ่าย</th>
+            <th style="text-align:center;padding:8px">วันที่จ่าย</th>
+            <th style="text-align:center;padding:8px">สถานะ</th>
+            <th style="text-align:center;padding:8px;width:120px">จัดการ</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${filtered.length === 0 ? `
+            <tr><td colspan="9" style="padding:30px;text-align:center;color:var(--text2)">${_pvState.list.length===0?'ยังไม่มีข้อมูล — กด "Migrate" เพื่อนำเข้าจาก Excel หรือ "สร้างใบใหม่"':'ไม่พบ'}</td></tr>
+          ` : filtered.map(pv => _pvRow(pv)).join('')}
+        </tbody>
+      </table>
+    </div>
+  `;
+  
+  // Wire events
+  document.getElementById('pv-tab-vat')?.addEventListener('click', () => { st.vat = 'VAT'; _pvRender(el); });
+  document.getElementById('pv-tab-novat')?.addEventListener('click', () => { st.vat = 'NOVAT'; _pvRender(el); });
+  document.getElementById('pv-sub-pending')?.addEventListener('click', () => { st.sub = 'pending'; _pvRender(el); });
+  document.getElementById('pv-sub-paid')?.addEventListener('click', () => { st.sub = 'paid'; _pvRender(el); });
+  document.getElementById('pv-sub-all')?.addEventListener('click', () => { st.sub = 'all'; _pvRender(el); });
+  document.getElementById('pv-search')?.addEventListener('input', e => { st.search = e.target.value; _pvRender(el); });
+  document.getElementById('pv-btn-new')?.addEventListener('click', () => _pvOpenModal(null, el));
+  document.getElementById('pv-btn-migrate')?.addEventListener('click', () => _pvOpenMigrateModal(el));
+  
+  el.querySelectorAll('.pv-btn-edit').forEach(b => b.addEventListener('click', () => {
+    const pv = st.list.find(x => x.pv_uuid === b.dataset.uuid);
+    if (pv) _pvOpenModal(pv, el);
+  }));
+  el.querySelectorAll('.pv-btn-print').forEach(b => b.addEventListener('click', () => {
+    const pv = st.list.find(x => x.pv_uuid === b.dataset.uuid);
+    if (pv) _pvOpenPrintPreview(pv);
+  }));
+  el.querySelectorAll('.pv-btn-del').forEach(b => b.addEventListener('click', async () => {
+    if (!confirm(`ลบใบสำคัญจ่าย ${b.dataset.num}?`)) return;
+    const r = await api('pv_delete', { pv_uuid: b.dataset.uuid });
+    if (r?.success) {
+      toast('✅ ลบสำเร็จ', 'success', 2500);
+      st.list = st.list.filter(x => x.pv_uuid !== b.dataset.uuid);
+      _pvRender(el);
+    } else {
+      toast(`❌ ${r?.error || 'fail'}`, 'error', 3000);
+    }
+  }));
+}
+
+function _pvRow(pv) {
+  const totalDeduct = (Number(pv.deduct_shipping)||0) + (Number(pv.deduct_dc_pm)||0) 
+                    + (Number(pv.deduct_claim)||0) + (Number(pv.deduct_other)||0);
+  const isPaid = pv.match_status === 'matched' || pv.match_status === 'matched_cash' || pv.match_status === 'migrated' || pv.pay_method === 'เงินสด' || !!pv.matched_at;
+  
+  let statusBadge;
+  if (pv.match_status === 'matched') {
+    statusBadge = '<span style="color:var(--success);font-size:.75rem">✓ Matched</span>';
+  } else if (pv.match_status === 'matched_cash' || pv.pay_method === 'เงินสด') {
+    statusBadge = '<span style="color:var(--success);font-size:.75rem">💵 Cash</span>';
+  } else if (pv.match_status === 'migrated') {
+    statusBadge = '<span style="color:#9b7fdf;font-size:.75rem" title="Imported จากระบบเก่า">📥 Migrated</span>';
+  } else {
+    statusBadge = '<span style="color:var(--warn);font-size:.75rem">⏳ รอจ่าย</span>';
+  }
+  
+  return `<tr style="border-top:1px solid var(--border)">
+    <td style="padding:6px 8px;font-family:monospace;font-size:.78rem">${pv.pv_number||'-'}</td>
+    <td style="padding:6px 8px;font-size:.78rem">${fmtDate(pv.issue_date)}</td>
+    <td style="padding:6px 8px">
+      <div style="font-weight:500">${pv.supplier_name||pv.supplier_nickname||'-'}</div>
+      <div style="font-size:11px;color:var(--text2);margin-top:1px">${pv.supplier_bank||''}${pv.supplier_account?' · '+pv.supplier_account:''}</div>
+    </td>
+    <td style="text-align:right;padding:6px 8px">${fmtNum(pv.amount_billed||0)}</td>
+    <td style="text-align:right;padding:6px 8px;color:${totalDeduct>0?'var(--warn)':'var(--text2)'}">${totalDeduct>0?'-'+fmtNum(totalDeduct):'-'}</td>
+    <td style="text-align:right;padding:6px 8px;font-weight:600">${fmtNum(pv.net_amount||0)}</td>
+    <td style="text-align:center;padding:6px 8px;font-size:.78rem">${isPaid?(fmtDate(pv.pay_date)||'-'):'<span style="color:var(--text2)">—</span>'}</td>
+    <td style="text-align:center;padding:6px 8px">${statusBadge}</td>
+    <td style="text-align:center;padding:6px 8px;white-space:nowrap">
+      <button class="btn btn-ghost btn-icon pv-btn-print" data-uuid="${pv.pv_uuid}" title="ปริ้น">🖨</button>
+      <button class="btn btn-ghost btn-icon pv-btn-edit" data-uuid="${pv.pv_uuid}" title="แก้ไข">${ICONS.edit}</button>
+      <button class="btn btn-ghost btn-icon pv-btn-del" data-uuid="${pv.pv_uuid}" data-num="${pv.pv_number||''}" title="ลบ" style="color:var(--danger)">🗑</button>
+    </td>
+  </tr>`;
+}
+
+function _pvOpenModal(existing, rootEl) {
+  const isEdit = !!existing;
+  const pv = existing || {
+    pv_uuid: '', pv_number: '', issue_date: toISODate(new Date()),
+    vat_type: _pvState.vat, category: 'ต้นทุน',
+    supplier_nickname: '', supplier_name: '', supplier_bank: '', supplier_account: '',
+    amount_billed: 0, deduct_shipping: 0, deduct_dc_pm: 0, deduct_claim: 0, deduct_other: 0,
+    net_amount: 0,
+    pay_method: 'โอน', pay_date: '', pay_from_bank: '',
+    match_status: 'unmatched', matched_stmt_uuid: '', matched_at: '',
+    note: '', bills: [],
+  };
+  
+  // Ensure at least 1 empty bill row
+  if (!Array.isArray(pv.bills) || pv.bills.length === 0) {
+    pv.bills = [{ seq: 1, bill_no: '', bill_period: '', bill_amount: 0 }];
+  }
+  
+  // Local mutable copy
+  const draft = JSON.parse(JSON.stringify(pv));
+  
+  openModal(`${isEdit ? '✏️ แก้ไข' : ICONS.plus + ' สร้าง'} ใบสำคัญจ่าย`, _pvModalHtml(draft, isEdit));
+  
+  setTimeout(() => _pvWireModal(draft, isEdit, rootEl), 50);
+}
+
+function _pvModalHtml(d, isEdit) {
+  const totalDeduct = (Number(d.deduct_shipping)||0) + (Number(d.deduct_dc_pm)||0) + (Number(d.deduct_claim)||0) + (Number(d.deduct_other)||0);
+  const billsSum = (d.bills||[]).reduce((s, b) => s + (Number(b.bill_amount)||0), 0);
+  const net = billsSum - totalDeduct;
+  
+  return `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;gap:10px">
+      <div style="display:flex;gap:6px;align-items:center">
+        <span class="text-xs text-dim">ประเภท:</span>
+        <button type="button" class="btn btn-sm pv-vat-btn" data-vat="VAT" style="${d.vat_type==='VAT'?'background:var(--primary);color:#fff':'background:transparent;border:1px solid var(--border);color:var(--text2)'}">VAT</button>
+        <button type="button" class="btn btn-sm pv-vat-btn" data-vat="NOVAT" style="${d.vat_type==='NOVAT'?'background:var(--primary);color:#fff':'background:transparent;border:1px solid var(--border);color:var(--text2)'}">NOVAT</button>
+      </div>
+      <div style="display:flex;gap:6px;align-items:center">
+        <span class="text-xs text-dim">เลขที่ตัดชำระ:</span>
+        <input id="pv-m-number" class="input" value="${d.pv_number||'(auto)'}" ${isEdit?'':'readonly'} style="width:140px;font-family:monospace;font-size:.75rem">
+      </div>
+    </div>
+    
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:10px">
+      <div class="input-group">
+        <label>วันที่ออกใบ</label>
+        <input type="date" id="pv-m-issue_date" class="input" value="${d.issue_date||''}">
+      </div>
+      <div class="input-group">
+        <label>ประเภท</label>
+        <select id="pv-m-category" class="input">
+          <option value="ต้นทุน" ${d.category==='ต้นทุน'?'selected':''}>ต้นทุน</option>
+          <option value="ค่าใช้จ่าย" ${d.category==='ค่าใช้จ่าย'?'selected':''}>ค่าใช้จ่าย</option>
+        </select>
+      </div>
+      <div class="input-group">
+        <label>ชื่อเรียก (nickname)</label>
+        <input id="pv-m-nickname" class="input" value="${(d.supplier_nickname||'').replace(/"/g,'&quot;')}" placeholder="เช่น CCS, HIET">
+      </div>
+    </div>
+    
+    <div class="input-group" style="margin-bottom:10px">
+      <label>ชื่อบริษัท / Supplier <span style="color:var(--danger)">*</span></label>
+      <input id="pv-m-supplier_name" class="input" value="${(d.supplier_name||'').replace(/"/g,'&quot;')}" placeholder="ชื่อเต็มของ supplier">
+    </div>
+    
+    <div style="display:grid;grid-template-columns:1fr 1.5fr;gap:8px;margin-bottom:10px">
+      <div class="input-group">
+        <label>ธนาคาร supplier</label>
+        <input id="pv-m-supplier_bank" class="input" value="${(d.supplier_bank||'').replace(/"/g,'&quot;')}" placeholder="กสิกรไทย">
+      </div>
+      <div class="input-group">
+        <label>เลขบัญชี supplier</label>
+        <input id="pv-m-supplier_account" class="input" value="${(d.supplier_account||'').replace(/"/g,'&quot;')}" placeholder="xxx-x-xxxxx-x" style="font-family:monospace">
+      </div>
+    </div>
+    
+    <!-- Bills section -->
+    <div style="margin:14px 0 8px">
+      <div class="flex justify-between items-center mb-1">
+        <strong style="font-size:.85rem">บิลที่ชำระ (PB)</strong>
+        <button type="button" id="pv-m-add-bill" class="btn btn-sm btn-outline">+ เพิ่มบิล</button>
+      </div>
+      <div id="pv-m-bills-list">
+        ${(d.bills||[]).map((b, i) => _pvBillRow(b, i)).join('')}
+      </div>
+    </div>
+    
+    <!-- Deductions -->
+    <div class="card-flat" style="margin:10px 0;padding:10px">
+      <strong style="font-size:.8rem;display:block;margin-bottom:6px">หักรายการ</strong>
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px">
+        <div class="input-group">
+          <label style="font-size:.7rem">ค่าขนส่ง</label>
+          <input id="pv-m-deduct_shipping" class="input pv-m-deduct" type="number" step="0.01" value="${d.deduct_shipping||0}">
+        </div>
+        <div class="input-group">
+          <label style="font-size:.7rem">DC/PM</label>
+          <input id="pv-m-deduct_dc_pm" class="input pv-m-deduct" type="number" step="0.01" value="${d.deduct_dc_pm||0}">
+        </div>
+        <div class="input-group">
+          <label style="font-size:.7rem">เคลม</label>
+          <input id="pv-m-deduct_claim" class="input pv-m-deduct" type="number" step="0.01" value="${d.deduct_claim||0}">
+        </div>
+        <div class="input-group">
+          <label style="font-size:.7rem">อื่นๆ</label>
+          <input id="pv-m-deduct_other" class="input pv-m-deduct" type="number" step="0.01" value="${d.deduct_other||0}">
+        </div>
+      </div>
+    </div>
+    
+    <!-- Payment method -->
+    <div class="card-flat" style="margin:10px 0;padding:10px">
+      <strong style="font-size:.8rem;display:block;margin-bottom:6px">การชำระ</strong>
+      <div style="display:flex;gap:8px;margin-bottom:8px" id="pv-m-method-group">
+        <button type="button" class="btn btn-sm pv-method-btn" data-m="โอน" style="${d.pay_method==='โอน'?'background:var(--primary);color:#fff':'background:transparent;border:1px solid var(--border);color:var(--text2)'}">โอน</button>
+        <button type="button" class="btn btn-sm pv-method-btn" data-m="เงินสด" style="${d.pay_method==='เงินสด'?'background:var(--success);color:#fff':'background:transparent;border:1px solid var(--border);color:var(--text2)'}">เงินสด</button>
+        <button type="button" class="btn btn-sm pv-method-btn" data-m="เช็ค" style="${d.pay_method==='เช็ค'?'background:var(--primary);color:#fff':'background:transparent;border:1px solid var(--border);color:var(--text2)'}">เช็ค</button>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+        <div class="input-group">
+          <label style="font-size:.7rem">วันที่จ่าย <span class="text-xs text-dim" id="pv-m-date-hint">${d.pay_method==='เงินสด'?'(auto-fill วันนี้, แก้ได้)':'(จะ auto-fill เมื่อ match stmt)'}</span></label>
+          <input id="pv-m-pay_date" type="date" class="input" value="${d.pay_date||''}">
+        </div>
+        <div class="input-group">
+          <label style="font-size:.7rem">ธนาคารผู้จ่าย (จงกลณี)</label>
+          <input id="pv-m-pay_from_bank" class="input" value="${(d.pay_from_bank||'').replace(/"/g,'&quot;')}" placeholder="K PLUS SME JKN">
+        </div>
+      </div>
+    </div>
+    
+    <!-- Summary -->
+    <div style="background:var(--surface2);padding:10px 14px;border-radius:6px;margin:10px 0">
+      <div style="display:flex;justify-content:space-between;font-size:.8rem;color:var(--text2);margin-bottom:3px">
+        <span>ยอดแจ้ง (รวมบิล):</span><span id="pv-m-sum-billed">฿${fmtNum(billsSum)}</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;font-size:.8rem;color:var(--warn);margin-bottom:3px">
+        <span>รวมหัก:</span><span id="pv-m-sum-deduct">-฿${fmtNum(totalDeduct)}</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;font-size:.95rem;font-weight:600;padding-top:5px;margin-top:5px;border-top:1px solid var(--border)">
+        <span>ยอดจ่ายสุทธิ:</span><span id="pv-m-sum-net" style="color:var(--success)">฿${fmtNum(net)}</span>
+      </div>
+    </div>
+    
+    <div class="input-group" style="margin-bottom:10px">
+      <label>หมายเหตุ</label>
+      <input id="pv-m-note" class="input" value="${(d.note||'').replace(/"/g,'&quot;')}" placeholder="">
+    </div>
+    
+    <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:14px">
+      <button type="button" class="btn btn-outline" onclick="closeModal()">ยกเลิก</button>
+      <button type="button" id="pv-m-save" class="btn btn-primary">${isEdit?'💾 บันทึก':'➕ สร้าง'}</button>
+    </div>
+  `;
+}
+
+function _pvBillRow(b, idx) {
+  return `<div class="pv-bill-row" data-idx="${idx}" style="display:grid;grid-template-columns:30px 1fr 100px 130px 30px;gap:6px;align-items:center;margin-bottom:4px">
+    <div style="text-align:center;color:var(--text2);font-size:.75rem">${idx+1}</div>
+    <input class="input pv-bill-no" value="${(b.bill_no||'').replace(/"/g,'&quot;')}" placeholder="PB00126-000xxx" style="font-family:monospace;font-size:.78rem">
+    <input class="input pv-bill-period" value="${(b.bill_period||'').replace(/"/g,'&quot;')}" placeholder="05/69" style="font-size:.78rem">
+    <input class="input pv-bill-amount" type="number" step="0.01" value="${b.bill_amount||0}" style="text-align:right">
+    <button type="button" class="btn btn-ghost btn-icon pv-bill-del" style="color:var(--danger)">×</button>
+  </div>`;
+}
+
+function _pvWireModal(draft, isEdit, rootEl) {
+  // Live update — recompute on input
+  const recomp = () => {
+    const billsSum = Array.from(document.querySelectorAll('.pv-bill-amount')).reduce((s, el) => s + (Number(el.value)||0), 0);
+    const dShip = Number(document.getElementById('pv-m-deduct_shipping').value)||0;
+    const dDcPm = Number(document.getElementById('pv-m-deduct_dc_pm').value)||0;
+    const dClaim = Number(document.getElementById('pv-m-deduct_claim').value)||0;
+    const dOther = Number(document.getElementById('pv-m-deduct_other').value)||0;
+    const totalDeduct = dShip + dDcPm + dClaim + dOther;
+    const net = billsSum - totalDeduct;
+    document.getElementById('pv-m-sum-billed').textContent = '฿' + fmtNum(billsSum);
+    document.getElementById('pv-m-sum-deduct').textContent = '-฿' + fmtNum(totalDeduct);
+    document.getElementById('pv-m-sum-net').textContent = '฿' + fmtNum(net);
+  };
+  
+  // VAT toggle
+  document.querySelectorAll('.pv-vat-btn').forEach(b => b.addEventListener('click', () => {
+    draft.vat_type = b.dataset.vat;
+    document.querySelectorAll('.pv-vat-btn').forEach(x => {
+      x.setAttribute('style', x.dataset.vat===draft.vat_type ? 'background:var(--primary);color:#fff' : 'background:transparent;border:1px solid var(--border);color:var(--text2)');
+    });
+  }));
+  
+  // Method toggle (Cash auto pay_date)
+  document.querySelectorAll('.pv-method-btn').forEach(b => b.addEventListener('click', () => {
+    draft.pay_method = b.dataset.m;
+    document.querySelectorAll('.pv-method-btn').forEach(x => {
+      const isSel = x.dataset.m === draft.pay_method;
+      const bgColor = isSel ? (x.dataset.m === 'เงินสด' ? 'var(--success)' : 'var(--primary)') : 'transparent';
+      const color = isSel ? '#fff' : 'var(--text2)';
+      const border = isSel ? 'none' : '1px solid var(--border)';
+      x.setAttribute('style', `background:${bgColor};color:${color};border:${border}`);
+    });
+    
+    // ⭐ Cash → auto-fill pay_date with today (editable)
+    const dateInp = document.getElementById('pv-m-pay_date');
+    const hint = document.getElementById('pv-m-date-hint');
+    if (draft.pay_method === 'เงินสด') {
+      if (!dateInp.value) dateInp.value = toISODate(new Date());
+      hint.textContent = '(auto-fill วันนี้, แก้ได้)';
+    } else {
+      hint.textContent = '(จะ auto-fill เมื่อ match stmt)';
+    }
+  }));
+  
+  // Add bill
+  document.getElementById('pv-m-add-bill')?.addEventListener('click', () => {
+    const list = document.getElementById('pv-m-bills-list');
+    const idx = list.querySelectorAll('.pv-bill-row').length;
+    list.insertAdjacentHTML('beforeend', _pvBillRow({ bill_no:'', bill_period:'', bill_amount:0 }, idx));
+    _pvWireBillRow(list.lastElementChild, recomp);
+  });
+  
+  // Wire existing bill rows
+  document.querySelectorAll('.pv-bill-row').forEach(row => _pvWireBillRow(row, recomp));
+  
+  // Wire deduction inputs
+  document.querySelectorAll('.pv-m-deduct').forEach(inp => inp.addEventListener('input', recomp));
+  
+  // Save
+  document.getElementById('pv-m-save').addEventListener('click', async () => {
+    // Collect bills
+    const bills = Array.from(document.querySelectorAll('.pv-bill-row')).map((row, i) => ({
+      seq: i + 1,
+      bill_no: row.querySelector('.pv-bill-no').value.trim(),
+      bill_period: row.querySelector('.pv-bill-period').value.trim(),
+      bill_amount: Number(row.querySelector('.pv-bill-amount').value) || 0,
+    })).filter(b => b.bill_no || b.bill_amount);
+    
+    // Build payload
+    const billsSum = bills.reduce((s, b) => s + b.bill_amount, 0);
+    const dShip = Number(document.getElementById('pv-m-deduct_shipping').value)||0;
+    const dDcPm = Number(document.getElementById('pv-m-deduct_dc_pm').value)||0;
+    const dClaim = Number(document.getElementById('pv-m-deduct_claim').value)||0;
+    const dOther = Number(document.getElementById('pv-m-deduct_other').value)||0;
+    const net = billsSum - dShip - dDcPm - dClaim - dOther;
+    
+    const payload = {
+      pv_uuid: draft.pv_uuid || '',
+      pv_number: isEdit ? document.getElementById('pv-m-number').value : '',
+      issue_date: document.getElementById('pv-m-issue_date').value,
+      vat_type: draft.vat_type,
+      category: document.getElementById('pv-m-category').value,
+      supplier_nickname: document.getElementById('pv-m-nickname').value.trim(),
+      supplier_name: document.getElementById('pv-m-supplier_name').value.trim(),
+      supplier_bank: document.getElementById('pv-m-supplier_bank').value.trim(),
+      supplier_account: document.getElementById('pv-m-supplier_account').value.trim(),
+      amount_billed: billsSum,
+      deduct_shipping: dShip,
+      deduct_dc_pm: dDcPm,
+      deduct_claim: dClaim,
+      deduct_other: dOther,
+      net_amount: net,
+      pay_method: draft.pay_method,
+      pay_date: document.getElementById('pv-m-pay_date').value || '',
+      pay_from_bank: document.getElementById('pv-m-pay_from_bank').value.trim(),
+      match_status: draft.pay_method === 'เงินสด' ? 'matched_cash' : (draft.match_status || 'unmatched'),
+      matched_stmt_uuid: draft.matched_stmt_uuid || '',
+      matched_at: draft.pay_method === 'เงินสด' ? (draft.matched_at || _nowISO()) : (draft.matched_at || ''),
+      note: document.getElementById('pv-m-note').value.trim(),
+      bills: bills,
+    };
+    
+    if (!payload.supplier_name) { toast('กรอกชื่อ supplier', 'error', 3000); return; }
+    if (bills.length === 0) { toast('ต้องมีอย่างน้อย 1 บิล', 'error', 3000); return; }
+    
+    const btn = document.getElementById('pv-m-save');
+    btn.disabled = true;
+    const orig = btn.innerHTML;
+    btn.textContent = '⏳ บันทึก...';
+    try {
+      const r = await api('pv_upsert', { data: payload });
+      if (r?.success) {
+        toast(`✅ ${isEdit?'อัปเดต':'สร้าง'}สำเร็จ${r.pv_number?' ('+r.pv_number+')':''}`, 'success', 2500);
+        closeModal();
+        // Reload list
+        const res = await api('pv_getList', { year: new Date().getFullYear() });
+        if (res?.success) _pvState.list = res.data || [];
+        _pvRender(rootEl);
+      } else {
+        toast(`❌ ${r?.error || 'fail'}`, 'error', 4000);
+        btn.disabled = false;
+        btn.innerHTML = orig;
+      }
+    } catch (e) {
+      toast(`❌ ${e.message}`, 'error', 4000);
+      btn.disabled = false;
+      btn.innerHTML = orig;
+    }
+  });
+}
+
+function _pvWireBillRow(row, recomp) {
+  row.querySelector('.pv-bill-amount')?.addEventListener('input', recomp);
+  row.querySelector('.pv-bill-del')?.addEventListener('click', () => {
+    row.remove();
+    recomp();
+  });
+}
+
+function _nowISO() {
+  const d = new Date();
+  const off = -d.getTimezoneOffset();
+  const sign = off >= 0 ? '+' : '-';
+  const pad = n => String(Math.floor(Math.abs(n))).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}${sign}${pad(off/60)}:${pad(off%60)}`;
+}
+
+// ── Print preview window — A4 HTML + window.print() + html2pdf ──
+function _pvOpenPrintPreview(pv) {
+  const totalDeduct = (Number(pv.deduct_shipping)||0) + (Number(pv.deduct_dc_pm)||0) + (Number(pv.deduct_claim)||0) + (Number(pv.deduct_other)||0);
+  const net = Number(pv.net_amount) || ((Number(pv.amount_billed)||0) - totalDeduct);
+  
+  const bahtText = _bahtThai(net);
+  const billsRows = (pv.bills||[]).map((b, i) => `
+    <tr style="background:${i%2?'#fafbfc':'#fff'}">
+      <td style="padding:8px 10px;border-bottom:1px solid #e5e7eb">${i+1}</td>
+      <td style="padding:8px 10px;border-bottom:1px solid #e5e7eb;font-family:monospace;font-weight:500">${b.bill_no||'-'}</td>
+      <td style="padding:8px 10px;border-bottom:1px solid #e5e7eb;text-align:center;color:#666">${b.bill_period||'-'}</td>
+      <td style="padding:8px 10px;border-bottom:1px solid #e5e7eb;text-align:right;font-weight:500">${fmtNum(b.bill_amount||0)}</td>
+    </tr>`).join('');
+  
+  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${pv.pv_number||'ใบสำคัญจ่าย'}</title>
+    <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@400;500;600&display=swap" rel="stylesheet">
+    <style>
+      body{font-family:'Sarabun',sans-serif;margin:0;padding:20px;color:#1a1f2e;background:#f0f0f0}
+      .voucher{background:#fff;max-width:800px;margin:0 auto;padding:30px;box-shadow:0 0 10px rgba(0,0,0,.1)}
+      @media print { body{background:#fff;padding:0} .voucher{box-shadow:none;max-width:100%} .no-print{display:none!important} }
+      .head{display:flex;justify-content:space-between;align-items:flex-start;padding-bottom:14px;border-bottom:2px solid #1a1f2e;margin-bottom:18px}
+      .badge-vat{display:inline-block;background:#3b82f6;color:#fff;padding:4px 14px;border-radius:4px;font-size:11px;font-weight:600;letter-spacing:.5px}
+      .badge-novat{background:#f59e0b}
+      table{width:100%;border-collapse:collapse;font-size:11px}
+      th{background:#1a1f2e;color:#fff;padding:8px 10px;font-weight:500;text-align:left}
+      .supplier-card{background:#f5f7fb;border-radius:6px;padding:12px 16px;margin-bottom:16px}
+      .actions{position:sticky;top:0;background:#f0f0f0;padding:10px;text-align:center;margin-bottom:20px}
+      .btn{background:#3b82f6;color:#fff;border:none;padding:8px 18px;border-radius:4px;font-size:13px;cursor:pointer;margin:0 4px;font-family:inherit}
+      .btn.outline{background:transparent;border:1px solid #3b82f6;color:#3b82f6}
+      .summary-card{background:#fff;border:1.5px solid #1a1f2e;border-radius:6px;overflow:hidden}
+      .summary-card .header{background:#1a1f2e;color:#fff;padding:6px 12px;font-size:10px;font-weight:500;letter-spacing:.5px}
+      .summary-card .body{padding:10px 12px}
+      .net-box{background:#1a1f2e;color:#fff;padding:8px 10px;border-radius:4px;display:flex;justify-content:space-between;font-weight:600;font-size:13px;margin-top:8px}
+    </style></head><body>
+    
+    <div class="actions no-print">
+      <button class="btn" onclick="window.print()">🖨 ปริ้น</button>
+      <button class="btn outline" onclick="downloadPDF()">📄 บันทึก PDF</button>
+      <button class="btn outline" onclick="window.close()">ปิด</button>
+    </div>
+    
+    <div class="voucher" id="voucher">
+      <div class="head">
+        <div>
+          <div style="font-size:11px;color:#666;letter-spacing:1px;font-weight:500">PAYMENT VOUCHER</div>
+          <div style="font-size:22px;font-weight:600;margin-top:2px">ใบสำคัญจ่าย</div>
+          <div style="font-size:11.5px;color:#444;margin-top:6px">บริษัท จงกลณีการไฟฟ้า จำกัด</div>
+          <div style="font-size:10px;color:#888;margin-top:1px">45,47,49 ถ.พิพิธภักดี ต.สะเตง อ.เมือง จ.ยะลา 95000</div>
+        </div>
+        <div style="text-align:right">
+          <div class="badge-vat ${pv.vat_type==='NOVAT'?'badge-novat':''}" style="background:${pv.vat_type==='NOVAT'?'#f59e0b':'#3b82f6'}">${pv.vat_type||'VAT'}</div>
+          <div style="margin-top:10px">
+            <div style="font-size:9px;color:#888;letter-spacing:.5px">เลขที่ตัดชำระ</div>
+            <div style="font-family:monospace;font-size:13px;font-weight:600">${pv.pv_number||'(N/A)'}</div>
+          </div>
+          <div style="margin-top:8px">
+            <div style="font-size:9px;color:#888;letter-spacing:.5px">วันที่ออกใบ</div>
+            <div style="font-size:11.5px;font-weight:500">${fmtDate(pv.issue_date)||'-'}</div>
+          </div>
+        </div>
+      </div>
+      
+      <div class="supplier-card">
+        <div style="font-size:9px;color:#3b82f6;letter-spacing:.5px;font-weight:600;margin-bottom:4px">ชำระให้ (SUPPLIER)</div>
+        <div style="font-size:14px;font-weight:600">${pv.supplier_name||'-'}</div>
+        <div style="display:flex;gap:18px;margin-top:6px;font-size:10.5px;color:#666">
+          <div><span style="color:#888">ธนาคาร supplier:</span> <span style="color:#1a1f2e;font-weight:500">${pv.supplier_bank||'-'}</span></div>
+          <div><span style="color:#888">เลขบัญชี supplier:</span> <span style="font-family:monospace;color:#1a1f2e;font-weight:500">${pv.supplier_account||'-'}</span></div>
+        </div>
+      </div>
+      
+      <div style="margin-bottom:16px">
+        <div style="font-size:10px;color:#3b82f6;letter-spacing:.5px;font-weight:600;margin-bottom:6px">รายการบิลที่ชำระ</div>
+        <table>
+          <thead><tr>
+            <th style="width:30px">#</th><th>เลขที่บิล</th><th style="text-align:center;width:80px">รอบบัญชี</th><th style="text-align:right;width:110px">ยอดเงิน</th>
+          </tr></thead>
+          <tbody>${billsRows||'<tr><td colspan="4" style="padding:20px;text-align:center;color:#888">— ไม่มีรายการบิล —</td></tr>'}</tbody>
+        </table>
+      </div>
+      
+      <div style="display:grid;grid-template-columns:1fr 280px;gap:18px;margin-bottom:18px">
+        <div>
+          <div style="font-size:10px;color:#3b82f6;letter-spacing:.5px;font-weight:600;margin-bottom:6px">วิธีการชำระ (จงกลณี โอนจาก)</div>
+          <div style="background:#f5f7fb;border-radius:6px;padding:12px 14px">
+            <div style="display:flex;gap:18px;align-items:center;margin-bottom:8px">
+              <div style="display:flex;gap:5px;align-items:center"><span style="display:inline-block;width:14px;height:14px;border:1.5px solid #1a1f2e;border-radius:2px;${pv.pay_method==='โอน'?'background:#1a1f2e;color:#fff;text-align:center;line-height:12px;font-size:10px':''}">${pv.pay_method==='โอน'?'✓':''}</span> <span style="font-size:11.5px;${pv.pay_method==='โอน'?'font-weight:500':'color:#888'}">โอน</span></div>
+              <div style="display:flex;gap:5px;align-items:center"><span style="display:inline-block;width:14px;height:14px;border:1.5px solid ${pv.pay_method==='เงินสด'?'#1a1f2e':'#ccc'};border-radius:2px;${pv.pay_method==='เงินสด'?'background:#1a1f2e;color:#fff;text-align:center;line-height:12px;font-size:10px':''}">${pv.pay_method==='เงินสด'?'✓':''}</span> <span style="font-size:11.5px;${pv.pay_method==='เงินสด'?'font-weight:500':'color:#888'}">เงินสด</span></div>
+              <div style="display:flex;gap:5px;align-items:center"><span style="display:inline-block;width:14px;height:14px;border:1.5px solid ${pv.pay_method==='เช็ค'?'#1a1f2e':'#ccc'};border-radius:2px;${pv.pay_method==='เช็ค'?'background:#1a1f2e;color:#fff;text-align:center;line-height:12px;font-size:10px':''}">${pv.pay_method==='เช็ค'?'✓':''}</span> <span style="font-size:11.5px;${pv.pay_method==='เช็ค'?'font-weight:500':'color:#888'}">เช็ค</span></div>
+            </div>
+            <div style="font-size:10.5px;color:#666;line-height:1.7">
+              <div>วันที่จ่าย: <span style="color:#1a1f2e;font-weight:500">${fmtDate(pv.pay_date)||'—'}</span></div>
+              <div>ธนาคารผู้จ่าย: <span style="color:#1a1f2e;font-weight:500">${pv.pay_from_bank||'—'}</span></div>
+            </div>
+          </div>
+        </div>
+        
+        <div>
+          <div class="summary-card">
+            <div class="header">สรุปยอดเงิน</div>
+            <div class="body">
+              <div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:5px">
+                <span style="color:#666">ยอดแจ้ง</span><span style="font-weight:500">${fmtNum(pv.amount_billed||0)}</span>
+              </div>
+              <div style="margin:6px 0;padding:6px 0;border-top:1px dashed #ccc">
+                <div style="font-size:9.5px;color:#888;letter-spacing:.5px;margin-bottom:3px">หัก:</div>
+                <div style="display:flex;justify-content:space-between;font-size:10.5px;color:#c64a4a;margin-bottom:2px">
+                  <span style="padding-left:8px">• ค่าขนส่ง</span><span>-${fmtNum(pv.deduct_shipping||0)}</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;font-size:10.5px;color:#c64a4a;margin-bottom:2px">
+                  <span style="padding-left:8px">• DC/PM</span><span>-${fmtNum(pv.deduct_dc_pm||0)}</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;font-size:10.5px;color:#c64a4a;margin-bottom:2px">
+                  <span style="padding-left:8px">• เคลม</span><span>-${fmtNum(pv.deduct_claim||0)}</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;font-size:10.5px;color:#c64a4a">
+                  <span style="padding-left:8px">• อื่นๆ</span><span>-${fmtNum(pv.deduct_other||0)}</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;font-size:10.5px;color:#c64a4a;font-weight:600;margin-top:3px;padding-top:3px;border-top:1px dotted #e5b8b8">
+                  <span>รวมหัก</span><span>-${fmtNum(totalDeduct)}</span>
+                </div>
+              </div>
+              <div class="net-box">
+                <span>ยอดจ่ายสุทธิ</span><span>฿${fmtNum(net)}</span>
+              </div>
+            </div>
+          </div>
+          <div style="font-size:10.5px;text-align:center;margin-top:6px;color:#666;font-style:italic">
+            (${bahtText})
+          </div>
+        </div>
+      </div>
+      
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:24px;margin-top:40px;font-size:10.5px">
+        <div style="text-align:center"><div style="border-top:1px solid #1a1f2e;padding-top:4px;width:75%;margin:0 auto"><div style="font-weight:500">ผู้จัดทำ</div><div style="font-size:9px;color:#888;margin-top:2px">วันที่: ...../...../.....</div></div></div>
+        <div style="text-align:center"><div style="border-top:1px solid #1a1f2e;padding-top:4px;width:75%;margin:0 auto"><div style="font-weight:500">ผู้อนุมัติ</div><div style="font-size:9px;color:#888;margin-top:2px">วันที่: ...../...../.....</div></div></div>
+        <div style="text-align:center"><div style="border-top:1px solid #1a1f2e;padding-top:4px;width:75%;margin:0 auto"><div style="font-weight:500">ผู้รับเงิน</div><div style="font-size:9px;color:#888;margin-top:2px">วันที่: ...../...../.....</div></div></div>
+      </div>
+      
+      <div style="text-align:center;margin-top:24px;padding-top:10px;border-top:1px dashed #ccc;font-size:8.5px;color:#aaa;letter-spacing:.5px">
+        เอกสารนี้สร้างโดย Smart Finance · ${pv.pv_number||''} · เก็บเป็นหลักฐานทางการบัญชี
+      </div>
+    </div>
+    
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"><\/script>
+    <script>
+      function downloadPDF() {
+        const el = document.getElementById('voucher');
+        const opt = {
+          margin: 0.4,
+          filename: '${pv.pv_number||'voucher'}.pdf',
+          image: { type: 'jpeg', quality: 0.98 },
+          html2canvas: { scale: 2, useCORS: true },
+          jsPDF: { unit: 'in', format: 'a4', orientation: 'portrait' }
+        };
+        html2pdf().set(opt).from(el).save();
+      }
+    <\/script>
+    </body></html>`;
+  
+  const win = window.open('', '_blank', 'width=900,height=1200');
+  if (win) {
+    win.document.write(html);
+    win.document.close();
+  } else {
+    toast('Browser blocked popup — โปรดอนุญาต popup ของ minialonez.github.io', 'error', 5000);
+  }
+}
+
+// Convert number to Thai baht text (simplified)
+function _bahtThai(n) {
+  if (n == null || isNaN(n)) return '';
+  const num = Math.abs(Number(n));
+  const integer = Math.floor(num);
+  const satang = Math.round((num - integer) * 100);
+  const intText = _numToThai(integer);
+  let text = intText + 'บาท';
+  if (satang > 0) text += _numToThai(satang) + 'สตางค์';
+  else text += 'ถ้วน';
+  return text;
+}
+
+function _numToThai(n) {
+  if (n === 0) return 'ศูนย์';
+  const digits = ['ศูนย์','หนึ่ง','สอง','สาม','สี่','ห้า','หก','เจ็ด','แปด','เก้า'];
+  const positions = ['','สิบ','ร้อย','พัน','หมื่น','แสน','ล้าน'];
+  let str = String(Math.floor(n));
+  // Handle millions and above (simplified)
+  if (str.length > 7) {
+    const upper = Math.floor(n / 1000000);
+    const lower = n % 1000000;
+    return _numToThai(upper) + 'ล้าน' + (lower > 0 ? _numToThai(lower) : '');
+  }
+  let result = '';
+  for (let i = 0; i < str.length; i++) {
+    const d = Number(str[str.length - 1 - i]);
+    if (d === 0) continue;
+    let dText = digits[d];
+    if (i === 0 && d === 1 && str.length > 1) dText = 'เอ็ด';
+    else if (i === 1 && d === 1) dText = '';
+    else if (i === 1 && d === 2) dText = 'ยี่';
+    result = dText + positions[i] + result;
+  }
+  return result;
+}
+
+// ── Migration modal ──
+function _pvOpenMigrateModal(rootEl) {
+  openModal('📥 Migrate จาก Excel เก่า', `
+    <div class="flex-col gap-2">
+      <p style="font-size:.85rem;color:var(--text2);line-height:1.6">
+        Upload ไฟล์ <code>2026_รายการโอนเงิน_JKN.xlsx</code> เพื่อนำเข้าข้อมูล Transfer Log เก่าเข้า Payment Voucher V3
+      </p>
+      <p style="font-size:.78rem;color:var(--warn)">
+        ⚠️ Migration นี้จะ <strong>เพิ่ม</strong> ข้อมูลใหม่ — ไม่กระทบ PV ที่มีอยู่แล้ว แต่ <em>ห้าม run 2 ครั้ง</em> (จะ duplicate)
+      </p>
+      <p style="font-size:.78rem;color:var(--text2)">
+        Schema: Vat sheet → vat_type='VAT', NoVat sheet → vat_type='NOVAT', โปรโมชั่น → หักอื่นๆ
+      </p>
+      
+      <div style="margin:14px 0">
+        <input type="file" id="pv-mig-file" accept=".xlsx" class="input" style="padding:8px">
+      </div>
+      
+      <div id="pv-mig-preview" style="background:var(--surface2);padding:10px;border-radius:6px;font-size:.78rem;color:var(--text2);min-height:60px;display:none"></div>
+      
+      <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:10px">
+        <button class="btn btn-outline" onclick="closeModal()">ยกเลิก</button>
+        <button class="btn btn-primary" id="pv-mig-go" disabled>📥 Migrate ทั้งหมด</button>
+      </div>
+    </div>
+  `);
+  
+  let parsedRows = null;
+  setTimeout(() => {
+    document.getElementById('pv-mig-file')?.addEventListener('change', async (e) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+      const preview = document.getElementById('pv-mig-preview');
+      preview.style.display = 'block';
+      preview.innerHTML = '⏳ กำลังอ่านไฟล์...';
+      try {
+        const res = await parseExcelFile(file);
+        const sheets = res.sheets || {};
+        const vatSheet = sheets['Vat'] || [];
+        const novatSheet = sheets['NoVat'] || sheets['Novat'] || sheets['NOVAT'] || [];
+        
+        const rows = [];
+        // Parse Vat: header at row 2 (index 2), data starts row 3
+        for (let i = 3; i < vatSheet.length; i++) {
+          const r = vatSheet[i];
+          if (!r || !r[1] || r[1] === 'ลำดับที่') continue;
+          rows.push(_pvParseVatRow(r, 'VAT'));
+        }
+        // Parse NoVat: header at row 1, data starts row 2
+        for (let i = 2; i < novatSheet.length; i++) {
+          const r = novatSheet[i];
+          if (!r || !r[1] || r[1] === 'ลำดับที่') continue;
+          rows.push(_pvParseVatRow(r, 'NOVAT'));
+        }
+        
+        parsedRows = rows;
+        const vatN = rows.filter(r => r.vat_type === 'VAT').length;
+        const novatN = rows.filter(r => r.vat_type === 'NOVAT').length;
+        const totalBilled = rows.reduce((s, r) => s + r.amount_billed, 0);
+        const totalNet = rows.reduce((s, r) => s + r.net_amount, 0);
+        
+        preview.innerHTML = `<div><strong>📊 พบ ${rows.length} rows:</strong></div>
+          <div style="margin-top:4px">• VAT: ${vatN} rows</div>
+          <div>• NOVAT: ${novatN} rows</div>
+          <div style="margin-top:4px">• ยอดแจ้งรวม: ฿${fmtNum(totalBilled)}</div>
+          <div>• ยอดจ่ายสุทธิรวม: ฿${fmtNum(totalNet)}</div>
+          <div style="margin-top:6px;color:var(--warn)">⚠️ กด "Migrate" เพื่อเริ่มอัปโหลด (อาจใช้เวลา 30-60s)</div>`;
+        document.getElementById('pv-mig-go').disabled = false;
+      } catch (err) {
+        preview.innerHTML = `<span style="color:var(--danger)">❌ ${err.message}</span>`;
+      }
+    });
+    
+    document.getElementById('pv-mig-go').addEventListener('click', async () => {
+      if (!parsedRows) return;
+      const btn = document.getElementById('pv-mig-go');
+      btn.disabled = true;
+      btn.textContent = '⏳ กำลัง migrate...';
+      try {
+        const r = await api('pv_migrateFromXlsx', { rows: parsedRows });
+        if (r?.success) {
+          toast(`✅ Migrated ${r.migrated} vouchers + ${r.bills_created} bills`, 'success', 4000);
+          closeModal();
+          const res = await api('pv_getList', { year: new Date().getFullYear() });
+          if (res?.success) _pvState.list = res.data || [];
+          _pvRender(rootEl);
+        } else {
+          toast(`❌ ${r?.error || 'fail'}`, 'error', 5000);
+          btn.disabled = false;
+          btn.textContent = '📥 Migrate ทั้งหมด';
+        }
+      } catch (e) {
+        toast(`❌ ${e.message}`, 'error', 5000);
+        btn.disabled = false;
+        btn.textContent = '📥 Migrate ทั้งหมด';
+      }
+    });
+  }, 50);
+}
+
+function _pvParseVatRow(r, vatType) {
+  // Both sheets share same logical structure after column mapping:
+  // VAT cols:   1=seq 2=date 3=cat 4=nick 5=supplier 6=bank 7=acct 8=inv 9=rcpt 10=billed 11=ship 12=dc_pm 13=claim 14=other 15=total_d 16=net 17=from 18=note
+  // NOVAT cols: 1=seq 2=date 3=cat 4=nick 5=supplier 6=bank 7=acct 8=inv 9=rcpt 10=billed 11=ship 12=claim 13=promo 14=total_d 15=net 16=from 17=note (no dc_pm)
+  
+  const dateRaw = r[2];
+  let dateISO = '';
+  if (dateRaw) {
+    if (typeof dateRaw === 'number') {
+      // Excel serial date
+      const epoch = new Date(Date.UTC(1899, 11, 30));
+      const d = new Date(epoch.getTime() + dateRaw * 86400000);
+      dateISO = d.toISOString().substring(0, 10);
+    } else if (dateRaw instanceof Date) {
+      dateISO = toISODate(dateRaw);
+    } else {
+      dateISO = String(dateRaw).substring(0, 10);
+    }
+  }
+  
+  if (vatType === 'VAT') {
+    return {
+      vat_type: 'VAT',
+      category: String(r[3]||''),
+      nickname: String(r[4]||''),
+      supplier_name: String(r[5]||''),
+      supplier_bank: String(r[6]||''),
+      supplier_account: String(r[7]||''),
+      invoice_no: String(r[8]||''),
+      receipt_no: String(r[9]||''),
+      pay_date: dateISO,
+      amount_billed: Number(r[10])||0,
+      deduct_shipping: Number(r[11])||0,
+      deduct_dc_pm: Number(r[12])||0,
+      deduct_claim: Number(r[13])||0,
+      deduct_other: Number(r[14])||0,
+      net_amount: Number(r[16])||0,
+      from_bank: String(r[17]||''),
+      note: String(r[18]||''),
+    };
+  } else {
+    // NOVAT
+    return {
+      vat_type: 'NOVAT',
+      category: String(r[3]||''),
+      nickname: String(r[4]||''),
+      supplier_name: String(r[5]||''),
+      supplier_bank: String(r[6]||''),
+      supplier_account: String(r[7]||''),
+      invoice_no: String(r[8]||''),
+      receipt_no: String(r[9]||''),
+      pay_date: dateISO,
+      amount_billed: Number(r[10])||0,
+      deduct_shipping: Number(r[11])||0,
+      deduct_dc_pm: 0,
+      deduct_claim: Number(r[12])||0,
+      deduct_other: Number(r[13])||0,  // โปรโมชั่น → other
+      net_amount: Number(r[15])||0,
+      from_bank: String(r[16]||''),
+      note: String(r[17]||''),
+    };
+  }
 }
 
 // ── Initialize after all declarations are ready ──
