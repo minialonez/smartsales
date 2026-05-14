@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R24.6-2026-05-14-2230 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R24.8-2026-05-14-2330 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -7,7 +7,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>Smart Finance R24.6</title>
+<title>Smart Finance R24.8</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
@@ -21692,7 +21692,6 @@ ${bodyHtml}
           <option value="ALL"${listFilter.month==='ALL'?' selected':''}>ทุกเดือน</option>
           ${TH_MONTHS.map((lbl, i) => `<option value="${i+1}"${String(listFilter.month)===String(i+1)?' selected':''}>${lbl}</option>`).join('')}
         </select>
-        <input class="input" id="bn-list-cust" placeholder="ลูกค้า" value="${listFilter.cust}" style="width:180px">
       </div>
       <div id="bn-list-rows-container">
         ${renderListRows()}
@@ -23068,6 +23067,18 @@ async function openReceivePaymentModal() {
   }
 }
 
+// ⭐ R24.7 14/5/26 — Top-level helper (used by Receive Payment v2)
+//   Previously called escapeHtml but never defined → ReferenceError silently broke search
+function escapeHtml(s) {
+  if (s == null) return '';
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 // ⭐ R24 14/5/26 — Receive Payment v2 (4-step + multi-installment + FIFO allocation)
 function wireReceivePaymentModalV2(state) {
   const $search = document.getElementById('rp-cust-search');
@@ -23109,7 +23120,9 @@ function wireReceivePaymentModalV2(state) {
     const seen = new Set();
     const matches = [];
     for (const c of list) {
-      const code = String(c.cust_id||c.cust_code||'').toLowerCase();
+      // ⭐ R24.7 — CIC fix: user types cust_code (BE-XXX) — must search cust_code FIRST
+      //   cust_id (C-ABC123) is internal master PK, NOT what users see/type
+      const code = String(c.cust_code||c.cust_id||'').toLowerCase();
       const name = String(c.cust_name||'').toLowerCase();
       if (!code.includes(q) && !name.includes(q)) continue;
       const key = code || name;
@@ -23126,11 +23139,12 @@ function wireReceivePaymentModalV2(state) {
     }
     
     $dropdown.innerHTML = matches.map(c => {
-      const code = c.cust_id || c.cust_code || '';
+      // ⭐ R24.7 — same field priority: cust_code first (user-facing); also fed to backend getOutstandingSBsByCust
+      const code = c.cust_code || c.cust_id || '';
       const name = c.cust_name || '';
-      return `<div class="rp-cust-opt" data-code="${code}" data-name="${escapeHtml(name)}"
+      return `<div class="rp-cust-opt" data-code="${escapeHtml(code)}" data-name="${escapeHtml(name)}"
               style="padding:8px 12px;cursor:pointer;border-bottom:1px solid var(--border);font-size:.85rem">
-              <span style="font-family:monospace;color:var(--info)">${code}</span> · ${escapeHtml(name)}
+              <span style="font-family:monospace;color:var(--info)">${escapeHtml(code)}</span> · ${escapeHtml(name)}
               </div>`;
     }).join('');
     $dropdown.style.display = 'block';
@@ -39981,10 +39995,10 @@ function _pvParseVatRow(r, vatType) {
 
 // ── Initialize after all declarations are ready ──
 (async function() {
-  // ⭐ R24.6 BOOT BEACON
-  console.log('%c[SF R24.6] Active build: 2026-05-14-2230 — R24.5 search fix + CIC outstanding fallback fix', 'color:#0c8;font-weight:bold;font-size:13px');
-  console.log('%c[SF R24.6] Drop total_amount fallback in outstanding display (was misleading on edge data)', 'color:#888');
-  window.__SF_BUILD = 'R24.6-2026-05-14-2230';
+  // ⭐ R24.8 BOOT BEACON
+  console.log('%c[SF R24.8] Active build: 2026-05-14-2330 — CIC fix: cust_code priority (was cust_id-first)', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R24.8] R24.7 escapeHtml + swap cust_code||cust_id priority + escape data-code attr', 'color:#888');
+  window.__SF_BUILD = 'R24.8-2026-05-14-2330';
   
   await restoreMainState();
   checkSavedLogin();
