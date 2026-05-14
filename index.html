@@ -1,9 +1,13 @@
 <!DOCTYPE html>
+<!-- SF Build: R21-2026-05-14-1230 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Smart Finance</title>
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
+<title>Smart Finance R21</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
@@ -39642,9 +39646,94 @@ function _pvParseVatRow(r, vatType) {
 
 // ── Initialize after all declarations are ready ──
 (async function() {
+  // ⭐ R21 BOOT BEACON — confirms fresh JS execution (not V8 cached old version)
+  //   If you see this in console, R21 code is active.
+  //   If you don't see this, your browser is running cached old code → clear V8 cache.
+  console.log('%c[SF R21] Active build: 2026-05-14-1230 — heal logic loaded', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R21] If you see this, R21 heal_reverse + markDirty fixes are running', 'color:#888');
+  window.__SF_BUILD = 'R21-2026-05-14-1230';
+  
   await restoreMainState();
   checkSavedLogin();
+  
+  // ⭐ R21 SAFETY NET — standalone heal runs 3s after boot
+  //   Even if V8 cached old loadAllFromCloud (without R21 inline heal),
+  //   this independent function will heal Case A + Case B inconsistencies.
+  //   Idempotent: only writes if status differs; safe to run repeatedly.
+  setTimeout(() => {
+    try { window.__SF_runR21Heal && window.__SF_runR21Heal(); } catch(e) { console.warn('[R21 safety net] failed:', e); }
+  }, 3000);
 })();
+
+// ⭐ R21 standalone heal function (independent of loadAllFromCloud)
+//   Exposed for both auto-run + manual debug via console: window.__SF_runR21Heal()
+window.__SF_runR21Heal = function() {
+  if (!Array.isArray(window.billList) || !Array.isArray(window.uploadedStatements)) {
+    console.log('[R21 safety net] skip — data not loaded yet');
+    return;
+  }
+  const bills = window.billList;
+  const stmts = window.uploadedStatements;
+  if (bills.length === 0 || stmts.length === 0) {
+    console.log('[R21 safety net] skip — empty data');
+    return;
+  }
+  
+  const stmtByBillNo = {};
+  const stmtByUuid = {};
+  stmts.forEach(s => {
+    if (s.stmt_uuid) stmtByUuid[s.stmt_uuid] = s;
+    if ((s.match_status !== 'paid') || !s.match_bill) return;
+    const billNos = Array.isArray(s.matched_bills) && s.matched_bills.length 
+      ? s.matched_bills 
+      : String(s.match_bill).split(' + ').map(x => x.split(' (')[0].trim()).filter(Boolean);
+    billNos.forEach(bn => { stmtByBillNo[bn] = s; });
+  });
+  
+  let healedBills = 0, healedStmts = 0;
+  
+  // Forward heal: stmt paid → bill paid
+  bills.forEach(b => {
+    if (!b.bill_no) return;
+    const stmt = stmtByBillNo[b.bill_no];
+    if (stmt && b.match_status !== 'paid' && b.match_status !== 'void') {
+      b.match_status = 'paid';
+      if (!b.matched_stmt_ref) { b.matched_stmt_ref = stmt.ref_no || ''; b.matched_stmt_uuid = stmt.stmt_uuid || ''; }
+      if (!b.confirmation && stmt.ref_no) b.confirmation = stmt.ref_no;
+      if (b.bill_uuid && window.syncManager?.markDirty) {
+        window.syncManager.markDirty('bills', b.bill_uuid);
+      }
+      healedBills++;
+    }
+  });
+  
+  // Reverse heal: bill paid + matched_stmt_uuid → stmt paid
+  bills.forEach(b => {
+    if (b.match_status !== 'paid') return;
+    if (!b.matched_stmt_uuid) return;
+    const stmt = stmtByUuid[b.matched_stmt_uuid];
+    if (!stmt) return;
+    if (stmt.match_status === 'paid' || stmt.match_status === 'void') return;
+    stmt.match_status = 'paid';
+    if (!stmt.match_bill) stmt.match_bill = b.bill_no;
+    if (!Array.isArray(stmt.matched_bills) || stmt.matched_bills.length === 0) {
+      stmt.matched_bills = [b.bill_no];
+    }
+    if (!stmt.matched_at) stmt.matched_at = b.matched_at || new Date().toISOString();
+    if (!stmt.match_method) stmt.match_method = 'heal_reverse';
+    if (stmt.stmt_uuid && window.syncManager?.markDirty) {
+      window.syncManager.markDirty('stmts', stmt.stmt_uuid);
+    }
+    healedStmts++;
+  });
+  
+  if (healedBills > 0 || healedStmts > 0) {
+    console.log(`%c[R21 safety net] healed bills=${healedBills} stmts=${healedStmts}`, 'color:#0c8;font-weight:bold');
+    try { persistMainState && persistMainState(); } catch(_) {}
+  } else {
+    console.log('[R21 safety net] no inconsistencies — all healthy ✓');
+  }
+};
 </script>
 </body>
 </html>
