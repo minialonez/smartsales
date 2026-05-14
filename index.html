@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R24.1-2026-05-14-1900 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R24.2-2026-05-14-2000 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -7,7 +7,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>Smart Finance R24.1</title>
+<title>Smart Finance R24.2</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
@@ -23186,7 +23186,19 @@ function wireReceivePaymentModalV2(state) {
 
   function toggleSB(uuid, checked) {
     if (checked) state.selected_sb_uuids.add(uuid);
-    else state.selected_sb_uuids.delete(uuid);
+    else {
+      state.selected_sb_uuids.delete(uuid);
+      // ⭐ R24.2 — cleanup orphan overrides + allocations of bills ใน SB ที่ untick
+      const sb = state.outstanding_sbs.find(s => s.billing_uuid === uuid);
+      if (sb && Array.isArray(sb.bills_snapshot)) {
+        sb.bills_snapshot.forEach(b => {
+          const key = b.bill_uuid || b.bill_no;
+          if (!key) return;
+          delete state.allocations[key];
+          state.METHODS.forEach(m => state.alloc_overrides.delete(`${key}|${m}`));
+        });
+      }
+    }
     
     if (state.selected_sb_uuids.size > 0) {
       // First time → add 1 installment row
@@ -23229,7 +23241,7 @@ function wireReceivePaymentModalV2(state) {
       <div class="rp-inst-row" data-uuid="${row.uuid}" 
            style="display:grid;grid-template-columns:30px 130px 110px 130px 120px 1fr 30px;gap:8px;padding:8px 12px;border-bottom:1px solid var(--border);align-items:center">
         <div style="color:var(--muted);font-size:.85rem">${idx + 1}</div>
-        <input type="number" class="input rp-inst-amount" data-uuid="${row.uuid}" step="0.01" value="${row.amount}" 
+        <input type="number" class="input rp-inst-amount" data-uuid="${row.uuid}" step="0.01" min="0" value="${row.amount}" 
                style="font-size:.85rem;text-align:right;padding:5px 8px" placeholder="0.00">
         <select class="select rp-inst-method" data-uuid="${row.uuid}" style="font-size:.8rem;padding:5px 6px">
           <option value="Cash" ${row.method==='Cash'?'selected':''}>Cash</option>
@@ -23253,7 +23265,13 @@ function wireReceivePaymentModalV2(state) {
     $installRows.querySelectorAll('.rp-inst-amount').forEach(inp => {
       inp.oninput = () => {
         const row = state.installments.find(r => r.uuid === inp.dataset.uuid);
-        if (row) row.amount = Number(inp.value) || 0;
+        let v = Number(inp.value) || 0;
+        if (v < 0) {
+          v = 0;
+          inp.value = '';
+          toast('ยอดติดลบยังไม่รองรับใน Phase 1 — ให้ใช้ทอนเงินที่ลูกค้าโดยตรง', 'warn', 4000);
+        }
+        if (row) row.amount = v;
         $installSum.textContent = '฿' + fmtNum(state.installments.reduce((s, r) => s + (Number(r.amount)||0), 0));
         autoFifoAllocate();
         renderAllocations();
@@ -23393,13 +23411,13 @@ function wireReceivePaymentModalV2(state) {
           </div>
           <div style="color:var(--muted);font-size:.78rem">${fmtDate(bill.date)}</div>
           <input type="number" class="input rp-alloc-cell" data-key="${key}" data-method="Cash" 
-                 step="0.01" value="${(alloc.Cash||0)===0?'':alloc.Cash}" 
+                 step="0.01" min="0" value="${(alloc.Cash||0)===0?'':alloc.Cash}" 
                  style="font-size:.8rem;text-align:right;padding:4px 6px;${(alloc.Cash||0)===0?'color:var(--muted)':''}">
           <input type="number" class="input rp-alloc-cell" data-key="${key}" data-method="Transfer" 
-                 step="0.01" value="${(alloc.Transfer||0)===0?'':alloc.Transfer}" 
+                 step="0.01" min="0" value="${(alloc.Transfer||0)===0?'':alloc.Transfer}" 
                  style="font-size:.8rem;text-align:right;padding:4px 6px;${(alloc.Transfer||0)===0?'color:var(--muted)':''}">
           <input type="number" class="input rp-alloc-cell" data-key="${key}" data-method="Cheque" 
-                 step="0.01" value="${(alloc.Cheque||0)===0?'':alloc.Cheque}" 
+                 step="0.01" min="0" value="${(alloc.Cheque||0)===0?'':alloc.Cheque}" 
                  style="font-size:.8rem;text-align:right;padding:4px 6px;${(alloc.Cheque||0)===0?'color:var(--muted)':''}">
           <div style="text-align:right;color:var(--muted)">฿${fmtNum(outstanding)}</div>
           <div style="text-align:right;color:${newOutColor};font-weight:600">${isPaid?'✓ 0':'฿'+fmtNum(newOut)}</div>
@@ -23410,7 +23428,12 @@ function wireReceivePaymentModalV2(state) {
     $allocRows.querySelectorAll('.rp-alloc-cell').forEach(inp => {
       inp.oninput = () => {
         const key = inp.dataset.key, m = inp.dataset.method;
-        const v = Number(inp.value) || 0;
+        let v = Number(inp.value) || 0;
+        if (v < 0) {
+          v = 0;
+          inp.value = '';
+          toast('ยอดติดลบยังไม่รองรับ', 'warn', 2500);
+        }
         if (!state.allocations[key]) state.allocations[key] = { Cash: 0, Transfer: 0, Cheque: 0 };
         state.allocations[key][m] = v;
         state.alloc_overrides.add(`${key}|${m}`);
@@ -23509,12 +23532,13 @@ function wireReceivePaymentModalV2(state) {
       });
       
       // Send 1 recordBillingPayment per (SB × method) combination
+      // ⭐ R24.2: store as thunks (not started promises) for sequential await
       const calls = [];
       Object.entries(totalsBySB).forEach(([billing_uuid, byMethod]) => {
         Object.entries(byMethod).forEach(([method, amt]) => {
           if (amt < 0.01) return;
           const inst = methodFirstInst[method] || { pay_date: todayISO(), bank: '', reference: '' };
-          calls.push(api('recordBillingPayment', {
+          calls.push(() => api('recordBillingPayment', {
             billing_uuid,
             amount: amt,
             payment_method: method,
@@ -23527,25 +23551,34 @@ function wireReceivePaymentModalV2(state) {
         });
       });
       
-      const results = await Promise.all(calls);
-      const failed = results.filter(r => !r || !r.success);
+      // ⭐ R24.2 — Sequential await (atomic-ish): หาก call ไหน fail จะหยุดทันที
+      //   ป้องกัน partial state (บาง SB ถูก update บางตัวไม่ถูก) — batch_id ใน reference ยังเชื่อมกันได้
+      let success = 0, failed = 0;
+      const errors = [];
+      for (const callFn of calls) {
+        try {
+          const r = await callFn();
+          if (r && r.success) success++;
+          else { failed++; errors.push(r?.message || r?.error || 'unknown'); break; }
+        } catch (e) {
+          failed++; errors.push(e.message || String(e)); break;
+        }
+      }
       
-      if (failed.length > 0) {
-        const errs = failed.map(r => r?.message || r?.error || 'unknown').join('\n');
-        toast('บางรายการล้มเหลว: ' + errs, 'error', 6000);
+      if (failed > 0) {
+        toast(`บันทึก ${success}/${calls.length} สำเร็จ — หยุดที่: ${errors[0]}`, 'error', 6000);
       } else {
         toast(`✓ บันทึก batch ${batchId} สำเร็จ (${calls.length} รายการ)`, 'success', 4000);
       }
       
       closeModal();
       
-      // Invalidate cache + reload Main
+      // Invalidate cache + reload Main (R24.2 fix: was renderMain → renderMainKeepScroll)
       try {
         if (typeof _invalidateCachedNotes === 'function') _invalidateCachedNotes();
       } catch(e) {}
-      // Trigger Main refresh if available
-      if (typeof renderMain === 'function') {
-        try { renderMain(); } catch(e) {}
+      if (typeof window.renderMainKeepScroll === 'function') {
+        try { window.renderMainKeepScroll(); } catch(e) {}
       }
     } catch (e) {
       toast('บันทึกล้มเหลว: ' + (e.message||e), 'error', 4000);
@@ -39888,10 +39921,10 @@ function _pvParseVatRow(r, vatType) {
 
 // ── Initialize after all declarations are ready ──
 (async function() {
-  // ⭐ R24.1 BOOT BEACON
-  console.log('%c[SF R24.1] Active build: 2026-05-14-1900 — SB progress bar + overdue filter', 'color:#0c8;font-weight:bold;font-size:13px');
-  console.log('%c[SF R24.1] Per-SB progress bar (paid hidden), overdue stat card, status filter overdue option', 'color:#888');
-  window.__SF_BUILD = 'R24.1-2026-05-14-1900';
+  // ⭐ R24.2 BOOT BEACON
+  console.log('%c[SF R24.2] Active build: 2026-05-14-2000 — CIC R24 fixes (sequential await + renderMain + neg block + orphan cleanup)', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R24.2] R24.1 SB progress/overdue intact + 4 CIC critical fixes applied', 'color:#888');
+  window.__SF_BUILD = 'R24.2-2026-05-14-2000';
   
   await restoreMainState();
   checkSavedLogin();
