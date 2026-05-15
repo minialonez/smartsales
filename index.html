@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.5-2026-05-15-0300 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.8-2026-05-15-0600 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -7,7 +7,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>Smart Finance R25.5</title>
+<title>Smart Finance R25.8</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
@@ -23228,7 +23228,10 @@ function wireReceivePaymentModalV3(state) {
     $search.value = `${code} — ${name}`;
     $dropdown.style.display = 'none';
     $custInfo.style.display = 'block';
-    $custInfo.innerHTML = `<span style="color:var(--muted)">กำลังโหลด SBs ค้างของ <b>${escapeHtml(code)}</b>…</span>`;
+    $custInfo.innerHTML = `<span style="color:var(--muted)">⏳ กำลังโหลด SBs ค้างของ <b>${escapeHtml(code)}</b>…</span>`;
+    // Show step 2 skeleton while loading (so user เห็นว่ากำลังจะโหลดมา)
+    $step2.style.display = 'block';
+    $sbsList.innerHTML = `<div style="padding:24px;text-align:center;color:var(--muted);font-size:.85rem">⏳ กำลังโหลด SB ของลูกค้า...</div>`;
     
     state.outstanding_sbs = [];
     state.selected_bills = new Set();
@@ -23266,8 +23269,13 @@ function wireReceivePaymentModalV3(state) {
     if (state.outstanding_sbs.length === 0) { $sbsList.innerHTML = ''; return; }
     const monthNames = {1:'ม.ค.',2:'ก.พ.',3:'มี.ค.',4:'เม.ย.',5:'พ.ค.',6:'มิ.ย.',7:'ก.ค.',8:'ส.ค.',9:'ก.ย.',10:'ต.ค.',11:'พ.ย.',12:'ธ.ค.'};
     $sbsList.innerHTML = state.outstanding_sbs.map(sb => {
+      // ⭐ R25.6 — clear stale cache before re-render (in case sb.paid_amount changed)
+      sb._billOutMap = null;
       const cycle = `${monthNames[sb.cycle_month]||sb.cycle_month}/${(sb.cycle_year%100).toString().padStart(2,'0')}`;
-      const bills = _sortBillsByNo(sb.bills_snapshot);
+      // ⭐ R25.6 — date ASC sort (matches FIFO order user sees)
+      const bills = [...(sb.bills_snapshot || [])].sort((a, b) =>
+        String(a.date || '').localeCompare(String(b.date || ''))
+      );
       const allBillUuids = bills.map(b => b.bill_uuid).filter(Boolean);
       const tickedCount = allBillUuids.filter(u => state.selected_bills.has(u)).length;
       const sbAllTicked = allBillUuids.length > 0 && tickedCount === allBillUuids.length;
@@ -23288,13 +23296,16 @@ function wireReceivePaymentModalV3(state) {
             ${bills.map(b => {
               const billOut = _getBillOutstanding(sb, b);
               const ticked = state.selected_bills.has(b.bill_uuid);
+              const billAmt = Number(b.amount) || 0;
+              const isPaidClosed = billAmt > 0 && billOut < 0.01;
+              const isRefund = billAmt < 0;
               return `
                 <div class="rp-bill-row" data-bill="${b.bill_uuid}" 
-                     style="display:flex;align-items:center;gap:8px;font-size:.78rem;cursor:pointer;padding:2px 0">
+                     style="display:flex;align-items:center;gap:8px;font-size:.78rem;cursor:pointer;padding:2px 0;${isPaidClosed?'opacity:.55':''}">
                   <span class="rp-bill-cb" data-bill="${b.bill_uuid}">${ticked?'☑':'☐'}</span>
                   <span style="font-family:monospace">${b.bill_no}</span>
                   <span style="color:var(--muted)">${fmtDate(b.date)}</span>
-                  <span style="margin-left:auto">฿${fmtNum(billOut)}</span>
+                  <span style="margin-left:auto">${isRefund?`<span style="color:var(--info)">฿${fmtNum(billAmt)} (ลด)</span>`:`฿${fmtNum(billOut)}${isPaidClosed?' <span style="color:var(--success);font-size:.7rem">✓ ปิดแล้ว</span>':''}`}</span>
                 </div>
               `;
             }).join('')}
@@ -23314,14 +23325,44 @@ function wireReceivePaymentModalV3(state) {
     });
   }
   
-  // Approximate bill outstanding (Phase 1 limitation — proportional from SB-level paid)
+  // ⭐ R25.8 15/5/26 — FIFO bill outstanding (per-bill, oldest first)
+  //   - snapshot.amount = ยอดเต็มของบิล (ไม่ใช่ outstanding)
+  //   - FIFO: เริ่ม remaining = sb.paid_amount → walk date ASC → consume each bill
+  //   - Refund (negative amount): map=0, remaining -= amount → add back to pool
+  //   - Cached on sb._billOutMap; invalidated when paid_amount changes
+  //
+  //   Earlier mistake (R25.7): detected "trimmed snapshot" mode — but real data uses full mode.
+  //   Toppy verified: OR-003562 snapshot.amount=31,713 (full bill), modal showed prorate 17,927.40 (old code).
+  function _computeBillOutstandingMap(sb) {
+    if (sb._billOutMap && sb._billOutMapPaid === Number(sb.paid_amount)) return sb._billOutMap;
+    const map = {};
+    const bills = [...(sb.bills_snapshot || [])].sort((a, b) =>
+      String(a.date || '').localeCompare(String(b.date || ''))
+    );
+    let remaining = Number(sb.paid_amount) || 0;
+    for (const b of bills) {
+      const amt = Number(b.amount) || 0;
+      if (amt >= 0) {
+        if (remaining >= amt) {
+          map[b.bill_uuid] = 0;
+          remaining -= amt;
+        } else {
+          map[b.bill_uuid] = amt - Math.max(0, remaining);
+          remaining = 0;
+        }
+      } else {
+        // Refund/credit-note — offset remaining (subtracting negative = +)
+        map[b.bill_uuid] = 0;
+        remaining -= amt;
+      }
+    }
+    sb._billOutMap = map;
+    sb._billOutMapPaid = Number(sb.paid_amount);
+    return map;
+  }
+  
   function _getBillOutstanding(sb, bill) {
-    const billAmt = Number(bill.amount) || 0;
-    const sbTotal = Number(sb.total_amount) || 0;
-    const sbPaid = Number(sb.paid_amount) || 0;
-    if (sbTotal <= 0.01) return billAmt;
-    const ratio = sbPaid / sbTotal;
-    return Math.max(0, billAmt - billAmt * ratio);
+    return _computeBillOutstandingMap(sb)[bill.bill_uuid] || 0;
   }
   
   function toggleSB(uuid) {
@@ -23401,48 +23442,86 @@ function wireReceivePaymentModalV3(state) {
             <span style="margin-left:auto;font-size:.78rem;color:var(--muted)">${grp.installments.length} งวด · ฿${fmtNum(grpTotal)}</span>
             ${state.sp_groups.length > 1 ? `<button class="rp-sp-del" data-gidx="${gIdx}" style="background:none;border:none;color:var(--danger);cursor:pointer;font-size:1rem">×</button>` : ''}
           </div>
-          <div style="display:grid;grid-template-columns:24px 100px 90px 110px 95px 50px 95px 1fr 24px;gap:6px;padding:4px 0;font-size:.7rem;color:var(--muted);border-bottom:1px solid var(--border)">
-            <div>#</div><div>จำนวน</div><div>วิธี</div><div>วันที่</div><div>ธนาคาร</div><div>WHT</div><div>ครบกำหนด</div><div>หมายเหตุ</div><div></div>
-          </div>
-          ${grp.installments.map((inst, iIdx) => `
-            <div class="rp-inst-row" data-gidx="${gIdx}" data-iidx="${iIdx}" 
-                 style="display:grid;grid-template-columns:24px 100px 90px 110px 95px 50px 95px 1fr 24px;gap:6px;padding:6px 0;align-items:center;border-bottom:1px solid var(--border)">
-              <span style="color:var(--muted);font-size:.78rem">${iIdx+1}</span>
-              <input type="number" class="input rp-inst-amount" data-gidx="${gIdx}" data-iidx="${iIdx}" 
-                     step="0.01" min="0" value="${inst.amount||''}" 
-                     style="font-size:.8rem;text-align:right;padding:4px 6px">
-              <select class="select rp-inst-method" data-gidx="${gIdx}" data-iidx="${iIdx}" 
-                      style="font-size:.78rem;padding:4px">
-                <option value="Cash" ${inst.method==='Cash'?'selected':''}>Cash</option>
-                <option value="Transfer" ${inst.method==='Transfer'?'selected':''}>Transfer</option>
-                <option value="Cheque" ${inst.method==='Cheque'?'selected':''}>Cheque</option>
-              </select>
-              <input type="date" class="input rp-inst-date" data-gidx="${gIdx}" data-iidx="${iIdx}" 
-                     value="${inst.pay_date}" style="font-size:.78rem;padding:4px 6px">
-              <input class="input rp-inst-bank" data-gidx="${gIdx}" data-iidx="${iIdx}" 
-                     value="${escapeHtml(inst.bank||'')}" placeholder="KBANK..."
-                     style="font-size:.78rem;padding:4px 6px">
-              <input type="checkbox" class="rp-inst-wht" data-gidx="${gIdx}" data-iidx="${iIdx}" 
-                     ${inst.wht_enabled?'checked':''} title="หัก ณ ที่จ่าย">
-              <input type="date" class="input rp-inst-duedate" data-gidx="${gIdx}" data-iidx="${iIdx}" 
-                     value="${inst.due_date||''}" ${inst.method!=='Cheque'?'disabled':''}
-                     style="font-size:.78rem;padding:4px 6px;${inst.method!=='Cheque'?'opacity:.4':''}">
-              <input class="input rp-inst-ref" data-gidx="${gIdx}" data-iidx="${iIdx}" 
-                     value="${escapeHtml(inst.reference||'')}" placeholder="เลขอ้างอิง"
-                     style="font-size:.78rem;padding:4px 6px">
-              ${grp.installments.length > 1 ? `<button class="rp-inst-del" data-gidx="${gIdx}" data-iidx="${iIdx}" 
-                       style="background:none;border:none;color:var(--danger);cursor:pointer;font-size:1rem">×</button>` : '<span></span>'}
-            </div>
-          `).join('')}
+          ${grp.installments.map((inst, iIdx) => _renderInstallmentRow(gIdx, iIdx, inst)).join('')}
         </div>
       `;
     }).join('');
     
-    // Wire SP no input
+    wireSpGroupsEvents();
+  }
+  
+  // ⭐ R25.6 — Each installment = multi-row form (flexible per method)
+  function _renderInstallmentRow(gIdx, iIdx, inst) {
+    const isCheque = inst.method === 'Cheque';
+    const isTransfer = inst.method === 'Transfer';
+    const isCash = inst.method === 'Cash';
+    const showBank = isCheque || isTransfer;
+    const grpHasMultipleInsts = state.sp_groups[gIdx].installments.length > 1;
+    
+    return `
+      <div class="rp-inst-row" data-gidx="${gIdx}" data-iidx="${iIdx}" 
+           style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:8px 0;border-top:1px solid var(--border)">
+        <span style="color:var(--muted);font-size:.78rem;min-width:18px">${iIdx+1}.</span>
+        
+        <input type="number" class="input rp-inst-amount" data-gidx="${gIdx}" data-iidx="${iIdx}" 
+               step="0.01" min="0" value="${inst.amount||''}" placeholder="จำนวน"
+               style="font-size:.82rem;text-align:right;padding:4px 6px;width:110px">
+        
+        <select class="select rp-inst-method" data-gidx="${gIdx}" data-iidx="${iIdx}" 
+                style="font-size:.8rem;padding:4px 6px;width:95px">
+          <option value="Cash" ${isCash?'selected':''}>Cash</option>
+          <option value="Transfer" ${isTransfer?'selected':''}>Transfer</option>
+          <option value="Cheque" ${isCheque?'selected':''}>Cheque</option>
+        </select>
+        
+        <label style="font-size:.78rem;color:var(--muted)">วันที่:</label>
+        <input type="date" class="input rp-inst-date" data-gidx="${gIdx}" data-iidx="${iIdx}" 
+               value="${inst.pay_date}" style="font-size:.8rem;padding:4px 6px;width:120px">
+        
+        ${showBank ? `
+          <label style="font-size:.78rem;color:var(--muted)">ธนาคาร:</label>
+          <input class="input rp-inst-bank" data-gidx="${gIdx}" data-iidx="${iIdx}" 
+                 value="${escapeHtml(inst.bank||'')}" placeholder="KBANK / KTB..."
+                 style="font-size:.8rem;padding:4px 6px;width:100px">
+        ` : ''}
+        
+        ${isCheque ? `
+          <label style="font-size:.78rem;color:var(--muted)">เลขเช็ค:</label>
+          <input class="input rp-inst-confirmation" data-gidx="${gIdx}" data-iidx="${iIdx}" 
+                 value="${escapeHtml(inst.confirmation||'')}" placeholder="0001234"
+                 style="font-size:.8rem;padding:4px 6px;width:110px">
+          <label style="font-size:.78rem;color:var(--muted)">ครบกำหนด:</label>
+          <input type="date" class="input rp-inst-duedate" data-gidx="${gIdx}" data-iidx="${iIdx}" 
+                 value="${inst.due_date||''}" style="font-size:.8rem;padding:4px 6px;width:130px">
+        ` : ''}
+        
+        <label style="display:inline-flex;align-items:center;gap:4px;font-size:.78rem;color:var(--muted);cursor:pointer">
+          <input type="checkbox" class="rp-inst-wht" data-gidx="${gIdx}" data-iidx="${iIdx}" 
+                 ${inst.wht_enabled?'checked':''} style="width:14px;height:14px;cursor:pointer">
+          WHT
+        </label>
+        ${inst.wht_enabled ? `
+          <input type="number" class="input rp-inst-wht-amt" data-gidx="${gIdx}" data-iidx="${iIdx}" 
+                 step="0.01" min="0" value="${inst.wht_amount||0}" 
+                 style="font-size:.8rem;text-align:right;padding:4px 6px;width:80px" title="ยอด WHT">
+        ` : ''}
+        
+        <input class="input rp-inst-ref" data-gidx="${gIdx}" data-iidx="${iIdx}" 
+               value="${escapeHtml(inst.reference||'')}" placeholder="หมายเหตุ / เลขอ้างอิง"
+               style="font-size:.8rem;padding:4px 6px;flex:1;min-width:140px">
+        
+        ${grpHasMultipleInsts || state.sp_groups[gIdx].installments.length > 0 && state.sp_groups.length > 1 ? `
+          <button class="rp-inst-del" data-gidx="${gIdx}" data-iidx="${iIdx}" 
+                  title="ลบงวด" style="background:none;border:none;color:var(--danger);cursor:pointer;font-size:1.1rem;padding:0 4px">×</button>
+        ` : ''}
+      </div>
+    `;
+  }
+  
+  function wireSpGroupsEvents() {
+    // SP no input
     $spGroups.querySelectorAll('.rp-sp-no').forEach(inp => {
-      inp.oninput = () => {
-        state.sp_groups[Number(inp.dataset.gidx)].sp_no = inp.value;
-      };
+      inp.oninput = () => { state.sp_groups[Number(inp.dataset.gidx)].sp_no = inp.value; };
       inp.onchange = () => renderSpGroups();
     });
     $spGroups.querySelectorAll('.rp-sp-del').forEach(btn => {
@@ -23451,7 +23530,8 @@ function wireReceivePaymentModalV3(state) {
         renderSpGroups(); afterChange();
       };
     });
-    // Wire installment fields
+    
+    // Field wires — generic
     const wireField = (sel, prop, parser) => {
       $spGroups.querySelectorAll(sel).forEach(inp => {
         const handler = () => {
@@ -23467,25 +23547,46 @@ function wireReceivePaymentModalV3(state) {
       });
     };
     wireField('.rp-inst-amount', 'amount', inp => Number(inp.value) || 0);
-    wireField('.rp-inst-method', 'method');
     wireField('.rp-inst-date', 'pay_date');
     wireField('.rp-inst-bank', 'bank');
     wireField('.rp-inst-duedate', 'due_date');
+    wireField('.rp-inst-confirmation', 'confirmation');
     wireField('.rp-inst-ref', 'reference');
+    wireField('.rp-inst-wht-amt', 'wht_amount', inp => Number(inp.value) || 0);
+    
+    // Method change → re-render (so cheque-only fields appear/disappear)
+    $spGroups.querySelectorAll('.rp-inst-method').forEach(sel => {
+      sel.onchange = () => {
+        const g = state.sp_groups[Number(sel.dataset.gidx)];
+        const i = g.installments[Number(sel.dataset.iidx)];
+        i.method = sel.value;
+        // Clear cheque-specific fields if switched away
+        if (sel.value !== 'Cheque') {
+          i.confirmation = '';
+          i.due_date = '';
+        }
+        renderSpGroups();   // ⭐ full re-render — show/hide fields per method
+        afterChange();
+      };
+    });
+    
+    // WHT checkbox → toggle wht_amount input visibility
     $spGroups.querySelectorAll('.rp-inst-wht').forEach(cb => {
       cb.onchange = () => {
         const g = state.sp_groups[Number(cb.dataset.gidx)];
         const i = g.installments[Number(cb.dataset.iidx)];
         i.wht_enabled = cb.checked;
-        if (cb.checked && !i.wht_amount) i.wht_amount = Math.round((i.amount / 1.07) * 0.01 * 100) / 100;
-        else if (!cb.checked) i.wht_amount = 0;
+        if (cb.checked) {
+          // Auto-fill: round((amount/1.07)*0.01, 2)
+          i.wht_amount = Math.round((Number(i.amount)||0) / 1.07 * 0.01 * 100) / 100;
+        } else {
+          i.wht_amount = 0;
+        }
+        renderSpGroups();  // ⭐ full re-render to show/hide wht_amount input
         afterChange();
       };
     });
-    // Re-render SP group if method changed (so due_date enables/disables)
-    $spGroups.querySelectorAll('.rp-inst-method').forEach(sel => {
-      sel.addEventListener('change', () => { renderSpGroups(); });
-    });
+    
     $spGroups.querySelectorAll('.rp-inst-del').forEach(btn => {
       btn.onclick = () => {
         const g = state.sp_groups[Number(btn.dataset.gidx)];
@@ -23593,7 +23694,7 @@ function wireReceivePaymentModalV3(state) {
       });
       const newOut = Math.max(0, outstanding - sumAlloc);
       const isPaid = newOut < 0.01;
-      const bg = isPaid ? 'rgba(99,153,34,.08)' : (sumAlloc > 0.01 ? 'rgba(186,117,23,.08)' : 'transparent');
+      const bg = isPaid ? 'var(--success-bg)' : (sumAlloc > 0.01 ? 'rgba(186,117,23,.08)' : 'transparent');
       
       html += `<div style="display:grid;grid-template-columns:${colTmpl};gap:6px;padding:8px 10px;font-size:.78rem;border-bottom:1px solid var(--border);align-items:center;background:${bg}">`;
       html += `<div><div style="font-family:monospace;font-weight:600;font-size:.75rem">${escapeHtml(bill.bill_no)}</div><div style="color:var(--muted);font-size:.68rem">${sb.billing_no}</div></div>`;
@@ -23638,7 +23739,7 @@ function wireReceivePaymentModalV3(state) {
     
     $progSummary.textContent = `${state.sp_groups.length} SP · ฿${fmtNum(totalInst)}`;
     $progBar.style.width = pct + '%';
-    $progBar.style.background = pct >= 99.99 ? '#639922' : (pct > 0.01 ? '#378ADD' : '#9ca3af');
+    $progBar.style.background = pct >= 99.99 ? 'var(--success)' : (pct > 0.01 ? '#378ADD' : '#9ca3af');
     $progAlloc.textContent = `฿${fmtNum(totalAlloc)} · ${pct.toFixed(1)}%`;
     $progDue.textContent = '฿' + fmtNum(due);
     $progUnalloc.textContent = '฿' + fmtNum(unalloc);
@@ -40030,10 +40131,10 @@ function _pvParseVatRow(r, vatType) {
 
 // ── Initialize after all declarations are ready ──
 (async function() {
-  // ⭐ R25.5 BOOT BEACON
-  console.log('%c[SF R25.5] Active build: 2026-05-15-0300 — Fix GET string boolean coercion (dry_run silent no-op)', 'color:#0c8;font-weight:bold;font-size:13px');
-  console.log('%c[SF R25.5] _coerceBool helper + POST for resync + fix 5 endpoints with dry_run/include_vat bool checks', 'color:#888');
-  window.__SF_BUILD = 'R25.5-2026-05-15-0300';
+  // ⭐ R25.8 BOOT BEACON
+  console.log('%c[SF R25.8] Active build: 2026-05-15-0600 — FIFO pure (R25.7 detection removed)', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.8] Toppy verified snapshot.amount = full bill amount → straight FIFO from paid_amount', 'color:#888');
+  window.__SF_BUILD = 'R25.8-2026-05-15-0600';
   
   await restoreMainState();
   checkSavedLogin();
