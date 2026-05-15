@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.9-2026-05-15-0700 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.10-2026-05-15-0800 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -7,7 +7,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>Smart Finance R25.9</title>
+<title>Smart Finance R25.10</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
@@ -23313,12 +23313,17 @@ function wireReceivePaymentModalV3(state) {
               const billOut = _getBillOutstanding(sb, b);
               const ticked = state.selected_bills.has(b.bill_uuid);
               const billAmt = Number(b.amount) || 0;
-              const isPaidClosed = billAmt > 0 && billOut < 0.01;
+              // ⭐ R25.10 — effective amount after credit-note absorb (may be < origAmt)
+              const billEff = (sb._billEffMap && sb._billEffMap[b.bill_uuid] !== undefined) 
+                              ? sb._billEffMap[b.bill_uuid] : billAmt;
+              const creditApplied = billAmt > 0 ? Math.max(0, billAmt - billEff) : 0;
+              const isPaidClosed = billEff > 0.01 && billOut < 0.01;
+              const isFullyAbsorbed = billAmt > 0 && billEff < 0.01;
               const isRefund = billAmt < 0;
-              const billPaid = Math.max(0, billAmt - billOut);
-              const billPct = billAmt > 0 ? Math.min(100, (billPaid / billAmt) * 100) : 0;
+              const billPaid = Math.max(0, billEff - billOut);
+              const billPct = billEff > 0 ? Math.min(100, (billPaid / billEff) * 100) : 100;
               const isPartial = billPaid > 0.01 && billOut > 0.01;
-              const barColor = isPaidClosed ? 'var(--success)' : (isPartial ? '#378ADD' : '#9ca3af');
+              const barColor = (isPaidClosed || isFullyAbsorbed) ? 'var(--success)' : (isPartial ? '#378ADD' : '#9ca3af');
               
               if (isRefund) {
                 return `
@@ -23334,17 +23339,18 @@ function wireReceivePaymentModalV3(state) {
               
               return `
                 <div class="rp-bill-row" data-bill="${b.bill_uuid}" 
-                     style="cursor:pointer;padding:3px 0;${isPaidClosed?'opacity:.7':''}">
+                     style="cursor:pointer;padding:3px 0;${(isPaidClosed||isFullyAbsorbed)?'opacity:.7':''}">
                   <div style="display:flex;align-items:center;gap:8px;font-size:.78rem">
                     <span class="rp-bill-cb" data-bill="${b.bill_uuid}">${ticked?'☑':'☐'}</span>
                     <span style="font-family:monospace;min-width:130px">${b.bill_no}</span>
                     <span style="color:var(--muted);min-width:80px">${fmtDate(b.date)}</span>
                     <span style="flex:1;font-size:.72rem;color:var(--muted)">
                       <span>ยอด ฿${fmtNum(billAmt)}</span>
+                      ${creditApplied > 0.01 ? ` · <span style="color:var(--info)">−ลดหนี้ ฿${fmtNum(creditApplied)}</span>` : ''}
                       ${billPaid > 0.01 ? ` · <span style="color:var(--success)">จ่าย ฿${fmtNum(billPaid)}</span>` : ''}
                       ${billOut > 0.01 ? ` · <span style="color:var(--warn)">ค้าง ฿${fmtNum(billOut)}</span>` : ''}
                     </span>
-                    ${isPaidClosed ? `<span style="color:var(--success);font-size:.72rem;font-weight:600">paid</span>` : ''}
+                    ${(isPaidClosed || isFullyAbsorbed) ? `<span style="color:var(--success);font-size:.72rem;font-weight:600">paid</span>` : ''}
                   </div>
                   <div style="margin-left:22px;margin-top:2px;display:flex;align-items:center;gap:6px">
                     <div style="flex:1;height:3px;background:var(--border);border-radius:2px;overflow:hidden">
@@ -23371,38 +23377,91 @@ function wireReceivePaymentModalV3(state) {
     });
   }
   
-  // ⭐ R25.8 15/5/26 — FIFO bill outstanding (per-bill, oldest first)
-  //   - snapshot.amount = ยอดเต็มของบิล (ไม่ใช่ outstanding)
-  //   - FIFO: เริ่ม remaining = sb.paid_amount → walk date ASC → consume each bill
-  //   - Refund (negative amount): map=0, remaining -= amount → add back to pool
-  //   - Cached on sb._billOutMap; invalidated when paid_amount changes
+  // ⭐ R25.10 15/5/26 — FIFO with credit-note pre-absorb
+  //   Issue: JR/SC (ใบลดหนี้) ลดยอด OR ในวันเดียวกัน — ต้อง pre-absorb ก่อน FIFO
+  //   เก่า R25.6-R25.9: refund ทำ remaining -= amt → กลายเป็นเงินจ่ายของบิลถัดไป (ผิด)
+  //   ใหม่ R25.10:
+  //     1. sort: date ASC, then positive-first (OR ก่อน JR same-date)
+  //     2. pre-pass: JR แต่ละใบ absorb preceding same-date positive → fallback any preceding
+  //     3. FIFO walk บน effective amounts
   //
-  //   Earlier mistake (R25.7): detected "trimmed snapshot" mode — but real data uses full mode.
-  //   Toppy verified: OR-003562 snapshot.amount=31,713 (full bill), modal showed prorate 17,927.40 (old code).
+  //   Test case JN-03127 SB-000568 (paid 17,532 / out 3,375):
+  //     OR-003774 eff 14,087 (after JR-262 absorb) → paid via FIFO
+  //     OR-003803 eff 40 (after JR-270 absorb) → paid via FIFO  
+  //     OR-003835 → ค้าง 3,375 เต็ม ✓
   function _computeBillOutstandingMap(sb) {
     if (sb._billOutMap && sb._billOutMapPaid === Number(sb.paid_amount)) return sb._billOutMap;
-    const map = {};
-    const bills = [...(sb.bills_snapshot || [])].sort((a, b) =>
-      String(a.date || '').localeCompare(String(b.date || ''))
-    );
-    let remaining = Number(sb.paid_amount) || 0;
-    for (const b of bills) {
-      const amt = Number(b.amount) || 0;
-      if (amt >= 0) {
-        if (remaining >= amt) {
-          map[b.bill_uuid] = 0;
-          remaining -= amt;
-        } else {
-          map[b.bill_uuid] = amt - Math.max(0, remaining);
-          remaining = 0;
+    
+    // Sort: date ASC, then positive amount first (OR before JR same-date), then bill_no
+    const sorted = [...(sb.bills_snapshot || [])].sort((a, b) => {
+      const d = String(a.date || '').localeCompare(String(b.date || ''));
+      if (d !== 0) return d;
+      const aPos = (Number(a.amount) || 0) >= 0 ? 0 : 1;
+      const bPos = (Number(b.amount) || 0) >= 0 ? 0 : 1;
+      if (aPos !== bPos) return aPos - bPos;
+      return String(a.bill_no || '').localeCompare(String(b.bill_no || ''));
+    });
+    
+    // Build effective amount table
+    const eff = sorted.map(b => ({
+      uuid: b.bill_uuid,
+      date: b.date,
+      origAmt: Number(b.amount) || 0,
+      effAmt: Number(b.amount) || 0,
+      absorbed: false,
+    }));
+    
+    // Pre-pass: absorb credits into preceding positive bills (same-date first)
+    for (let i = 0; i < eff.length; i++) {
+      const c = eff[i];
+      if (c.effAmt >= 0) continue;
+      let creditLeft = -c.effAmt;
+      // Pass 1: same-date preceding positive bills (JR refunds same-day OR)
+      for (let j = i - 1; j >= 0 && creditLeft > 0; j--) {
+        const t = eff[j];
+        if (t.effAmt > 0 && t.date === c.date) {
+          const take = Math.min(t.effAmt, creditLeft);
+          t.effAmt -= take;
+          creditLeft -= take;
         }
+      }
+      // Pass 2: fallback — any preceding positive (rare: JR กับ OR ไม่อยู่วันเดียวกัน)
+      if (creditLeft > 0) {
+        for (let j = i - 1; j >= 0 && creditLeft > 0; j--) {
+          const t = eff[j];
+          if (t.effAmt > 0) {
+            const take = Math.min(t.effAmt, creditLeft);
+            t.effAmt -= take;
+            creditLeft -= take;
+          }
+        }
+      }
+      c.effAmt = 0;
+      c.absorbed = true;
+      // Note: leftover creditLeft (refund > preceding bills) — ignore for now
+    }
+    
+    // FIFO walk on effective amounts
+    const map = {};
+    const effByUuid = {};
+    let remaining = Number(sb.paid_amount) || 0;
+    for (const b of eff) {
+      effByUuid[b.uuid] = b.effAmt;
+      if (b.origAmt < 0 || b.absorbed) {
+        map[b.uuid] = 0;             // refund row or fully-absorbed
+      } else if (b.effAmt <= 0.01) {
+        map[b.uuid] = 0;             // absorbed by credit notes
+      } else if (remaining >= b.effAmt) {
+        map[b.uuid] = 0;
+        remaining -= b.effAmt;
       } else {
-        // Refund/credit-note — offset remaining (subtracting negative = +)
-        map[b.bill_uuid] = 0;
-        remaining -= amt;
+        map[b.uuid] = b.effAmt - Math.max(0, remaining);
+        remaining = 0;
       }
     }
+    
     sb._billOutMap = map;
+    sb._billEffMap = effByUuid;  // for UI to show "ลดหนี้ ฿X" hint
     sb._billOutMapPaid = Number(sb.paid_amount);
     return map;
   }
@@ -40177,10 +40236,10 @@ function _pvParseVatRow(r, vatType) {
 
 // ── Initialize after all declarations are ready ──
 (async function() {
-  // ⭐ R25.9 BOOT BEACON
-  console.log('%c[SF R25.9] Active build: 2026-05-15-0700 — UI polish: progress bars + % + paid label', 'color:#0c8;font-weight:bold;font-size:13px');
-  console.log('%c[SF R25.9] SB header shows ยอดเต็ม/จ่าย/ค้าง + progress bar · per-bill shows breakdown + own progress', 'color:#888');
-  window.__SF_BUILD = 'R25.9-2026-05-15-0700';
+  // ⭐ R25.10 BOOT BEACON
+  console.log('%c[SF R25.10] Active build: 2026-05-15-0800 — FIFO + credit-note pre-absorb (same-date)', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.10] JR/SC reduces OR same-day before FIFO walk · per-bill shows ลดหนี้ hint', 'color:#888');
+  window.__SF_BUILD = 'R25.10-2026-05-15-0800';
   
   await restoreMainState();
   checkSavedLogin();
