@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.13-2026-05-15-1100 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.14-2026-05-15-1200 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -7,7 +7,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>Smart Finance R25.13</title>
+<title>Smart Finance R25.14</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
@@ -40252,10 +40252,10 @@ function _pvParseVatRow(r, vatType) {
 
 // ── Initialize after all declarations are ready ──
 (async function() {
-  // ⭐ R25.13 BOOT BEACON
-  console.log('%c[SF R25.13] Active build: 2026-05-15-1100 — Sibling cust_code fallback actually working', 'color:#0c8;font-weight:bold;font-size:13px');
-  console.log('%c[SF R25.13] Date normalization fix — R25.12 used Date reference compare (always false)', 'color:#888');
-  window.__SF_BUILD = 'R25.13-2026-05-15-1100';
+  // ⭐ R25.14 BOOT BEACON
+  console.log('%c[SF R25.14] Active build: 2026-05-15-1200 — Conservative sibling fallback (no wrong assignments)', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.14] Sibling assign only when same-date is single-customer · multi-cust → skipped_ambiguous_refund', 'color:#888');
+  window.__SF_BUILD = 'R25.14-2026-05-15-1200';
   
   await restoreMainState();
   checkSavedLogin();
