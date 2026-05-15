@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.4-2026-05-15-0200 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.5-2026-05-15-0300 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -7,7 +7,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>Smart Finance R25.4</title>
+<title>Smart Finance R25.5</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
@@ -424,6 +424,9 @@ async function api(action, params = {}) {
       'upsertPcBatch', 'updatePcStatus',
       'createOrAddPcSubmission', 'removeFromPcSubmission', 'deletePcSubmission',
       'splitPcLineitem', 'unsplitPcLineitems',
+      // ⭐ R25.5 — POST to preserve boolean types (dry_run, include_vat, etc.)
+      //   GET converts boolean → "true"/"false" string → backend equality checks fail
+      'resyncSbPaidFromPayments',
     ];
     const forcePost = FORCE_POST_ACTIONS.indexOf(action) !== -1;
     
@@ -40027,10 +40030,10 @@ function _pvParseVatRow(r, vatType) {
 
 // ── Initialize after all declarations are ready ──
 (async function() {
-  // ⭐ R25.4 BOOT BEACON
-  console.log('%c[SF R25.4] Active build: 2026-05-15-0200 — Resync paid_amount from billing_payments', 'color:#0c8;font-weight:bold;font-size:13px');
-  console.log('%c[SF R25.4] Dry-run preview modal + safe apply (only edits billing_notes header)', 'color:#888');
-  window.__SF_BUILD = 'R25.4-2026-05-15-0200';
+  // ⭐ R25.5 BOOT BEACON
+  console.log('%c[SF R25.5] Active build: 2026-05-15-0300 — Fix GET string boolean coercion (dry_run silent no-op)', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.5] _coerceBool helper + POST for resync + fix 5 endpoints with dry_run/include_vat bool checks', 'color:#888');
+  window.__SF_BUILD = 'R25.5-2026-05-15-0300';
   
   await restoreMainState();
   checkSavedLogin();
