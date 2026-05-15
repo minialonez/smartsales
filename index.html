@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.8-2026-05-15-0600 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.9-2026-05-15-0700 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -7,7 +7,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>Smart Finance R25.8</title>
+<title>Smart Finance R25.9</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
@@ -23282,15 +23282,31 @@ function wireReceivePaymentModalV3(state) {
       const sbPartial = tickedCount > 0 && !sbAllTicked;
       const checkboxIcon = sbAllTicked ? '☑' : (sbPartial ? '⊟' : '☐');
       
+      // SB-level progress
+      const sbTotal = Number(sb.total_amount) || 0;
+      const sbPaid = Number(sb.paid_amount) || 0;
+      const sbPct = sbTotal > 0 ? Math.min(100, (sbPaid / sbTotal) * 100) : 0;
+      const sbBarColor = sbPct >= 99.99 ? 'var(--success)' : (sbPct > 0.01 ? '#378ADD' : '#9ca3af');
+      
       return `
         <div class="rp-sb-card" data-uuid="${sb.billing_uuid}" 
              style="border-bottom:1px solid var(--border);padding:10px 12px;background:${tickedCount>0?'rgba(55,138,221,.06)':'transparent'}">
-          <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
             <span class="rp-sb-toggle" data-uuid="${sb.billing_uuid}" 
                   style="cursor:pointer;font-size:1.1rem;user-select:none">${checkboxIcon}</span>
             <span style="font-family:monospace;font-weight:600;font-size:.85rem">${sb.billing_no}</span>
             <span style="color:var(--muted);font-size:.78rem">${cycle}</span>
-            <span style="margin-left:auto;font-weight:700;color:var(--warn);font-size:.9rem">ค้าง ฿${fmtNum(sb.outstanding)}</span>
+            <span style="margin-left:auto;font-size:.78rem">
+              <span style="color:var(--muted)">ยอดเต็ม</span> ฿${fmtNum(sbTotal)} ·
+              <span style="color:var(--success)">จ่าย</span> ฿${fmtNum(sbPaid)} ·
+              <span style="color:var(--warn);font-weight:600">ค้าง ฿${fmtNum(sb.outstanding)}</span>
+            </span>
+          </div>
+          <div style="margin-left:24px;margin-bottom:6px;display:flex;align-items:center;gap:8px">
+            <div style="flex:1;height:5px;background:var(--border);border-radius:3px;overflow:hidden">
+              <div style="height:100%;width:${sbPct}%;background:${sbBarColor};transition:width .3s"></div>
+            </div>
+            <span style="font-size:.7rem;color:var(--muted);min-width:36px;text-align:right">${sbPct.toFixed(0)}%</span>
           </div>
           <div style="padding-left:24px;display:flex;flex-direction:column;gap:3px">
             ${bills.map(b => {
@@ -23299,13 +23315,43 @@ function wireReceivePaymentModalV3(state) {
               const billAmt = Number(b.amount) || 0;
               const isPaidClosed = billAmt > 0 && billOut < 0.01;
               const isRefund = billAmt < 0;
+              const billPaid = Math.max(0, billAmt - billOut);
+              const billPct = billAmt > 0 ? Math.min(100, (billPaid / billAmt) * 100) : 0;
+              const isPartial = billPaid > 0.01 && billOut > 0.01;
+              const barColor = isPaidClosed ? 'var(--success)' : (isPartial ? '#378ADD' : '#9ca3af');
+              
+              if (isRefund) {
+                return `
+                  <div class="rp-bill-row" data-bill="${b.bill_uuid}" 
+                       style="display:flex;align-items:center;gap:8px;font-size:.78rem;cursor:pointer;padding:2px 0">
+                    <span class="rp-bill-cb" data-bill="${b.bill_uuid}">${ticked?'☑':'☐'}</span>
+                    <span style="font-family:monospace">${b.bill_no}</span>
+                    <span style="color:var(--muted)">${fmtDate(b.date)}</span>
+                    <span style="margin-left:auto;color:var(--info)">฿${fmtNum(billAmt)} (ลดหนี้)</span>
+                  </div>
+                `;
+              }
+              
               return `
                 <div class="rp-bill-row" data-bill="${b.bill_uuid}" 
-                     style="display:flex;align-items:center;gap:8px;font-size:.78rem;cursor:pointer;padding:2px 0;${isPaidClosed?'opacity:.55':''}">
-                  <span class="rp-bill-cb" data-bill="${b.bill_uuid}">${ticked?'☑':'☐'}</span>
-                  <span style="font-family:monospace">${b.bill_no}</span>
-                  <span style="color:var(--muted)">${fmtDate(b.date)}</span>
-                  <span style="margin-left:auto">${isRefund?`<span style="color:var(--info)">฿${fmtNum(billAmt)} (ลด)</span>`:`฿${fmtNum(billOut)}${isPaidClosed?' <span style="color:var(--success);font-size:.7rem">✓ ปิดแล้ว</span>':''}`}</span>
+                     style="cursor:pointer;padding:3px 0;${isPaidClosed?'opacity:.7':''}">
+                  <div style="display:flex;align-items:center;gap:8px;font-size:.78rem">
+                    <span class="rp-bill-cb" data-bill="${b.bill_uuid}">${ticked?'☑':'☐'}</span>
+                    <span style="font-family:monospace;min-width:130px">${b.bill_no}</span>
+                    <span style="color:var(--muted);min-width:80px">${fmtDate(b.date)}</span>
+                    <span style="flex:1;font-size:.72rem;color:var(--muted)">
+                      <span>ยอด ฿${fmtNum(billAmt)}</span>
+                      ${billPaid > 0.01 ? ` · <span style="color:var(--success)">จ่าย ฿${fmtNum(billPaid)}</span>` : ''}
+                      ${billOut > 0.01 ? ` · <span style="color:var(--warn)">ค้าง ฿${fmtNum(billOut)}</span>` : ''}
+                    </span>
+                    ${isPaidClosed ? `<span style="color:var(--success);font-size:.72rem;font-weight:600">paid</span>` : ''}
+                  </div>
+                  <div style="margin-left:22px;margin-top:2px;display:flex;align-items:center;gap:6px">
+                    <div style="flex:1;height:3px;background:var(--border);border-radius:2px;overflow:hidden">
+                      <div style="height:100%;width:${billPct}%;background:${barColor};transition:width .3s"></div>
+                    </div>
+                    <span style="font-size:.65rem;color:var(--muted);min-width:30px;text-align:right">${billPct.toFixed(0)}%</span>
+                  </div>
                 </div>
               `;
             }).join('')}
@@ -40131,10 +40177,10 @@ function _pvParseVatRow(r, vatType) {
 
 // ── Initialize after all declarations are ready ──
 (async function() {
-  // ⭐ R25.8 BOOT BEACON
-  console.log('%c[SF R25.8] Active build: 2026-05-15-0600 — FIFO pure (R25.7 detection removed)', 'color:#0c8;font-weight:bold;font-size:13px');
-  console.log('%c[SF R25.8] Toppy verified snapshot.amount = full bill amount → straight FIFO from paid_amount', 'color:#888');
-  window.__SF_BUILD = 'R25.8-2026-05-15-0600';
+  // ⭐ R25.9 BOOT BEACON
+  console.log('%c[SF R25.9] Active build: 2026-05-15-0700 — UI polish: progress bars + % + paid label', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.9] SB header shows ยอดเต็ม/จ่าย/ค้าง + progress bar · per-bill shows breakdown + own progress', 'color:#888');
+  window.__SF_BUILD = 'R25.9-2026-05-15-0700';
   
   await restoreMainState();
   checkSavedLogin();
