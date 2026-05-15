@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.10-2026-05-15-0800 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.12-2026-05-15-1000 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -7,7 +7,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>Smart Finance R25.10</title>
+<title>Smart Finance R25.12</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
@@ -21769,7 +21769,7 @@ ${bodyHtml}
                 <td style="text-align:center;white-space:nowrap">
                   <button class="btn btn-outline btn-sm bn-view" data-uuid="${n.billing_uuid}" title="ดู">👁</button>
                   <button class="btn btn-outline btn-sm bn-print" data-uuid="${n.billing_uuid}" title="พิมพ์ / บันทึกเป็น PDF">📄 PDF</button>
-                  ${n.status !== 'cancelled' ? `<button class="btn btn-outline btn-sm bn-refresh" data-uuid="${n.billing_uuid}" data-cust="${n.cust_code||''}" data-y="${n.cycle_year||''}" data-m="${n.cycle_month||''}" title="🔄 Refresh ยอดจากบิลปัจจุบัน — กรณียอดบิลผิด/แก้บิลย้อนหลัง" style="color:var(--warn)">🔄</button>` : ''}
+                  ${n.status !== 'cancelled' ? `<button class="btn btn-outline btn-sm bn-refresh" data-uuid="${n.billing_uuid}" data-cust="${n.cust_code||''}" data-y="${n.cycle_year||''}" data-m="${n.cycle_month||''}" title="🔄 Refresh bills_snapshot + ยอดรวม (ไม่แตะยอดจ่าย — ใช้ 🔧 ตรวจยอดชำระ แทน)" style="color:var(--warn)">🔄</button>` : ''}
                   ${n.status !== 'paid' && n.status !== 'cancelled' ? `<button class="btn btn-primary btn-sm bn-pay" data-uuid="${n.billing_uuid}" title="รับชำระ">💵</button>` : ''}
                   ${n.paid_amount === 0 && n.status !== 'cancelled' ? `<button class="btn btn-outline btn-sm bn-edit" data-uuid="${n.billing_uuid}" title="แก้ไข">✏</button>` : ''}
                   ${n.status !== 'cancelled' ? `<button class="btn btn-outline btn-sm bn-cancel" data-uuid="${n.billing_uuid}" title="ยกเลิก" style="color:#ef4444">✖</button>` : ''}
@@ -21866,7 +21866,7 @@ ${bodyHtml}
       toast('SB นี้ไม่มี cust_code/year/month — ใช้ "Re-aggregate" ในหน้า Data แทน', 'warn');
       return;
     }
-    if (!confirm(`Refresh ยอด SB นี้?\n\n• ลูกค้า: ${custCode}\n• เดือน: ${month}/${year}\n\nระบบจะ recalculate ยอดจากบิลปัจจุบันใน Sheet bills_${year}\nเหมาะสำหรับกรณี:\n• แก้ยอดบิล\n• เพิ่มบิลย้อนหลัง\n• แก้ match_status`)) return;
+    if (!confirm(`🔄 Refresh bills_snapshot + ยอดรวม?\n\n• ลูกค้า: ${custCode}\n• เดือน: ${month}/${year}\n\nระบบจะ:\n• rebuild bills_snapshot (รวมบิลที่เพิ่ม/แก้ย้อนหลัง)\n• recalculate total_amount\n• ⚠️ ไม่แตะยอดจ่าย (paid_amount)\n\n📌 ถ้าต้องการแก้ paid_amount → ใช้ปุ่ม 🔧 ตรวจยอดชำระ ที่ header`)) return;
     
     try {
       const r = await api('aggregateSB', { year: Number(year), month: Number(month), cust_code: custCode });
@@ -23560,7 +23560,9 @@ function wireReceivePaymentModalV3(state) {
     const isCheque = inst.method === 'Cheque';
     const isTransfer = inst.method === 'Transfer';
     const isCash = inst.method === 'Cash';
-    const showBank = isCheque || isTransfer;
+    const isCard = inst.method === 'Card';
+    const isRefund = inst.method === 'Refund';
+    const showBank = isCheque || isTransfer || isCard || isRefund;  // ⭐ R25.11 — Card+Refund ก็ผ่าน bank
     const grpHasMultipleInsts = state.sp_groups[gIdx].installments.length > 1;
     
     return `
@@ -23573,13 +23575,15 @@ function wireReceivePaymentModalV3(state) {
                style="font-size:.82rem;text-align:right;padding:4px 6px;width:110px">
         
         <select class="select rp-inst-method" data-gidx="${gIdx}" data-iidx="${iIdx}" 
-                style="font-size:.8rem;padding:4px 6px;width:95px">
+                style="font-size:.8rem;padding:4px 6px;width:100px">
           <option value="Cash" ${isCash?'selected':''}>Cash</option>
           <option value="Transfer" ${isTransfer?'selected':''}>Transfer</option>
           <option value="Cheque" ${isCheque?'selected':''}>Cheque</option>
+          <option value="Card" ${inst.method==='Card'?'selected':''}>Card</option>
+          <option value="Refund" ${inst.method==='Refund'?'selected':''}>Refund</option>
         </select>
         
-        <label style="font-size:.78rem;color:var(--muted)">วันที่:</label>
+        <label style="font-size:.78rem;color:var(--muted)" title="วันที่ออก SP — สำหรับ Cash ใช้เป็นวันที่ได้รับเงินด้วย / Transfer-Cheque-Card รอ match กับ statement">วันที่ SP:</label>
         <input type="date" class="input rp-inst-date" data-gidx="${gIdx}" data-iidx="${iIdx}" 
                value="${inst.pay_date}" style="font-size:.8rem;padding:4px 6px;width:120px">
         
@@ -23664,12 +23668,15 @@ function wireReceivePaymentModalV3(state) {
       sel.onchange = () => {
         const g = state.sp_groups[Number(sel.dataset.gidx)];
         const i = g.installments[Number(sel.dataset.iidx)];
+        const oldMethod = i.method;
         i.method = sel.value;
         // Clear cheque-specific fields if switched away
         if (sel.value !== 'Cheque') {
           i.confirmation = '';
           i.due_date = '';
         }
+        // ⭐ R25.11 — clear bank when switched to Cash (Cash ไม่ผ่าน bank)
+        if (sel.value === 'Cash') i.bank = '';
         renderSpGroups();   // ⭐ full re-render — show/hide fields per method
         afterChange();
       };
@@ -23893,6 +23900,15 @@ function wireReceivePaymentModalV3(state) {
       closeModal();
       
       try { if (typeof _invalidateCachedNotes === 'function') _invalidateCachedNotes(); } catch(e){}
+      
+      // ⭐ R25.11 — pull bills + stmts จาก cloud เพื่อให้ SP-row ใหม่อยู่ใน local billList
+      //   (เพื่อให้ search SP-XXXXX ใหม่หาเจอใน Main page โดยไม่ต้อง F5)
+      try {
+        if (typeof syncManager !== 'undefined' && syncManager.pullFromCloud) {
+          await syncManager.pullFromCloud(2, 'force', { types: ['bills'] });
+        }
+      } catch(e) { console.warn('[R25.11] post-submit pull failed:', e); }
+      
       if (typeof window.renderMainKeepScroll === 'function') {
         try { window.renderMainKeepScroll(); } catch(e){}
       }
@@ -40236,10 +40252,10 @@ function _pvParseVatRow(r, vatType) {
 
 // ── Initialize after all declarations are ready ──
 (async function() {
-  // ⭐ R25.10 BOOT BEACON
-  console.log('%c[SF R25.10] Active build: 2026-05-15-0800 — FIFO + credit-note pre-absorb (same-date)', 'color:#0c8;font-weight:bold;font-size:13px');
-  console.log('%c[SF R25.10] JR/SC reduces OR same-day before FIFO walk · per-bill shows ลดหนี้ hint', 'color:#888');
-  window.__SF_BUILD = 'R25.10-2026-05-15-0800';
+  // ⭐ R25.12 BOOT BEACON
+  console.log('%c[SF R25.12] Active build: 2026-05-15-1000 — Fix aggregateSB destructive refresh', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.12] Preserve paid_amount on Refresh + fallback cust_code for JR/SC with empty remarks1', 'color:#888');
+  window.__SF_BUILD = 'R25.12-2026-05-15-1000';
   
   await restoreMainState();
   checkSavedLogin();
