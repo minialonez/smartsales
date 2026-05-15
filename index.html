@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.2-2026-05-15-0100 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.4-2026-05-15-0200 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -7,7 +7,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>Smart Finance R25.2</title>
+<title>Smart Finance R25.4</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
@@ -20314,6 +20314,7 @@ async function renderBilling(el) {
             ${monthOpts.map(o => `<option value="${o.value}" ${o.year===agYear && o.month===agMonth ? 'selected' : ''}>${o.label}</option>`).join('')}
           </select>
           <button class="btn btn-primary btn-sm" id="bn-auto-gen" title="รวบใบวางบิลของเดือนที่เลือก — 1 ใบ/ลูกค้า สำหรับลูกค้าทุกคน">⚡ รวบจาก Daily</button>
+          <button class="btn btn-outline btn-sm" id="bn-resync-paid" title="ตรวจ paid_amount ของทุก SB เทียบกับยอดจ่ายจริงใน billing_payments — แก้ SB ที่แสดงยอดผิด">🔧 ตรวจยอดชำระ</button>
           <button class="btn btn-outline btn-sm" id="bn-refresh" title="โหลดรายการใหม่จาก cloud">🔄 Refresh</button>
         </div>
       </div>
@@ -20422,6 +20423,122 @@ async function renderBilling(el) {
         }
       };
     }
+    
+    // ⭐ R25.4 15/5/26 — ตรวจ paid_amount เทียบ billing_payments → preview + confirm
+    const resyncBtn = document.getElementById('bn-resync-paid');
+    if (resyncBtn) {
+      resyncBtn.onclick = () => openResyncPaidModal();
+    }
+  
+  // ⭐ R25.4 — Resync paid_amount modal (dry-run preview → user confirm → commit)
+  async function openResyncPaidModal() {
+    openModal('🔧 ตรวจยอดชำระ — Sync paid_amount จาก billing_payments', `
+      <div style="display:flex;flex-direction:column;gap:14px">
+        <div style="padding:10px 14px;background:rgba(55,138,221,.08);border:1px solid var(--info);border-radius:6px;font-size:.85rem">
+          🔍 <b>ระบบจะตรวจ:</b><br>
+          • Sum ของ <code>billing_payments</code> สำหรับแต่ละ SB (ยอดจ่ายจริงสะสม)<br>
+          • เทียบกับ <code>paid_amount</code> ที่เก็บใน <code>billing_notes</code><br>
+          • ใบไหนไม่ตรง → แสดงให้ตรวจก่อน apply<br>
+          <span style="color:var(--muted)">* ไม่แตะ bills_2026 / billing_payments — แก้แค่ paid_amount + outstanding + status ใน billing_notes</span>
+        </div>
+        <div id="rs-result" style="min-height:200px;display:flex;align-items:center;justify-content:center;color:var(--muted)">
+          <span>⏳ กำลังตรวจ...</span>
+        </div>
+        <div style="display:flex;gap:10px;justify-content:flex-end;border-top:1px solid var(--border);padding-top:12px">
+          <button class="btn btn-ghost" id="rs-cancel">ปิด</button>
+          <button class="btn btn-primary" id="rs-apply" disabled>✓ ยืนยัน apply</button>
+        </div>
+      </div>
+    `);
+    const modalEl = document.getElementById('modal-card');
+    if (modalEl) { modalEl.style.width = 'min(1100px, 96vw)'; modalEl.style.maxHeight = '90vh'; modalEl.style.overflowY = 'auto'; }
+    
+    const $result = document.getElementById('rs-result');
+    const $apply = document.getElementById('rs-apply');
+    const $cancel = document.getElementById('rs-cancel');
+    $cancel.onclick = () => closeModal();
+    
+    let cachedChanges = [];
+    
+    try {
+      const r = await api('resyncSbPaidFromPayments', { dry_run: true });
+      if (!r?.success) {
+        $result.innerHTML = `<span style="color:var(--danger)">❌ ${r?.error || 'ตรวจล้มเหลว'}</span>`;
+        return;
+      }
+      const d = r.data || {};
+      cachedChanges = d.changes || [];
+      
+      if (cachedChanges.length === 0) {
+        $result.innerHTML = `<div style="color:var(--success);padding:20px;text-align:center">✅ ทุก SB (${d.scanned} ใบ) มี paid_amount ตรงกับ billing_payments อยู่แล้ว ไม่ต้องแก้</div>`;
+        return;
+      }
+      
+      $result.innerHTML = `
+        <div style="width:100%">
+          <div style="margin-bottom:10px;font-size:.9rem">
+            <b>เจอ SB ${cachedChanges.length} ใบ</b> ที่ paid_amount ไม่ตรง (สแกนทั้งหมด ${d.scanned} ใบ) — ตรวจก่อน apply:
+          </div>
+          <div style="max-height:50vh;overflow-y:auto;border:1px solid var(--border);border-radius:6px">
+            <table style="width:100%;border-collapse:collapse;font-size:.82rem">
+              <thead style="background:var(--bg-elev);position:sticky;top:0">
+                <tr>
+                  <th style="text-align:left;padding:6px 10px">เลขที่ SB</th>
+                  <th style="text-align:left;padding:6px 10px">ลูกค้า</th>
+                  <th style="text-align:right;padding:6px 10px">ยอดรวม</th>
+                  <th style="text-align:right;padding:6px 10px">paid (เดิม)</th>
+                  <th style="text-align:right;padding:6px 10px">paid (ใหม่)</th>
+                  <th style="text-align:right;padding:6px 10px">Diff</th>
+                  <th style="text-align:center;padding:6px 10px">สถานะ</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${cachedChanges.map(c => {
+                  const diffColor = c.diff > 0 ? 'var(--success)' : 'var(--danger)';
+                  const statusChanged = c.status_before !== c.status_after;
+                  return `
+                    <tr style="border-top:1px solid var(--border)">
+                      <td style="padding:6px 10px;font-family:monospace">${escapeHtml(c.billing_no)}</td>
+                      <td style="padding:6px 10px">${escapeHtml(c.cust_code)} ${escapeHtml(c.cust_name)}</td>
+                      <td style="text-align:right;padding:6px 10px">฿${fmtNum(c.total_amount)}</td>
+                      <td style="text-align:right;padding:6px 10px;color:var(--muted)">฿${fmtNum(c.paid_before)}</td>
+                      <td style="text-align:right;padding:6px 10px;font-weight:600">฿${fmtNum(c.paid_after)}</td>
+                      <td style="text-align:right;padding:6px 10px;color:${diffColor};font-weight:600">${c.diff>0?'+':''}${fmtNum(c.diff)}</td>
+                      <td style="text-align:center;padding:6px 10px;font-size:.75rem">
+                        ${statusChanged 
+                          ? `<span style="color:var(--muted)">${escapeHtml(c.status_before)}</span> → <b style="color:var(--success)">${escapeHtml(c.status_after)}</b>`
+                          : escapeHtml(c.status_after)}
+                      </td>
+                    </tr>
+                  `;
+                }).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      `;
+      $apply.disabled = false;
+      $apply.onclick = async () => {
+        if (!confirm(`ยืนยัน apply การแก้ paid_amount ${cachedChanges.length} ใบ?\n\nระบบจะ update billing_notes — ไม่แตะ bills_2026 หรือ billing_payments`)) return;
+        $apply.disabled = true;
+        $apply.textContent = '⏳ กำลัง apply...';
+        try {
+          const r2 = await api('resyncSbPaidFromPayments', { dry_run: false });
+          if (!r2?.success) throw new Error(r2?.error || 'apply ล้มเหลว');
+          toast(`✅ แก้สำเร็จ ${r2.data.applied} ใบ`, 'success', 5000);
+          closeModal();
+          try { if (typeof _invalidateCachedNotes === 'function') _invalidateCachedNotes(); } catch(e){}
+          await refresh();
+        } catch (e) {
+          toast(`❌ ${e.message||e}`, 'error', 5000);
+          $apply.disabled = false;
+          $apply.textContent = '✓ ยืนยัน apply';
+        }
+      };
+    } catch (e) {
+      $result.innerHTML = `<span style="color:var(--danger)">❌ ${e.message||e}</span>`;
+    }
+  }
     
     // ⭐ Credit warn stat card → toggle filter
     const $statCredit = document.getElementById('stat-credit-warn');
@@ -22907,6 +23024,18 @@ ${n.remarks?`<div style="margin-top:12px;padding:8px;border-left:3px solid #888;
 // Phase 3 (5/5/26) — รับชำระลูกค้า + ตัดจ่าย SB (Modal)
 // ⭐ R25 15/5/26 — v3 redesigned: SP groups + bill-level allocation + match flow
 // ═══════════════════════════════════════════════════════════════════
+
+// ⭐ R24.7/R25.3 — Top-level helper (was lost in R25 rewrite, re-added R25.3)
+//   Called by Receive Payment v3 modal — if missing, ReferenceError silently breaks customer search
+function escapeHtml(s) {
+  if (s == null) return '';
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 
 async function openReceivePaymentModal() {
   // ⭐ R25 v3 state: SP groups
@@ -39898,10 +40027,10 @@ function _pvParseVatRow(r, vatType) {
 
 // ── Initialize after all declarations are ready ──
 (async function() {
-  // ⭐ R25.2 BOOT BEACON
-  console.log('%c[SF R25.2] Active build: 2026-05-15-0100 — CIC R25 critical fixes', 'color:#0c8;font-weight:bold;font-size:13px');
-  console.log('%c[SF R25.2] pipelineError short-circuit + schema fields (match_ref/paid_at) + status (paid/pending) + orphan detect + dead code removed', 'color:#888');
-  window.__SF_BUILD = 'R25.2-2026-05-15-0100';
+  // ⭐ R25.4 BOOT BEACON
+  console.log('%c[SF R25.4] Active build: 2026-05-15-0200 — Resync paid_amount from billing_payments', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.4] Dry-run preview modal + safe apply (only edits billing_notes header)', 'color:#888');
+  window.__SF_BUILD = 'R25.4-2026-05-15-0200';
   
   await restoreMainState();
   checkSavedLogin();
