@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.15-2026-05-15-1300 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.16-2026-05-15-1400 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -7,7 +7,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>Smart Finance R25.15</title>
+<title>Smart Finance R25.16</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
@@ -3039,7 +3039,9 @@ const syncManager = {
           for (let i = 0; i < billList.length; i++) {
             const b = billList[i];
             // ลำดับสำคัญ — ถ้าเพิ่ม field ใหม่ต้องเพิ่มที่นี่ด้วย
+            // ⭐ R25.16 — เพิ่ม bank, match_ref, paid_at, wht_amount, transfer_fee, card_fee, date
             fpParts[i] = (b.bill_uuid || b.bill_no || i) + '|' +
+                        (b.date || '') + '|' +
                         (b.amount || 0) + '|' +
                         (b.type || '') + '|' +
                         (b.station || '') + '|' +
@@ -3048,10 +3050,16 @@ const syncManager = {
                         (b.pay_date || '') + '|' +
                         (b.remarks1 || '') + '|' +
                         (b.remarks2 || '') + '|' +
+                        (b.bank || '') + '|' +
                         (b.matched_stmt_ref || '') + '|' +
                         (b.matched_stmt_uuid || '') + '|' +  // ⭐ FK link to stmt
+                        (b.match_ref || '') + '|' +           // ⭐ R25 schema
+                        (b.paid_at || '') + '|' +              // ⭐ R25 schema
                         (b.paid_by_sp || '') + '|' +
-                        (b.due_date || '');
+                        (b.due_date || '') + '|' +
+                        (b.wht_amount || 0) + '|' +
+                        (b.transfer_fee || 0) + '|' +
+                        (b.card_fee || 0);
           }
           const fp = this._fp(billList.length + ':' + fpParts.join(';'));
           if (fp === this._fpCache.bills) { results.skipped++; this.dirty.delete('bills'); continue; }
@@ -9651,6 +9659,17 @@ async function renderMain(el) {
           // (user confirmed: กรอก pay_date = ถือว่าจ่ายแล้ว)
           if (b.pay_date && b.match_status !== 'paid' && b.match_status !== 'void' && b.match_status !== 'bounced') {
             b.match_status = 'paid';
+          }
+          // ⭐ R25.16 — ลบ pay_date → revert status เป็น pending (ยกเว้น void/bounced/Cash)
+          //   เดิม: ลบ pay_date แต่ status คง 'paid' → state ขัดกัน → user งง / fp อาจไม่เปลี่ยน
+          //   ใหม่: pay_date='' + status='paid' (และไม่ใช่ Cash auto + ไม่ใช่ void/bounced) → revert pending
+          if (!b.pay_date && b.match_status === 'paid' && b.type !== 'Cash') {
+            b.match_status = 'pending';
+            // เคลียร์ match_ref ด้วย (กัน stmt link ค้าง)
+            if (b.match_ref) b.match_ref = '';
+            if (b.matched_stmt_ref) b.matched_stmt_ref = '';
+            if (b.matched_stmt_uuid) b.matched_stmt_uuid = '';
+            if (b.paid_at) b.paid_at = '';
           }
           
           persistMainState();
@@ -40257,10 +40276,10 @@ function _pvParseVatRow(r, vatType) {
 
 // ── Initialize after all declarations are ready ──
 (async function() {
-  // ⭐ R25.15 BOOT BEACON
-  console.log('%c[SF R25.15] Active build: 2026-05-15-1300 — Cheque field mapping fix', 'color:#0c8;font-weight:bold;font-size:13px');
-  console.log('%c[SF R25.15] reference→remarks2 fallback · wht_enabled=Y/empty · init confirmation in state · UI hint for pay_date', 'color:#888');
-  window.__SF_BUILD = 'R25.15-2026-05-15-1300';
+  // ⭐ R25.16 BOOT BEACON
+  console.log('%c[SF R25.16] Active build: 2026-05-15-1400 — Clear pay_date → revert status + expand fp coverage', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.16] +bank +match_ref +paid_at +date +wht/fees in fingerprint · auto-revert paid→pending on pay_date clear', 'color:#888');
+  window.__SF_BUILD = 'R25.16-2026-05-15-1400';
   
   await restoreMainState();
   checkSavedLogin();
