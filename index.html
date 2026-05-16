@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.19-2026-05-15-1700 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.20-2026-05-15-1800 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -7,7 +7,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>Smart Finance R25.19</title>
+<title>Smart Finance R25.20</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
@@ -40279,10 +40279,10 @@ function _pvParseVatRow(r, vatType) {
 
 // ── Initialize after all declarations are ready ──
 (async function() {
-  // ⭐ R25.19 BOOT BEACON
-  console.log('%c[SF R25.19] Active build: 2026-05-15-1700 — Auto-flip billing_payments after stmt match + Resync skip pending_match', 'color:#0c8;font-weight:bold;font-size:13px');
-  console.log('%c[SF R25.19] Hook in _upsertGeneric(bills): scan SP-rows with match_status=paid+match_ref → flip pending_match→matched', 'color:#888');
-  window.__SF_BUILD = 'R25.19-2026-05-15-1700';
+  // ⭐ R25.20 BOOT BEACON
+  console.log('%c[SF R25.20] Active build: 2026-05-15-1800 — sp_row_uuid linkage fix (data + backfill)', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.20] recordBatchPayment: fill sp_row_uuid by (gIdx,method) · backfillSpRowUuid endpoint for 665 legacy rows', 'color:#888');
+  window.__SF_BUILD = 'R25.20-2026-05-15-1800';
   
   await restoreMainState();
   checkSavedLogin();
