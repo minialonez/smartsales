@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.31-2026-05-17-1100 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.33-2026-05-17-1300 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -7,7 +7,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>Smart Finance R25.31</title>
+<title>Smart Finance R25.33</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
@@ -16616,44 +16616,123 @@ async function loadAllFromCloud(opts) {
     const beforeBillsCount = Array.isArray(billList) ? billList.length : 0;
     
     // ══════════════════════════════════════════════════════════════
-    // ⭐ MEGA-PARALLEL FETCH (4/5/26)
+    // ⭐ R25.33 — BOOTSTRAP FAST PATH (Strategy C)
     // ══════════════════════════════════════════════════════════════
-    // เดิม: sequential year + per-bank loop = ~94s
-    // ใหม่: ทุกอย่าง parallel = ~10s
+    // Single batched fetch instead of 12+ parallel requests.
+    // - Eliminates HTTPS overhead for 11 requests
+    // - Apps Script cold-boot ครั้งเดียว
+    // - Server-side cache 30s
     //
-    // - Group 1 (collections): 5 requests
-    // - Per year × N years × (1 bills + 1 meta + 5 banks) = 7 requests/year
-    // - Default 1 year → 12 requests รวม → run พร้อมกัน
+    // Feature flag: window.__SF_USE_BOOTSTRAP (default true)
+    //   set false in console + reload to disable + use legacy parallel path
+    //
+    // Strategy:
+    //   1. Try bootstrap first
+    //   2. If success → build results[] in SAME ORDER as legacy parallel
+    //      → downstream parsing code doesn't need to change
+    //   3. If bootstrap fails → fall through to legacy parallel path
     // ══════════════════════════════════════════════════════════════
     
     const BANKS = ['KTB', 'KBANK', 'BBL_NW', 'BBL', 'TTB'];
-    const fetchPromises = [];
     const fetchLabels = [];
-    
-    // Group 1: independent collections
-    fetchPromises.push(api('getPayments').catch(e => ({ _err: e.message })));        fetchLabels.push('SP');
-    fetchPromises.push(api('getSpTemps').catch(e => ({ _err: e.message })));         fetchLabels.push('SP-TEMP');
-    fetchPromises.push(api('getCashflow').catch(e => ({ _err: e.message })));        fetchLabels.push('Cashflow');
-    fetchPromises.push(api('getSuppliers').catch(e => ({ _err: e.message })));       fetchLabels.push('Suppliers');
-    fetchPromises.push(api('getSupplierPayments').catch(e => ({ _err: e.message }))); fetchLabels.push('Supplier Payments');
-    // ⭐ R25.22 — Transfer Log fetches removed (replaced by PV V3 — payment_vouchers)
-    
-    // Per year: bills + meta + 5 banks
+    let results = null;
     const yearPromiseStart = {};
-    years.forEach(y => {
-      yearPromiseStart[y] = fetchPromises.length;
-      fetchPromises.push(api('getBillsWithUuid', { year: y }).catch(e => ({ _err: e.message })));  fetchLabels.push(`Bills ${y}`);
-      fetchPromises.push(api('getMetaWithUuid', { year: y }).catch(e => ({ _err: e.message })));   fetchLabels.push(`Meta ${y}`);
-      BANKS.forEach(bank => {
-        fetchPromises.push(api('v2_getStatementsByBank', { bank, year: y }).catch(e => ({ _err: e.message })));
-        fetchLabels.push(`Stmts ${y} ${bank}`);
-      });
-    });
     
-    console.log(`[loadAllFromCloud] firing ${fetchPromises.length} parallel requests...`);
-    const tFetch = Date.now();
-    const results = await Promise.all(fetchPromises);
-    console.log(`[loadAllFromCloud] all responses received in ${Math.round((Date.now() - tFetch)/1000)}s`);
+    const useBootstrap = (window.__SF_USE_BOOTSTRAP !== false);
+    
+    if (useBootstrap) {
+      try {
+        console.log(`[loadAllFromCloud] using bootstrap fast-path (years=${years.join(',')})`);
+        const tBoot = Date.now();
+        const bootResp = await api('bootstrap', { years: years, tier: 'all' });
+        const bootDur = Math.round((Date.now() - tBoot) / 1000);
+        
+        if (bootResp?.success && bootResp.data && typeof bootResp.data === 'object') {
+          const d = bootResp.data;
+          const meta = d._meta || {};
+          console.log(`[loadAllFromCloud] bootstrap OK ${bootDur}s (cached=${meta.cached}, errors=${(meta.errors||[]).length})`);
+          if (meta.errors && meta.errors.length) {
+            console.warn(`[loadAllFromCloud] bootstrap section errors:`, meta.errors);
+          }
+          
+          // Build results[] in same order as legacy fetchPromises:
+          //   [0] SP, [1] SP-TEMP, [2] Cashflow, [3] Suppliers, [4] Supplier Payments
+          //   then per year: [Bills, Meta, Stmts KTB, KBANK, BBL_NW, BBL, TTB]
+          // Each entry mimics api() response shape: { success: true, data: <payload> }
+          //   so downstream parsing reads r.data.data / r.data — same as before.
+          //
+          // Note: bootstrap unwraps sub-endpoints' envelopes via _section() — 
+          //   so d.sp is ALREADY the inner data (not wrapped). We re-wrap for compat.
+          const _wrap = (data) => (data === null || data === undefined) ? { _err: 'bootstrap section missing' } : { success: true, data: data };
+          
+          results = [];
+          results.push(_wrap(d.sp));                fetchLabels.push('SP');
+          results.push(_wrap(d.sp_temps));          fetchLabels.push('SP-TEMP');
+          results.push(_wrap(d.cashflow));          fetchLabels.push('Cashflow');
+          results.push(_wrap(d.suppliers));         fetchLabels.push('Suppliers');
+          results.push(_wrap(d.supplier_payments)); fetchLabels.push('Supplier Payments');
+          
+          years.forEach(y => {
+            yearPromiseStart[y] = results.length;
+            results.push(_wrap(d.bills?.[y]));      fetchLabels.push(`Bills ${y}`);
+            results.push(_wrap(d.meta?.[y]));       fetchLabels.push(`Meta ${y}`);
+            BANKS.forEach(bank => {
+              results.push(_wrap(d.stmts?.[y]?.[bank]));
+              fetchLabels.push(`Stmts ${y} ${bank}`);
+            });
+          });
+          
+          // ⭐ R25.33 — Stash PV + billing_payments + billing_notes for downstream consumers
+          //   (these are NEW in bootstrap — not in legacy parallel results[])
+          //   Frontend code that uses these picks them up via window.__SF_BOOT
+          window.__SF_BOOT = {
+            pv: d.pv,
+            billing_payments: d.billing_payments,
+            billing_notes: d.billing_notes,
+            generated_at: meta.generated_at,
+          };
+        } else {
+          console.warn(`[loadAllFromCloud] bootstrap returned non-success — fallback to parallel`, bootResp);
+        }
+      } catch (e) {
+        console.warn(`[loadAllFromCloud] bootstrap exception — fallback to parallel:`, e.message);
+      }
+    }
+    
+    // ── Fallback: legacy parallel path (if bootstrap disabled or failed) ──
+    if (!results) {
+      // ══════════════════════════════════════════════════════════════
+      // ⭐ MEGA-PARALLEL FETCH (4/5/26 legacy)
+      // - Group 1 (collections): 5 requests
+      // - Per year × N years × (1 bills + 1 meta + 5 banks) = 7 requests/year
+      // - Default 1 year → 12 requests รวม → run พร้อมกัน
+      // ══════════════════════════════════════════════════════════════
+      console.log(`[loadAllFromCloud] using legacy parallel path`);
+      const fetchPromises = [];
+      
+      // Group 1: independent collections
+      fetchPromises.push(api('getPayments').catch(e => ({ _err: e.message })));        fetchLabels.push('SP');
+      fetchPromises.push(api('getSpTemps').catch(e => ({ _err: e.message })));         fetchLabels.push('SP-TEMP');
+      fetchPromises.push(api('getCashflow').catch(e => ({ _err: e.message })));        fetchLabels.push('Cashflow');
+      fetchPromises.push(api('getSuppliers').catch(e => ({ _err: e.message })));       fetchLabels.push('Suppliers');
+      fetchPromises.push(api('getSupplierPayments').catch(e => ({ _err: e.message }))); fetchLabels.push('Supplier Payments');
+      
+      // Per year: bills + meta + 5 banks
+      years.forEach(y => {
+        yearPromiseStart[y] = fetchPromises.length;
+        fetchPromises.push(api('getBillsWithUuid', { year: y }).catch(e => ({ _err: e.message })));  fetchLabels.push(`Bills ${y}`);
+        fetchPromises.push(api('getMetaWithUuid', { year: y }).catch(e => ({ _err: e.message })));   fetchLabels.push(`Meta ${y}`);
+        BANKS.forEach(bank => {
+          fetchPromises.push(api('v2_getStatementsByBank', { bank, year: y }).catch(e => ({ _err: e.message })));
+          fetchLabels.push(`Stmts ${y} ${bank}`);
+        });
+      });
+      
+      console.log(`[loadAllFromCloud] firing ${fetchPromises.length} parallel requests...`);
+      const tFetch = Date.now();
+      results = await Promise.all(fetchPromises);
+      console.log(`[loadAllFromCloud] all responses received in ${Math.round((Date.now() - tFetch)/1000)}s`);
+    }
     
     // ── Process Group 1 ──
     // SP (idx 0)
@@ -18110,9 +18189,18 @@ async function renderBilling(el) {
   }
   
   async function loadNotes() {
-    // ⭐ R23: omit bills_snapshot — saves 50-70% bandwidth
-    const r = await api('getBillingNotes', {});
-    billingNotes = (r && r.success && Array.isArray(r.data)) ? r.data : [];
+    // ⭐ R25.33 — Use preloaded from bootstrap if available
+    let raw;
+    if (window.__SF_BOOT && Array.isArray(window.__SF_BOOT.billing_notes)) {
+      raw = window.__SF_BOOT.billing_notes;
+      // Don't clear bootstrap data — used by other consumers too
+    } else {
+      // Fallback: direct API call
+      // R23: omit bills_snapshot — saves 50-70% bandwidth
+      const r = await api('getBillingNotes', {});
+      raw = (r && r.success && Array.isArray(r.data)) ? r.data : [];
+    }
+    billingNotes = raw;
     // ⭐ Normalize backend status → frontend canonical status (5/6/26)
     //   Backend uses: open / partial / complete
     //   Frontend STATUS_INFO uses: pending / partial / paid / cancelled
@@ -18127,6 +18215,11 @@ async function renderBilling(el) {
     _saveCachedNotes(billingNotes);
   }
   async function loadPayments() {
+    // ⭐ R25.33 — Use preloaded from bootstrap if available
+    if (window.__SF_BOOT && Array.isArray(window.__SF_BOOT.billing_payments)) {
+      billingPayments = window.__SF_BOOT.billing_payments;
+      return;
+    }
     const r = await api('getBillingPayments', {});
     billingPayments = (r && r.success && Array.isArray(r.data)) ? r.data : [];
   }
@@ -37192,9 +37285,17 @@ const _pvState = {
 };
 
 async function renderPaymentVoucher(el) {
+  // ⭐ R25.33 — Use preloaded PV from bootstrap if available (instant render)
+  //   Falls back to direct API call if bootstrap didn't run or data missing
+  if (window.__SF_BOOT && Array.isArray(window.__SF_BOOT.pv)) {
+    _pvState.list = window.__SF_BOOT.pv;
+    _pvRender(el);
+    return;
+  }
+  
   el.innerHTML = `<div class="card"><p class="text-dim">กำลังโหลด...</p></div>`;
   
-  // Load PV list
+  // Load PV list (fallback path)
   _pvState.loading = true;
   try {
     const res = await api('pv_getList', { year: new Date().getFullYear() });
@@ -37295,11 +37396,11 @@ function _pvRender(el) {
       <button id="pv-tab-novat" style="background:${st.vat==='NOVAT'?'var(--primary)':'transparent'};color:${st.vat==='NOVAT'?'#fff':'var(--text2)'};border:none;padding:8px 24px;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer">📋 NOVAT (${counts.novat})</button>
     </div>
     
-    <!-- TIER 2: รอโอน / จ่ายแล้ว / ทั้งหมด -->
+    <!-- TIER 2: ทั้งหมด / รอโอน / จ่ายแล้ว (R25.32 — ทั้งหมดซ้ายสุด) -->
     <div style="display:flex;gap:0;border-bottom:1px solid var(--border);margin-bottom:14px;align-items:center">
+      <div id="pv-sub-all" style="padding:8px 18px;border-bottom:2px solid ${st.sub==='all'?'var(--primary)':'transparent'};color:${st.sub==='all'?'var(--primary)':'var(--text2)'};font-size:12px;font-weight:${st.sub==='all'?'600':'400'};cursor:pointer">📜 ทั้งหมด (${st.vat==='VAT'?counts.vat:counts.novat})</div>
       <div id="pv-sub-pending" style="padding:8px 18px;border-bottom:2px solid ${st.sub==='pending'?'var(--warn)':'transparent'};color:${st.sub==='pending'?'var(--warn)':'var(--text2)'};font-size:12px;font-weight:${st.sub==='pending'?'600':'400'};cursor:pointer">⏳ รอโอน (${st.vat==='VAT'?counts.vatPending:counts.novatPending})</div>
       <div id="pv-sub-paid" style="padding:8px 18px;border-bottom:2px solid ${st.sub==='paid'?'var(--success)':'transparent'};color:${st.sub==='paid'?'var(--success)':'var(--text2)'};font-size:12px;font-weight:${st.sub==='paid'?'600':'400'};cursor:pointer">✓ จ่ายแล้ว (${st.vat==='VAT'?counts.vatPaid:counts.novatPaid})</div>
-      <div id="pv-sub-all" style="padding:8px 18px;border-bottom:2px solid ${st.sub==='all'?'var(--primary)':'transparent'};color:${st.sub==='all'?'var(--primary)':'var(--text2)'};font-size:12px;font-weight:${st.sub==='all'?'600':'400'};cursor:pointer">📜 ทั้งหมด (${st.vat==='VAT'?counts.vat:counts.novat})</div>
       <div style="margin-left:auto;font-size:11px;color:var(--text2)">
         <span style="color:var(--warn)">฿${fmtNum(pendingSum)}</span> รอโอน
         <span style="color:var(--border);margin:0 6px">·</span>
@@ -37911,27 +38012,75 @@ function _pvOpenMatchModal(pv, rootEl) {
   `);
   
   setTimeout(() => {
-    document.querySelectorAll('.pv-match-opt').forEach(opt => {
-      opt.addEventListener('click', async () => {
+    document.querySelectorAll('.pv-match-opt').forEach((opt, idx) => {
+      opt.addEventListener('click', () => {
         const stmtUuid = opt.dataset.uuid;
         if (!stmtUuid) return;
         if (!confirm(`ยืนยัน match ${pv.pv_number} กับ stmt นี้?`)) return;
-        opt.style.opacity = '0.5';
-        opt.style.pointerEvents = 'none';
-        const r = await api('pv_setMatch', { pv_uuid: pv.pv_uuid, stmt_uuid: stmtUuid });
-        if (r?.success) {
-          toast(`✅ Match แล้ว: ${pv.pv_number} ↔ ${r.data?.stmt_bank||''}`, 'success', 3000);
-          // Update local state
-          pv.match_status = 'matched';
-          pv.matched_stmt_uuid = stmtUuid;
-          pv.matched_at = r.data?.matched_at || new Date().toISOString();
-          closeModal();
+        
+        // ⭐ R25.32 — Optimistic UI: update local + close modal FIRST, fire API async
+        //   Pull stmt info from candidates[] (we still have access via idx)
+        const cand = candidates[idx];
+        const stmtObj = cand?.stmt || {};
+        const stmtBank = stmtObj.bank || '';
+        const stmtYear = String(toISODate(stmtObj.date)||'').substring(0, 4);
+        const optimisticNow = new Date().toISOString();
+        
+        // Save previous state for rollback
+        const prevStatus = pv.match_status;
+        const prevStmtUuid = pv.matched_stmt_uuid;
+        const prevMatchedAt = pv.matched_at;
+        
+        // Apply optimistic
+        pv.match_status = 'matched';
+        pv.matched_stmt_uuid = stmtUuid;
+        pv.matched_at = optimisticNow;
+        // Also update stmt local state for getAllStatements consistency
+        try {
+          if (stmtObj && stmtObj.stmt_uuid) {
+            stmtObj.match_status = 'paid';
+            stmtObj.match_bill = pv.pv_number || '';
+            stmtObj.matched_at = optimisticNow;
+          }
+        } catch(_) {}
+        
+        closeModal();
+        _pvRender(rootEl);
+        toast(`⏳ Match ${pv.pv_number} → ${stmtBank}...`, 'info', 1500);
+        
+        // Fire async — pass bank+year for backend fast path
+        api('pv_setMatch', { 
+          pv_uuid: pv.pv_uuid, 
+          stmt_uuid: stmtUuid,
+          stmt_bank: stmtBank,
+          stmt_year: stmtYear,
+        }).then(r => {
+          if (r?.success) {
+            toast(`✅ ${pv.pv_number} ↔ ${r.data?.stmt_bank || stmtBank}`, 'success', 2000);
+            // Sync server's matched_at if different
+            if (r.data?.matched_at) pv.matched_at = r.data.matched_at;
+          } else {
+            // Rollback
+            pv.match_status = prevStatus;
+            pv.matched_stmt_uuid = prevStmtUuid;
+            pv.matched_at = prevMatchedAt;
+            try {
+              if (stmtObj && stmtObj.stmt_uuid) {
+                stmtObj.match_status = '';
+                stmtObj.match_bill = '';
+                stmtObj.matched_at = '';
+              }
+            } catch(_) {}
+            _pvRender(rootEl);
+            toast(`❌ Match ล้มเหลว: ${r?.error || 'unknown'}`, 'error', 5000);
+          }
+        }).catch(e => {
+          pv.match_status = prevStatus;
+          pv.matched_stmt_uuid = prevStmtUuid;
+          pv.matched_at = prevMatchedAt;
           _pvRender(rootEl);
-        } else {
-          toast(`❌ ${r?.error || 'fail'}`, 'error', 4000);
-          opt.style.opacity = '1';
-          opt.style.pointerEvents = 'auto';
-        }
+          toast(`❌ Network error: ${e.message}`, 'error', 5000);
+        });
       });
     });
   }, 50);
@@ -38480,10 +38629,10 @@ function _pvMakeReversal(orig) {
 
 // ── Initialize after all declarations are ready ──
 (async function() {
-  // ⭐ R25.31 BOOT BEACON
-  console.log('%c[SF R25.31] Active build: 2026-05-17-1100 — reversal PV = รอรับคืน (pending) not paid', 'color:#0c8;font-weight:bold;font-size:13px');
-  console.log('%c[SF R25.31] migrated_reversal removed from _pvIsPaid · canMatch allow reversal · badge consistent with tab', 'color:#888');
-  window.__SF_BUILD = 'R25.31-2026-05-17-1100';
+  // ⭐ R25.33 BOOT BEACON
+  console.log('%c[SF R25.33] Active build: 2026-05-17-1300 — Bootstrap endpoint (Strategy C) — 12 requests → 1', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.33] CacheService 30s · Tiered (1/2/all) · PV+billing_payments+billing_notes preload · feature flag __SF_USE_BOOTSTRAP', 'color:#888');
+  window.__SF_BUILD = 'R25.33-2026-05-17-1300';
   
   await restoreMainState();
   checkSavedLogin();
