@@ -37989,17 +37989,50 @@ function _pvOpenMigrateModal(rootEl) {
           }
         }
         
+        // ⭐ R25.23 — Parse supplier master from DropdownVat + DropdownNoVat
+        //   Cols (both sheets): 2=seq, 3=nickname, 4=name, 5=bank, 6=account, 7=note
+        //   Header at row 2 (Thai labels), data starts row 3
+        const dropdownVatSheet = sheets['DropdownVat'] || [];
+        const dropdownNovatSheet = sheets['DropdownNoVat'] || sheets['DropdownNovat'] || [];
+        const parsedSuppliers = [];
+        function _parseSupplierRow(r, vat) {
+          if (!r || !r[2] || !r[3]) return null;  // skip if no nickname/name
+          const nickname = String(r[2]||'').trim();
+          const name = String(r[3]||'').trim();
+          if (!nickname || !name || nickname === 'ชื่อเรียก') return null;  // skip header echoes
+          return {
+            supplier_code: nickname,                // nickname → code
+            supplier_name: name,
+            bank: String(r[4]||'').trim(),
+            bank_account: String(r[5]||'').trim(),
+            account_name: name,                     // ชื่อบัญชี = ชื่อเต็ม (NoVat sheet) / fallback
+            notes: String(r[6]||'').trim(),
+            vat: vat,
+          };
+        }
+        for (let i = 2; i < dropdownVatSheet.length; i++) {
+          const sup = _parseSupplierRow(dropdownVatSheet[i], 'VAT');
+          if (sup) parsedSuppliers.push(sup);
+        }
+        for (let i = 2; i < dropdownNovatSheet.length; i++) {
+          const sup = _parseSupplierRow(dropdownNovatSheet[i], 'NOVAT');
+          if (sup) parsedSuppliers.push(sup);
+        }
+        
         parsedRows = rows;
+        window.__pvMigSuppliers = parsedSuppliers;  // stash for apply
         const vatN = rows.filter(r => r.vat_type === 'VAT').length;
         const novatN = rows.filter(r => r.vat_type === 'NOVAT').length;
         const totalBilled = rows.reduce((s, r) => s + r.amount_billed, 0);
         const totalNet = rows.reduce((s, r) => s + r.net_amount, 0);
         
-        preview.innerHTML = `<div><strong>📊 พบ ${rows.length} rows:</strong></div>
+        preview.innerHTML = `<div><strong>📊 พบ ${rows.length} payment rows:</strong></div>
           <div style="margin-top:4px">• VAT: ${vatN} rows</div>
           <div>• NOVAT: ${novatN} rows</div>
           <div style="margin-top:4px">• ยอดแจ้งรวม: ฿${fmtNum(totalBilled)}</div>
           <div>• ยอดจ่ายสุทธิรวม: ฿${fmtNum(totalNet)}</div>
+          <div style="margin-top:8px"><strong>🏦 พบ ${parsedSuppliers.length} suppliers จาก master:</strong></div>
+          <div style="margin-top:2px;color:var(--text2)">• VAT: ${parsedSuppliers.filter(s=>s.vat==='VAT').length} · NOVAT: ${parsedSuppliers.filter(s=>s.vat==='NOVAT').length}</div>
           <div style="margin-top:6px;color:var(--warn)">⚠️ กด "Migrate" เพื่อเริ่มอัปโหลด (อาจใช้เวลา 30-60s)</div>`;
         document.getElementById('pv-mig-go').disabled = false;
       } catch (err) {
@@ -38013,15 +38046,43 @@ function _pvOpenMigrateModal(rootEl) {
       btn.disabled = true;
       btn.textContent = '⏳ กำลัง migrate...';
       try {
+        // ⭐ R25.23 — Step 1: merge suppliers (only add new — don't overwrite existing)
+        const newSuppliers = window.__pvMigSuppliers || [];
+        let supAdded = 0, supSkipped = 0;
+        if (newSuppliers.length > 0) {
+          btn.textContent = '⏳ migrate suppliers...';
+          // Get current suppliers
+          const curR = await api('getSuppliers', {});
+          const existing = (curR?.data || curR || []);
+          // Build dedupe key: supplier_code (nickname) lowercase
+          const existingCodes = new Set(existing.map(s => String(s.supplier_code||'').trim().toLowerCase()).filter(Boolean));
+          const merged = existing.slice();
+          newSuppliers.forEach(ns => {
+            const code = String(ns.supplier_code||'').trim().toLowerCase();
+            if (existingCodes.has(code)) { supSkipped++; return; }
+            merged.push(ns);
+            existingCodes.add(code);
+            supAdded++;
+          });
+          if (supAdded > 0) {
+            const sR = await api('saveSuppliers', { records: merged });
+            if (!sR?.success) {
+              toast(`⚠️ Save suppliers fail: ${sR?.error||'unknown'} — ข้ามไป migrate PV`, 'error', 4000);
+            }
+          }
+        }
+        
+        // Step 2: PV migrate
+        btn.textContent = '⏳ migrate PVs...';
         const r = await api('pv_migrateFromXlsx', { rows: parsedRows });
         if (r?.success) {
-          toast(`✅ Migrated ${r.migrated} vouchers + ${r.bills_created} bills`, 'success', 4000);
+          toast(`✅ Suppliers +${supAdded} (skip ${supSkipped}) · PV ${r.migrated} + bills ${r.bills_created}`, 'success', 6000);
           closeModal();
           const res = await api('pv_getList', { year: new Date().getFullYear() });
           if (res?.success) _pvState.list = res.data || [];
           _pvRender(rootEl);
         } else {
-          toast(`❌ ${r?.error || 'fail'}`, 'error', 5000);
+          toast(`❌ PV migrate fail: ${r?.error || 'fail'}`, 'error', 5000);
           btn.disabled = false;
           btn.textContent = '📥 Migrate ทั้งหมด';
         }
@@ -38142,8 +38203,8 @@ function _pvMakeReversal(orig) {
 // ── Initialize after all declarations are ready ──
 (async function() {
   // ⭐ R25.23 BOOT BEACON
-  console.log('%c[SF R25.23] Active build: 2026-05-16-1100 — Remove pay_date copy-down button (data corruption risk)', 'color:#0c8;font-weight:bold;font-size:13px');
-  console.log('%c[SF R25.23] Removed ONLY pay_date copy-down (kept date/bank/due_date copy-down buttons) · handler unchanged', 'color:#888');
+  console.log('%c[SF R25.23] Active build: 2026-05-16-1100 — Remove pay_date copy-down + Migrate suppliers from xlsx', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.23] Removed ONLY pay_date copy-down (kept date/bank/due_date) · PV migrate now extracts DropdownVat+NoVat suppliers', 'color:#888');
   window.__SF_BUILD = 'R25.23-2026-05-16-1100';
   
   await restoreMainState();
