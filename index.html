@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.26-2026-05-16-1400 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.27-2026-05-16-1500 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -7,7 +7,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>Smart Finance R25.26</title>
+<title>Smart Finance R25.27</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
@@ -37983,12 +37983,43 @@ function _pvOpenMigrateModal(rootEl) {
       
       <div id="pv-mig-preview" style="background:var(--surface2);padding:10px;border-radius:6px;font-size:.78rem;color:var(--text2);min-height:60px;display:none"></div>
       
-      <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:10px">
-        <button class="btn btn-outline" onclick="closeModal()">ยกเลิก</button>
-        <button class="btn btn-primary" id="pv-mig-go" disabled>📥 Migrate ทั้งหมด</button>
+      <div style="display:flex;justify-content:space-between;gap:8px;margin-top:10px;align-items:center">
+        <button class="btn btn-outline" id="pv-mig-clear" style="color:var(--danger);border-color:var(--danger)" title="ลบ PV ทั้งหมด (rollback)">🗑️ ล้าง PV ทั้งหมด</button>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-outline" onclick="closeModal()">ยกเลิก</button>
+          <button class="btn btn-primary" id="pv-mig-go" disabled>📥 Migrate ทั้งหมด</button>
+        </div>
       </div>
     </div>
   `);
+  
+  // ⭐ R25.27 — Rollback handler
+  setTimeout(() => {
+    document.getElementById('pv-mig-clear')?.addEventListener('click', async () => {
+      const txt = prompt('⚠️ คำเตือน: จะลบ PV ทั้งหมด + line items ในระบบ\n\nพิมพ์ "DELETE ALL" เพื่อยืนยัน:');
+      if (txt !== 'DELETE ALL') { toast('ยกเลิก', 'info'); return; }
+      const btn = document.getElementById('pv-mig-clear');
+      btn.disabled = true;
+      btn.textContent = '⏳ กำลังลบ...';
+      try {
+        const r = await api('pv_deleteAll', { confirm: true });
+        if (r?.success) {
+          toast(`✅ ลบ ${r.data?.deleted_pvs||0} PVs + ${r.data?.deleted_pvbs||0} bills`, 'success', 4000);
+          _pvState.list = [];
+          closeModal();
+          _pvRender(rootEl);
+        } else {
+          toast(`❌ ${r?.error || 'fail'}`, 'error', 5000);
+          btn.disabled = false;
+          btn.textContent = '🗑️ ล้าง PV ทั้งหมด';
+        }
+      } catch (e) {
+        toast(`❌ ${e.message}`, 'error', 5000);
+        btn.disabled = false;
+        btn.textContent = '🗑️ ล้าง PV ทั้งหมด';
+      }
+    });
+  }, 50);
   
   let parsedRows = null;
   setTimeout(() => {
@@ -38027,29 +38058,36 @@ function _pvOpenMigrateModal(rootEl) {
           }
         }
         
-        // ⭐ R25.25 — Parse supplier master from DropdownVat + DropdownNoVat
-        //   Cols (both sheets): 2=seq, 3=nickname, 4=name, 5=bank, 6=account, 7=note
-        //   Header at row 2 (Thai labels), data starts row 3
+        // ⭐ R25.27 — Parse supplier master with defensive col-A detection
+        //   Same SheetJS strip issue as Vat/NoVat: if r[0] is numeric seq → col-A stripped
         //   Map to FRONTEND supplierList shape: {id, code, name, vat, account_no, account_name, bank, phone, note}
-        //   - nickname → code (เก็บไว้เผื่อ ref) BUT dedupe by NAME (Toppy specified)
         const dropdownVatSheet = sheets['DropdownVat'] || [];
         const dropdownNovatSheet = sheets['DropdownNoVat'] || sheets['DropdownNovat'] || [];
         const parsedSuppliers = [];
         function _parseSupplierRow(r, vat) {
-          if (!r || !r[2] || !r[3]) return null;
-          const nickname = String(r[2]||'').trim();
-          const name = String(r[3]||'').trim();
-          if (!name || nickname === 'ชื่อเรียก' || name === 'ชื่อบริษัท ใหม่' || name === 'ชื่อบัญชี') return null;
+          if (!r) return null;
+          // Detect col-A strip
+          const r0 = r[0];
+          const colAStripped = (typeof r0 === 'number') 
+                            || (typeof r0 === 'string' && r0 !== '' && /^\d+$/.test(r0.trim()));
+          const off = colAStripped ? -1 : 0;
+          const c = (i) => r[i + off];
+          
+          const nickname = String(c(2)||'').trim();
+          const name = String(c(3)||'').trim();
+          if (!name) return null;
+          // Skip header echoes
+          if (nickname === 'ชื่อเรียก' || name === 'ชื่อบริษัท ใหม่' || name === 'ชื่อบัญชี') return null;
           return {
             id: 'SUP-MIG-' + Date.now() + '-' + Math.random().toString(36).slice(2,7),
-            code: nickname,                        // เก็บ nickname เป็น code (optional reference)
-            name: name,                            // ชื่อบริษัท — search key
-            vat: vat,                              // VAT / NOVAT
-            bank: String(r[4]||'').trim(),
-            account_no: String(r[5]||'').trim(),
-            account_name: name,                    // default = ชื่อบริษัท
+            code: nickname,
+            name: name,
+            vat: vat,
+            bank: String(c(4)||'').trim(),
+            account_no: String(c(5)||'').trim(),
+            account_name: name,
             phone: '',
-            note: String(r[6]||'').trim(),
+            note: String(c(6)||'').trim(),
           };
         }
         for (let i = 2; i < dropdownVatSheet.length; i++) {
@@ -38141,11 +38179,27 @@ function _pvOpenMigrateModal(rootEl) {
 }
 
 function _pvParseVatRow(r, vatType) {
-  // Both sheets share same logical structure after column mapping:
+  // ⭐ R25.27 — DEFENSIVE PARSER: handle SheetJS col-A stripping
+  //   Bug found: when sheet's col-A is empty across all rows, SheetJS sometimes
+  //              strips it → all indices shift -1. Different sheets in same
+  //              workbook can be parsed differently:
+  //              - VAT sheet has header in col-A=empty + data with col-A=empty → preserved (idx 0 = '')
+  //              - NoVat has all rows col-A=empty → stripped (idx 0 = seq number)
+  //   Detection: check r[0] — if it's a number (seq), col-A was stripped.
+  //   Fix: apply offset to all index lookups.
+  //
+  // Expected layout (col-A=empty preserved, 1-based logical Excel cols):
   // VAT cols:   1=seq 2=date 3=cat 4=nick 5=supplier 6=bank 7=acct 8=inv 9=rcpt 10=billed 11=ship 12=dc_pm 13=claim 14=other 15=total_d 16=net 17=from 18=note
   // NOVAT cols: 1=seq 2=date 3=cat 4=nick 5=supplier 6=bank 7=acct 8=inv 9=rcpt 10=billed 11=ship 12=claim 13=promo 14=total_d 15=net 16=from 17=note (no dc_pm)
   
-  const dateRaw = r[2];
+  // Detect col-A offset: if r[0] is numeric seq (1, 2, 3...) → col-A stripped → shift -1
+  const r0 = r[0];
+  const colAStripped = (typeof r0 === 'number') 
+                    || (typeof r0 === 'string' && r0 !== '' && /^\d+$/.test(r0.trim()));
+  const off = colAStripped ? -1 : 0;
+  const c = (i) => r[i + off];  // logical-col getter
+  
+  const dateRaw = c(2);
   let dateISO = '';
   if (dateRaw) {
     if (typeof dateRaw === 'number') {
@@ -38163,43 +38217,43 @@ function _pvParseVatRow(r, vatType) {
   if (vatType === 'VAT') {
     return {
       vat_type: 'VAT',
-      category: String(r[3]||''),
-      nickname: String(r[4]||''),
-      supplier_name: String(r[5]||''),
-      supplier_bank: String(r[6]||''),
-      supplier_account: String(r[7]||''),
-      invoice_no: String(r[8]||''),
-      receipt_no: String(r[9]||''),
+      category: String(c(3)||''),
+      nickname: String(c(4)||''),
+      supplier_name: String(c(5)||''),
+      supplier_bank: String(c(6)||''),
+      supplier_account: String(c(7)||''),
+      invoice_no: String(c(8)||''),
+      receipt_no: String(c(9)||''),
       pay_date: dateISO,
-      amount_billed: Number(r[10])||0,
-      deduct_shipping: Number(r[11])||0,
-      deduct_dc_pm: Number(r[12])||0,
-      deduct_claim: Number(r[13])||0,
-      deduct_other: Number(r[14])||0,
-      net_amount: Number(r[16])||0,
-      from_bank: String(r[17]||''),
-      note: String(r[18]||''),
+      amount_billed: Number(c(10))||0,
+      deduct_shipping: Number(c(11))||0,
+      deduct_dc_pm: Number(c(12))||0,
+      deduct_claim: Number(c(13))||0,
+      deduct_other: Number(c(14))||0,
+      net_amount: Number(c(16))||0,
+      from_bank: String(c(17)||''),
+      note: String(c(18)||''),
     };
   } else {
     // NOVAT
     return {
       vat_type: 'NOVAT',
-      category: String(r[3]||''),
-      nickname: String(r[4]||''),
-      supplier_name: String(r[5]||''),
-      supplier_bank: String(r[6]||''),
-      supplier_account: String(r[7]||''),
-      invoice_no: String(r[8]||''),
-      receipt_no: String(r[9]||''),
+      category: String(c(3)||''),
+      nickname: String(c(4)||''),
+      supplier_name: String(c(5)||''),
+      supplier_bank: String(c(6)||''),
+      supplier_account: String(c(7)||''),
+      invoice_no: String(c(8)||''),
+      receipt_no: String(c(9)||''),
       pay_date: dateISO,
-      amount_billed: Number(r[10])||0,
-      deduct_shipping: Number(r[11])||0,
+      amount_billed: Number(c(10))||0,
+      deduct_shipping: Number(c(11))||0,
       deduct_dc_pm: 0,
-      deduct_claim: Number(r[12])||0,
-      deduct_other: Number(r[13])||0,  // โปรโมชั่น → other
-      net_amount: Number(r[15])||0,
-      from_bank: String(r[16]||''),
-      note: String(r[17]||''),
+      deduct_claim: Number(c(12))||0,
+      deduct_other: Number(c(13))||0,  // โปรโมชั่น → other
+      net_amount: Number(c(15))||0,
+      from_bank: String(c(16)||''),
+      note: String(c(17)||''),
     };
   }
 }
@@ -38247,10 +38301,10 @@ function _pvMakeReversal(orig) {
 
 // ── Initialize after all declarations are ready ──
 (async function() {
-  // ⭐ R25.26 BOOT BEACON
-  console.log('%c[SF R25.26] Active build: 2026-05-16-1400 — Fix raw SVG in modal titles (3 callers)', 'color:#0c8;font-weight:bold;font-size:13px');
-  console.log('%c[SF R25.26] Add user/customer/PV modal: ICONS.plus → ➕ emoji (openModal uses textContent — SVG was rendered as text)', 'color:#888');
-  window.__SF_BUILD = 'R25.26-2026-05-16-1400';
+  // ⭐ R25.27 BOOT BEACON
+  console.log('%c[SF R25.27] Active build: 2026-05-16-1500 — Fix SheetJS col-A strip + rollback button', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.27] Parser now detects col-A offset (Vat/NoVat/Dropdown) · pv_deleteAll endpoint + "🗑️ ล้าง PV ทั้งหมด" button', 'color:#888');
+  window.__SF_BUILD = 'R25.27-2026-05-16-1500';
   
   await restoreMainState();
   checkSavedLogin();
