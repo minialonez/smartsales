@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.21-2026-05-15-1900 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.23-2026-05-16-1100 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -7,7 +7,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>Smart Finance R25.21</title>
+<title>Smart Finance R25.23</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
@@ -2072,13 +2072,7 @@ let ppReport = {
   merged: [],                  // Main sheet - รวมทุกอย่าง ready to export
 };
 // Transfer Log (ไฟล์ 2026_รายการโอนเงิน_JKN.xlsx)
-let transferLog = {
-  vatTransfers: [],            // จาก sheet "Vat"
-  novatTransfers: [],          // จาก sheet "NoVat"
-  vatSuppliers: [],            // จาก sheet "DropdownVat" - Master
-  novatSuppliers: [],          // จาก sheet "DropdownNoVat" - Master
-  monthlyChecks: {},           // key = "2025-01" → array ของรายการตรวจ
-};
+// ⭐ R25.22 — transferLog state removed (replaced by PV V3 — payment_vouchers)
 
 // ── Persist state to localStorage — function only, restore happens after mainSummary/cashCount declared ──
 // แก้ปัญหา lag กับ billList 8,000+ records: cache invalidate ทันที, localStorage I/O debounce
@@ -4391,7 +4385,6 @@ function persistMainState() {
       safeStorage.set('sf_supplierList', JSON.stringify(supplierList));
       safeStorage.set('sf_supplierPayments', JSON.stringify(supplierPayments));
       safeStorage.set('sf_ppReport', JSON.stringify(ppReport));
-      safeStorage.set('sf_transferLog', JSON.stringify(transferLog));
     } catch (e) { console.warn('Could not persist:', e); }
   }, 500);
   
@@ -4467,7 +4460,6 @@ function flushPersistState() {
       safeStorage.set('sf_supplierList', JSON.stringify(supplierList));
       safeStorage.set('sf_supplierPayments', JSON.stringify(supplierPayments));
       safeStorage.set('sf_ppReport', JSON.stringify(ppReport));
-      safeStorage.set('sf_transferLog', JSON.stringify(transferLog));
     } catch (e) { console.warn('Could not persist:', e); }
   }
 }
@@ -4981,8 +4973,6 @@ async function restoreMainState() {
     if (savedSupPay) supplierPayments = JSON.parse(savedSupPay);
     const savedPPRpt = safeStorage.get('sf_ppReport');
     if (savedPPRpt) ppReport = JSON.parse(savedPPRpt);
-    const savedTransferLog = safeStorage.get('sf_transferLog');
-    if (savedTransferLog) transferLog = JSON.parse(savedTransferLog);
     
     // Statements จาก localStorage (ถ้า IndexedDB ไม่มี)
     if (uploadedStatements.length === 0) {
@@ -7807,7 +7797,6 @@ async function renderMain(el) {
                     <td><input type="text" class="input bl-cell" data-field="confirmation" value="${b.confirmation||''}" style="padding:3px 6px;font-size:.78rem;width:120px"></td>
                     <td style="white-space:nowrap">
                       <input type="date" class="input bl-cell" data-field="pay_date" value="${toISODate(b.pay_date)}" style="padding:3px 6px;font-size:.78rem;width:130px">
-                      <button class="btn-copy-down" data-idx="${realIdx}" data-field="pay_date" title="คัดลอกลงทุกแถว" style="background:none;border:1px solid var(--border);color:var(--text2);padding:0 4px;margin-left:2px;border-radius:4px;cursor:pointer;font-size:.75rem">⬇️</button>
                     </td>
                     <td><input type="text" class="input bl-cell" data-field="remarks1" value="${b.remarks1||''}" style="padding:3px 6px;font-size:.78rem;min-width:160px"></td>
                     <td><input type="text" class="input bl-cell" data-field="remarks2" value="${b.remarks2||''}" style="padding:3px 6px;font-size:.78rem;width:140px"></td>
@@ -15132,14 +15121,7 @@ async function renderPPReport(el) {
         }
       }
       
-      // ── Auto-link กับ Transfer Log (JKN) ──
-      const allTransfers = [...(transferLog.vatTransfers||[]), ...(transferLog.novatTransfers||[])];
-      const linkedTransfer = allTransfers.find(t => t.pp_no === pp.pp_no);
-      if (linkedTransfer) {
-        pp.linked_transfer = linkedTransfer.id;
-        pp.transfer_from_bank = linkedTransfer.from_bank;
-        pp.transfer_nickname = linkedTransfer.nickname;
-      }
+      // ⭐ R25.22 — transferLog auto-link removed (replaced by PV V3)
     });
     
     ppReport.merged = Object.values(ppMap).sort((a, b) => (a.pp_no||'').localeCompare(b.pp_no||''));
@@ -15219,13 +15201,10 @@ async function renderPPReport(el) {
       ${ppReport.merged.length > 0 ? (() => {
         const linkedSp = ppReport.merged.filter(p => p.linked_sp).length;
         const unlinkedSp = ppReport.merged.filter(p => !p.linked_sp).length;
-        const linkedTl = ppReport.merged.filter(p => p.linked_transfer).length;
-        const unlinkedTl = ppReport.merged.filter(p => !p.linked_transfer).length;
         const pxCount = ppReport.merged.filter(p => p.vat === 'PX').length;
         
         const warnings = [];
         if (unlinkedSp > 0) warnings.push(`<strong>⚠️ ${unlinkedSp} PP</strong> ยังไม่มีใน "จ่ายเจ้าหนี้"`);
-        if (unlinkedTl > 0) warnings.push(`<strong>📋 ${unlinkedTl} PP</strong> ยังไม่มีใน Transfer Log`);
         if (pxCount > 0) warnings.push(`<strong>🔶 ${pxCount} PP</strong> มี PX ที่ระบุ VAT ไม่ได้`);
         
         return warnings.length > 0 ? `
@@ -15237,18 +15216,17 @@ async function renderPPReport(el) {
                   ${warnings.join('<br>')}
                 </div>
                 <div class="text-xs" style="margin-top:6px;color:var(--success)">
-                  ✓ SP Linked: ${linkedSp} · 📋 TL Linked: ${linkedTl} / ${ppReport.merged.length} PP
+                  ✓ SP Linked: ${linkedSp} / ${ppReport.merged.length} PP
                 </div>
               </div>
               <div class="flex gap-2 flex-wrap">
                 ${unlinkedSp > 0 ? `<button class="btn btn-primary btn-sm" id="btn-bulk-create-sp">${ICONS.plus} สร้างใน "จ่ายเจ้าหนี้"</button>` : ''}
-                ${unlinkedTl > 0 && transferLog.vatTransfers.length + transferLog.novatTransfers.length > 0 ? `<button class="btn btn-outline btn-sm" id="btn-relink-tl">🔄 Re-link TL</button>` : ''}
               </div>
             </div>
           </div>
         ` : `
           <div class="card mb-3" style="border-left:4px solid var(--success);padding:10px 14px">
-            <div class="text-sm" style="color:var(--success)">✅ ทุกอย่างเชื่อมครบ — SP: ${linkedSp}/${ppReport.merged.length} · TL: ${linkedTl}/${ppReport.merged.length}</div>
+            <div class="text-sm" style="color:var(--success)">✅ ทุกอย่างเชื่อมครบ — SP: ${linkedSp}/${ppReport.merged.length}</div>
           </div>
         `;
       })() : ''}
@@ -15302,14 +15280,11 @@ async function renderPPReport(el) {
                 </td></tr>` :
                 visibleData.map((p, idx) => {
                   const vatColor = p.vat === 'V' ? '#4f9cf9' : p.vat === 'N' ? '#8e44ad' : p.vat === 'MIX' ? 'var(--warn)' : p.vat === 'PX' ? 'var(--warn)' : 'var(--text3)';
-                  // 3-way status: Supplier Payment (ระบบ) + Transfer Log (JKN file) + Statement Match
+                  // 2-way status: Supplier Payment (ระบบ) + Statement Match
                   const spIcon = p.linked_sp 
                     ? (p.sp_match_status === 'paid' ? '<span class="badge" style="background:var(--success-bg);color:var(--success);font-size:.65rem;padding:2px 5px" title="Matched กับ Statement">✓ SP</span>' 
                       : '<span class="badge" style="background:var(--info-bg);color:var(--info);font-size:.65rem;padding:2px 5px" title="มีในจ่ายเจ้าหนี้">🔗 SP</span>') 
                     : '<span class="badge" style="background:rgba(244,180,26,.15);color:var(--warn);font-size:.65rem;padding:2px 5px" title="ยังไม่อยู่ในจ่ายเจ้าหนี้">⚠ SP</span>';
-                  const tlIcon = p.linked_transfer 
-                    ? '<span class="badge" style="background:rgba(138,92,246,.15);color:#8a5cf6;font-size:.65rem;padding:2px 5px" title="มีใน Transfer Log JKN">📋 TL</span>' 
-                    : '<span class="badge badge-muted" style="font-size:.65rem;padding:2px 5px" title="ยังไม่อยู่ใน Transfer Log">— TL</span>';
                   return `<tr>
                     <td class="text-xs text-muted">${idx+1}</td>
                     <td style="text-align:center"><span class="badge" style="background:${vatColor}22;color:${vatColor};font-size:.75rem;font-weight:700">${p.vat||'-'}</span></td>
@@ -15333,7 +15308,6 @@ async function renderPPReport(el) {
                     <td style="text-align:center">
                       <div style="display:flex;flex-direction:column;gap:2px;align-items:center">
                         ${spIcon}
-                        ${tlIcon}
                       </div>
                     </td>
                   </tr>`;
@@ -15434,13 +15408,7 @@ async function renderPPReport(el) {
       });
     });
     
-    // ── Re-link with Transfer Log ──
-    document.getElementById('btn-relink-tl')?.addEventListener('click', () => {
-      rebuildMerged();
-      persistMainState();
-      toast('เชื่อม Transfer Log ใหม่เรียบร้อย', 'success');
-      render();
-    });
+    // ⭐ R25.22 — btn-relink-tl handler removed (Transfer Log replaced by PV V3)
     
     // ── Bulk create supplier payments from PP Report ──
     document.getElementById('btn-bulk-create-sp')?.addEventListener('click', () => {
@@ -15899,1942 +15867,7 @@ function parseMonthlyCheck(sheet) {
   return records;
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// Transfer Log V2 — pull/push helpers (Phase 2)
-// ═══════════════════════════════════════════════════════════════════
-
-// Field mapping: V2 schema (net_amount, tl_uuid) ↔ legacy (amount, transfer_amount, id)
-function _tlNormalize(rec) {
-  // Convert any incoming row → canonical V2 shape
-  const r = { ...rec };
-  // Backfill new fields from legacy if missing
-  if (r.net_amount == null && (r.transfer_amount != null || r.amount != null)) {
-    r.net_amount = Number(r.transfer_amount ?? r.amount) || 0;
-  }
-  if (r.amount_billed == null && r.amount != null) {
-    r.amount_billed = Number(r.amount) || 0;
-  }
-  if (!r.tl_uuid && r.id) r.tl_uuid = r.id;
-  // Ensure deduct fields are numeric
-  ['deduct_shipping','deduct_dc_pm','deduct_claim','deduct_other','deduct_total','amount_billed','net_amount']
-    .forEach(k => { r[k] = Number(r[k]) || 0; });
-  return r;
-}
-
-function _tmNormalize(s) {
-  const r = { ...s };
-  if (!r.tm_uuid && r.id) r.tm_uuid = r.id;
-  return r;
-}
-
-// Cash auto-match: from_bank='Cash' → match immediately (no stmt needed)
-function _tlAutoMatchCash(rec) {
-  const fb = String(rec.from_bank || '').trim().toLowerCase();
-  if (fb === 'cash' || fb === 'เงินสด') {
-    rec.match_status = 'matched_cash';
-    if (!rec.stmt_ref) rec.stmt_ref = 'CASH-' + String(rec.transfer_date || '').substring(0, 10);
-  }
-  return rec;
-}
-
-async function pullTransferFromCloud() {
-  const [logResp, masterResp] = await Promise.all([
-    api('v2_getTransferLog', {}),
-    api('v2_getTransferMaster', {}),
-  ]);
-  if (logResp?.success === false) throw new Error(logResp.error || 'pullTransferLog failed');
-  if (masterResp?.success === false) throw new Error(masterResp.error || 'pullTransferMaster failed');
-  
-  const logData = logResp.data || logResp;
-  const masterData = masterResp.data || masterResp;
-  
-  transferLog.vatTransfers = (logData.vat || []).map(_tlNormalize);
-  transferLog.novatTransfers = (logData.novat || []).map(_tlNormalize);
-  transferLog.vatSuppliers = (masterData.vat || []).map(_tmNormalize);
-  transferLog.novatSuppliers = (masterData.novat || []).map(_tmNormalize);
-  
-  persistMainState();
-  return {
-    vatTL: transferLog.vatTransfers.length,
-    novatTL: transferLog.novatTransfers.length,
-    vatMaster: transferLog.vatSuppliers.length,
-    novatMaster: transferLog.novatSuppliers.length,
-  };
-}
-
-async function pushTransferLogRow(rec, sheet) {
-  // sheet = 'vat' | 'novat' ; rec must have tl_uuid (auto-gen if missing)
-  if (!rec.tl_uuid) {
-    rec.tl_uuid = (typeof crypto !== 'undefined' && crypto.randomUUID) 
-      ? crypto.randomUUID() 
-      : 'tl-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
-  }
-  _tlAutoMatchCash(rec); // apply Cash rule
-  const r = await api('v2_upsertTransferLog', { sheet, records: [rec] });
-  if (r?.success === false) throw new Error(r.error || 'upsert failed');
-  return rec; // return enriched (with uuid + match)
-}
-
-async function deleteTransferLogRow(uuid, sheet) {
-  const r = await api('v2_upsertTransferLog', { sheet, records: [], deletes: [uuid] });
-  if (r?.success === false) throw new Error(r.error || 'delete failed');
-  return r.data;
-}
-
-async function pushTransferMasterRow(rec, sheet) {
-  if (!rec.tm_uuid) {
-    rec.tm_uuid = (typeof crypto !== 'undefined' && crypto.randomUUID) 
-      ? crypto.randomUUID() 
-      : 'tm-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
-  }
-  const r = await api('v2_upsertTransferMaster', { sheet, records: [rec] });
-  if (r?.success === false) throw new Error(r.error || 'upsert failed');
-  return rec;
-}
-
-async function deleteTransferMasterRow(uuid, sheet) {
-  const r = await api('v2_upsertTransferMaster', { sheet, records: [], deletes: [uuid] });
-  if (r?.success === false) throw new Error(r.error || 'delete failed');
-  return r.data;
-}
-
-// ── Add/Edit TL Modal ──
-function openTransferLogModal(opts = {}) {
-  const { existing = null, sheet = 'vat', onSave } = opts;
-  const isEdit = !!existing;
-  const allMasters = [
-    ...(transferLog.vatSuppliers || []).map(s => ({ ...s, _vat: 'VAT' })),
-    ...(transferLog.novatSuppliers || []).map(s => ({ ...s, _vat: 'NOVAT' })),
-  ];
-  const existingBanks = [...new Set([
-    ...transferLog.vatTransfers, ...transferLog.novatTransfers
-  ].map(t => t.from_bank).filter(Boolean))];
-  const existingCats = [...new Set([
-    ...transferLog.vatTransfers, ...transferLog.novatTransfers
-  ].map(t => t.category).filter(Boolean))].sort();
-  
-  const PRESET_CATEGORIES = ['ต้นทุน', 'ค่าใช้จ่าย', 'Refund'];
-  const existingCatsAll = [...new Set([
-    ...transferLog.vatTransfers, ...transferLog.novatTransfers
-  ].map(t => t.category).filter(Boolean))];
-  const allCategoriesForModal = [...new Set([...PRESET_CATEGORIES, ...existingCatsAll])];
-  
-  const r = existing ? _tlNormalize(existing) : {
-    tl_uuid: '',
-    seq: 0,
-    transfer_date: new Date().toISOString().substring(0, 10),
-    category: 'ต้นทุน',
-    supplier_name: '',
-    supplier_bank: '',
-    supplier_account: '',
-    invoice_no: '',
-    receipt_no: '',
-    amount_billed: 0,
-    deduct_shipping: 0,
-    deduct_dc_pm: 0,
-    deduct_claim: 0,
-    deduct_other: 0,
-    deduct_total: 0,
-    net_amount: 0,
-    from_bank: '',
-    vat: sheet === 'vat' ? 'VAT' : 'NOVAT',
-    pp_no: '',
-    match_status: 'pending',
-    stmt_ref: '',
-  };
-  
-  const modal = document.createElement('div');
-  modal.className = 'modal-overlay';
-  modal.innerHTML = `
-    <div class="modal-card" style="max-width:720px">
-      <div class="modal-head">
-        <h3>${isEdit ? '✏️ แก้ไข Transfer Log' : '➕ เพิ่ม Transfer Log'} 
-          <span class="badge" style="background:${r.vat==='VAT'?'#4f9cf922':'#8e44ad22'};color:${r.vat==='VAT'?'#4f9cf9':'#8e44ad'}">${r.vat}</span>
-        </h3>
-        <button class="btn-close" data-close>&times;</button>
-      </div>
-      <div class="modal-body" style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
-        <div>
-          <label class="text-xs text-muted">วันที่โอน</label>
-          <input type="date" class="input" id="tl-m-date" value="${r.transfer_date || ''}">
-        </div>
-        <div>
-          <label class="text-xs text-muted">ประเภท (category)</label>
-          <select class="select" id="tl-m-cat" style="width:100%">
-            ${allCategoriesForModal.map(c => `<option value="${c}" ${r.category===c?'selected':''}>${c}</option>`).join('')}
-            ${!allCategoriesForModal.includes(r.category) && r.category ? `<option value="${r.category}" selected>${r.category}</option>` : ''}
-          </select>
-        </div>
-        
-        <div style="grid-column:1/-1">
-          <label class="text-xs text-muted">ชื่อบริษัท / ผู้รับโอน <span style="color:var(--info)">(พิมพ์เลือก master)</span></label>
-          <input class="input" id="tl-m-sup-name" value="${r.supplier_name || ''}" list="tl-m-sup-list" placeholder="ค้นหาจาก Master Supplier">
-          <datalist id="tl-m-sup-list">
-            ${allMasters.map(s => `<option value="${s.name||''}" data-uuid="${s.tm_uuid||''}" data-bank="${s.bank||''}" data-acct="${s.account_no||''}" data-vat="${s._vat||''}">${s.bank||''} ${s.account_no||''}</option>`).join('')}
-          </datalist>
-        </div>
-        <div>
-          <label class="text-xs text-muted">ธนาคารผู้รับ</label>
-          <input class="input" id="tl-m-sup-bank" value="${r.supplier_bank || ''}">
-        </div>
-        <div>
-          <label class="text-xs text-muted">บัญชีผู้รับ</label>
-          <input class="input" id="tl-m-sup-acct" value="${r.supplier_account || ''}">
-        </div>
-        
-        <div>
-          <label class="text-xs text-muted">เลข Invoice</label>
-          <input class="input" id="tl-m-inv" value="${r.invoice_no || ''}">
-        </div>
-        <div>
-          <label class="text-xs text-muted">เลขใบเสร็จ</label>
-          <input class="input" id="tl-m-rec" value="${r.receipt_no || ''}">
-        </div>
-        
-        <div style="grid-column:1/-1;border-top:1px solid var(--border);padding-top:10px;margin-top:5px">
-          <div class="text-xs font-semi text-muted mb-1">ยอดเงิน</div>
-        </div>
-        <div>
-          <label class="text-xs text-muted">ยอดแจ้ง (amount_billed)</label>
-          <input type="number" step="0.01" class="input" id="tl-m-billed" value="${r.amount_billed}">
-        </div>
-        <div>
-          <label class="text-xs text-muted">ค่าขนส่ง (ship)</label>
-          <input type="number" step="0.01" class="input tl-m-ded" id="tl-m-ship" value="${r.deduct_shipping}">
-        </div>
-        <div>
-          <label class="text-xs text-muted">DC/PM</label>
-          <input type="number" step="0.01" class="input tl-m-ded" id="tl-m-dcpm" value="${r.deduct_dc_pm}">
-        </div>
-        <div>
-          <label class="text-xs text-muted">เคลม (claim)</label>
-          <input type="number" step="0.01" class="input tl-m-ded" id="tl-m-claim" value="${r.deduct_claim}">
-        </div>
-        <div>
-          <label class="text-xs text-muted">อื่นๆ (other)</label>
-          <input type="number" step="0.01" class="input tl-m-ded" id="tl-m-other" value="${r.deduct_other}">
-        </div>
-        <div>
-          <label class="text-xs text-muted">รวมหัก (auto)</label>
-          <input type="number" step="0.01" class="input" id="tl-m-total" value="${r.deduct_total}" readonly style="background:var(--surface2);color:var(--danger)">
-        </div>
-        <div style="grid-column:1/-1;background:rgba(34,197,94,.08);padding:8px;border-radius:6px;border:1px solid rgba(34,197,94,.3)">
-          <label class="text-xs font-semi" style="color:var(--success)">💰 ยอดสุทธิที่ต้องโอน (net_amount = billed − total)</label>
-          <input type="number" step="0.01" class="input" id="tl-m-net" value="${r.net_amount}" readonly style="background:transparent;font-size:1.1rem;font-weight:700;color:var(--success);border:none">
-        </div>
-        
-        <div style="grid-column:1/-1;border-top:1px solid var(--border);padding-top:10px;margin-top:5px">
-          <div class="text-xs font-semi text-muted mb-1">การชำระ</div>
-        </div>
-        <div>
-          <label class="text-xs text-muted">โอนจาก (from_bank) <span style="color:var(--info)">— "Cash"=เงินสด match อัตโนมัติ</span></label>
-          <input class="input" id="tl-m-from" value="${r.from_bank || ''}" list="tl-m-from-list" placeholder="KTB / KBANK / BBL NW / Cash / ...">
-          <datalist id="tl-m-from-list">
-            <option value="Cash">เงินสด (auto-match)</option>
-            ${existingBanks.map(b=>`<option value="${b}">`).join('')}
-          </datalist>
-        </div>
-        <div>
-          <label class="text-xs text-muted">เลข PP</label>
-          <input class="input" id="tl-m-pp" value="${r.pp_no || ''}">
-        </div>
-      </div>
-      <div class="modal-foot" style="display:flex;justify-content:space-between;gap:10px">
-        <div>
-          ${isEdit ? `<button class="btn btn-outline btn-sm" id="tl-m-del" style="color:var(--danger);border-color:var(--danger)">🗑 ลบ</button>` : ''}
-        </div>
-        <div class="flex gap-2">
-          <button class="btn btn-ghost" data-close>ยกเลิก</button>
-          <button class="btn btn-primary" id="tl-m-save">${isEdit ? '💾 บันทึก' : '➕ เพิ่ม'}</button>
-        </div>
-      </div>
-    </div>
-  `;
-  document.body.appendChild(modal); requestAnimationFrame(() => modal.classList.add("open"));
-  
-  // Auto-recompute total + net on deduct/billed change
-  function recompute() {
-    const billed = Number(document.getElementById('tl-m-billed').value) || 0;
-    const ship = Number(document.getElementById('tl-m-ship').value) || 0;
-    const dcpm = Number(document.getElementById('tl-m-dcpm').value) || 0;
-    const claim = Number(document.getElementById('tl-m-claim').value) || 0;
-    const other = Number(document.getElementById('tl-m-other').value) || 0;
-    const total = ship + dcpm + claim + other;
-    const net = billed - total;
-    document.getElementById('tl-m-total').value = total.toFixed(2);
-    document.getElementById('tl-m-net').value = net.toFixed(2);
-  }
-  ['tl-m-billed','tl-m-ship','tl-m-dcpm','tl-m-claim','tl-m-other'].forEach(id => {
-    document.getElementById(id).addEventListener('input', recompute);
-  });
-  
-  // Auto-fill bank/account from supplier dropdown
-  document.getElementById('tl-m-sup-name').addEventListener('input', e => {
-    const v = e.target.value.trim();
-    const m = allMasters.find(s => s.name === v);
-    if (m) {
-      document.getElementById('tl-m-sup-bank').value = m.bank || '';
-      document.getElementById('tl-m-sup-acct').value = m.account_no || '';
-    }
-  });
-  
-  function close() { modal.remove(); }
-  modal.querySelectorAll('[data-close]').forEach(b => b.addEventListener('click', close));
-  // ⭐ Backdrop close — ปิดเฉพาะคลิกจริงที่ backdrop ไม่ใช่ลากจาก modal ออกมา
-  let _mdownBd = false;
-  modal.addEventListener('mousedown', e => { _mdownBd = (e.target === modal); });
-  modal.addEventListener('mouseup', e => { if (_mdownBd && e.target === modal) close(); _mdownBd = false; });
-  modal.addEventListener('touchend', e => { if (e.target === modal) close(); });
-  
-  if (isEdit) {
-    document.getElementById('tl-m-del').addEventListener('click', async () => {
-      if (!confirm('ลบรายการนี้?')) return;
-      try {
-        await deleteTransferLogRow(r.tl_uuid, sheet);
-        // remove from local state
-        const arr = sheet === 'vat' ? transferLog.vatTransfers : transferLog.novatTransfers;
-        const idx = arr.findIndex(x => x.tl_uuid === r.tl_uuid);
-        if (idx >= 0) arr.splice(idx, 1);
-        persistMainState();
-        toast('ลบสำเร็จ', 'success');
-        close();
-        if (onSave) onSave({ deleted: true });
-      } catch (e) { toast('ลบล้มเหลว: ' + e.message, 'error'); }
-    });
-  }
-  
-  document.getElementById('tl-m-save').addEventListener('click', async () => {
-    const billed = Number(document.getElementById('tl-m-billed').value) || 0;
-    const ship = Number(document.getElementById('tl-m-ship').value) || 0;
-    const dcpm = Number(document.getElementById('tl-m-dcpm').value) || 0;
-    const claim = Number(document.getElementById('tl-m-claim').value) || 0;
-    const other = Number(document.getElementById('tl-m-other').value) || 0;
-    const total = ship + dcpm + claim + other;
-    const net = billed - total;
-    
-    const rec = {
-      tl_uuid: r.tl_uuid || '',
-      seq: r.seq || 0,
-      transfer_date: document.getElementById('tl-m-date').value,
-      category: document.getElementById('tl-m-cat').value.trim(),
-      supplier_name: document.getElementById('tl-m-sup-name').value.trim(),
-      supplier_bank: document.getElementById('tl-m-sup-bank').value.trim(),
-      supplier_account: document.getElementById('tl-m-sup-acct').value.trim(),
-      invoice_no: document.getElementById('tl-m-inv').value.trim(),
-      receipt_no: document.getElementById('tl-m-rec').value.trim(),
-      amount_billed: billed,
-      deduct_shipping: ship,
-      deduct_dc_pm: dcpm,
-      deduct_claim: claim,
-      deduct_other: other,
-      deduct_total: total,
-      net_amount: net,
-      from_bank: document.getElementById('tl-m-from').value.trim(),
-      vat: r.vat,
-      pp_no: document.getElementById('tl-m-pp').value.trim(),
-      match_status: r.match_status || 'pending',
-      stmt_ref: r.stmt_ref || '',
-    };
-    
-    if (!rec.transfer_date) { toast('ใส่วันที่โอน', 'warn'); return; }
-    if (!rec.supplier_name) { toast('ใส่ชื่อผู้รับโอน', 'warn'); return; }
-    if (rec.amount_billed <= 0) { toast('ยอดแจ้งต้อง > 0', 'warn'); return; }
-    
-    const btn = document.getElementById('tl-m-save');
-    btn.disabled = true;
-    btn.textContent = '⏳ กำลังบันทึก...';
-    try {
-      const saved = await pushTransferLogRow(rec, sheet);
-      // Update local state
-      const arr = sheet === 'vat' ? transferLog.vatTransfers : transferLog.novatTransfers;
-      const idx = arr.findIndex(x => x.tl_uuid === saved.tl_uuid);
-      if (idx >= 0) arr[idx] = saved;
-      else arr.push(saved);
-      persistMainState();
-      toast(isEdit ? 'บันทึกสำเร็จ' : 'เพิ่มรายการสำเร็จ', 'success');
-      close();
-      if (onSave) onSave({ saved });
-    } catch (e) {
-      toast('บันทึกล้มเหลว: ' + e.message, 'error');
-      btn.disabled = false;
-      btn.textContent = isEdit ? '💾 บันทึก' : '➕ เพิ่ม';
-    }
-  });
-}
-
-// ── Add/Edit Master Supplier Modal ──
-function openTransferMasterModal(opts = {}) {
-  const { existing = null, sheet = 'vat', onSave } = opts;
-  const isEdit = !!existing;
-  const r = existing ? _tmNormalize(existing) : {
-    tm_uuid: '',
-    seq: 0,
-    name: '',
-    bank: '',
-    account_no: '',
-    note: '',
-    vat: sheet === 'vat' ? 'VAT' : 'NOVAT',
-  };
-  
-  const modal = document.createElement('div');
-  modal.className = 'modal-overlay';
-  modal.innerHTML = `
-    <div class="modal-card" style="max-width:520px">
-      <div class="modal-head">
-        <h3>${isEdit ? '✏️ แก้ไข Master Supplier' : '➕ เพิ่ม Master Supplier'}
-          <span class="badge" style="background:${r.vat==='VAT'?'#4f9cf922':'#8e44ad22'};color:${r.vat==='VAT'?'#4f9cf9':'#8e44ad'}">${r.vat}</span>
-        </h3>
-        <button class="btn-close" data-close>&times;</button>
-      </div>
-      <div class="modal-body" style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
-        <div style="grid-column:1/-1">
-          <label class="text-xs text-muted">ชื่อบริษัท / ชื่อผู้รับโอน</label>
-          <input class="input" id="tm-m-name" value="${r.name || ''}">
-        </div>
-        <div>
-          <label class="text-xs text-muted">ธนาคาร</label>
-          <input class="input" id="tm-m-bank" value="${r.bank || ''}">
-        </div>
-        <div>
-          <label class="text-xs text-muted">เลขบัญชี</label>
-          <input class="input" id="tm-m-acct" value="${r.account_no || ''}">
-        </div>
-        <div style="grid-column:1/-1">
-          <label class="text-xs text-muted">หมายเหตุ</label>
-          <input class="input" id="tm-m-note" value="${r.note || ''}">
-        </div>
-      </div>
-      <div class="modal-foot" style="display:flex;justify-content:space-between;gap:10px">
-        <div>
-          ${isEdit ? `<button class="btn btn-outline btn-sm" id="tm-m-del" style="color:var(--danger);border-color:var(--danger)">🗑 ลบ</button>` : ''}
-        </div>
-        <div class="flex gap-2">
-          <button class="btn btn-ghost" data-close>ยกเลิก</button>
-          <button class="btn btn-primary" id="tm-m-save">${isEdit ? '💾 บันทึก' : '➕ เพิ่ม'}</button>
-        </div>
-      </div>
-    </div>
-  `;
-  document.body.appendChild(modal); requestAnimationFrame(() => modal.classList.add("open"));
-  
-  function close() { modal.remove(); }
-  modal.querySelectorAll('[data-close]').forEach(b => b.addEventListener('click', close));
-  // ⭐ Backdrop close — ปิดเฉพาะคลิกจริงที่ backdrop ไม่ใช่ลากจาก modal ออกมา
-  let _mdownBd = false;
-  modal.addEventListener('mousedown', e => { _mdownBd = (e.target === modal); });
-  modal.addEventListener('mouseup', e => { if (_mdownBd && e.target === modal) close(); _mdownBd = false; });
-  modal.addEventListener('touchend', e => { if (e.target === modal) close(); });
-  
-  if (isEdit) {
-    document.getElementById('tm-m-del').addEventListener('click', async () => {
-      if (!confirm('ลบ Master นี้?')) return;
-      try {
-        await deleteTransferMasterRow(r.tm_uuid, sheet);
-        const arr = sheet === 'vat' ? transferLog.vatSuppliers : transferLog.novatSuppliers;
-        const idx = arr.findIndex(x => x.tm_uuid === r.tm_uuid);
-        if (idx >= 0) arr.splice(idx, 1);
-        persistMainState();
-        toast('ลบสำเร็จ', 'success');
-        close();
-        if (onSave) onSave({ deleted: true });
-      } catch (e) { toast('ลบล้มเหลว: ' + e.message, 'error'); }
-    });
-  }
-  
-  document.getElementById('tm-m-save').addEventListener('click', async () => {
-    const rec = {
-      tm_uuid: r.tm_uuid || '',
-      seq: r.seq || 0,
-      name: document.getElementById('tm-m-name').value.trim(),
-      bank: document.getElementById('tm-m-bank').value.trim(),
-      account_no: document.getElementById('tm-m-acct').value.trim(),
-      note: document.getElementById('tm-m-note').value.trim(),
-      vat: r.vat,
-    };
-    if (!rec.name) { toast('ใส่ชื่อ', 'warn'); return; }
-    
-    const btn = document.getElementById('tm-m-save');
-    btn.disabled = true;
-    btn.textContent = '⏳ กำลังบันทึก...';
-    try {
-      const saved = await pushTransferMasterRow(rec, sheet);
-      const arr = sheet === 'vat' ? transferLog.vatSuppliers : transferLog.novatSuppliers;
-      const idx = arr.findIndex(x => x.tm_uuid === saved.tm_uuid);
-      if (idx >= 0) arr[idx] = saved;
-      else arr.push(saved);
-      persistMainState();
-      toast(isEdit ? 'บันทึกสำเร็จ' : 'เพิ่ม Master สำเร็จ', 'success');
-      close();
-      if (onSave) onSave({ saved });
-    } catch (e) {
-      toast('บันทึกล้มเหลว: ' + e.message, 'error');
-      btn.disabled = false;
-      btn.textContent = isEdit ? '💾 บันทึก' : '➕ เพิ่ม';
-    }
-  });
-}
-
-window.openTransferLogModal = openTransferLogModal;
-window.openTransferMasterModal = openTransferMasterModal;
-window.pullTransferFromCloud = pullTransferFromCloud;
-window.pushTransferLogRow = pushTransferLogRow;
-window.pushTransferMasterRow = pushTransferMasterRow;
-
-async function renderTransferLog(el) {
-  let tab = 'transfers'; // transfers | suppliers | checks
-  let filterVat = 'ALL';
-  let filterBank = 'ALL';
-  let filterCategory = 'ALL';
-  let searchText = '';
-  let dateFrom = '';
-  let dateTo = '';
-  
-  function render() {
-    if (tab === 'suppliers') return renderSuppliersTab();
-    if (tab === 'checks') return renderChecksTab();
-    if (tab === 'stmts') return renderStmtsTab();
-    renderTransfersTab();
-  }
-  
-  function renderTransfersTab() {
-    let data = [
-      ...transferLog.vatTransfers,
-      ...transferLog.novatTransfers,
-    ];
-    
-    if (filterVat !== 'ALL') data = data.filter(t => t.vat === filterVat);
-    if (filterBank !== 'ALL') data = data.filter(t => t.from_bank === filterBank);
-    if (filterCategory !== 'ALL') data = data.filter(t => t.category === filterCategory);
-    if (dateFrom || dateTo) {
-      data = data.filter(t => {
-        const d = toISODate(t.transfer_date);
-        if (!d) return true;
-        if (dateFrom && d < dateFrom) return false;
-        if (dateTo && d > dateTo) return false;
-        return true;
-      });
-    }
-    if (searchText) {
-      const s = searchText.toLowerCase();
-      data = data.filter(t => 
-        (t.nickname||'').toLowerCase().includes(s) ||
-        (t.supplier_name||'').toLowerCase().includes(s) ||
-        (t.invoice_no||'').toLowerCase().includes(s) ||
-        (t.pp_no||'').toLowerCase().includes(s)
-      );
-    }
-    
-    // Sort: newest first
-    const _tlOrder = getSortOrder('transferlog');
-    data.sort((a, b) => {
-      const da = toISODate(a.transfer_date) || '';
-      const db = toISODate(b.transfer_date) || '';
-      return _tlOrder === 'asc' ? da.localeCompare(db) : db.localeCompare(da);
-    });
-    
-    // PERF: truncate
-    const _t = truncateForRender(data);
-    const visibleData = _t.visible;
-    
-    // Stats — ใช้ transfer_amount (ยอดโอนจริง = amount - หัก) ไม่ใช่ amount (ยอดตามใบแจ้งยอด)
-    const totalAmount = data.reduce((s,t) => s + Number(t.net_amount ?? t.transfer_amount ?? t.amount ?? 0), 0);
-    const vatCount = transferLog.vatTransfers.length;
-    const novatCount = transferLog.novatTransfers.length;
-    const vatAmount = transferLog.vatTransfers.reduce((s,t)=>s + Number(t.net_amount ?? t.transfer_amount ?? t.amount ?? 0),0);
-    const novatAmount = transferLog.novatTransfers.reduce((s,t)=>s + Number(t.net_amount ?? t.transfer_amount ?? t.amount ?? 0),0);
-    const matchedPP = data.filter(t => t.pp_no).length;
-    const matchedStmt = data.filter(t => t.match_status === 'stmt_matched').length;
-    
-    const allBanks = [...new Set([...transferLog.vatTransfers, ...transferLog.novatTransfers].map(t => t.from_bank).filter(Boolean))];
-    const allCategories = [...new Set([...transferLog.vatTransfers, ...transferLog.novatTransfers].map(t => t.category).filter(Boolean))];
-
-    el.innerHTML = `
-      <div class="flex justify-between items-center mb-3">
-        <div>
-          <div class="page-title">🔄 Transfer Log — รายการโอนเจ้าหนี้</div>
-          <p class="text-sm text-dim" style="margin-top:2px">รวม VAT + NOVAT · เชื่อมกับ PP Report + Supplier Payments + Statement</p>
-        </div>
-        <div class="flex gap-2 flex-wrap">
-          <button class="btn btn-success btn-sm" id="btn-tl-refresh" title="Refresh Transfer Log + Master + Statements จาก Cloud">🔄 Refresh</button>
-          <span class="text-xs text-dim" id="tl-refresh-badge" style="align-self:center;color:var(--text3);min-width:120px"></span>
-          <button class="btn btn-primary btn-sm" id="btn-tl-add-vat">➕ เพิ่ม VAT</button>
-          <button class="btn btn-primary btn-sm" id="btn-tl-add-novat" style="background:#8e44ad">➕ เพิ่ม NOVAT</button>
-          <span style="border-left:1px solid var(--border);height:24px;align-self:center"></span>
-          <button class="btn btn-outline btn-sm" id="btn-tl-import">${ICONS.download} Import JKN</button>
-          <button class="btn btn-success btn-sm" id="btn-tl-save">${ICONS.check} บันทึกเข้า Sheet</button>
-          <button class="btn btn-ghost btn-sm" id="btn-tl-clear" style="color:var(--danger)">🗑️ ล้าง</button>
-        </div>
-      </div>
-      
-      <!-- Tabs -->
-      <div class="flex gap-2 mb-3">
-        <button class="pill ${tab==='transfers'?'active':''}" data-tab="transfers">💸 รายการโอน (${vatCount + novatCount})</button>
-        <button class="pill ${tab==='suppliers'?'active':''}" data-tab="suppliers">📋 Master Supplier (${transferLog.vatSuppliers.length + transferLog.novatSuppliers.length})</button>
-        <button class="pill ${tab==='checks'?'active':''}" data-tab="checks">✅ ตรวจรายเดือน (${Object.keys(transferLog.monthlyChecks).length} เดือน)</button>
-        <button class="pill ${tab==='stmts'?'active':''}" data-tab="stmts">💳 Statements (${(getAllStatements()||[]).length})</button>
-      </div>
-      
-      <!-- Summary -->
-      <div class="flex gap-3 flex-wrap mb-3 stagger">
-        ${statCard('🔵 VAT', '฿'+fmtNum(vatAmount), vatCount+' รายการ', '#4f9cf9', ICONS.dollar)}
-        ${statCard('🟣 NOVAT (BBL NW)', '฿'+fmtNum(novatAmount), novatCount+' รายการ', '#8e44ad', ICONS.dollar)}
-        ${statCard('🔗 Match กับ PP', matchedPP, matchedPP?(matchedPP*100/data.length).toFixed(0)+'%':'0%', 'var(--success)', ICONS.check)}
-        ${statCard('🏦 Match Statement', matchedStmt, '', 'var(--info)', ICONS.pulse)}
-      </div>
-
-      <!-- Filters -->
-      <div class="flex gap-2 mb-2 flex-wrap items-center">
-        <input class="input" id="tl-search" placeholder="ค้นหา ชื่อ / INV / PP" value="${searchText}" style="width:220px">
-        <button class="pill ${filterVat==='ALL'?'active':''}" data-fv="ALL">ทั้งหมด</button>
-        <button class="pill ${filterVat==='VAT'?'active':''}" data-fv="VAT" style="--pill-color:#4f9cf9">🔵 VAT</button>
-        <button class="pill ${filterVat==='NOVAT'?'active':''}" data-fv="NOVAT" style="--pill-color:#8e44ad">🟣 NOVAT</button>
-        <select class="select" id="tl-bank" style="width:170px">
-          <option value="ALL" ${filterBank==='ALL'?'selected':''}>ทุกบัญชี</option>
-          ${allBanks.map(b => `<option value="${b}" ${filterBank===b?'selected':''}>${b}</option>`).join('')}
-        </select>
-        <select class="select" id="tl-cat" style="width:140px">
-          <option value="ALL" ${filterCategory==='ALL'?'selected':''}>ทุกประเภท</option>
-          ${allCategories.map(c => `<option value="${c}" ${filterCategory===c?'selected':''}>${c}</option>`).join('')}
-        </select>
-      </div>
-      <div class="flex gap-2 mb-3 flex-wrap items-center">
-        <span class="text-xs text-dim">ช่วงวัน:</span>
-        <button class="btn btn-ghost btn-sm" id="tl-date-prev" title="เลื่อนช่วงวันถอยหลัง" style="padding:4px 8px">◀</button>
-        <input type="date" class="input" id="tl-from" value="${dateFrom}" style="width:140px;font-size:.8rem">
-        <span class="text-xs text-dim">→</span>
-        <input type="date" class="input" id="tl-to" value="${dateTo}" style="width:140px;font-size:.8rem">
-        <button class="btn btn-ghost btn-sm" id="tl-date-next" title="เลื่อนช่วงวันไปข้างหน้า" style="padding:4px 8px">▶</button>
-        <button class="btn btn-outline btn-sm" id="tl-date-today" title="วันนี้" style="font-size:.78rem;padding:4px 8px">วันนี้</button>
-        <button class="btn btn-outline btn-sm" id="tl-date-month" title="เดือนนี้" style="font-size:.78rem;padding:4px 8px">เดือนนี้</button>
-        <button class="btn btn-ghost btn-sm" id="tl-date-clear" title="ล้างช่วงวัน" style="font-size:.78rem;padding:4px 8px;color:var(--text3)">✕</button>
-        <span style="margin-left:auto"></span>
-        ${sortToggleBtn('transferlog')}
-      </div>
-
-      <!-- Table -->
-      <div class="card-flat">
-        <div class="table-wrap" style="max-height:540px;overflow-y:auto;overflow-x:auto">
-          <table style="min-width:1500px">
-            <thead>
-              <tr>
-                <th style="width:36px">#</th>
-                <th style="text-align:center">VAT</th>
-                <th>วันที่โอน</th>
-                <th>ประเภท</th>
-                <th>ชื่อเรียก</th>
-                <th>ชื่อบริษัท / บัญชี</th>
-                <th>เลขที่ INV</th>
-                <th style="text-align:right">ยอดแจ้ง</th>
-                <th style="text-align:right">หัก</th>
-                <th style="text-align:right">ยอดจ่าย</th>
-                <th>โอนจาก</th>
-                <th>PP</th>
-                <th style="text-align:center">Match</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${data.length === 0 ? 
-                `<tr><td colspan="13" style="text-align:center;padding:40px;color:var(--text3)">
-                  ยังไม่มีข้อมูล — กด <strong>"📥 Import ไฟล์ JKN"</strong>
-                </td></tr>` :
-                visibleData.map((t, idx) => {
-                  const vatColor = t.vat === 'VAT' ? '#4f9cf9' : '#8e44ad';
-                  const ms = String(t.match_status || '').toLowerCase();
-                  const matchIcon = ms === 'matched_cash' ? '💵' : ms === 'stmt_matched' || ms === 'matched' ? '✓✓' : t.pp_no ? '✓' : '⏳';
-                  const matchColor = ms === 'matched_cash' ? '#22c55e' : (ms === 'stmt_matched' || ms === 'matched') ? 'var(--success)' : t.pp_no ? 'var(--info)' : 'var(--text3)';
-                  const sh = t.vat === 'NOVAT' ? 'novat' : 'vat';
-                  const billed = Number(t.amount_billed ?? t.amount ?? 0);
-                  const total = Number(t.deduct_total || 0);
-                  const net = Number(t.net_amount ?? t.transfer_amount ?? (billed - total));
-                  return `<tr data-tl-uuid="${t.tl_uuid||''}" data-tl-sheet="${sh}" title="คลิกเพื่อแก้ไข">
-                    <td class="text-xs text-muted">${idx+1}</td>
-                    <td style="text-align:center"><span class="badge" style="background:${vatColor}22;color:${vatColor};font-size:.7rem;font-weight:700">${t.vat==='VAT'?'V':'N'}</span></td>
-                    <td class="text-xs">${fmtDate(t.transfer_date)}</td>
-                    <td class="text-xs">${t.category||'-'}</td>
-                    <td class="font-semi text-sm" style="color:var(--text)">${t.supplier_name||'-'}</td>
-                    <td>
-                      <div class="text-sm">${t.supplier_name||'-'}</div>
-                      ${t.supplier_account ? `<div class="text-xs text-muted" style="font-family:var(--mono)">${t.supplier_bank||''} ${t.supplier_account}</div>` : ''}
-                    </td>
-                    <td class="text-xs" style="font-family:var(--mono)">${t.invoice_no||'-'}</td>
-                    <td style="text-align:right">฿${fmtNum(billed)}</td>
-                    <td style="text-align:right;color:${total>0?'var(--danger)':'var(--text3)'}">${total>0?'-':''}฿${fmtNum(total)}</td>
-                    <td style="text-align:right;font-weight:700;color:var(--success)">฿${fmtNum(net)}</td>
-                    <td class="text-xs">${t.from_bank||'-'}</td>
-                    <td class="text-xs" style="font-family:var(--mono);font-weight:600">${t.pp_no||'-'}</td>
-                    <td style="text-align:center" title="${ms||'pending'}">
-                      <span style="color:${matchColor};font-weight:600">${matchIcon}</span>
-                    </td>
-                  </tr>`;
-                }).join('')
-              }
-            </tbody>
-          </table>
-        </div>
-        <div class="flex justify-between items-center" style="padding:10px 14px;border-top:1px solid var(--border)">
-          <span class="text-sm text-dim">${visibleData.length} / ${data.length} · ทั้งหมด ${vatCount+novatCount} ${truncationFooter(data.length)}</span>
-          <span class="font-bold">รวม: ฿${fmtNum(totalAmount)}</span>
-        </div>
-      </div>
-    `;
-
-    attachCommonHandlers();
-    document.getElementById('tl-search')?.addEventListener('input', debounce(e => { searchText = e.target.value; render(); }, 300));
-    document.getElementById('tl-bank')?.addEventListener('change', e => { filterBank = e.target.value; render(); });
-    document.getElementById('tl-cat')?.addEventListener('change', e => { filterCategory = e.target.value; render(); });
-    document.getElementById('tl-from')?.addEventListener('change', e => { dateFrom = e.target.value; render(); });
-    document.getElementById('tl-to')?.addEventListener('change', e => { dateTo = e.target.value; render(); });
-    
-    // ── Date nav buttons ──
-    const _shiftDays = (iso, days) => {
-      if (!iso) return iso;
-      const d = new Date(iso); d.setDate(d.getDate() + days);
-      return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
-    };
-    document.getElementById('tl-date-prev')?.addEventListener('click', () => {
-      if (!dateFrom && !dateTo) {
-        // No range → set to yesterday
-        const y = _shiftDays(todayISO(), -1);
-        dateFrom = y; dateTo = y;
-      } else if (dateFrom && dateTo) {
-        // Shift range backward by length+1 days
-        const fromMs = new Date(dateFrom).getTime();
-        const toMs = new Date(dateTo).getTime();
-        const days = Math.max(1, Math.round((toMs - fromMs) / 86400000) + 1);
-        dateFrom = _shiftDays(dateFrom, -days);
-        dateTo = _shiftDays(dateTo, -days);
-      } else if (dateFrom) {
-        dateFrom = _shiftDays(dateFrom, -1);
-      } else {
-        dateTo = _shiftDays(dateTo, -1);
-      }
-      render();
-    });
-    document.getElementById('tl-date-next')?.addEventListener('click', () => {
-      if (!dateFrom && !dateTo) {
-        const t = todayISO();
-        dateFrom = t; dateTo = t;
-      } else if (dateFrom && dateTo) {
-        const fromMs = new Date(dateFrom).getTime();
-        const toMs = new Date(dateTo).getTime();
-        const days = Math.max(1, Math.round((toMs - fromMs) / 86400000) + 1);
-        dateFrom = _shiftDays(dateFrom, days);
-        dateTo = _shiftDays(dateTo, days);
-      } else if (dateFrom) {
-        dateFrom = _shiftDays(dateFrom, 1);
-      } else {
-        dateTo = _shiftDays(dateTo, 1);
-      }
-      render();
-    });
-    document.getElementById('tl-date-today')?.addEventListener('click', () => {
-      const t = todayISO();
-      dateFrom = t; dateTo = t;
-      render();
-    });
-    document.getElementById('tl-date-month')?.addEventListener('click', () => {
-      const t = new Date();
-      const y = t.getFullYear(), m = t.getMonth();
-      const first = `${y}-${String(m+1).padStart(2,'0')}-01`;
-      const lastDay = new Date(y, m+1, 0).getDate();
-      const last = `${y}-${String(m+1).padStart(2,'0')}-${String(lastDay).padStart(2,'0')}`;
-      dateFrom = first; dateTo = last;
-      render();
-    });
-    document.getElementById('tl-date-clear')?.addEventListener('click', () => {
-      dateFrom = ''; dateTo = ''; render();
-    });
-    el.querySelectorAll('.sort-toggle').forEach(btn => {
-      btn.addEventListener('click', () => {
-        toggleSortOrder(btn.dataset.pageKey);
-        render();
-      });
-    });
-    el.querySelectorAll('.pill[data-fv]').forEach(btn => {
-      btn.addEventListener('click', () => { filterVat = btn.dataset.fv; render(); });
-    });
-    
-    // ── Refresh: Pull TL + Statements (with dirty guard, like Main page) ──
-    document.getElementById('btn-tl-refresh')?.addEventListener('click', async () => {
-      const btn = document.getElementById('btn-tl-refresh');
-      
-      // Dirty guard
-      const dirtyTypes = window.syncManager?.dirty ? [...window.syncManager.dirty] : [];
-      if (dirtyTypes.length > 0) {
-        if (!confirm(`⚠️ มีการแก้ไขที่ยังไม่ได้บันทึก (${dirtyTypes.join(', ')})\n\nการ Refresh จะดึงข้อมูลจาก cloud — การแก้ไข local อาจถูก overwrite\n\nกด "บันทึก" ก่อน หรือดำเนินการต่อ?`)) return;
-      }
-      
-      btn.disabled = true;
-      const orig = btn.textContent;
-      btn.textContent = '⏳ Refresh...';
-      try {
-        // 1) Pull TL data (vat + novat + masters + checks)
-        const r = await pullTransferFromCloud();
-        
-        // 2) Pull stmts (shared pool with Main page) — uses common pull
-        let stmtCount = 0;
-        if (typeof pullFromCloud === 'function') {
-          try {
-            const r2 = await pullFromCloud(2, 'force', { types: ['stmts'] });
-            stmtCount = r2?.stats?.stmts || 0;
-          } catch(e) {
-            console.warn('[TL refresh] stmt pull failed:', e);
-          }
-        }
-        
-        const tlTotal = (r.vatTL||0) + (r.novatTL||0);
-        const masterTotal = (r.vatMaster||0) + (r.novatMaster||0);
-        toast(`✓ Refresh สำเร็จ — TL ${tlTotal} · Master ${masterTotal} · Stmts ${stmtCount}`, 'success', 4000);
-        
-        // Update badge
-        window._tlRefreshAt = Date.now();
-        const badge = document.getElementById('tl-refresh-badge');
-        if (badge) badge.textContent = '↻ Refresh เมื่อสักครู่';
-        
-        render();
-      } catch (e) {
-        toast('Refresh ล้มเหลว: ' + e.message, 'error', 6000);
-      } finally {
-        btn.disabled = false;
-        btn.textContent = orig;
-      }
-    });
-    
-    // ── Phase 2: Add VAT/NOVAT ──
-    document.getElementById('btn-tl-add-vat')?.addEventListener('click', () => {
-      openTransferLogModal({ sheet: 'vat', onSave: () => render() });
-    });
-    document.getElementById('btn-tl-add-novat')?.addEventListener('click', () => {
-      openTransferLogModal({ sheet: 'novat', onSave: () => render() });
-    });
-    
-    // ── Phase 2: Click row → edit modal ──
-    el.querySelectorAll('tr[data-tl-uuid]').forEach(tr => {
-      tr.style.cursor = 'pointer';
-      tr.addEventListener('click', e => {
-        if (e.target.closest('button,input,a,select')) return;
-        const uuid = tr.dataset.tlUuid;
-        const sh = tr.dataset.tlSheet;
-        const arr = sh === 'vat' ? transferLog.vatTransfers : transferLog.novatTransfers;
-        const existing = arr.find(t => t.tl_uuid === uuid);
-        if (existing) {
-          openTransferLogModal({ existing, sheet: sh, onSave: () => render() });
-        }
-      });
-    });
-  }
-  
-  // ──────────────────────────────────────────────────
-  // Statements Tab — match TL ↔ stmt (separate flow from Main)
-  // Match key: from_bank + |net_amount|=|stmt.amount| + transfer_date(±1d)
-  // Stmt fields used (shared pool):
-  //   match_status='paid', match_station='TL-VAT'/'TL-NOVAT',
-  //   match_bill=invoice_no, matched_bills=[tl_uuid], match_method='auto_tl'/'manual_tl'
-  // TL fields used:
-  //   match_status='paid', matched_stmt_uuid, matched_at, matched_by
-  // ──────────────────────────────────────────────────
-  function renderStmtsTab() {
-    const bankColors = { KTB:'#00a4e4', KBANK:'#138f2d', 'BBL NW':'#ff7b00', BBL:'#1e3a7b', TTB:'#ff0066' };
-    const allStmts = getAllStatements() || [];
-    
-    // Pre-compute TL pool for match detection
-    const tlAll = [...transferLog.vatTransfers, ...transferLog.novatTransfers];
-    const tlByUuid = new Map();
-    tlAll.forEach(t => { if (t.tl_uuid) tlByUuid.set(t.tl_uuid, t); });
-    
-    // Filter: by date range + bank + status
-    let data = allStmts.slice();
-    if (dateFrom || dateTo) {
-      data = data.filter(s => {
-        const d = toISODate(s.date);
-        if (!d) return true;
-        if (dateFrom && d < dateFrom) return false;
-        if (dateTo && d > dateTo) return false;
-        return true;
-      });
-    }
-    if (filterBank !== 'ALL') data = data.filter(s => s.bank === filterBank);
-    if (searchText) {
-      const q = searchText.toLowerCase();
-      data = data.filter(s => 
-        (s.ref_no && String(s.ref_no).toLowerCase().includes(q)) ||
-        (s.description && String(s.description).toLowerCase().includes(q)) ||
-        (s.match_bill && String(s.match_bill).toLowerCase().includes(q))
-      );
-    }
-    
-    // Sort: newest first
-    const _order = getSortOrder('transferlog');
-    data.sort((a, b) => {
-      const da = toISODate(a.date) || '';
-      const db = toISODate(b.date) || '';
-      return _order === 'asc' ? da.localeCompare(db) : db.localeCompare(da);
-    });
-    
-    const _t = truncateForRender(data);
-    const visible = _t.visible;
-    
-    const matchedTL = data.filter(s => s.match_station === 'TL-VAT' || s.match_station === 'TL-NOVAT').length;
-    const unpaidOut = data.filter(s => s.match_status !== 'paid' && Number(s.amount) < 0).length;
-    
-    el.innerHTML = `
-      <div class="flex justify-between items-center mb-3">
-        <div>
-          <h2 style="display:inline-flex;align-items:center;gap:8px">${ICONS.pulse} Transfer Log</h2>
-          <p class="text-sm text-dim" style="margin-top:2px">💳 Statement Matching — Match TL กับ Bank Statement</p>
-        </div>
-        <div class="flex gap-2 flex-wrap">
-          <button class="btn btn-success btn-sm" id="btn-tl-refresh" title="Refresh TL + Statements จาก Cloud">🔄 Refresh</button>
-          <span class="text-xs text-dim" id="tl-refresh-badge" style="align-self:center;color:var(--text3);min-width:120px"></span>
-          <button class="btn btn-primary btn-sm" id="tl-stmts-auto" style="background:var(--info)">⚡ Auto Match</button>
-        </div>
-      </div>
-      
-      <!-- Tabs (same as transfers) -->
-      <div class="flex gap-2 mb-3">
-        <button class="pill ${tab==='transfers'?'active':''}" data-tab="transfers">💸 รายการโอน</button>
-        <button class="pill ${tab==='suppliers'?'active':''}" data-tab="suppliers">📋 Master Supplier</button>
-        <button class="pill ${tab==='checks'?'active':''}" data-tab="checks">✅ ตรวจรายเดือน</button>
-        <button class="pill ${tab==='stmts'?'active':''}" data-tab="stmts">💳 Statements (${allStmts.length})</button>
-      </div>
-      
-      <!-- Summary cards -->
-      <div class="flex gap-3 flex-wrap mb-3">
-        ${statCard('💳 Total Stmts', String(data.length), '', 'var(--info)', ICONS.dollar)}
-        ${statCard('✓ Match TL', String(matchedTL), matchedTL?(matchedTL*100/(data.length||1)).toFixed(0)+'%':'0%', 'var(--success)', ICONS.check)}
-        ${statCard('🔴 ยังไม่ match (เงินออก)', String(unpaidOut), '', 'var(--danger)', ICONS.alert)}
-      </div>
-      
-      <!-- Filters -->
-      <div class="flex gap-2 mb-3 flex-wrap items-center">
-        <input class="input" id="tl-stmts-search" placeholder="ค้นหา ref / รายละเอียด / invoice" value="${searchText}" style="width:280px">
-        <button class="pill ${filterBank==='ALL'?'active':''}" data-fb="ALL">ทั้งหมด</button>
-        ${['KTB','KBANK','BBL','BBL NW','TTB'].map(bk =>
-          `<button class="pill ${filterBank===bk?'active':''}" data-fb="${bk}">${bk}</button>`
-        ).join('')}
-      </div>
-      <div class="flex gap-2 mb-3 flex-wrap items-center">
-        <span class="text-xs text-dim">ช่วงวัน:</span>
-        <button class="btn btn-ghost btn-sm" id="tl-date-prev" style="padding:4px 8px">◀</button>
-        <input type="date" class="input" id="tl-from" value="${dateFrom}" style="width:140px;font-size:.8rem">
-        <span class="text-xs text-dim">→</span>
-        <input type="date" class="input" id="tl-to" value="${dateTo}" style="width:140px;font-size:.8rem">
-        <button class="btn btn-ghost btn-sm" id="tl-date-next" style="padding:4px 8px">▶</button>
-        <button class="btn btn-outline btn-sm" id="tl-date-today" style="font-size:.78rem;padding:4px 8px">วันนี้</button>
-        <button class="btn btn-outline btn-sm" id="tl-date-month" style="font-size:.78rem;padding:4px 8px">เดือนนี้</button>
-        <button class="btn btn-ghost btn-sm" id="tl-date-clear" style="font-size:.78rem;padding:4px 8px;color:var(--text3)">✕</button>
-      </div>
-      
-      <!-- Table -->
-      <div class="card-flat">
-        <table class="table">
-          <thead>
-            <tr>
-              <th>ธนาคาร</th>
-              <th>วันที่</th>
-              <th>Ref</th>
-              <th style="text-align:right">จำนวนเงิน</th>
-              <th>รายละเอียด</th>
-              <th>TL Match</th>
-              <th>สถานะ</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${visible.length ? visible.map((s,i) => {
-              const isMatchedTL = s.match_station === 'TL-VAT' || s.match_station === 'TL-NOVAT';
-              const isMatchedBill = s.match_status === 'paid' && !isMatchedTL;
-              const isReason = s.match_method === 'manual_reason';
-              const linkedTl = isMatchedTL && Array.isArray(s.matched_bills) && s.matched_bills[0]
-                ? tlByUuid.get(s.matched_bills[0])
-                : null;
-              const rowStyle = isMatchedTL 
-                ? 'background:rgba(91,124,250,.07)'
-                : (isMatchedBill ? 'background:rgba(45,212,160,.06)' : (Number(s.amount) < 0 ? 'background:rgba(239,87,87,.05);border-left:3px solid var(--danger)' : ''));
-              return `
-                <tr style="${rowStyle}" data-stmt-uuid="${s.stmt_uuid||''}">
-                  <td><span class="badge" style="background:${(bankColors[s.bank]||'#555')}22;color:${bankColors[s.bank]||'#aaa'}">${s.bank||'-'}</span></td>
-                  <td style="white-space:nowrap">${fmtDate(s.date)}</td>
-                  <td class="text-xs" style="font-family:var(--mono)">${String(s.ref_no||'').substring(0,30)}</td>
-                  <td style="text-align:right;font-weight:600;color:${Number(s.amount)>=0?'var(--success)':'var(--danger)'}">${Number(s.amount)>=0?'+':''}${fmtNum(s.amount)}</td>
-                  <td class="truncate" style="max-width:200px;color:var(--text2)">${String(s.description||'').substring(0,80)}</td>
-                  <td>
-                    ${isMatchedTL ? 
-                      `<span class="badge" style="background:rgba(91,124,250,.2);color:var(--info)">${s.match_station}</span> ${linkedTl ? `<span class="text-xs" title="${linkedTl.supplier_name||''}">${linkedTl.invoice_no||linkedTl.tl_uuid?.substring(0,8)||''}</span>` : ''}` :
-                      (isMatchedBill ? `<span class="badge badge-success" style="font-size:.7rem">Bill: ${s.match_bill||'-'}</span>` :
-                      (isReason ? `<span class="badge" style="background:rgba(165,134,255,.2);color:var(--purple);font-size:.7rem">📝 reason</span>` : '-'))}
-                  </td>
-                  <td>${isMatchedTL ? 
-                    `<button class="btn btn-ghost btn-sm btn-tl-stmt-unmatch" data-stmt-uuid="${s.stmt_uuid||''}" title="ยกเลิก">↩</button>` :
-                    (isMatchedBill ? `<span class="text-xs text-dim" title="Match กับบิลที่หน้า Main แล้ว">🔒 ผูก Bill</span>` :
-                    (isReason ? `<span class="text-xs text-dim">🔒 มีเหตุผล</span>` :
-                    `<button class="btn btn-primary btn-sm btn-tl-stmt-manual" data-stmt-uuid="${s.stmt_uuid||''}">${ICONS.search} Match TL</button>`))}
-                  </td>
-                </tr>
-              `;
-            }).join('') : `<tr><td colspan="7" style="text-align:center;padding:30px;color:var(--text3)">ไม่มีข้อมูล Statement</td></tr>`}
-          </tbody>
-        </table>
-        <div class="text-xs text-dim" style="padding:10px">
-          แสดง ${visible.length} / ${data.length} รายการ ${truncationFooter(data.length)}
-        </div>
-      </div>
-    `;
-    
-    // ── Wire common nav (tabs, refresh, dates) ──
-    el.querySelectorAll('[data-tab]').forEach(btn => {
-      btn.addEventListener('click', () => { tab = btn.dataset.tab; render(); });
-    });
-    el.querySelectorAll('[data-fb]').forEach(btn => {
-      btn.addEventListener('click', () => { filterBank = btn.dataset.fb; render(); });
-    });
-    document.getElementById('tl-stmts-search')?.addEventListener('input', e => { searchText = e.target.value; render(); });
-    document.getElementById('tl-from')?.addEventListener('change', e => { dateFrom = e.target.value; render(); });
-    document.getElementById('tl-to')?.addEventListener('change', e => { dateTo = e.target.value; render(); });
-    
-    const _shiftDays = (iso, days) => {
-      if (!iso) return iso;
-      const d = new Date(iso); d.setDate(d.getDate() + days);
-      return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
-    };
-    document.getElementById('tl-date-prev')?.addEventListener('click', () => {
-      if (!dateFrom && !dateTo) { const y = _shiftDays(todayISO(), -1); dateFrom=y; dateTo=y; }
-      else if (dateFrom && dateTo) {
-        const days = Math.max(1, Math.round((new Date(dateTo)-new Date(dateFrom))/86400000) + 1);
-        dateFrom = _shiftDays(dateFrom,-days); dateTo = _shiftDays(dateTo,-days);
-      } else if (dateFrom) dateFrom = _shiftDays(dateFrom,-1);
-      else dateTo = _shiftDays(dateTo,-1);
-      render();
-    });
-    document.getElementById('tl-date-next')?.addEventListener('click', () => {
-      if (!dateFrom && !dateTo) { const t = todayISO(); dateFrom=t; dateTo=t; }
-      else if (dateFrom && dateTo) {
-        const days = Math.max(1, Math.round((new Date(dateTo)-new Date(dateFrom))/86400000) + 1);
-        dateFrom = _shiftDays(dateFrom,days); dateTo = _shiftDays(dateTo,days);
-      } else if (dateFrom) dateFrom = _shiftDays(dateFrom,1);
-      else dateTo = _shiftDays(dateTo,1);
-      render();
-    });
-    document.getElementById('tl-date-today')?.addEventListener('click', () => {
-      const t = todayISO(); dateFrom=t; dateTo=t; render();
-    });
-    document.getElementById('tl-date-month')?.addEventListener('click', () => {
-      const t = new Date(); const y=t.getFullYear(), m=t.getMonth();
-      dateFrom = `${y}-${String(m+1).padStart(2,'0')}-01`;
-      const lastDay = new Date(y, m+1, 0).getDate();
-      dateTo = `${y}-${String(m+1).padStart(2,'0')}-${String(lastDay).padStart(2,'0')}`;
-      render();
-    });
-    document.getElementById('tl-date-clear')?.addEventListener('click', () => {
-      dateFrom=''; dateTo=''; render();
-    });
-    
-    // ── Refresh button (TL-specific) ──
-    document.getElementById('btn-tl-refresh')?.addEventListener('click', async () => {
-      const btn = document.getElementById('btn-tl-refresh');
-      const dirtyTypes = window.syncManager?.dirty ? [...window.syncManager.dirty] : [];
-      if (dirtyTypes.length > 0) {
-        if (!confirm(`⚠️ มีการแก้ไขที่ยังไม่ได้บันทึก (${dirtyTypes.join(', ')})\n\nกด "บันทึก" ก่อน หรือดำเนินการต่อ?`)) return;
-      }
-      btn.disabled = true;
-      const orig = btn.textContent;
-      btn.textContent = '⏳ Refresh...';
-      try {
-        const r = await pullTransferFromCloud();
-        let stmtCount = 0;
-        if (typeof pullFromCloud === 'function') {
-          try {
-            const r2 = await pullFromCloud(2, 'force', { types: ['stmts'] });
-            stmtCount = r2?.stats?.stmts || 0;
-          } catch(e) {}
-        }
-        const tlTotal = (r.vatTL||0) + (r.novatTL||0);
-        toast(`✓ Refresh สำเร็จ — TL ${tlTotal} · Master ${(r.vatMaster||0)+(r.novatMaster||0)} · Stmts ${stmtCount}`, 'success', 4000);
-        render();
-      } catch (e) {
-        toast('Refresh ล้มเหลว: ' + e.message, 'error', 6000);
-      } finally {
-        btn.disabled = false; btn.textContent = orig;
-      }
-    });
-    
-    // ── Auto Match TL ↔ Stmt ──
-    document.getElementById('tl-stmts-auto')?.addEventListener('click', () => {
-      autoMatchTLStatements();
-    });
-    
-    // ── Manual Match button on row ──
-    el.querySelectorAll('.btn-tl-stmt-manual').forEach(btn => {
-      btn.addEventListener('click', e => {
-        e.stopPropagation();
-        const stmtUuid = btn.dataset.stmtUuid;
-        const stmt = allStmts.find(s => s.stmt_uuid === stmtUuid);
-        if (!stmt) { toast('ไม่พบ statement', 'error'); return; }
-        openTlManualMatchModal(stmt);
-      });
-    });
-    
-    // ── Unmatch ──
-    el.querySelectorAll('.btn-tl-stmt-unmatch').forEach(btn => {
-      btn.addEventListener('click', e => {
-        e.stopPropagation();
-        const stmtUuid = btn.dataset.stmtUuid;
-        if (!confirm('ยกเลิก match TL ↔ Statement นี้?')) return;
-        unmatchTLStatement(stmtUuid);
-      });
-    });
-  }
-  
-  // ── Auto Match TL ↔ Stmt ──
-  function autoMatchTLStatements() {
-    const tlAll = [...transferLog.vatTransfers, ...transferLog.novatTransfers];
-    const stmts = getAllStatements() || [];
-    
-    // Bank name normalize: TL.from_bank อาจเป็น "K PLUS SME JKN" / "BBL" / "SCB" / "BBL NW"
-    //   stmt.bank = "KTB" / "KBANK" / "BBL" / "BBL NW" / "TTB"
-    const normalizeBank = (s) => {
-      const lc = String(s||'').toLowerCase();
-      if (lc.includes('bbl nw') || lc.includes('bbl-nw') || lc.includes('bblnw')) return 'BBL NW';
-      if (lc.includes('bbl') || lc.includes('กรุงเทพ')) return 'BBL';
-      if (lc.includes('kbank') || lc.includes('k plus') || lc.includes('กสิกร')) return 'KBANK';
-      if (lc.includes('ktb') || lc.includes('กรุงไทย')) return 'KTB';
-      if (lc.includes('ttb')) return 'TTB';
-      if (lc.includes('scb')) return 'SCB';
-      return String(s||'').toUpperCase();
-    };
-    
-    let matched = 0, skipped = 0;
-    const dirtyStmts = new Set();
-    
-    // Index stmts by composite key: bank|date|abs(amount)
-    //   pre-filter: amount<0 (เงินออก) + unmatched
-    const stmtIdx = new Map();
-    stmts.forEach(s => {
-      if (s.match_status === 'paid') return;
-      if (Number(s.amount) >= 0) return;
-      const bk = normalizeBank(s.bank);
-      const dt = toISODate(s.date);
-      const k2 = Math.round(Math.abs(Number(s.amount))*100);
-      const key = `${bk}|${dt}|${k2}`;
-      if (!stmtIdx.has(key)) stmtIdx.set(key, []);
-      stmtIdx.get(key).push(s);
-    });
-    
-    // Loop TL — find unique stmt match
-    tlAll.forEach(t => {
-      if (t.match_status === 'paid') return;
-      if (!t.tl_uuid) return; // need uuid
-      const tlBk = normalizeBank(t.from_bank);
-      const tlDate = toISODate(t.transfer_date);
-      const k2 = Math.round(Math.abs(Number(t.net_amount)||0)*100);
-      if (!k2) return;
-      
-      // Try ±1 day
-      const candidates = [];
-      [-1, 0, 1].forEach(d => {
-        const dt = d === 0 ? tlDate : (() => {
-          const dd = new Date(tlDate); dd.setDate(dd.getDate()+d);
-          return dd.getFullYear()+'-'+String(dd.getMonth()+1).padStart(2,'0')+'-'+String(dd.getDate()).padStart(2,'0');
-        })();
-        const arr = stmtIdx.get(`${tlBk}|${dt}|${k2}`) || [];
-        candidates.push(...arr);
-      });
-      
-      // Unique match required (ambiguous → skip)
-      const fresh = candidates.filter(s => s.match_status !== 'paid');
-      if (fresh.length !== 1) { skipped++; return; }
-      const stmt = fresh[0];
-      
-      // Apply match
-      const station = t.vat === 'VAT' ? 'TL-VAT' : 'TL-NOVAT';
-      stmt.match_status = 'paid';
-      stmt.match_station = station;
-      stmt.match_bill = t.invoice_no || t.tl_uuid;
-      stmt.matched_bills = [t.tl_uuid];
-      stmt.match_method = 'auto_tl';
-      stmt.matched_at = new Date().toISOString();
-      if (typeof currentUser !== 'undefined' && currentUser?.username) stmt.matched_by = currentUser.username;
-      
-      t.match_status = 'paid';
-      t.matched_stmt_uuid = stmt.stmt_uuid;
-      t.matched_at = stmt.matched_at;
-      t.matched_by = stmt.matched_by || '';
-      t.stmt_ref = stmt.ref_no || '';
-      
-      dirtyStmts.add(stmt.stmt_uuid);
-      matched++;
-    });
-    
-    // Mark dirty + persist + push TL
-    dirtyStmts.forEach(uuid => {
-      if (window.syncManager?.markDirty) window.syncManager.markDirty('stmts', uuid);
-    });
-    try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(_) {}
-    persistMainState();
-    
-    if (matched === 0) {
-      toast(`Auto Match: ไม่เจอคู่ที่ตรงเงื่อนไข (skip ${skipped})`, 'info', 4000);
-      return;
-    }
-    
-    // Push TL records ที่เพิ่ง match (fire-and-forget)
-    (async () => {
-      try {
-        const updatedTL = tlAll.filter(t => dirtyStmts.has(t.matched_stmt_uuid));
-        const vatRecs = updatedTL.filter(t => t.vat === 'VAT');
-        const novatRecs = updatedTL.filter(t => t.vat === 'NOVAT');
-        if (vatRecs.length) await api('v2_upsertTransferLog', { sheet: 'vat', records: vatRecs });
-        if (novatRecs.length) await api('v2_upsertTransferLog', { sheet: 'novat', records: novatRecs });
-      } catch(e) { console.warn('[TL push delta]', e); }
-    })();
-    
-    toast(`✓ Auto Match สำเร็จ ${matched} คู่ · skip ${skipped} (ไม่ unique หรือไม่ตรง) — กด "บันทึก" เพื่อ push stmts`, 'success', 6000);
-    render();
-  }
-  
-  // ── Manual Match modal: pick TL row to link with stmt ──
-  function openTlManualMatchModal(stmt) {
-    const tlAll = [...transferLog.vatTransfers, ...transferLog.novatTransfers];
-    const candidates = tlAll.filter(t => t.match_status !== 'paid' && t.tl_uuid);
-    
-    // Sort: closest to stmt date first, then by amount diff
-    const stmtDate = toISODate(stmt.date);
-    const stmtAmtAbs = Math.abs(Number(stmt.amount)||0);
-    candidates.sort((a,b) => {
-      const dDa = Math.abs(new Date(toISODate(a.transfer_date)) - new Date(stmtDate)) / 86400000;
-      const dDb = Math.abs(new Date(toISODate(b.transfer_date)) - new Date(stmtDate)) / 86400000;
-      const dAa = Math.abs((Number(a.net_amount)||0) - stmtAmtAbs);
-      const dAb = Math.abs((Number(b.net_amount)||0) - stmtAmtAbs);
-      return (dDa + dAa/10000) - (dDb + dAb/10000);
-    });
-    
-    let selectedUuid = null;
-    let searchTl = '';
-    
-    const renderCandidates = () => {
-      const q = searchTl.toLowerCase();
-      const filtered = q ? candidates.filter(t =>
-        (t.invoice_no||'').toLowerCase().includes(q) ||
-        (t.supplier_name||'').toLowerCase().includes(q) ||
-        (t.nickname||'').toLowerCase().includes(q)
-      ) : candidates;
-      const list = filtered.slice(0, 50);
-      const container = document.getElementById('tl-mm-list');
-      if (!container) return;
-      container.innerHTML = list.length ? list.map(t => {
-        const dDiff = Math.round(Math.abs(new Date(toISODate(t.transfer_date)) - new Date(stmtDate)) / 86400000);
-        const aDiff = Math.abs((Number(t.net_amount)||0) - stmtAmtAbs);
-        const isExact = dDiff <= 1 && aDiff < 0.01;
-        return `
-          <div class="tl-mm-row" data-uuid="${t.tl_uuid}" style="padding:8px 10px;border-bottom:1px solid var(--border);cursor:pointer;display:grid;grid-template-columns:80px 110px 1fr 130px 100px;gap:8px;align-items:center;font-size:.85rem;${selectedUuid===t.tl_uuid?'background:rgba(91,124,250,.15)':''}${isExact?';border-left:3px solid var(--success)':''}">
-            <span class="badge" style="background:${t.vat==='VAT'?'rgba(79,156,249,.2)':'rgba(142,68,173,.2)'};color:${t.vat==='VAT'?'#4f9cf9':'#8e44ad'};font-size:.7rem">${t.vat}</span>
-            <span style="font-family:var(--mono);font-size:.78rem">${fmtDate(t.transfer_date)}${dDiff?` <span class="text-xs" style="color:var(--warn)">±${dDiff}d</span>`:''}</span>
-            <span title="${t.supplier_name||''}">${t.invoice_no||'-'} · <span class="text-xs text-dim">${(t.supplier_name||t.nickname||'').substring(0,30)}</span></span>
-            <span style="text-align:right;font-weight:600;color:var(--text)">฿${fmtNum(t.net_amount)}${aDiff>0.01?`<br><span class="text-xs" style="color:var(--warn)">Δ฿${fmtNum(aDiff)}</span>`:''}</span>
-            <span class="text-xs text-dim">${t.from_bank||'-'}</span>
-          </div>
-        `;
-      }).join('') : `<div style="padding:30px;text-align:center;color:var(--text3)">ไม่พบ TL ที่ unmatch</div>`;
-      
-      container.querySelectorAll('.tl-mm-row').forEach(row => {
-        row.addEventListener('click', () => {
-          selectedUuid = row.dataset.uuid;
-          renderCandidates();
-        });
-      });
-    };
-    
-    openModal('🔗 Match TL ↔ Statement', `
-      <div style="min-width:760px">
-        <div style="padding:10px;background:var(--bg2);border-radius:5px;margin-bottom:12px;font-size:.85rem">
-          <strong>Statement:</strong> ${stmt.bank} · ${fmtDate(stmt.date)} · 
-          <span style="color:${Number(stmt.amount)>=0?'var(--success)':'var(--danger)'};font-weight:600">฿${fmtNum(stmt.amount)}</span><br>
-          <span class="text-xs text-dim">${String(stmt.description||'').substring(0,120)}</span>
-        </div>
-        
-        <input class="input mb-2" id="tl-mm-search" placeholder="ค้นหา invoice / supplier / nickname" style="width:100%">
-        
-        <div style="max-height:380px;overflow-y:auto;border:1px solid var(--border);border-radius:6px" id="tl-mm-list"></div>
-        
-        <div style="padding:8px 0;font-size:.8rem;color:var(--text-dim)">
-          🟢 = ตรงเป๊ะ (วันเดียวกัน + ยอดเท่ากัน) — เรียงตามใกล้ที่สุด
-        </div>
-        
-        <div class="flex gap-2 mt-3">
-          <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ยกเลิก</button>
-          <button class="btn btn-primary btn-sm flex-1" id="tl-mm-confirm">${ICONS.check} Match</button>
-        </div>
-      </div>
-    `);
-    
-    document.getElementById('tl-mm-search')?.addEventListener('input', e => {
-      searchTl = e.target.value;
-      renderCandidates();
-    });
-    renderCandidates();
-    
-    document.getElementById('tl-mm-confirm')?.addEventListener('click', async () => {
-      if (!selectedUuid) { toast('เลือก TL ก่อน', 'warn'); return; }
-      const tl = tlAll.find(t => t.tl_uuid === selectedUuid);
-      if (!tl) { toast('TL not found', 'error'); return; }
-      
-      const station = tl.vat === 'VAT' ? 'TL-VAT' : 'TL-NOVAT';
-      stmt.match_status = 'paid';
-      stmt.match_station = station;
-      stmt.match_bill = tl.invoice_no || tl.tl_uuid;
-      stmt.matched_bills = [tl.tl_uuid];
-      stmt.match_method = 'manual_tl';
-      stmt.matched_at = new Date().toISOString();
-      if (typeof currentUser !== 'undefined' && currentUser?.username) stmt.matched_by = currentUser.username;
-      
-      tl.match_status = 'paid';
-      tl.matched_stmt_uuid = stmt.stmt_uuid;
-      tl.matched_at = stmt.matched_at;
-      tl.matched_by = stmt.matched_by || '';
-      tl.stmt_ref = stmt.ref_no || '';
-      
-      if (window.syncManager?.markDirty) window.syncManager.markDirty('stmts', stmt.stmt_uuid);
-      try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(_) {}
-      persistMainState();
-      
-      // Push TL row
-      try {
-        await api('v2_upsertTransferLog', { sheet: tl.vat==='VAT'?'vat':'novat', records: [tl] });
-      } catch(e) { console.warn('[TL push]', e); }
-      
-      closeModal();
-      toast(`✓ Match สำเร็จ — ${stmt.bank} ${fmtDate(stmt.date)} ↔ ${tl.invoice_no||'TL'} · กด "บันทึก" เพื่อ push stmts`, 'success', 5000);
-      render();
-    });
-  }
-  
-  // ── Unmatch TL ↔ Stmt ──
-  async function unmatchTLStatement(stmtUuid) {
-    const stmt = (getAllStatements()||[]).find(s => s.stmt_uuid === stmtUuid);
-    if (!stmt) { toast('ไม่พบ statement', 'error'); return; }
-    
-    const tlUuid = (Array.isArray(stmt.matched_bills) && stmt.matched_bills[0]) || '';
-    const tlAll = [...transferLog.vatTransfers, ...transferLog.novatTransfers];
-    const tl = tlUuid ? tlAll.find(t => t.tl_uuid === tlUuid) : null;
-    
-    // Clear stmt side
-    stmt.match_status = 'unpaid';
-    stmt.match_station = '';
-    stmt.match_bill = '';
-    stmt.matched_bills = [];
-    stmt.match_method = '';
-    stmt.matched_at = '';
-    stmt.matched_by = '';
-    stmt.match_reason = '';
-    stmt.overpay_amount = '';
-    
-    // Clear TL side
-    if (tl) {
-      tl.match_status = 'unpaid';
-      tl.matched_stmt_uuid = '';
-      tl.matched_at = '';
-      tl.matched_by = '';
-      tl.stmt_ref = '';
-    }
-    
-    if (window.syncManager?.markDirty) window.syncManager.markDirty('stmts', stmt.stmt_uuid);
-    try { safeStorage.set('sf_statementsByBank', JSON.stringify(statementsByBank)); } catch(_) {}
-    persistMainState();
-    
-    if (tl) {
-      try {
-        await api('v2_upsertTransferLog', { sheet: tl.vat==='VAT'?'vat':'novat', records: [tl] });
-      } catch(e) { console.warn('[TL unmatch push]', e); }
-    }
-    
-    toast('✓ Unmatch สำเร็จ — กด "บันทึก" เพื่อ push stmts', 'success', 4000);
-    render();
-  }
-  
-  function renderSuppliersTab() {
-    const allSups = [
-      ...transferLog.vatSuppliers,
-      ...transferLog.novatSuppliers,
-    ];
-    
-    let data = [...allSups];
-    if (filterVat !== 'ALL') data = data.filter(s => s.vat === filterVat);
-    if (searchText) {
-      const s = searchText.toLowerCase();
-      data = data.filter(x => (x.nickname||'').toLowerCase().includes(s) || (x.name||'').toLowerCase().includes(s));
-    }
-    
-    el.innerHTML = `
-      <div class="flex justify-between items-center mb-3">
-        <div>
-          <div class="page-title">📋 Master Supplier</div>
-          <p class="text-sm text-dim" style="margin-top:2px">VAT (${transferLog.vatSuppliers.length}) + NOVAT (${transferLog.novatSuppliers.length})</p>
-        </div>
-        <div class="flex gap-2 flex-wrap">
-          <button class="btn btn-primary btn-sm" id="btn-tm-add-vat">➕ เพิ่ม VAT</button>
-          <button class="btn btn-primary btn-sm" id="btn-tm-add-novat" style="background:#8e44ad">➕ เพิ่ม NOVAT</button>
-          <button class="btn btn-outline btn-sm" id="btn-tl-sync-sup">${ICONS.check} Sync → "จ่ายเจ้าหนี้"</button>
-        </div>
-      </div>
-      
-      <div class="flex gap-2 mb-3">
-        <button class="pill ${tab==='transfers'?'active':''}" data-tab="transfers">💸 รายการโอน</button>
-        <button class="pill ${tab==='suppliers'?'active':''}" data-tab="suppliers">📋 Master Supplier</button>
-        <button class="pill ${tab==='checks'?'active':''}" data-tab="checks">✅ ตรวจรายเดือน</button>
-        <button class="pill ${tab==='stmts'?'active':''}" data-tab="stmts">💳 Statements</button>
-      </div>
-      
-      <div class="flex gap-2 mb-3 items-center">
-        <input class="input" id="tl-search" placeholder="ค้นหาชื่อ" value="${searchText}" style="width:220px">
-        <button class="pill ${filterVat==='ALL'?'active':''}" data-fv="ALL">ทั้งหมด</button>
-        <button class="pill ${filterVat==='VAT'?'active':''}" data-fv="VAT" style="--pill-color:#4f9cf9">🔵 VAT</button>
-        <button class="pill ${filterVat==='NOVAT'?'active':''}" data-fv="NOVAT" style="--pill-color:#8e44ad">🟣 NOVAT</button>
-      </div>
-      
-      <div class="card-flat">
-        <div class="table-wrap" style="max-height:540px;overflow-y:auto">
-          <table>
-            <thead>
-              <tr>
-                <th style="width:40px">#</th>
-                <th>VAT</th>
-                <th>ชื่อบริษัท</th>
-                <th>ธนาคาร</th>
-                <th>เลขที่บัญชี</th>
-                <th>หมายเหตุ</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${data.length === 0 ? '<tr><td colspan="6" style="text-align:center;padding:30px">ไม่มีข้อมูล — กด "ดึงจาก Cloud" หรือ "เพิ่ม"</td></tr>' :
-                data.map((s, i) => {
-                  const vatColor = s.vat === 'VAT' ? '#4f9cf9' : '#8e44ad';
-                  const sh = s.vat === 'NOVAT' ? 'novat' : 'vat';
-                  return `<tr data-tm-uuid="${s.tm_uuid||''}" data-tm-sheet="${sh}" style="cursor:pointer" title="คลิกเพื่อแก้ไข">
-                    <td class="text-xs text-muted">${i+1}</td>
-                    <td><span class="badge" style="background:${vatColor}22;color:${vatColor};font-size:.7rem">${s.vat}</span></td>
-                    <td class="font-semi">${s.name||'-'}</td>
-                    <td class="text-xs">${s.bank||'-'}</td>
-                    <td class="text-xs" style="font-family:var(--mono)">${s.account_no||'-'}</td>
-                    <td class="text-xs text-muted">${s.note||''}</td>
-                  </tr>`;
-                }).join('')
-              }
-            </tbody>
-          </table>
-        </div>
-      </div>
-    `;
-    
-    attachCommonHandlers();
-    document.getElementById('tl-search')?.addEventListener('input', debounce(e => { searchText = e.target.value; render(); }, 300));
-    el.querySelectorAll('.pill[data-fv]').forEach(btn => {
-      btn.addEventListener('click', () => { filterVat = btn.dataset.fv; render(); });
-    });
-    
-    // Phase 2: Add Master VAT/NOVAT
-    document.getElementById('btn-tm-add-vat')?.addEventListener('click', () => {
-      openTransferMasterModal({ sheet: 'vat', onSave: () => render() });
-    });
-    document.getElementById('btn-tm-add-novat')?.addEventListener('click', () => {
-      openTransferMasterModal({ sheet: 'novat', onSave: () => render() });
-    });
-    
-    // Phase 2: Click row → edit Master
-    el.querySelectorAll('tr[data-tm-uuid]').forEach(tr => {
-      tr.addEventListener('click', e => {
-        if (e.target.closest('button,input,a,select')) return;
-        const uuid = tr.dataset.tmUuid;
-        const sh = tr.dataset.tmSheet;
-        const arr = sh === 'vat' ? transferLog.vatSuppliers : transferLog.novatSuppliers;
-        const existing = arr.find(s => s.tm_uuid === uuid);
-        if (existing) {
-          openTransferMasterModal({ existing, sheet: sh, onSave: () => render() });
-        }
-      });
-    });
-    
-    // Sync to Supplier Master (legacy)
-    document.getElementById('btn-tl-sync-sup')?.addEventListener('click', () => {
-      if (allSups.length === 0) { toast('ไม่มีข้อมูลให้ sync', 'error'); return; }
-      let added = 0, updated = 0;
-      allSups.forEach(s => {
-        const existing = supplierList.find(x => 
-          (x.code && x.code === s.nickname) || 
-          (x.name && x.name === s.name) ||
-          (x.account_no && s.account_no && x.account_no === s.account_no)
-        );
-        if (existing) {
-          existing.code = existing.code || s.nickname;
-          existing.name = existing.name || s.name;
-          existing.vat = existing.vat || s.vat;
-          existing.bank = existing.bank || s.bank;
-          existing.account_no = existing.account_no || s.account_no;
-          updated++;
-        } else {
-          supplierList.push({
-            id: 'SUP-' + Date.now() + '-' + added,
-            code: s.nickname,
-            name: s.name,
-            vat: s.vat,
-            bank: s.bank,
-            account_no: s.account_no,
-            account_name: s.name,
-            phone: '',
-            note: s.note || '',
-            created_at: new Date().toISOString(),
-          });
-          added++;
-        }
-      });
-      persistMainState();
-      toast(`Sync เสร็จ — เพิ่มใหม่ ${added} ราย, อัปเดต ${updated} ราย`, 'success');
-    });
-  }
-  
-  function renderChecksTab() {
-    const months = Object.keys(transferLog.monthlyChecks).sort();
-    let selectedMonth = months[0] || '';
-    
-    // ── Compute linkage for all checks across months ──
-    const allChecks = Object.values(transferLog.monthlyChecks).flat();
-    allChecks.forEach(c => {
-      if (c.pp_no) {
-        const sp = supplierPayments.find(s => s.pp_no === c.pp_no);
-        c.linked_sp = sp ? sp.id : '';
-        c.sp_match_status = sp ? sp.match_status : '';
-      } else {
-        c.linked_sp = '';
-        c.sp_match_status = '';
-      }
-    });
-    
-    const checks = transferLog.monthlyChecks[selectedMonth] || [];
-    const totalChecks = allChecks.length;
-    const linkedCount = allChecks.filter(c => c.linked_sp).length;
-    const unlinkedCount = allChecks.filter(c => c.pp_no && !c.linked_sp).length;
-    const noPpCount = allChecks.filter(c => !c.pp_no).length;
-    const diffCount = allChecks.filter(c => Math.abs(c.diff||0) >= 0.01).length;
-    
-    el.innerHTML = `
-      <div class="flex justify-between items-center mb-3">
-        <div>
-          <div class="page-title">✅ ตรวจรายเดือน — Cross-check กับ PP</div>
-          <p class="text-sm text-dim" style="margin-top:2px">เปรียบเทียบรายการโอนกับ PP Report จากระบบ Smart · ${totalChecks} รายการรวม</p>
-        </div>
-      </div>
-      
-      <div class="flex gap-2 mb-3">
-        <button class="pill ${tab==='transfers'?'active':''}" data-tab="transfers">💸 รายการโอน</button>
-        <button class="pill ${tab==='suppliers'?'active':''}" data-tab="suppliers">📋 Master Supplier</button>
-        <button class="pill ${tab==='checks'?'active':''}" data-tab="checks">✅ ตรวจรายเดือน</button>
-        <button class="pill ${tab==='stmts'?'active':''}" data-tab="stmts">💳 Statements</button>
-      </div>
-      
-      ${months.length === 0 ? '<div class="card text-center" style="padding:40px;color:var(--text3)">ยังไม่มีข้อมูลตรวจ — Import ไฟล์ JKN ก่อน</div>' : `
-        
-        <!-- Stats -->
-        <div class="flex gap-3 flex-wrap mb-3 stagger">
-          ${statCard('📋 ตรวจทั้งหมด', totalChecks, Object.keys(transferLog.monthlyChecks).length+' เดือน', 'var(--info)', ICONS.card)}
-          ${statCard('✓ Linked กับ SP', linkedCount, '', 'var(--success)', ICONS.check)}
-          ${unlinkedCount > 0 ? statCard('⚠️ มี PP ไม่ link', unlinkedCount, 'รอสร้าง SP', 'var(--warn)', ICONS.alert) : ''}
-          ${noPpCount > 0 ? statCard('❓ ไม่มี PP', noPpCount, 'รอตรวจ', 'var(--text3)', ICONS.alert) : ''}
-          ${diffCount > 0 ? statCard('⚠️ Diff ≠ 0', diffCount, 'ยอดไม่ตรง', 'var(--danger)', ICONS.alert) : ''}
-        </div>
-        
-        ${unlinkedCount > 0 ? `
-          <div class="card mb-3" style="border-left:4px solid var(--warn);padding:12px">
-            <div class="flex justify-between items-center flex-wrap gap-2">
-              <div>
-                <div class="font-semi">⚠️ มี ${unlinkedCount} รายการตรวจที่มี PP แต่ยังไม่มีใน "จ่ายเจ้าหนี้"</div>
-                <div class="text-xs text-muted mt-1">ระบบจะสร้างรายการใน SupplierPayments ให้อัตโนมัติ (status: paid)</div>
-              </div>
-              <button class="btn btn-primary btn-sm" id="btn-chk-bulk-create">${ICONS.plus} สร้างใน "จ่ายเจ้าหนี้" (${unlinkedCount})</button>
-            </div>
-          </div>
-        ` : linkedCount === totalChecks && totalChecks > 0 ? `
-          <div class="card mb-3" style="border-left:4px solid var(--success);padding:10px 14px">
-            <div class="text-sm" style="color:var(--success)">✅ ทุกรายการตรวจ link ครบ — ${linkedCount}/${totalChecks}</div>
-          </div>
-        ` : ''}
-        
-        <!-- Month tabs with linkage count -->
-        <div class="flex gap-2 mb-3 flex-wrap">
-          ${months.map(m => {
-            const mChecks = transferLog.monthlyChecks[m];
-            const mLinked = mChecks.filter(c => c.linked_sp).length;
-            return `<button class="pill ${selectedMonth===m?'active':''}" data-month="${m}">${m} <span style="opacity:.6">(${mLinked}/${mChecks.length})</span></button>`;
-          }).join('')}
-        </div>
-        
-        <div class="card-flat">
-          <div class="table-wrap" style="max-height:560px;overflow-y:auto;overflow-x:auto">
-            <table style="min-width:1400px">
-              <thead>
-                <tr>
-                  <th style="width:40px">#</th>
-                  <th>วันโอน</th>
-                  <th>ชื่อเรียก</th>
-                  <th>บริษัท</th>
-                  <th>INV</th>
-                  <th style="text-align:right">ยอดจ่าย</th>
-                  <th>โอนจาก</th>
-                  <th style="text-align:right">Diff</th>
-                  <th>เลข PP</th>
-                  <th>วันรับ</th>
-                  <th style="text-align:right">ยอด PP</th>
-                  <th style="text-align:center">↔ SP</th>
-                  <th>หมายเหตุ</th>
-                </tr>
-              </thead>
-              <tbody>
-                ${checks.map((c, i) => {
-                  const diffColor = Math.abs(c.diff||0) < 0.01 ? 'var(--text3)' : 'var(--danger)';
-                  let spBadge;
-                  if (c.linked_sp) {
-                    const color = c.sp_match_status === 'paid' ? 'var(--success)' : 'var(--info)';
-                    const label = c.sp_match_status === 'paid' ? '✓ Paid' : '🔗 Linked';
-                    spBadge = `<span class="badge" style="background:${color}22;color:${color};font-size:.7rem">${label}</span>`;
-                  } else if (c.pp_no) {
-                    spBadge = `<span class="badge" style="background:rgba(244,180,26,.15);color:var(--warn);font-size:.7rem">⚠️ ไม่มี SP</span>`;
-                  } else {
-                    spBadge = `<span class="badge badge-muted" style="font-size:.7rem">— ไม่มี PP</span>`;
-                  }
-                  return `<tr>
-                    <td class="text-xs text-muted">${i+1}</td>
-                    <td class="text-xs">${fmtDate(c.transfer_date)}</td>
-                    <td class="font-semi">${c.nickname||''}</td>
-                    <td class="text-xs">${c.supplier_name||'-'}</td>
-                    <td class="text-xs" style="font-family:var(--mono)">${c.invoice_no||'-'}</td>
-                    <td style="text-align:right;font-weight:600">฿${fmtNum(c.amount_paid)}</td>
-                    <td class="text-xs">${c.from_bank||'-'}</td>
-                    <td style="text-align:right;color:${diffColor};font-weight:${Math.abs(c.diff||0)>=0.01?'700':'400'}">${c.diff?'฿'+fmtNum(c.diff):'-'}</td>
-                    <td class="text-xs" style="font-family:var(--mono);color:var(--info)">${c.pp_no||'-'}</td>
-                    <td class="text-xs">${fmtDate(c.receive_date)||'-'}</td>
-                    <td style="text-align:right">${c.amount_pp?'฿'+fmtNum(c.amount_pp):'-'}</td>
-                    <td style="text-align:center">${spBadge}</td>
-                    <td class="text-xs text-muted">${c.note||''}</td>
-                  </tr>`;
-                }).join('')}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      `}
-    `;
-    
-    attachCommonHandlers();
-    el.querySelectorAll('[data-month]').forEach(btn => {
-      btn.addEventListener('click', () => { selectedMonth = btn.dataset.month; renderChecksTab(); });
-    });
-    
-    // ── Bulk create SP from unlinked monthly checks ──
-    document.getElementById('btn-chk-bulk-create')?.addEventListener('click', () => {
-      const unlinked = allChecks.filter(c => c.pp_no && !c.linked_sp);
-      if (unlinked.length === 0) { toast('ไม่มีรายการให้สร้าง', 'info'); return; }
-      
-      openModal(`➕ สร้างรายการจ่ายเจ้าหนี้ — ${unlinked.length} รายการ (จากตรวจรายเดือน)`, `
-        <div class="flex-col gap-3">
-          <p class="text-sm text-dim">ระบบจะสร้างรายการใน "จ่ายเจ้าหนี้" จากรายการตรวจที่มีเลข PP (status: paid)</p>
-          <div style="padding:10px;background:rgba(79,156,249,.08);border-radius:8px">
-            <div class="text-sm"><strong>จะสร้าง ${unlinked.length} รายการ</strong></div>
-            <div class="text-xs text-muted" style="margin-top:4px">
-              • ดึง VAT/NOVAT จาก Transfer Log (invoice_no match)<br>
-              • Default bank: VAT → KBANK / NOVAT → BBL NW<br>
-              • Skip รายการที่มี pp_no ซ้ำใน SP อยู่แล้ว
-            </div>
-          </div>
-          <div class="flex gap-2 mt-2">
-            <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ยกเลิก</button>
-            <button class="btn btn-primary btn-sm flex-1" id="chk-bc-confirm">${ICONS.check} ยืนยันสร้าง</button>
-          </div>
-        </div>
-      `);
-      
-      document.getElementById('chk-bc-confirm')?.addEventListener('click', () => {
-        let created = 0, skipped = 0;
-        unlinked.forEach(c => {
-          if (supplierPayments.find(sp => sp.pp_no === c.pp_no)) { skipped++; return; }
-          
-          const vatRec = transferLog.vatTransfers.find(t => t.invoice_no && c.invoice_no && t.invoice_no === c.invoice_no);
-          const novatRec = transferLog.novatTransfers.find(t => t.invoice_no && c.invoice_no && t.invoice_no === c.invoice_no);
-          const matched = vatRec || novatRec;
-          const vatType = vatRec ? 'VAT' : (novatRec ? 'NOVAT' : 'VAT');
-          
-          const sup = supplierList.find(s => s.code && c.nickname && s.code.toUpperCase() === c.nickname.toUpperCase());
-          
-          let bank = vatType === 'NOVAT' ? 'BBL NW' : 'KBANK';
-          const fromLC = (c.from_bank||'').toLowerCase();
-          if (fromLC.includes('bbl') || fromLC.includes('กรุงเทพ')) bank = vatType === 'NOVAT' ? 'BBL NW' : 'BBL';
-          else if (fromLC.includes('ktb') || fromLC.includes('กรุงไทย')) bank = 'KTB';
-          
-          supplierPayments.push({
-            id: 'CHK-' + c.pp_no,
-            supplier_id: sup?.id || '',
-            supplier_name: c.supplier_name || matched?.supplier_name || c.nickname,
-            supplier_code: c.nickname,
-            supplier_account: matched?.account_no || sup?.account_no || '',
-            supplier_bank: matched?.bank || sup?.bank || '',
-            vat: vatType,
-            amount: Number(c.amount_paid) || 0,
-            invoice_no: c.invoice_no || '',
-            bank: bank,
-            scheduled_date: '',
-            status: 'paid',
-            pp_no: c.pp_no,
-            reference: c.from_bank || '',
-            transfer_date: c.transfer_date,
-            note: `นำเข้าจากตรวจรายเดือน ${c.period||selectedMonth}${c.note?' · '+c.note:''}`,
-            match_status: 'pending',
-            match_stmt_ref: '',
-            created_by: currentUser?.display_name || 'Admin',
-            created_at: new Date().toISOString(),
-            created_date: todayISO(),
-            paid_by: currentUser?.display_name || 'Admin',
-            paid_at: new Date().toISOString(),
-            imported_from_check: true,
-          });
-          c.linked_sp = 'CHK-' + c.pp_no;
-          created++;
-        });
-        
-        persistMainState();
-        closeModal();
-        toast(`✅ สร้าง ${created} รายการ · ข้าม ${skipped} (มีอยู่แล้ว)`, 'success');
-        renderChecksTab();
-      });
-    });
-  }
-  
-  function attachCommonHandlers() {
-    el.querySelectorAll('.pill[data-tab]').forEach(btn => {
-      btn.addEventListener('click', () => { tab = btn.dataset.tab; render(); });
-    });
-    document.getElementById('btn-tl-import')?.addEventListener('click', () => openImportModal());
-    
-    document.getElementById('btn-tl-save')?.addEventListener('click', async () => {
-      toast('กำลังบันทึก...', 'info');
-      const res = await api('saveTransferLog', { data: transferLog });
-      if (res.success) toast(`บันทึกสำเร็จ — ${res.data?.total||0} รายการ`, 'success');
-      else toast(res.error || 'บันทึกไม่สำเร็จ', 'error');
-    });
-    document.getElementById('btn-tl-clear')?.addEventListener('click', () => {
-      if (!confirm('ล้างข้อมูล Transfer Log ทั้งหมด?')) return;
-      transferLog = { vatTransfers:[], novatTransfers:[], vatSuppliers:[], novatSuppliers:[], monthlyChecks:{} };
-      persistMainState();
-      render();
-    });
-  }
-  
-  // ── Import Modal ──
-  function openImportModal() {
-    openModal('📥 Import ไฟล์ 2026_รายการโอนเงิน_JKN.xlsx', `
-      <div class="flex-col gap-3">
-        <p class="text-sm text-dim">ระบบจะอ่านทั้ง 6+ sheets:<br>
-          • <strong>Vat</strong>: รายการโอน VAT → ${transferLog.vatTransfers.length ? '✓ '+transferLog.vatTransfers.length+' รายการ' : 'รอ'}<br>
-          • <strong>NoVat</strong>: รายการโอน NOVAT → ${transferLog.novatTransfers.length ? '✓ '+transferLog.novatTransfers.length+' รายการ' : 'รอ'}<br>
-          • <strong>DropdownVat/NoVat</strong>: Master Supplier<br>
-          • <strong>ตรวจ YYYY-MM</strong>: ตรวจรายเดือน cross-match กับ PP
-        </p>
-        
-        <div class="input-group">
-          <label>เลือกไฟล์ (.xlsx) *</label>
-          <input type="file" class="input" id="tl-file" accept=".xlsx,.xls,.xlsm">
-        </div>
-        
-        <div class="flex gap-2 mt-2">
-          <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ยกเลิก</button>
-          <button class="btn btn-primary btn-sm flex-1" id="tl-import-go">${ICONS.check} Import</button>
-        </div>
-      </div>
-    `);
-    
-    document.getElementById('tl-import-go')?.addEventListener('click', async () => {
-      const f = document.getElementById('tl-file').files[0];
-      if (!f) { toast('เลือกไฟล์ก่อน', 'error'); return; }
-      
-      toast('กำลังอ่านไฟล์...', 'info');
-      try {
-        const result = await parseExcelFile(f);
-        
-        // Parse each sheet
-        let vatCount = 0, novatCount = 0, vatSupCount = 0, novatSupCount = 0, checkMonths = 0;
-        let vatSkipped = 0, novatSkipped = 0;
-        
-        // ⭐ Merge helper: skip if invoice_no|transfer_date|net_amount duplicate
-        //    Preserves user matches (matched_stmt_uuid, pp_no, match_status)
-        const _tlKey = r => `${r.invoice_no||''}|${r.transfer_date||''}|${Math.round(Number(r.net_amount)||0)}`;
-        const mergeTransfers = (existing, incoming) => {
-          const seen = new Set(existing.map(_tlKey));
-          let added = 0, skipped = 0;
-          incoming.forEach(r => {
-            const k = _tlKey(r);
-            if (seen.has(k)) { skipped++; return; }
-            seen.add(k);
-            existing.push(r);
-            added++;
-          });
-          return { added, skipped };
-        };
-        
-        const vatSheet = result.sheets['Vat'];
-        if (vatSheet) {
-          const fresh = parseTransferSheet(vatSheet, true);
-          const m = mergeTransfers(transferLog.vatTransfers, fresh);
-          vatCount = m.added;
-          vatSkipped = m.skipped;
-        }
-        
-        const novatSheet = result.sheets['NoVat'];
-        if (novatSheet) {
-          const fresh = parseTransferSheet(novatSheet, false);
-          const m = mergeTransfers(transferLog.novatTransfers, fresh);
-          novatCount = m.added;
-          novatSkipped = m.skipped;
-        }
-        
-        // Master suppliers — replace ทับได้ (data ไม่มี user match)
-        const dropVatSheet = result.sheets['DropdownVat'];
-        if (dropVatSheet) {
-          transferLog.vatSuppliers = parseDropdownSheet(dropVatSheet, true);
-          vatSupCount = transferLog.vatSuppliers.length;
-        }
-        
-        const dropNoVatSheet = result.sheets['DropdownNoVat'];
-        if (dropNoVatSheet) {
-          transferLog.novatSuppliers = parseDropdownSheet(dropNoVatSheet, false);
-          novatSupCount = transferLog.novatSuppliers.length;
-        }
-        
-        // Monthly check sheets
-        transferLog.monthlyChecks = {};
-        result.sheetNames.forEach(name => {
-          const match = name.match(/^ตรวจ\s+(\d{4}-\d{2})$/);
-          if (match) {
-            const checks = parseMonthlyCheck(result.sheets[name]);
-            if (checks.length > 0) {
-              transferLog.monthlyChecks[match[1]] = checks;
-              checkMonths++;
-            }
-          }
-        });
-        
-        // ── Auto-link รายการโอน กับ PP จาก monthly checks ──
-        const checksByKey = {};
-        Object.values(transferLog.monthlyChecks).forEach(arr => {
-          arr.forEach(c => {
-            if (c.pp_no && c.invoice_no) {
-              checksByKey[`${c.invoice_no}|${Math.round(Number(c.amount_paid))}`] = c.pp_no;
-            }
-          });
-        });
-        
-        [...transferLog.vatTransfers, ...transferLog.novatTransfers].forEach(t => {
-          const key = `${t.invoice_no}|${Math.round(Number(t.amount))}`;
-          if (checksByKey[key]) {
-            t.pp_no = checksByKey[key];
-            t.match_status = 'paid';
-          }
-        });
-        
-        persistMainState();
-        closeModal();
-        const skippedTotal = vatSkipped + novatSkipped;
-        const skippedMsg = skippedTotal > 0 ? ` · ข้าม ${skippedTotal} รายการซ้ำ` : '';
-        toast(`Import สำเร็จ — เพิ่ม VAT ${vatCount} · NOVAT ${novatCount}${skippedMsg} · Supplier ${vatSupCount+novatSupCount} · ตรวจ ${checkMonths} เดือน`, 'success', 5000);
-        render();
-      } catch (err) {
-        toast('อ่านไฟล์ไม่สำเร็จ: ' + err.message, 'error');
-      }
-    });
-  }
-  
-  // ── Sync → Supplier Payments ──
-  function syncToSupplierPayments() {
-    const transfers = [...transferLog.vatTransfers, ...transferLog.novatTransfers];
-    if (transfers.length === 0) { toast('ไม่มีรายการโอนให้ sync', 'error'); return; }
-    
-    openModal(`🔗 Sync รายการโอน → จ่ายเจ้าหนี้`, `
-      <div class="flex-col gap-3">
-        <p class="text-sm text-dim">ระบบจะสร้าง/อัปเดต supplier_payments จากรายการโอนในไฟล์ JKN</p>
-        
-        <div style="padding:10px;background:rgba(79,156,249,.08);border-radius:8px">
-          <div class="text-sm"><strong>จะ sync:</strong></div>
-          <div class="text-xs text-muted" style="margin-top:4px">
-            • VAT: ${transferLog.vatTransfers.length} รายการ<br>
-            • NOVAT: ${transferLog.novatTransfers.length} รายการ<br>
-            • รายการมี PP: ${transfers.filter(t => t.pp_no).length} (match_status = stmt_pending)<br>
-            • รายการไม่มี PP: ${transfers.filter(t => !t.pp_no).length} (match_status = pending)
-          </div>
-        </div>
-        
-        <div class="flex gap-2 mt-2">
-          <button class="btn btn-outline btn-sm flex-1" onclick="closeModal()">ยกเลิก</button>
-          <button class="btn btn-primary btn-sm flex-1" id="sync-go">${ICONS.check} ยืนยัน Sync</button>
-        </div>
-      </div>
-    `);
-    
-    document.getElementById('sync-go')?.addEventListener('click', () => {
-      let added = 0, updated = 0;
-      transfers.forEach(t => {
-        // Map "โอนจาก" → bank code ของระบบ
-        let bankCode = '';
-        const fromLC = (t.from_bank || '').toLowerCase();
-        if (fromLC.includes('k plus') || fromLC.includes('kbank') || fromLC.includes('กสิกร')) bankCode = 'KBANK';
-        else if (fromLC.includes('bbl nw') || fromLC.includes('bblnw')) bankCode = 'BBL NW';
-        else if (fromLC.includes('bbl') || fromLC.includes('กรุงเทพ')) bankCode = 'BBL';
-        else if (fromLC.includes('ktb') || fromLC.includes('กรุงไทย')) bankCode = 'KTB';
-        else if (fromLC.includes('scb') || fromLC.includes('ไทยพาณิชย์')) bankCode = 'BBL'; // fallback
-        else bankCode = t.vat === 'NOVAT' ? 'BBL NW' : 'KBANK';
-        
-        // ID stable: use invoice + date + amount
-        const stableId = `TL-${t.vat}-${t.invoice_no||''}-${t.transfer_date||''}-${Math.round(Number(t.amount))}`;
-        
-        const existing = supplierPayments.find(sp => sp.id === stableId);
-        const record = {
-          id: stableId,
-          supplier_id: '',
-          supplier_name: t.supplier_name || t.nickname,
-          supplier_account: t.supplier_account || '',
-          supplier_bank: t.supplier_bank || '',
-          vat: t.vat,
-          amount: Number(t.amount) || 0,
-          invoice_no: t.invoice_no,
-          bank: bankCode,
-          scheduled_date: '',
-          status: 'paid',
-          pp_no: t.pp_no || '',
-          reference: t.receipt_no || '',
-          transfer_date: t.transfer_date,
-          note: `นำเข้าจาก Transfer Log (${t.category||'-'})${t.deduct_total>0?' · หัก ฿'+fmtNum(t.deduct_total):''}`,
-          match_status: t.pp_no ? 'stmt_pending' : 'pending',
-          match_stmt_ref: '',
-          created_by: currentUser?.display_name || 'Admin',
-          created_at: existing?.created_at || new Date().toISOString(),
-          created_date: existing?.created_date || todayISO(),
-          paid_by: currentUser?.display_name || 'Admin',
-          paid_at: existing?.paid_at || new Date().toISOString(),
-          imported_from_transfer_log: true,
-          nickname: t.nickname,
-        };
-        
-        if (existing) {
-          Object.assign(existing, record);
-          updated++;
-        } else {
-          supplierPayments.push(record);
-          added++;
-        }
-      });
-      persistMainState();
-      closeModal();
-      toast(`Sync สำเร็จ — เพิ่มใหม่ ${added} / อัปเดต ${updated} ใน "จ่ายเจ้าหนี้"`, 'success');
-      render();
-    });
-  }
-  
-  render();
-}
-
+// ⭐ R25.22 — Entire Transfer Log V2 section removed (1934 lines). Replaced by PV V3.
 function toISODate(d) {
   if (!d && d !== 0) return '';
   // Cache for primitives only (Date objects are mutable, skip)
@@ -18337,7 +16370,7 @@ const NAV_ITEMS = [
   { id:'dashboard', icon:'home',    label:'แดชบอร์ด' },
   { id:'main',      icon:'dollar',  label:'Main' },
   { id:'payments',  icon:'card',    label:'Payments (SP)' },
-  { id:'payment_voucher', icon:'dollar', label:'💰 ใบสำคัญจ่าย' },  // ⭐ R19 13/5/26 (replaces transferlog)
+  { id:'payment_voucher', icon:'dollar', label:'💰 ใบสำคัญจ่าย' },
   { id:'sp_recon',  icon:'check',   label:'📥 ตรวจ SP (ลูกหนี้)' },
   { id:'pp_recon',  icon:'check',   label:'📤 ตรวจ PP (เจ้าหนี้)' },
   { id:'billing',   icon:'card',    label:'📋 ใบวางบิล + หนี้' },
@@ -18603,11 +16636,7 @@ async function loadAllFromCloud(opts) {
     fetchPromises.push(api('getCashflow').catch(e => ({ _err: e.message })));        fetchLabels.push('Cashflow');
     fetchPromises.push(api('getSuppliers').catch(e => ({ _err: e.message })));       fetchLabels.push('Suppliers');
     fetchPromises.push(api('getSupplierPayments').catch(e => ({ _err: e.message }))); fetchLabels.push('Supplier Payments');
-    // ⭐ Transfer Log (4/5/26) — เดิม lazy-load → ทำให้หน้า Transfer Log ว่างตอนเข้าใหม่
-    //    Fix: load ตอน initial เสมอ (ปกติ ~6s, ทำ parallel ไม่กระทบเวลารวม)
-    const TRANSFER_LOG_IDX = fetchPromises.length;
-    fetchPromises.push(api('v2_getTransferLog', {}).catch(e => ({ _err: e.message })));    fetchLabels.push('Transfer Log');
-    fetchPromises.push(api('v2_getTransferMaster', {}).catch(e => ({ _err: e.message }))); fetchLabels.push('Transfer Master');
+    // ⭐ R25.22 — Transfer Log fetches removed (replaced by PV V3 — payment_vouchers)
     
     // Per year: bills + meta + 5 banks
     const yearPromiseStart = {};
@@ -18673,38 +16702,7 @@ async function loadAllFromCloud(opts) {
       _log('Supplier Payments', items.length);
     } catch (e) { _log('Supplier Payments', 0, e); }
     
-    // ⭐ Transfer Log (idx 5) + Master (idx 6)
-    try {
-      const rLog = results[TRANSFER_LOG_IDX];
-      const rMaster = results[TRANSFER_LOG_IDX + 1];
-      if (rLog?._err) throw new Error(rLog._err);
-      if (rMaster?._err) throw new Error(rMaster._err);
-      const logData = rLog?.data || rLog || {};
-      const masterData = rMaster?.data || rMaster || {};
-      // Apply ทันทีเพราะ transferLog เป็น global state อยู่แล้ว (ไม่มี temp staging)
-      if (typeof transferLog !== 'undefined') {
-        const vatTL = Array.isArray(logData.vat) ? logData.vat : [];
-        const novatTL = Array.isArray(logData.novat) ? logData.novat : [];
-        const vatMaster = Array.isArray(masterData.vat) ? masterData.vat : [];
-        const novatMaster = Array.isArray(masterData.novat) ? masterData.novat : [];
-        if (typeof _tlNormalize === 'function') {
-          transferLog.vatTransfers = vatTL.map(_tlNormalize);
-          transferLog.novatTransfers = novatTL.map(_tlNormalize);
-        } else {
-          transferLog.vatTransfers = vatTL;
-          transferLog.novatTransfers = novatTL;
-        }
-        if (typeof _tmNormalize === 'function') {
-          transferLog.vatSuppliers = vatMaster.map(_tmNormalize);
-          transferLog.novatSuppliers = novatMaster.map(_tmNormalize);
-        } else {
-          transferLog.vatSuppliers = vatMaster;
-          transferLog.novatSuppliers = novatMaster;
-        }
-        _log(`Transfer Log`, vatTL.length + novatTL.length);
-        _log(`Transfer Master`, vatMaster.length + novatMaster.length);
-      }
-    } catch (e) { _log('Transfer Log', 0, e); }
+    // ⭐ R25.22 — Transfer Log processing removed (replaced by PV V3)
     
     // ── Process per-year results ──
     for (const y of years) {
@@ -19143,7 +17141,6 @@ const PAGE_RENDERERS = {
   cashflow: renderCashflow,
   supplier: renderSupplier,
   pprpt: renderPPReport,
-  transferlog: renderTransferLog,  // legacy — keep mapped for backward compat
   payment_voucher: renderPaymentVoucher,  // ⭐ R19 13/5/26 — ใบสำคัญจ่าย
   debt: () => navigateTo('billing'), // ⭐ legacy redirect → ใบวางบิล + หนี้
   billing: renderBilling,
@@ -19305,10 +17302,9 @@ async function renderDashboard(el) {
   const cashflowPending = (cashflowList||[]).filter(c => c.match_status !== 'paid' && (c.type === 'deposit' || c.type === 'supplier' || c.type === 'transfer'));
   const supplierPendingPay = (supplierPayments||[]).filter(p => p.status === 'pending' || p.status === 'scheduled');
   const supplierUnmatched = (supplierPayments||[]).filter(p => p.status === 'paid' && p.match_status !== 'paid');
-  const transferLogTotal = (transferLog.vatTransfers||[]).length + (transferLog.novatTransfers||[]).length;
-  const transferLogNoPP = [...(transferLog.vatTransfers||[]), ...(transferLog.novatTransfers||[])].filter(t => !t.pp_no).length;
+  // ⭐ R25.22 — transferLog refs removed (replaced by PV V3)
   
-  const totalUnmatched = unmatchedBillsTransfer.length + chequesAwaitingClear.length + unmatchedStmts.length + cashflowPending.length + supplierPendingPay.length + supplierUnmatched.length + transferLogNoPP;
+  const totalUnmatched = unmatchedBillsTransfer.length + chequesAwaitingClear.length + unmatchedStmts.length + cashflowPending.length + supplierPendingPay.length + supplierUnmatched.length;
   const alerts = []; // populate after background fetch
   
   // ── Build period selector pills ──
@@ -26784,193 +24780,7 @@ function renderData(el) {
       }
     });
     
-    // ── 🔄 Migrate Transfer Schema (Phase 1) ──
-    async function _runMigrateTransfer(dryRun) {
-      const statusEl = document.getElementById('migrate-tl-status');
-      const btnDry = document.getElementById('btn-migrate-tl-dryrun');
-      const btnApp = document.getElementById('btn-migrate-tl-apply');
-      
-      if (!dryRun) {
-        if (!confirm('⚠️ จะ migrate Transfer Schema จริง (ไม่ใช่ dry-run)\n\n' +
-                     '• ลบ column nickname ออกจาก master/log/checks\n' +
-                     '• เพิ่ม uuid + deduct_dc_pm + net columns\n' +
-                     '• Backup ทุกชีทก่อน (เป็น *_backup_yyyymmdd_hhmmss)\n\n' +
-                     'ยืนยัน?')) return;
-      }
-      
-      btnDry.disabled = true;
-      btnApp.disabled = true;
-      const origText = dryRun ? btnDry.textContent : btnApp.textContent;
-      (dryRun ? btnDry : btnApp).textContent = '⏳ กำลังประมวลผล...';
-      statusEl.style.display = 'block';
-      statusEl.style.color = 'var(--info)';
-      statusEl.textContent = `${dryRun ? '🧪 Dry-run' : '⚡ Apply'} — กำลังประมวลผล...`;
-      
-      try {
-        const r = await api('v2_migrateTransferSchema', { dryRun });
-        if (r?.success === false) throw new Error(r.error || 'API error');
-        const d = r?.data || r;
-        
-        let log = `${dryRun ? '🧪 DRY-RUN' : '✅ APPLIED'} — ${dryRun ? 'จำลอง' : 'เสร็จเรียบร้อย'}\n\n`;
-        Object.keys(d.sheets || {}).forEach(name => {
-          const s = d.sheets[name];
-          if (s.skipped) {
-            log += `· ${name}: SKIPPED — ${s.skipped}\n`;
-          } else if (s.error) {
-            log += `❌ ${name}: ERROR — ${s.error}\n`;
-          } else {
-            log += `✓ ${name}\n`;
-            log += `    เก่า: ${s.old_rows} แถว × ${s.old_cols} คอลัมน์\n`;
-            log += `    ใหม่: ${s.new_rows} แถว × ${s.new_cols} คอลัมน์`;
-            if (s.duplicates_removed) log += ` (ลบซ้ำ ${s.duplicates_removed})`;
-            log += `\n`;
-            if (s.backup) log += `    💾 backup: ${s.backup}\n`;
-          }
-        });
-        if (d.errors && d.errors.length) {
-          log += `\n⚠️ Errors:\n${d.errors.join('\n')}\n`;
-        }
-        if (!dryRun) {
-          log += `\n💡 แนะนำ: ตรวจ sheet ใน Google Sheets ว่า schema เปลี่ยนตาม + กด "🔄 Rebuild Local" เพื่อ pull schema ใหม่ลง local`;
-        }
-        statusEl.textContent = log;
-        statusEl.style.color = (d.errors && d.errors.length) ? 'var(--warn)' : 'var(--success)';
-        toast(`${dryRun ? 'Dry-run' : 'Migrate'} เสร็จ`, 'success', 3500);
-      } catch (e) {
-        statusEl.style.color = 'var(--danger)';
-        statusEl.textContent = `❌ Error: ${e.message}`;
-        toast('Migrate ล้มเหลว: ' + e.message, 'error', 6000);
-      } finally {
-        btnDry.disabled = false;
-        btnApp.disabled = false;
-        btnDry.textContent = '🧪 Dry-run';
-        btnApp.textContent = '⚡ Apply';
-      }
-    }
-    document.getElementById('btn-migrate-tl-dryrun')?.addEventListener('click', () => _runMigrateTransfer(true));
-    document.getElementById('btn-migrate-tl-apply')?.addEventListener('click', () => _runMigrateTransfer(false));
-    
-    // Drop 'net' column (post-migration cleanup) — net และ amount ซ้ำซ้อน
-    document.getElementById('btn-drop-net-col')?.addEventListener('click', async () => {
-      if (!confirm('⚠️ จะลบ column "net" จาก transfer_log_vat + transfer_log_novat\n\n' +
-                   '• net = amount ในทุกแถว (ซ้ำซ้อน)\n' +
-                   '• Backup ทั้ง 2 ชีทก่อน\n' +
-                   '• Recompute amount = amount_billed − deduct_total\n\n' +
-                   'ยืนยัน?')) return;
-      
-      const btn = document.getElementById('btn-drop-net-col');
-      const statusEl = document.getElementById('migrate-tl-status');
-      btn.disabled = true;
-      const orig = btn.textContent;
-      btn.textContent = '⏳ กำลังลบ...';
-      statusEl.style.display = 'block';
-      statusEl.style.color = 'var(--info)';
-      statusEl.textContent = '🗑 กำลังลบ column net + recompute amount...';
-      
-      try {
-        const r = await api('v2_dropNetColumn', {});
-        if (r?.success === false) throw new Error(r.error || 'API error');
-        const d = r?.data || r;
-        
-        let log = `✅ DROP NET — เสร็จ\n\n`;
-        Object.keys(d.sheets || {}).forEach(name => {
-          const s = d.sheets[name];
-          if (s.skipped) {
-            log += `· ${name}: SKIPPED — ${s.skipped}\n`;
-          } else if (s.error) {
-            log += `❌ ${name}: ERROR — ${s.error}\n`;
-          } else {
-            log += `✓ ${name}: ${s.old_cols} → ${s.new_cols} cols (${s.rows} rows)\n`;
-            if (s.backup) log += `    💾 backup: ${s.backup}\n`;
-          }
-        });
-        if (d.errors && d.errors.length) log += `\n⚠️ Errors:\n${d.errors.join('\n')}\n`;
-        statusEl.textContent = log;
-        statusEl.style.color = (d.errors && d.errors.length) ? 'var(--warn)' : 'var(--success)';
-        toast('ลบ column net สำเร็จ', 'success', 3500);
-      } catch (e) {
-        statusEl.style.color = 'var(--danger)';
-        statusEl.textContent = `❌ Error: ${e.message}`;
-        toast('Drop net ล้มเหลว: ' + e.message, 'error', 6000);
-      } finally {
-        btn.disabled = false;
-        btn.textContent = orig;
-      }
-    });
-    
-    // ── 🔧 Repair Transfer UUIDs (fill column A if missing/empty) ──
-    document.getElementById('btn-repair-tl-uuid')?.addEventListener('click', async () => {
-      const statusEl = document.getElementById('migrate-tl-status');
-      const btn = document.getElementById('btn-repair-tl-uuid');
-      
-      const dryFirst = confirm('🔧 Repair UUIDs\n\n' +
-                                'จะเติม uuid ให้ rows ที่ column A ว่าง/หาย\n\n' +
-                                'OK = ดู preview ก่อน (dry-run)\n' +
-                                'Cancel = ยกเลิก');
-      if (!dryFirst) return;
-      
-      btn.disabled = true;
-      btn.textContent = '⏳ กำลังตรวจ...';
-      statusEl.style.display = 'block';
-      statusEl.style.color = 'var(--info)';
-      statusEl.textContent = '🔧 Dry-run: ตรวจ uuid ที่หายไป...';
-      
-      try {
-        // Dry-run first
-        let r = await api('v2_repairTransferUuids', { dryRun: true });
-        if (r?.success === false) throw new Error(r.error || 'API error');
-        let d = r?.data || r;
-        
-        let totalToFill = 0;
-        let log = `🧪 DRY-RUN — สำรวจ\n\n`;
-        Object.keys(d.sheets || {}).forEach(name => {
-          const s = d.sheets[name];
-          if (s.error) { log += `❌ ${name}: ${s.error}\n`; return; }
-          if (s.skipped) { log += `· ${name}: ${s.skipped}\n`; return; }
-          log += `${name}\n`;
-          log += `    A1 header: "${s.col_a_header}"${s.col_a_was_empty ? ' (จะแก้เป็น tm_uuid/tl_uuid)' : ' ✓'}\n`;
-          log += `    rows missing uuid: ${s.rows_filled}\n`;
-          totalToFill += s.rows_filled;
-        });
-        
-        if (totalToFill === 0 && !Object.values(d.sheets || {}).some(s => s.col_a_was_empty)) {
-          log += '\n✓ ไม่มีอะไรต้องซ่อม — uuid ครบทุก row';
-          statusEl.textContent = log;
-          statusEl.style.color = 'var(--success)';
-          return;
-        }
-        
-        if (!confirm(`พบ ${totalToFill} rows ที่ uuid หาย\n\nApply repair (เติม uuid ให้ rows ขาด)?`)) {
-          statusEl.textContent = log + '\n\n[ยกเลิก — ไม่ apply]';
-          return;
-        }
-        
-        statusEl.textContent = log + '\n\n⚡ กำลัง apply...';
-        r = await api('v2_repairTransferUuids', { dryRun: false });
-        if (r?.success === false) throw new Error(r.error || 'API error');
-        d = r?.data || r;
-        
-        log = `✅ APPLIED\n\n`;
-        Object.keys(d.sheets || {}).forEach(name => {
-          const s = d.sheets[name];
-          if (s.error) { log += `❌ ${name}: ${s.error}\n`; return; }
-          if (s.skipped) { log += `· ${name}: ${s.skipped}\n`; return; }
-          log += `✓ ${name}: เติม uuid ${s.rows_filled} rows`;
-          if (s.col_a_was_empty) log += ` + แก้ header A1`;
-          log += `\n`;
-        });
-        statusEl.textContent = log;
-        statusEl.style.color = 'var(--success)';
-        toast(`Repair เสร็จ — เติม uuid ${totalToFill} rows`, 'success', 4000);
-      } catch (e) {
-        statusEl.style.color = 'var(--danger)';
-        statusEl.textContent = `❌ Error: ${e.message}`;
-        toast('Repair ล้มเหลว: ' + e.message, 'error', 6000);
-      } finally {
-        btn.disabled = false;
-        btn.textContent = '🔧 Repair UUIDs';
-      }
-    });
+    // ⭐ R25.22 — TL migrate/repair buttons removed (Transfer Log retired)
     
     document.getElementById('btn-sync-cloud')?.addEventListener('click', async () => {
       // ⭐ Rebuild mode: ถ้า checkbox ติ๊ก → trigger rebuild handler แทน sync
@@ -28824,7 +26634,6 @@ function renderData(el) {
         supplierList: supplierList || [],
         supplierPayments: supplierPayments || [],
         ppReport: ppReport || {},
-        transferLog: transferLog || { vatTransfers: [], novatTransfers: [] },
         customerList: customerList || [],
         // Metadata
         _counts: {
@@ -28914,7 +26723,6 @@ function renderData(el) {
           if (backup.supplierList) supplierList = backup.supplierList;
           if (backup.supplierPayments) supplierPayments = backup.supplierPayments;
           if (backup.ppReport) ppReport = backup.ppReport;
-          if (backup.transferLog) transferLog = backup.transferLog;
           if (backup.customerList) customerList = backup.customerList;
           
           // ⭐ Clear sync artifacts
@@ -39412,10 +37220,11 @@ function _pvFilter() {
     if (pv.vat_type !== st.vat) return false;
     
     // Sub-tab: pending = no matched_at AND pay_method !== Cash AND match_status !== matched/migrated
-    //          paid    = matched_at OR Cash OR match_status in (matched, migrated, matched_cash)
+    //          paid    = matched_at OR Cash OR match_status in (matched, migrated, migrated_reversal, matched_cash)
     const isPaid = pv.match_status === 'matched' 
                 || pv.match_status === 'matched_cash' 
                 || pv.match_status === 'migrated'
+                || pv.match_status === 'migrated_reversal'  // ⭐ R25.22
                 || pv.pay_method === 'เงินสด'
                 || !!pv.matched_at;
     
@@ -39568,6 +37377,8 @@ function _pvRow(pv) {
     statusBadge = '<span style="color:var(--success);font-size:.75rem">💵 Cash</span>';
   } else if (pv.match_status === 'migrated') {
     statusBadge = '<span style="color:#9b7fdf;font-size:.75rem" title="Imported จากระบบเก่า">📥 Migrated</span>';
+  } else if (pv.match_status === 'migrated_reversal') {
+    statusBadge = '<span style="color:#ef4444;font-size:.75rem" title="รับเงินคืน (จาก โอนซ้ำ)">🔄 รับคืน</span>';
   } else {
     statusBadge = '<span style="color:var(--warn);font-size:.75rem">⏳ รอจ่าย</span>';
   }
@@ -39711,6 +37522,7 @@ function _pvModalHtml(d, isEdit) {
         <button type="button" class="btn btn-sm pv-method-btn" data-m="โอน" style="${d.pay_method==='โอน'?'background:var(--primary);color:#fff':'background:transparent;border:1px solid var(--border);color:var(--text2)'}">โอน</button>
         <button type="button" class="btn btn-sm pv-method-btn" data-m="เงินสด" style="${d.pay_method==='เงินสด'?'background:var(--success);color:#fff':'background:transparent;border:1px solid var(--border);color:var(--text2)'}">เงินสด</button>
         <button type="button" class="btn btn-sm pv-method-btn" data-m="เช็ค" style="${d.pay_method==='เช็ค'?'background:var(--primary);color:#fff':'background:transparent;border:1px solid var(--border);color:var(--text2)'}">เช็ค</button>
+        <button type="button" class="btn btn-sm pv-method-btn" data-m="บัตรเครดิต" style="${d.pay_method==='บัตรเครดิต'?'background:var(--purple,#8b5cf6);color:#fff':'background:transparent;border:1px solid var(--border);color:var(--text2)'}">บัตรเครดิต</button>
       </div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
         <div class="input-group">
@@ -39951,8 +37763,8 @@ function _pvOpenPrintPreview(pv) {
     <div class="voucher" id="voucher">
       <div class="head">
         <div>
-          <div style="font-size:11px;color:#666;letter-spacing:1px;font-weight:500">PAYMENT VOUCHER</div>
-          <div style="font-size:22px;font-weight:600;margin-top:2px">ใบสำคัญจ่าย</div>
+          <div style="font-size:11px;color:#666;letter-spacing:1px;font-weight:500">${Number(pv.net_amount)<0?'PAYMENT VOUCHER · REFUND':'PAYMENT VOUCHER'}</div>
+          <div style="font-size:22px;font-weight:600;margin-top:2px">${Number(pv.net_amount)<0?'ใบสำคัญรับเงินคืน':'ใบสำคัญจ่าย'}</div>
           <div style="font-size:11.5px;color:#444;margin-top:6px">บริษัท จงกลณีการไฟฟ้า จำกัด</div>
           <div style="font-size:10px;color:#888;margin-top:1px">45,47,49 ถ.พิพิธภักดี ต.สะเตง อ.เมือง จ.ยะลา 95000</div>
         </div>
@@ -40159,13 +37971,22 @@ function _pvOpenMigrateModal(rootEl) {
         for (let i = 3; i < vatSheet.length; i++) {
           const r = vatSheet[i];
           if (!r || !r[1] || r[1] === 'ลำดับที่') continue;
-          rows.push(_pvParseVatRow(r, 'VAT'));
+          const parsed = _pvParseVatRow(r, 'VAT');
+          rows.push(parsed);
+          // ⭐ R25.22 — detect "โอนซ้ำ รับเงินคืนแล้ว" in note → create reversal PV
+          if (parsed && /โอนซ้ำ.*(รับเงินคืน|รับคืน)/.test(parsed.note || '')) {
+            rows.push(_pvMakeReversal(parsed));
+          }
         }
         // Parse NoVat: header at row 1, data starts row 2
         for (let i = 2; i < novatSheet.length; i++) {
           const r = novatSheet[i];
           if (!r || !r[1] || r[1] === 'ลำดับที่') continue;
-          rows.push(_pvParseVatRow(r, 'NOVAT'));
+          const parsed = _pvParseVatRow(r, 'NOVAT');
+          rows.push(parsed);
+          if (parsed && /โอนซ้ำ.*(รับเงินคืน|รับคืน)/.test(parsed.note || '')) {
+            rows.push(_pvMakeReversal(parsed));
+          }
         }
         
         parsedRows = rows;
@@ -40277,12 +38098,53 @@ function _pvParseVatRow(r, vatType) {
   }
 }
 
+// ⭐ R25.22 — Build reversal PV from "โอนซ้ำ" original
+// Logic: Original PV records the duplicate transfer (เงินออก จริง)
+//        Reversal PV records the refund received (เงินเข้า) — flipped sign
+//        Stmt match: original ↔ stmt out (-), reversal ↔ stmt in (+)
+//        Match algo (R25.22 signed-sum): |pv.net + stmt.amount| < 0.01
+//
+// Note extraction: try to parse refund date from "รับเงินคืนแล้ว 14/01/69"
+function _pvMakeReversal(orig) {
+  // Try parse refund date from note: รับเงินคืน DD/MM/YY or DD/MM/YYYY
+  let refundDate = orig.pay_date;  // fallback: same date
+  const m = (orig.note || '').match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
+  if (m) {
+    let d = parseInt(m[1], 10), mo = parseInt(m[2], 10), y = parseInt(m[3], 10);
+    if (y < 100) y += 2000;  // 2-digit year → 20xx
+    if (y > 2400) y -= 543;   // พ.ศ. → ค.ศ.
+    refundDate = `${y}-${String(mo).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+  }
+  return {
+    vat_type: orig.vat_type,
+    category: orig.category,
+    nickname: orig.nickname,
+    supplier_name: orig.supplier_name,
+    supplier_bank: orig.supplier_bank,
+    supplier_account: orig.supplier_account,
+    invoice_no: orig.invoice_no,
+    receipt_no: orig.receipt_no,
+    pay_date: refundDate,
+    // ⭐ ติดลบทั้งหมด (mirror)
+    amount_billed: -orig.amount_billed,
+    deduct_shipping: -orig.deduct_shipping,
+    deduct_dc_pm: -(orig.deduct_dc_pm||0),
+    deduct_claim: -orig.deduct_claim,
+    deduct_other: -orig.deduct_other,
+    net_amount: -orig.net_amount,
+    from_bank: orig.from_bank,
+    pay_method: 'โอน',
+    match_status: 'migrated_reversal',  // ⭐ distinct status for filter
+    note: 'รับเงินคืน (mirror ของ "โอนซ้ำ"): ' + (orig.note || ''),
+  };
+}
+
 // ── Initialize after all declarations are ready ──
 (async function() {
-  // ⭐ R25.21 BOOT BEACON
-  console.log('%c[SF R25.21] Active build: 2026-05-15-1900 — Retroactive flip endpoint for past stmt matches', 'color:#0c8;font-weight:bold;font-size:13px');
-  console.log('%c[SF R25.21] Scan bills_YYYY for matched SP-rows → flip pending_match → matched · catches up data before R25.20', 'color:#888');
-  window.__SF_BUILD = 'R25.21-2026-05-15-1900';
+  // ⭐ R25.23 BOOT BEACON
+  console.log('%c[SF R25.23] Active build: 2026-05-16-1100 — Remove pay_date copy-down button (data corruption risk)', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.23] Removed ONLY pay_date copy-down (kept date/bank/due_date copy-down buttons) · handler unchanged', 'color:#888');
+  window.__SF_BUILD = 'R25.23-2026-05-16-1100';
   
   await restoreMainState();
   checkSavedLogin();
