@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.30-2026-05-17-1000 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.31-2026-05-17-1100 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -7,7 +7,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>Smart Finance R25.30</title>
+<title>Smart Finance R25.31</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
@@ -37217,16 +37217,15 @@ async function renderPaymentVoucher(el) {
 
 // ⭐ R25.29 — Single source of truth for paid classification
 //   IMPORTANT: 'migrated' is NOT paid! Imported from xlsx → ยังต้อง verify กับ stmt จริง
+//   IMPORTANT: 'migrated_reversal' is NOT paid either (R25.31) — รอ stmt match ของเงินรับคืน
 //   Paid when:
 //     - match_status === 'matched' (stmt confirmed)
 //     - match_status === 'matched_cash' (Cash auto)
-//     - match_status === 'migrated_reversal' (mirror reversal — pair กับ original = ปิด)
 //     - pay_method === 'เงินสด' (Cash, ไม่ต้องรอ stmt)
 //     - matched_at filled (stmt match อะไรก็ตามที่ flow set field นี้)
 function _pvIsPaid(pv) {
   return pv.match_status === 'matched'
       || pv.match_status === 'matched_cash'
-      || pv.match_status === 'migrated_reversal'
       || pv.pay_method === 'เงินสด'
       || !!pv.matched_at;
 }
@@ -37391,17 +37390,17 @@ function _pvRow(pv) {
   const totalDeduct = (Number(pv.deduct_shipping)||0) + (Number(pv.deduct_dc_pm)||0) 
                     + (Number(pv.deduct_claim)||0) + (Number(pv.deduct_other)||0);
   const isPaid = _pvIsPaid(pv);   // ⭐ R25.29 — single source of truth
-  // ปุ่ม match แสดงเมื่อ: ยังไม่ matched + ไม่ใช่ Cash + ไม่ใช่ reversal mirror
+  // ⭐ R25.31 — ปุ่ม match แสดงเมื่อ: ยังไม่ matched + ไม่ใช่ Cash
+  //   (reversal PV ก็ match กับ stmt ได้ — เพราะรอเงินคืนเข้า)
   const canMatch = pv.match_status !== 'matched' 
                 && pv.match_status !== 'matched_cash'
-                && pv.match_status !== 'migrated_reversal'
                 && pv.pay_method !== 'เงินสด';
   const canUnmatch = pv.match_status === 'matched';
   
   // ⭐ R25.30 — Status labels (Toppy spec):
   //   matched (stmt confirmed)  → ✓ Matched
   //   matched_cash / Cash       → 💵 Cash
-  //   migrated_reversal (mirror) → 🔄 รับคืนแล้ว (paid pair)
+  //   migrated_reversal (mirror) → ⏳ รอรับคืน (R25.31 — pending, รอ stmt+)
   //   migrated + net<0 (รอรับคืน) → ⏳ รอรับคืน  (NEW)
   //   migrated + net>0           → ⏳ รอโอน    (NEW — was "รอ verify")
   //   else                        → ⏳ รอโอน
@@ -37411,7 +37410,7 @@ function _pvRow(pv) {
   } else if (pv.match_status === 'matched_cash' || pv.pay_method === 'เงินสด') {
     statusBadge = '<span style="color:var(--success);font-size:.75rem">💵 Cash</span>';
   } else if (pv.match_status === 'migrated_reversal') {
-    statusBadge = '<span style="color:#ef4444;font-size:.75rem" title="รับเงินคืน (mirror ของ โอนซ้ำ) — ปิดคู่แล้ว">🔄 รับคืนแล้ว</span>';
+    statusBadge = '<span style="color:var(--info,#3b82f6);font-size:.75rem" title="รอรับเงินคืนจาก supplier (โอนซ้ำ)">⏳ รอรับคืน</span>';
   } else if (Number(pv.net_amount) < 0) {
     // ยอดลบ + ยังไม่ matched = รอรับเงินคืนเข้ามา (PV reversal/refund pending)
     statusBadge = '<span style="color:var(--info,#3b82f6);font-size:.75rem" title="รอรับเงินคืนจาก supplier">⏳ รอรับคืน</span>';
@@ -38481,10 +38480,10 @@ function _pvMakeReversal(orig) {
 
 // ── Initialize after all declarations are ready ──
 (async function() {
-  // ⭐ R25.30 BOOT BEACON
-  console.log('%c[SF R25.30] Active build: 2026-05-17-1000 — PV polish: autocomplete fix, status labels, bank-scoped match', 'color:#0c8;font-weight:bold;font-size:13px');
-  console.log('%c[SF R25.30] Search by name-only + opaque · status รอโอน/รอรับคืน/รับคืนแล้ว · VAT→KBANK, NOVAT→BBL NW + month scope', 'color:#888');
-  window.__SF_BUILD = 'R25.30-2026-05-17-1000';
+  // ⭐ R25.31 BOOT BEACON
+  console.log('%c[SF R25.31] Active build: 2026-05-17-1100 — reversal PV = รอรับคืน (pending) not paid', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.31] migrated_reversal removed from _pvIsPaid · canMatch allow reversal · badge consistent with tab', 'color:#888');
+  window.__SF_BUILD = 'R25.31-2026-05-17-1100';
   
   await restoreMainState();
   checkSavedLogin();
