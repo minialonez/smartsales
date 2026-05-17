@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.33-2026-05-17-1300 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.34-2026-05-17-1400 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -7,7 +7,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>Smart Finance R25.33</title>
+<title>Smart Finance R25.34</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
@@ -16638,7 +16638,7 @@ async function loadAllFromCloud(opts) {
     let results = null;
     const yearPromiseStart = {};
     
-    const useBootstrap = (window.__SF_USE_BOOTSTRAP !== false);
+    const useBootstrap = (window.__SF_USE_BOOTSTRAP === true);  // ⭐ R25.34 — default off (legacy parallel faster on Apps Script)
     
     if (useBootstrap) {
       try {
@@ -16685,10 +16685,11 @@ async function loadAllFromCloud(opts) {
           // ⭐ R25.33 — Stash PV + billing_payments + billing_notes for downstream consumers
           //   (these are NEW in bootstrap — not in legacy parallel results[])
           //   Frontend code that uses these picks them up via window.__SF_BOOT
+          //   ⭐ R25.34 — pvGetList returns {data:[...], count:N}; unwrap to array
           window.__SF_BOOT = {
-            pv: d.pv,
-            billing_payments: d.billing_payments,
-            billing_notes: d.billing_notes,
+            pv: (d.pv && Array.isArray(d.pv.data)) ? d.pv.data : (Array.isArray(d.pv) ? d.pv : []),
+            billing_payments: Array.isArray(d.billing_payments) ? d.billing_payments : [],
+            billing_notes: Array.isArray(d.billing_notes) ? d.billing_notes : [],
             generated_at: meta.generated_at,
           };
         } else {
@@ -16728,10 +16729,39 @@ async function loadAllFromCloud(opts) {
         });
       });
       
-      console.log(`[loadAllFromCloud] firing ${fetchPromises.length} parallel requests...`);
+      // ⭐ R25.34 — Fire PV + billing_notes + billing_payments IN PARALLEL with the rest
+      //   These don't go into results[] (downstream index-based parsing) — instead
+      //   their resolved values land in __SF_BOOT after main promise.all settles.
+      //   This adds NO extra wall-clock time (all 15 fire together).
+      const sideFetches = {
+        pv: api('pv_getList', { year: years[0] || new Date().getFullYear() }).catch(e => ({ _err: e.message })),
+        billing_notes: api('getBillingNotes', {}).catch(e => ({ _err: e.message })),
+        billing_payments: api('getBillingPayments', {}).catch(e => ({ _err: e.message })),
+      };
+      
+      console.log(`[loadAllFromCloud] firing ${fetchPromises.length} parallel requests + 3 side fetches (PV/billing_notes/billing_payments)...`);
       const tFetch = Date.now();
       results = await Promise.all(fetchPromises);
       console.log(`[loadAllFromCloud] all responses received in ${Math.round((Date.now() - tFetch)/1000)}s`);
+      
+      // ⭐ R25.34 — Collect side fetches (already resolved or close to it — fired in parallel)
+      try {
+        const [pvR, bnR, bpR] = await Promise.all([sideFetches.pv, sideFetches.billing_notes, sideFetches.billing_payments]);
+        const _pvArr = (pvR && !pvR._err) 
+                     ? (Array.isArray(pvR.data?.data) ? pvR.data.data : (Array.isArray(pvR.data) ? pvR.data : []))
+                     : [];
+        const _bnArr = (bnR && !bnR._err && Array.isArray(bnR.data)) ? bnR.data : [];
+        const _bpArr = (bpR && !bpR._err && Array.isArray(bpR.data)) ? bpR.data : [];
+        window.__SF_BOOT = {
+          pv: _pvArr,
+          billing_payments: _bpArr,
+          billing_notes: _bnArr,
+          generated_at: new Date().toISOString(),
+        };
+        console.log(`[loadAllFromCloud] side fetches: pv=${_pvArr.length} billing_notes=${_bnArr.length} billing_payments=${_bpArr.length}`);
+      } catch (e) {
+        console.warn(`[loadAllFromCloud] side fetch error (non-blocking):`, e.message);
+      }
     }
     
     // ── Process Group 1 ──
@@ -17014,12 +17044,21 @@ async function loadAllFromCloud(opts) {
     
     window._lastCloudLoad = Date.now();
     const elapsed = Math.round((Date.now() - t0) / 1000);
-    console.log(`[loadAllFromCloud] DONE (${reason}) ${elapsed}s — bills=${billList.length} stmts=${totalStmts} sp=${paymentList.length}`);
+    const _bootCounts = window.__SF_BOOT ? {
+      pv: (window.__SF_BOOT.pv || []).length,
+      bn: (window.__SF_BOOT.billing_notes || []).length,
+      bp: (window.__SF_BOOT.billing_payments || []).length,
+    } : { pv: 0, bn: 0, bp: 0 };
+    console.log(`[loadAllFromCloud] DONE (${reason}) ${elapsed}s — bills=${billList.length} stmts=${totalStmts} sp=${paymentList.length} pv=${_bootCounts.pv} bn=${_bootCounts.bn} bp=${_bootCounts.bp}`);
     
-    // Toast summary
-    if (!silent) {
+    // ⭐ R25.34 — Toast summary
+    //   Always show on initial login + manual click. Suppress only on background tab-focus refresh.
+    const isBackgroundRefresh = (silent && reason === 'tab-focus');
+    if (!isBackgroundRefresh) {
       const errMsg = errors.length > 0 ? ` (${errors.length} errors)` : '';
-      toast(`✓ Loaded ${billList.length} bills, ${totalStmts} stmts ใน ${elapsed}s${errMsg}`, 'success', 4000);
+      const ready = `✅ พร้อมใช้งาน · ${elapsed}s · บิล ${billList.length} · stmt ${totalStmts} · SP ${paymentList.length}` + 
+                    (_bootCounts.pv ? ` · PV ${_bootCounts.pv}` : '') + errMsg;
+      toast(ready, 'success', 5000);
     }
     
     // Update badge
@@ -38629,10 +38668,10 @@ function _pvMakeReversal(orig) {
 
 // ── Initialize after all declarations are ready ──
 (async function() {
-  // ⭐ R25.33 BOOT BEACON
-  console.log('%c[SF R25.33] Active build: 2026-05-17-1300 — Bootstrap endpoint (Strategy C) — 12 requests → 1', 'color:#0c8;font-weight:bold;font-size:13px');
-  console.log('%c[SF R25.33] CacheService 30s · Tiered (1/2/all) · PV+billing_payments+billing_notes preload · feature flag __SF_USE_BOOTSTRAP', 'color:#888');
-  window.__SF_BUILD = 'R25.33-2026-05-17-1300';
+  // ⭐ R25.34 BOOT BEACON
+  console.log('%c[SF R25.34] Active build: 2026-05-17-1400 — Bootstrap reverted as default, PV/billing fire parallel', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.34] Legacy 15 parallel ~9s · __SF_BOOT populated · DONE toast "✅ พร้อมใช้งาน" · bootstrap kept opt-in', 'color:#888');
+  window.__SF_BUILD = 'R25.34-2026-05-17-1400';
   
   await restoreMainState();
   checkSavedLogin();
