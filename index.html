@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.35-2026-05-17-1500 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.36-2026-05-17-1700 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -7,7 +7,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>Smart Finance R25.35</title>
+<title>Smart Finance R25.36</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
@@ -2753,7 +2753,7 @@ const syncManager = {
     // ⭐ Manual save only — markDirty ทำงานเสมอ (ไม่ขึ้นกับ enabled flag)
     // user กดปุ่มบันทึก = trigger _flushPush manually → push ขึ้น cloud
     // (auto-push debounce ถูกปิดที่ _schedulePush แล้ว)
-    const NO_ARG_TYPES = ['payments', 'sp_temps', 'cashflow', 'suppliers', 'meta'];
+    const NO_ARG_TYPES = ['payments', 'cashflow', 'suppliers', 'meta'];  // ⭐ R25.36 — removed sp_temps
     const ALL_TYPES = [...NO_ARG_TYPES, 'bills', 'stmts'];
     if (type) {
       if (!ALL_TYPES.includes(type)) return;
@@ -2839,22 +2839,7 @@ const syncManager = {
         last: paymentList[paymentList.length-1]?.sp_no
       });
     }
-    if (type === 'sp_temps') {
-      const delNos = window.deletedSpTempNos ? [...window.deletedSpTempNos] : [];
-      return this._fp({
-        n: spTempList.length,
-        billHash: spTempList.map(t => (t.bills||[]).map(b => 
-          `${b.sb_no||''}|${b.bill_no||''}|${b.bill_type||''}|${b.bill_amount||0}`
-        ).sort().join(',')),
-        partialHash: spTempList.map(t => 
-          (t.partials||[]).map(p => 
-            `${p.partial_uuid||''}|${p.sb_no||''}|${p.amount||0}|${p.pay_date||''}|${p.type||''}|${p.match_status||''}|${p.matched_stmt_uuid||''}`
-          ).sort().join(',')
-        ),
-        master: spTempList.map(t => `${t.no}|${t.customer||''}|${t.expected_total||0}|${t.status||''}|${t.linked_sp||''}|${t.notes||''}`),
-        del: delNos
-      });
-    }
+    // ⭐ R25.36 — sp_temps fingerprint block removed (SP-TEMP module retired)
     if (type === 'cashflow') {
       return this._fp({
         n: cashflowList.length,
@@ -2894,7 +2879,7 @@ const syncManager = {
   //    ใหม่: ถ้า dirty.has(type) → skip update fp + keep dirty → push cycle ถัดไปจะ sync
   _recomputeFpCache() {
     this._fpCache = this._fpCache || {};
-    const TYPES = ['bills','stmts','meta','payments','sp_temps','cashflow','suppliers'];
+    const TYPES = ['bills','stmts','meta','payments','cashflow','suppliers'];  // ⭐ R25.36 — removed sp_temps
     TYPES.forEach(t => {
       if (this.dirty.has(t)) return; // skip — local has pending edit ที่ยังไม่ push
       const fp = this._computeFp(t);
@@ -3386,54 +3371,11 @@ const syncManager = {
           this.dirty.delete('payments');
           this._emit();
         } else if (type === 'sp_temps') {
-          // ⭐ Flat schema — flatten nested state ก่อนส่ง backend
-          //    1 row = 1 (bill × partial event)
-          const delNos = window.deletedSpTempNos ? [...window.deletedSpTempNos] : [];
-          
-          // Fingerprint จาก nested structure ใหม่
-          const fp = this._fp({
-            n: spTempList.length,
-            // hash bills (sb_no, bill_no, type, amount) per SP-TEMP
-            billHash: spTempList.map(t => (t.bills||[]).map(b => 
-              `${b.sb_no||''}|${b.bill_no||''}|${b.bill_type||''}|${b.bill_amount||0}`
-            ).sort().join(',')),
-            // hash partials (per bill + unassigned)
-            partialHash: spTempList.map(t => 
-              (t.partials||[]).map(p => 
-                `${p.partial_uuid||''}|${p.sb_no||''}|${p.amount||0}|${p.pay_date||''}|${p.type||''}|${p.match_status||''}|${p.matched_stmt_uuid||''}`
-              ).sort().join(',')
-            ),
-            master: spTempList.map(t => `${t.no}|${t.customer||''}|${t.expected_total||0}|${t.status||''}|${t.linked_sp||''}|${t.notes||''}`),
-            del: delNos
-          });
-          console.log('[sp_temps push] sp-temps:', spTempList.length, '| deletes:', delNos.length);
-          if (fp === this._fpCache.sp_temps) { 
-            console.log('[sp_temps push] SKIPPED — fp matches cache');
-            results.skipped++; 
-            this.dirty.delete('sp_temps');
-            continue; 
-          }
-          
-          // ⭐ Flatten ALL spTempList → flat rows
-          const flatRecords = [];
-          spTempList.forEach(t => {
-            const rows = (typeof spTempFlatten === 'function') ? spTempFlatten(t) : [];
-            rows.forEach(r => flatRecords.push(r));
-          });
-          console.log('[sp_temps push] flat rows:', flatRecords.length);
-          
-          const r = await api('saveSpTemps', { records: flatRecords, deletes: delNos, created_by: by });
-          console.log('[sp_temps push] response:', r?.success === false ? `FAIL: ${r.error}` : `OK updated:${r?.data?.updated} inserted:${r?.data?.inserted} deleted:${r?.data?.deleted} total:${r?.data?.total_rows}`);
-          if (r?.success === false) throw new Error(r.error || 'API error');
-          if (delNos.length > 0 && window.deletedSpTempNos) {
-            const deleted = Number(r?.data?.deleted) || 0;
-            console.log(`[sp_temps push] cleared deletedSpTempNos (deleted ${deleted}/${delNos.length} on cloud)`);
-            window.deletedSpTempNos.clear();
-            try { localStorage.removeItem('sf_deleted_sp_temp_nos'); } catch(_){}
-          }
-          this._fpCache.sp_temps = fp;
+          // ⭐ R25.36 — SP-TEMP module retired (replaced by SB + Receive Payment v3)
+          //   Just clear dirty flag — no backend push. Block kept as no-op stub
+          //   in case any legacy markDirty('sp_temps') call still fires.
           this.dirty.delete('sp_temps');
-          this._emit();
+          continue;
         } else if (type === 'cashflow') {
           if (cashflowList.length === 0) continue;
           const fp = this._fp({n: cashflowList.length, first: cashflowList[0]?.id, last: cashflowList[cashflowList.length-1]?.id});
@@ -3714,7 +3656,7 @@ const syncManager = {
     // ⭐ Type filter — ถ้า opts.types = ['bills','stmts'] → pull เฉพาะ types นั้น
     //   ใช้สำหรับ per-page Refresh (Daily/Matching/SP/Cashflow/Supplier ดึงเฉพาะที่ใช้)
     //   ไม่ใส่ → ดึงทุก type (default behavior)
-    const ALL_TYPES = ['bills','stmts','payments','sp_temps','cashflow','suppliers','supplier_payments','meta'];
+    const ALL_TYPES = ['bills','stmts','payments','cashflow','suppliers','supplier_payments','meta'];  // ⭐ R25.36 — removed sp_temps
     const filterTypes = Array.isArray(opts.types) && opts.types.length > 0 ? opts.types : ALL_TYPES;
     const _shouldPull = (t) => filterTypes.includes(t);
     if (filterTypes.length < ALL_TYPES.length) {
@@ -4034,56 +3976,7 @@ const syncManager = {
         });
       } catch(err) { stats.errors.push(`SP: ${err.message}`); console.warn('[sync] SP', err); }
       
-      // SP-TEMPs (flat schema — backend returns flat array, group ฝั่ง frontend)
-      if (_shouldPull('sp_temps')) try {
-        const r = await api('getSpTemps');
-        if (r?.success === false) throw new Error(r.error || 'API error');
-        const flatRows = (r?.data?.data) || (Array.isArray(r?.data) ? r.data : []) || [];
-        if (Array.isArray(flatRows)) {
-          // ⭐ Group flat rows → nested SP-TEMP objects
-          const grouped = (typeof spTempGroupFlat === 'function') ? spTempGroupFlat(flatRows) : [];
-          
-          const byUuid = {};
-          spTempList.forEach(t => { if (t.sp_temp_uuid) byUuid[t.sp_temp_uuid] = t; });
-          
-          // ⭐ Dirty/timestamp guards — ป้องกัน cloud ทับ local ที่แก้ไขใหม่กว่า
-          const isDirty = this.dirty.has('sp_temps');
-          let kept = 0, replaced = 0, added = 0;
-          
-          grouped.forEach(t => {
-            if (!t.sp_temp_uuid) return;
-            const localT = byUuid[t.sp_temp_uuid];
-            if (!localT) {
-              // ใหม่ใน cloud → เพิ่มเข้า local
-              spTempList.push(t);
-              added++;
-            } else {
-              // ⭐ mode='force' → trust cloud, override
-              if (mode === 'force') {
-                Object.assign(localT, t);
-                replaced++;
-                return;
-              }
-              // ⭐ Dirty guard: ถ้า user มี local edits ที่ยังไม่ push → skip merge
-              if (isDirty) {
-                kept++;
-                return;
-              }
-              // ⭐ Timestamp guard: local.updated_at >= cloud.updated_at → keep local
-              const localTs = localT.updated_at ? new Date(localT.updated_at).getTime() : 0;
-              const cloudTs = t.updated_at ? new Date(t.updated_at).getTime() : 0;
-              if (localTs >= cloudTs && localTs > 0) {
-                kept++;
-                return;
-              }
-              // Cloud ใหม่กว่า → replace
-              Object.assign(localT, t);
-              replaced++;
-            }
-          });
-          console.log(`[sync sp_temps] flat:${flatRows.length} grouped:${grouped.length} added:${added} replaced:${replaced} kept-local:${kept} dirty:${isDirty} mode:${mode}`);
-        }
-      } catch(err) { console.warn('[sync] SpTemps', err?.message); }
+      // ⭐ R25.36 — SP-TEMP pull removed (module retired)
       
       if (_shouldPull('cashflow')) try {
         const r = await api('getCashflow');
@@ -4440,7 +4333,7 @@ function persistMainState() {
       fpAndMark('bills');
       fpAndMark('stmts');
       // type อื่น ใช้ fp check เพื่อกัน stale
-      ['payments', 'sp_temps', 'cashflow', 'suppliers', 'meta'].forEach(fpAndMark);
+      ['payments', 'cashflow', 'suppliers', 'meta'].forEach(fpAndMark);  // ⭐ R25.36 — removed sp_temps
     }
   } catch(_) {}
 }
@@ -11343,60 +11236,18 @@ window.openSpTempBillModal = openSpTempBillModal;
 window.spTempBillsSum = spTempBillsSum;
 
 function markDirtySpTemps() {
-  // ⭐ Persist counter to localStorage (moved from genSpTempNo)
-  // Only fires on commit path → counter ไม่เขยิบถ้า user cancel modal
-  let max = 0;
-  spTempList.forEach(t => {
-    const m = String(t.no||'').match(/SP-TEMP-(\d+)/);
-    if (m) max = Math.max(max, Number(m[1]));
-  });
-  if (max > 0) localStorage.setItem('sf_spTempCounter', String(max));
-  
-  persistMainState();
-  if (window.syncManager) {
-    syncManager.markDirty('sp_temps');
-    // ⭐ AUTO-PUSH for sp_temps — debounced 2s
-    //   small data + frequent edits → auto-sync ดีกว่ารอ user กด save
-    if (window._spTempAutoPushTimer) clearTimeout(window._spTempAutoPushTimer);
-    window._spTempAutoPushTimer = setTimeout(async () => {
-      if (!syncManager.dirty.has('sp_temps')) return;
-      if (syncManager.status === 'pushing') {
-        // กำลัง push อยู่ → ลองอีกที 2s ข้างหน้า
-        window._spTempAutoPushTimer = setTimeout(() => markDirtySpTemps(), 2000);
-        return;
-      }
-      try {
-        console.log('[sp_temps auto-push] firing...');
-        const r = await syncManager._flushPush();
-        const ok = r?.ok || 0;
-        const errs = (r?.errors && r.errors.length) || 0;
-        if (errs > 0) {
-          console.warn('[sp_temps auto-push] errors:', r.errors);
-          if (typeof toast === 'function') toast('⚠ Auto-sync error — กด ✓ บันทึก เพื่อลองใหม่', 'warn', 4000);
-        } else if (ok > 0) {
-          console.log('[sp_temps auto-push] success');
-          if (typeof toast === 'function') toast('☁️ ซิงค์ขึ้น cloud แล้ว', 'info', 1500);
-        }
-      } catch (e) {
-        console.error('[sp_temps auto-push] failed:', e);
-      }
-    }, 2000);
-  }
+  // ⭐ R25.36 — SP-TEMP module retired. Function kept as no-op stub
+  //   to prevent ReferenceError from legacy callsites (8068, 10956, 11030, 11079, 11102).
+  //   No localStorage counter, no syncManager.markDirty, no auto-push.
+  return;
 }
 
-// ⭐ Track SP-TEMP deletions — push to backend ตอน save
+// ⭐ R25.36 — SP-TEMP deletion tracking removed (no-op stubs)
 window.deletedSpTempNos = window.deletedSpTempNos || new Set();
-try {
-  const _stored = localStorage.getItem('sf_deleted_sp_temp_nos');
-  if (_stored) JSON.parse(_stored).forEach(n => window.deletedSpTempNos.add(n));
-} catch(_){}
 
 function trackSpTempDelete(no) {
-  if (!no) return;
-  window.deletedSpTempNos.add(String(no));
-  try {
-    localStorage.setItem('sf_deleted_sp_temp_nos', JSON.stringify([...window.deletedSpTempNos]));
-  } catch(_){}
+  // ⭐ R25.36 — no-op stub
+  return;
 }
 
 // Customer typeahead HTML
@@ -27723,19 +27574,7 @@ async function renderAlerts(el) {
     });
   });
   
-  // 4. SP-TEMP ที่ยังไม่แก้
-  paymentList.filter(p => p.is_temp || /^SP-TEMP-/.test(p.sp_no)).forEach(sp => {
-    alerts.push({
-      category: 'sp_temp',
-      priority: 3,
-      title: `SP ชั่วคราว ${sp.sp_no}`,
-      detail: `${sp.cust_name} · ฿${fmtNum(sp.total)} · ${fmtDate(sp.date)}`,
-      meta: 'รอ SP จริงจากโปรแกรม Smart',
-      type: 'sp_temp',
-      action: 'payments',
-      data: sp,
-    });
-  });
+  // ⭐ R25.36 — SP-TEMP alerts removed (module retired)
   
   // 5. Statement unmatched > 3 วัน
   const old3days = new Date(Date.now() - 3*86400000).toISOString().substring(0,10);
@@ -38053,11 +37892,10 @@ function _pvOpenMatchModal(pv, rootEl) {
          <div style="font-size:.78rem;margin-top:4px">ยอดคาดหวัง: ${pvNet > 0 ? '−' : '+'}${fmtNum(Math.abs(pvNet))} ใน ${preferredBank || 'stmts ใดๆ'} · เดือน ${pvIssueMonth || '?'} (±1)</div>
          <div style="font-size:.7rem;margin-top:6px;color:var(--text2)">ถ้าควรเห็นแต่ไม่เจอ ตรวจ: stmt อยู่ bank ถูกหรือยัง · ยอดใกล้เคียงไหม · สัญลักษณ์ตรงข้ามหรือยัง</div>
        </div>`
-    : `<div style="max-height:400px;overflow-y:auto">
-        ${candidates.map(({stmt, diff, dateDiff}) => `
-          <div class="pv-match-opt" data-uuid="${escapeHtml(stmt.stmt_uuid||'')}" 
-               style="padding:10px 12px;border:1px solid var(--border);border-radius:6px;margin-bottom:6px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:8px"
-               onmouseover="this.style.background='var(--bg-elev)'" onmouseout="this.style.background='transparent'">
+    : `<div id="pvmm-stmt-list" style="max-height:320px;overflow-y:auto;border:1px solid var(--border);border-radius:8px">
+        ${candidates.map(({stmt, diff, dateDiff}, idx) => `
+          <div class="pvmm-stmt-opt" data-idx="${idx}" data-uuid="${escapeHtml(stmt.stmt_uuid||'')}" 
+               style="padding:10px 12px;border-bottom:1px solid var(--border);cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:8px;transition:background .12s">
             <div style="flex:1;min-width:0">
               <div style="font-size:.85rem;font-weight:500">
                 ${fmtDate(stmt.date)} · <span style="color:var(--text2)">${escapeHtml(stmt.bank||'')}</span>
@@ -38075,6 +37913,11 @@ function _pvOpenMatchModal(pv, rootEl) {
         `).join('')}
        </div>`;
   
+  // ⭐ R25.36 — UX redesign: select-then-confirm flow (matches Bills Manual Match pattern)
+  //   1. Click stmt row → highlight (no API call)
+  //   2. Preview area populates with PV+stmt side-by-side
+  //   3. User clicks "✓ ยืนยัน Match" → fires API
+  //   4. Cancel = closeModal, no API
   openModal(`🔗 จับคู่ ${pv.pv_number||''} — ${fmtNum(pvNet)} ฿`, `
     <div class="flex-col gap-2">
       <div style="background:var(--bg-elev);padding:10px;border-radius:6px;font-size:.85rem">
@@ -38088,82 +37931,189 @@ function _pvOpenMatchModal(pv, rootEl) {
         แสดง stmt ของ <strong>${preferredBank || 'ทุก bank'}</strong> · ${pvNet>0?'เงินออก':'เงินเข้า'} · เดือน ${pvIssueMonth || '?'} (±1 เดือน) · ยอด ±10% · เรียงตามวันใกล้สุด
       </div>
       ${listHtml}
+      
+      <!-- Preview area: PV ↔ Stmt side-by-side (visible after selection) -->
+      <div id="pvmm-preview" style="display:none;padding:12px;background:rgba(79,156,249,.08);border:1px solid rgba(79,156,249,.3);border-radius:8px;margin-top:6px">
+        <div style="font-size:.78rem;font-weight:600;color:var(--info);margin-bottom:8px">📋 ตรวจสอบก่อนยืนยัน</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;font-size:.82rem">
+          <div>
+            <div style="color:var(--text2);font-size:.72rem">PV (ใบสำคัญจ่าย)</div>
+            <div style="font-weight:600;margin-top:2px">${pv.pv_number||'-'}</div>
+            <div>${escapeHtml(pv.supplier_name||'-')}</div>
+            <div style="color:${pvNet>=0?'var(--text)':'var(--danger)'}">฿ ${fmtNum(pvNet)}</div>
+            <div style="font-size:.72rem;color:var(--text2)">issue ${fmtDate(pv.issue_date)}</div>
+          </div>
+          <div>
+            <div style="color:var(--text2);font-size:.72rem">Statement</div>
+            <div style="font-weight:600;margin-top:2px" id="pvmm-pv-stmt-bank">-</div>
+            <div id="pvmm-pv-stmt-desc" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">-</div>
+            <div id="pvmm-pv-stmt-amt">-</div>
+            <div style="font-size:.72rem;color:var(--text2)" id="pvmm-pv-stmt-date">-</div>
+          </div>
+        </div>
+        <div style="margin-top:8px;padding-top:8px;border-top:1px solid rgba(79,156,249,.2);font-size:.78rem;display:flex;justify-content:space-between;align-items:center">
+          <span>หลัง match: PV.pay_date จะถูกตั้งเป็น <strong id="pvmm-pv-stmt-paydate" style="color:var(--info)">-</strong></span>
+          <span id="pvmm-pv-diff" style="font-weight:600"></span>
+        </div>
+      </div>
+      
       <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:10px">
         <button class="btn btn-outline" onclick="closeModal()">ยกเลิก</button>
+        <button class="btn btn-primary" id="pvmm-confirm" disabled>${typeof ICONS!=='undefined'?ICONS.check:'✓'} ยืนยัน Match</button>
       </div>
     </div>
   `);
   
   setTimeout(() => {
-    document.querySelectorAll('.pv-match-opt').forEach((opt, idx) => {
+    let selectedIdx = -1;
+    
+    function selectRow(idx) {
+      // De-highlight previous
+      document.querySelectorAll('.pvmm-stmt-opt').forEach(el => {
+        el.style.background = 'transparent';
+        el.style.borderLeft = '';
+      });
+      
+      const opt = document.querySelector(`.pvmm-stmt-opt[data-idx="${idx}"]`);
+      if (!opt) return;
+      
+      selectedIdx = idx;
+      opt.style.background = 'rgba(79,156,249,.12)';
+      opt.style.borderLeft = '3px solid var(--info)';
+      
+      const cand = candidates[idx];
+      const stmt = cand?.stmt || {};
+      const stmtAmt = Number(stmt.amount) || 0;
+      const stmtDateISO = toISODate(stmt.date) || '';
+      
+      // Populate preview
+      const $bank = document.getElementById('pvmm-pv-stmt-bank');
+      const $desc = document.getElementById('pvmm-pv-stmt-desc');
+      const $amt = document.getElementById('pvmm-pv-stmt-amt');
+      const $date = document.getElementById('pvmm-pv-stmt-date');
+      const $paydate = document.getElementById('pvmm-pv-stmt-paydate');
+      const $diff = document.getElementById('pvmm-pv-diff');
+      const $preview = document.getElementById('pvmm-preview');
+      
+      if ($bank) $bank.textContent = stmt.bank || '-';
+      if ($desc) $desc.textContent = stmt.description || stmt.ref_no || '-';
+      if ($amt) {
+        $amt.textContent = '฿ ' + fmtNum(stmtAmt);
+        $amt.style.color = stmtAmt < 0 ? 'var(--danger)' : 'var(--success)';
+      }
+      if ($date) $date.textContent = fmtDate(stmt.date) || '-';
+      if ($paydate) $paydate.textContent = fmtDate(stmtDateISO) || '-';
+      
+      // Diff indicator
+      const signedDiff = pvNet + stmtAmt;
+      const absDiff = Math.abs(signedDiff);
+      if ($diff) {
+        if (absDiff < 0.01) {
+          $diff.innerHTML = '<span style="color:var(--success)">✓ ยอดตรงเป๊ะ</span>';
+        } else {
+          $diff.innerHTML = `<span style="color:var(--warn)">⚠ ต่าง ฿${fmtNum(absDiff)}</span>`;
+        }
+      }
+      
+      if ($preview) $preview.style.display = 'block';
+      
+      const $confirm = document.getElementById('pvmm-confirm');
+      if ($confirm) $confirm.disabled = false;
+    }
+    
+    document.querySelectorAll('.pvmm-stmt-opt').forEach(opt => {
+      opt.addEventListener('mouseover', () => {
+        if (Number(opt.dataset.idx) === selectedIdx) return;  // keep selected highlight
+        opt.style.background = 'var(--bg-elev)';
+      });
+      opt.addEventListener('mouseout', () => {
+        if (Number(opt.dataset.idx) === selectedIdx) return;  // keep selected highlight
+        opt.style.background = 'transparent';
+      });
       opt.addEventListener('click', () => {
-        const stmtUuid = opt.dataset.uuid;
-        if (!stmtUuid) return;
-        if (!confirm(`ยืนยัน match ${pv.pv_number} กับ stmt นี้?`)) return;
-        
-        // ⭐ R25.32 — Optimistic UI: update local + close modal FIRST, fire API async
-        //   Pull stmt info from candidates[] (we still have access via idx)
-        const cand = candidates[idx];
-        const stmtObj = cand?.stmt || {};
-        const stmtBank = stmtObj.bank || '';
-        const stmtYear = String(toISODate(stmtObj.date)||'').substring(0, 4);
-        const optimisticNow = new Date().toISOString();
-        
-        // Save previous state for rollback
-        const prevStatus = pv.match_status;
-        const prevStmtUuid = pv.matched_stmt_uuid;
-        const prevMatchedAt = pv.matched_at;
-        
-        // Apply optimistic
-        pv.match_status = 'matched';
-        pv.matched_stmt_uuid = stmtUuid;
-        pv.matched_at = optimisticNow;
-        // Also update stmt local state for getAllStatements consistency
-        try {
-          if (stmtObj && stmtObj.stmt_uuid) {
-            stmtObj.match_status = 'paid';
-            stmtObj.match_bill = pv.pv_number || '';
-            stmtObj.matched_at = optimisticNow;
-          }
-        } catch(_) {}
-        
-        closeModal();
-        _pvRender(rootEl);
-        toast(`⏳ Match ${pv.pv_number} → ${stmtBank}...`, 'info', 1500);
-        
-        // Fire async — pass bank+year for backend fast path
-        api('pv_setMatch', { 
-          pv_uuid: pv.pv_uuid, 
-          stmt_uuid: stmtUuid,
-          stmt_bank: stmtBank,
-          stmt_year: stmtYear,
-        }).then(r => {
-          if (r?.success) {
-            toast(`✅ ${pv.pv_number} ↔ ${r.data?.stmt_bank || stmtBank}`, 'success', 2000);
-            // Sync server's matched_at if different
-            if (r.data?.matched_at) pv.matched_at = r.data.matched_at;
-          } else {
-            // Rollback
-            pv.match_status = prevStatus;
-            pv.matched_stmt_uuid = prevStmtUuid;
-            pv.matched_at = prevMatchedAt;
-            try {
-              if (stmtObj && stmtObj.stmt_uuid) {
-                stmtObj.match_status = '';
-                stmtObj.match_bill = '';
-                stmtObj.matched_at = '';
-              }
-            } catch(_) {}
-            _pvRender(rootEl);
-            toast(`❌ Match ล้มเหลว: ${r?.error || 'unknown'}`, 'error', 5000);
-          }
-        }).catch(e => {
+        const idx = Number(opt.dataset.idx);
+        if (isNaN(idx)) return;
+        selectRow(idx);
+      });
+    });
+    
+    // Confirm button — fires API
+    document.getElementById('pvmm-confirm')?.addEventListener('click', () => {
+      if (selectedIdx < 0) return;
+      const cand = candidates[selectedIdx];
+      if (!cand) return;
+      const stmtObj = cand.stmt || {};
+      const stmtUuid = stmtObj.stmt_uuid;
+      if (!stmtUuid) { toast('Stmt uuid missing', 'error', 3000); return; }
+      const stmtBank = stmtObj.bank || '';
+      const stmtYear = String(toISODate(stmtObj.date)||'').substring(0, 4);
+      const stmtDateISO = toISODate(stmtObj.date) || '';
+      const optimisticNow = new Date().toISOString();
+      
+      // Save previous state for rollback
+      const prevStatus = pv.match_status;
+      const prevStmtUuid = pv.matched_stmt_uuid;
+      const prevMatchedAt = pv.matched_at;
+      const prevPayDate = pv.pay_date;
+      const prevPayFromBank = pv.pay_from_bank;
+      
+      // Apply optimistic — ⭐ R25.36 also set pay_date + pay_from_bank from stmt
+      pv.match_status = 'matched';
+      pv.matched_stmt_uuid = stmtUuid;
+      pv.matched_at = optimisticNow;
+      if (stmtDateISO) pv.pay_date = stmtDateISO;
+      if (stmtBank) pv.pay_from_bank = stmtBank;
+      
+      // Also update stmt local state for getAllStatements consistency
+      try {
+        if (stmtObj && stmtObj.stmt_uuid) {
+          stmtObj.match_status = 'paid';
+          stmtObj.match_bill = pv.pv_number || '';
+          stmtObj.matched_at = optimisticNow;
+        }
+      } catch(_) {}
+      
+      closeModal();
+      _pvRender(rootEl);
+      toast(`⏳ Match ${pv.pv_number} → ${stmtBank}...`, 'info', 1500);
+      
+      // Fire async — pass bank+year for backend fast path
+      api('pv_setMatch', { 
+        pv_uuid: pv.pv_uuid, 
+        stmt_uuid: stmtUuid,
+        stmt_bank: stmtBank,
+        stmt_year: stmtYear,
+      }).then(r => {
+        if (r?.success) {
+          toast(`✅ ${pv.pv_number} ↔ ${r.data?.stmt_bank || stmtBank}`, 'success', 2000);
+          // Sync server's matched_at + pay_date if returned
+          if (r.data?.matched_at) pv.matched_at = r.data.matched_at;
+          if (r.data?.pay_date) pv.pay_date = r.data.pay_date;  // ⭐ R25.36 — trust server-normalized date
+        } else {
+          // Rollback
           pv.match_status = prevStatus;
           pv.matched_stmt_uuid = prevStmtUuid;
           pv.matched_at = prevMatchedAt;
+          pv.pay_date = prevPayDate;
+          pv.pay_from_bank = prevPayFromBank;
+          try {
+            if (stmtObj && stmtObj.stmt_uuid) {
+              stmtObj.match_status = '';
+              stmtObj.match_bill = '';
+              stmtObj.matched_at = '';
+            }
+          } catch(_) {}
           _pvRender(rootEl);
-          toast(`❌ Network error: ${e.message}`, 'error', 5000);
-        });
+          toast(`❌ Match ล้มเหลว: ${r?.error || 'unknown'}`, 'error', 5000);
+        }
+      }).catch(e => {
+        pv.match_status = prevStatus;
+        pv.matched_stmt_uuid = prevStmtUuid;
+        pv.matched_at = prevMatchedAt;
+        pv.pay_date = prevPayDate;
+        pv.pay_from_bank = prevPayFromBank;
+        _pvRender(rootEl);
+        toast(`❌ Network error: ${e.message}`, 'error', 5000);
       });
     });
   }, 50);
@@ -38712,10 +38662,10 @@ function _pvMakeReversal(orig) {
 
 // ── Initialize after all declarations are ready ──
 (async function() {
-  // ⭐ R25.35 BOOT BEACON
-  console.log('%c[SF R25.35] Active build: 2026-05-17-1500 — Preload users+customers for instant page nav', 'color:#0c8;font-weight:bold;font-size:13px');
-  console.log('%c[SF R25.35] 5 side fetches: pv/billing_notes/billing_payments/users/customers · renderUsers + renderCustomersMgmt now consume __SF_BOOT', 'color:#888');
-  window.__SF_BUILD = 'R25.35-2026-05-17-1500';
+  // ⭐ R25.36 BOOT BEACON
+  console.log('%c[SF R25.36] Active build: 2026-05-17-1700 — SP-TEMP removed + PV match UX redesign + date fix', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.36] BE -316 lines · PV match: select→preview→confirm pattern · pay_date = stmt.date (Bangkok TZ) · pay_from_bank auto-set', 'color:#888');
+  window.__SF_BUILD = 'R25.36-2026-05-17-1700';
   
   await restoreMainState();
   checkSavedLogin();
