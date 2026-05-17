@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.23-2026-05-16-1100 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.26-2026-05-16-1400 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -7,7 +7,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>Smart Finance R25.23</title>
+<title>Smart Finance R25.26</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
@@ -36745,7 +36745,7 @@ async function renderUsers(el) {
     const u = existingUser || { username: '', display_name: '', role: 'staff', permissions: ['read','write'], status: 'active' };
     const allPerms = ['read', 'write', 'delete', 'manage_users'];
     
-    openModal(`${isEdit?'✏️ แก้ไข':ICONS.plus+' เพิ่ม'} ผู้ใช้`, `
+    openModal(`${isEdit?'✏️ แก้ไข':'➕ เพิ่ม'} ผู้ใช้`, `
       <div class="flex-col gap-3">
         <div class="input-group">
           <label>Username ${isEdit?'<span class="text-xs text-dim">(แก้ไม่ได้)</span>':''}</label>
@@ -37057,7 +37057,7 @@ async function renderCustomersMgmt(el) {
       payment_terms: '', notes: '',
     };
     
-    openModal(`${isEdit?'✏️ แก้ไข':ICONS.plus+' เพิ่ม'} ลูกค้า`, `
+    openModal(`${isEdit?'✏️ แก้ไข':'➕ เพิ่ม'} ลูกค้า`, `
       <div class="flex-col gap-3">
         <div class="input-group">
           <label>รหัสลูกค้า ${isEdit?'<span class="text-xs text-dim">(แก้ไม่ได้)</span>':'<span class="text-xs text-dim">(เช่น 00126 — ห้ามว่าง)</span>'}</label>
@@ -37199,7 +37199,8 @@ async function renderPaymentVoucher(el) {
   try {
     const res = await api('pv_getList', { year: new Date().getFullYear() });
     if (res?.success) {
-      _pvState.list = res.data || [];
+      const d = res.data;
+      _pvState.list = Array.isArray(d) ? d : (Array.isArray(d?.data) ? d.data : []);
     } else {
       el.innerHTML = `<div class="card"><p style="color:var(--danger)">โหลดล้มเหลว: ${res?.error || 'unknown'}</p></div>`;
       return;
@@ -37235,7 +37236,6 @@ function _pvFilter() {
       const q = String(st.search).toLowerCase();
       const hit = String(pv.supplier_name||'').toLowerCase().includes(q)
                || String(pv.pv_number||'').toLowerCase().includes(q)
-               || String(pv.supplier_nickname||'').toLowerCase().includes(q)
                || (Array.isArray(pv.bills) && pv.bills.some(b => String(b.bill_no||'').toLowerCase().includes(q)));
       if (!hit) return false;
     }
@@ -37387,7 +37387,7 @@ function _pvRow(pv) {
     <td style="padding:6px 8px;font-family:monospace;font-size:.78rem">${pv.pv_number||'-'}</td>
     <td style="padding:6px 8px;font-size:.78rem">${fmtDate(pv.issue_date)}</td>
     <td style="padding:6px 8px">
-      <div style="font-weight:500">${pv.supplier_name||pv.supplier_nickname||'-'}</div>
+      <div style="font-weight:500">${pv.supplier_name||'-'}</div>
       <div style="font-size:11px;color:var(--text2);margin-top:1px">${pv.supplier_bank||''}${pv.supplier_account?' · '+pv.supplier_account:''}</div>
     </td>
     <td style="text-align:right;padding:6px 8px">${fmtNum(pv.amount_billed||0)}</td>
@@ -37408,7 +37408,7 @@ function _pvOpenModal(existing, rootEl) {
   const pv = existing || {
     pv_uuid: '', pv_number: '', issue_date: toISODate(new Date()),
     vat_type: _pvState.vat, category: 'ต้นทุน',
-    supplier_nickname: '', supplier_name: '', supplier_bank: '', supplier_account: '',
+    supplier_name: '', supplier_bank: '', supplier_account: '',
     amount_billed: 0, deduct_shipping: 0, deduct_dc_pm: 0, deduct_claim: 0, deduct_other: 0,
     net_amount: 0,
     pay_method: 'โอน', pay_date: '', pay_from_bank: '',
@@ -37424,7 +37424,7 @@ function _pvOpenModal(existing, rootEl) {
   // Local mutable copy
   const draft = JSON.parse(JSON.stringify(pv));
   
-  openModal(`${isEdit ? '✏️ แก้ไข' : ICONS.plus + ' สร้าง'} ใบสำคัญจ่าย`, _pvModalHtml(draft, isEdit));
+  openModal(`${isEdit ? '✏️ แก้ไข' : '➕ สร้าง'} ใบสำคัญจ่าย`, _pvModalHtml(draft, isEdit));
   
   setTimeout(() => _pvWireModal(draft, isEdit, rootEl), 50);
 }
@@ -37459,15 +37459,12 @@ function _pvModalHtml(d, isEdit) {
           <option value="ค่าใช้จ่าย" ${d.category==='ค่าใช้จ่าย'?'selected':''}>ค่าใช้จ่าย</option>
         </select>
       </div>
-      <div class="input-group">
-        <label>ชื่อเรียก (nickname)</label>
-        <input id="pv-m-nickname" class="input" value="${(d.supplier_nickname||'').replace(/"/g,'&quot;')}" placeholder="เช่น CCS, HIET">
-      </div>
     </div>
     
-    <div class="input-group" style="margin-bottom:10px">
-      <label>ชื่อบริษัท / Supplier <span style="color:var(--danger)">*</span></label>
-      <input id="pv-m-supplier_name" class="input" value="${(d.supplier_name||'').replace(/"/g,'&quot;')}" placeholder="ชื่อเต็มของ supplier">
+    <div class="input-group" style="margin-bottom:10px;position:relative">
+      <label>ชื่อบริษัท / Supplier <span style="color:var(--danger)">*</span> <span style="color:var(--text2);font-size:.78rem;font-weight:400">(พิมพ์ค้นหา — เลือกแล้วเติมธนาคาร+เลขบัญชีอัตโนมัติ)</span></label>
+      <input id="pv-m-supplier_name" class="input" value="${(d.supplier_name||'').replace(/"/g,'&quot;')}" placeholder="พิมพ์ชื่อบริษัท..." autocomplete="off">
+      <div id="pv-m-supplier-suggest" style="position:absolute;top:100%;left:0;right:0;background:var(--bg-elev);border:1px solid var(--border);border-top:none;max-height:240px;overflow-y:auto;z-index:100;display:none;box-shadow:0 4px 12px rgba(0,0,0,.15);border-radius:0 0 6px 6px"></div>
     </div>
     
     <div style="display:grid;grid-template-columns:1fr 1.5fr;gap:8px;margin-bottom:10px">
@@ -37594,6 +37591,48 @@ function _pvWireModal(draft, isEdit, rootEl) {
     });
   }));
   
+  // ⭐ R25.25 — Supplier autocomplete (search by name, auto-fill bank+account)
+  const supInput = document.getElementById('pv-m-supplier_name');
+  const supSuggest = document.getElementById('pv-m-supplier-suggest');
+  const bankInput = document.getElementById('pv-m-supplier_bank');
+  const acctInput = document.getElementById('pv-m-supplier_account');
+  if (supInput && supSuggest) {
+    let activeIdx = -1;
+    const _renderSuggest = (q) => {
+      if (!q || q.length < 1) { supSuggest.style.display = 'none'; supSuggest.innerHTML = ''; return; }
+      const ql = q.toLowerCase();
+      const matches = (supplierList || []).filter(s => {
+        return String(s.name||'').toLowerCase().includes(ql)
+            || String(s.code||'').toLowerCase().includes(ql);
+      }).slice(0, 8);
+      if (matches.length === 0) { supSuggest.style.display = 'none'; return; }
+      supSuggest.innerHTML = matches.map((s, i) => `
+        <div class="pv-sup-opt" data-idx="${i}" style="padding:8px 12px;cursor:pointer;border-bottom:1px solid var(--border);${i===activeIdx?'background:var(--primary);color:#fff':''}">
+          <div style="font-weight:500;font-size:.88rem">${escapeHtml(s.name||'-')}</div>
+          <div style="font-size:.75rem;color:${i===activeIdx?'rgba(255,255,255,.85)':'var(--text2)'};margin-top:1px">
+            🏦 ${escapeHtml(s.bank||'-')} · ${escapeHtml(s.account_no||'-')}
+            ${s.vat?`· <span style="opacity:.85">${s.vat}</span>`:''}
+          </div>
+        </div>
+      `).join('');
+      supSuggest.style.display = 'block';
+      // Wire clicks
+      supSuggest.querySelectorAll('.pv-sup-opt').forEach((el, i) => {
+        el.addEventListener('mousedown', (e) => {
+          e.preventDefault();  // prevent input blur
+          const s = matches[i];
+          supInput.value = s.name || '';
+          if (bankInput) bankInput.value = s.bank || '';
+          if (acctInput) acctInput.value = s.account_no || '';
+          supSuggest.style.display = 'none';
+        });
+      });
+    };
+    supInput.addEventListener('input', () => _renderSuggest(supInput.value.trim()));
+    supInput.addEventListener('focus', () => { if (supInput.value.trim()) _renderSuggest(supInput.value.trim()); });
+    supInput.addEventListener('blur', () => setTimeout(() => { supSuggest.style.display = 'none'; }, 150));
+  }
+  
   // Method toggle (Cash auto pay_date)
   document.querySelectorAll('.pv-method-btn').forEach(b => b.addEventListener('click', () => {
     draft.pay_method = b.dataset.m;
@@ -37654,7 +37693,6 @@ function _pvWireModal(draft, isEdit, rootEl) {
       issue_date: document.getElementById('pv-m-issue_date').value,
       vat_type: draft.vat_type,
       category: document.getElementById('pv-m-category').value,
-      supplier_nickname: document.getElementById('pv-m-nickname').value.trim(),
       supplier_name: document.getElementById('pv-m-supplier_name').value.trim(),
       supplier_bank: document.getElementById('pv-m-supplier_bank').value.trim(),
       supplier_account: document.getElementById('pv-m-supplier_account').value.trim(),
@@ -37688,7 +37726,7 @@ function _pvWireModal(draft, isEdit, rootEl) {
         closeModal();
         // Reload list
         const res = await api('pv_getList', { year: new Date().getFullYear() });
-        if (res?.success) _pvState.list = res.data || [];
+        if (res?.success) { const d = res.data; _pvState.list = Array.isArray(d) ? d : (Array.isArray(d?.data) ? d.data : []); }
         _pvRender(rootEl);
       } else {
         toast(`❌ ${r?.error || 'fail'}`, 'error', 4000);
@@ -37989,25 +38027,29 @@ function _pvOpenMigrateModal(rootEl) {
           }
         }
         
-        // ⭐ R25.23 — Parse supplier master from DropdownVat + DropdownNoVat
+        // ⭐ R25.25 — Parse supplier master from DropdownVat + DropdownNoVat
         //   Cols (both sheets): 2=seq, 3=nickname, 4=name, 5=bank, 6=account, 7=note
         //   Header at row 2 (Thai labels), data starts row 3
+        //   Map to FRONTEND supplierList shape: {id, code, name, vat, account_no, account_name, bank, phone, note}
+        //   - nickname → code (เก็บไว้เผื่อ ref) BUT dedupe by NAME (Toppy specified)
         const dropdownVatSheet = sheets['DropdownVat'] || [];
         const dropdownNovatSheet = sheets['DropdownNoVat'] || sheets['DropdownNovat'] || [];
         const parsedSuppliers = [];
         function _parseSupplierRow(r, vat) {
-          if (!r || !r[2] || !r[3]) return null;  // skip if no nickname/name
+          if (!r || !r[2] || !r[3]) return null;
           const nickname = String(r[2]||'').trim();
           const name = String(r[3]||'').trim();
-          if (!nickname || !name || nickname === 'ชื่อเรียก') return null;  // skip header echoes
+          if (!name || nickname === 'ชื่อเรียก' || name === 'ชื่อบริษัท ใหม่' || name === 'ชื่อบัญชี') return null;
           return {
-            supplier_code: nickname,                // nickname → code
-            supplier_name: name,
+            id: 'SUP-MIG-' + Date.now() + '-' + Math.random().toString(36).slice(2,7),
+            code: nickname,                        // เก็บ nickname เป็น code (optional reference)
+            name: name,                            // ชื่อบริษัท — search key
+            vat: vat,                              // VAT / NOVAT
             bank: String(r[4]||'').trim(),
-            bank_account: String(r[5]||'').trim(),
-            account_name: name,                     // ชื่อบัญชี = ชื่อเต็ม (NoVat sheet) / fallback
-            notes: String(r[6]||'').trim(),
-            vat: vat,
+            account_no: String(r[5]||'').trim(),
+            account_name: name,                    // default = ชื่อบริษัท
+            phone: '',
+            note: String(r[6]||'').trim(),
           };
         }
         for (let i = 2; i < dropdownVatSheet.length; i++) {
@@ -38046,29 +38088,32 @@ function _pvOpenMigrateModal(rootEl) {
       btn.disabled = true;
       btn.textContent = '⏳ กำลัง migrate...';
       try {
-        // ⭐ R25.23 — Step 1: merge suppliers (only add new — don't overwrite existing)
+        // ⭐ R25.25 — Step 1: merge suppliers into LOCAL supplierList (dedupe by NAME lowercase)
+        //   Toppy preference: search by ชื่อบริษัท, not nickname
+        //   After merge: save via saveSuppliers + frontend gets new entries immediately for autocomplete
         const newSuppliers = window.__pvMigSuppliers || [];
         let supAdded = 0, supSkipped = 0;
         if (newSuppliers.length > 0) {
           btn.textContent = '⏳ migrate suppliers...';
-          // Get current suppliers
-          const curR = await api('getSuppliers', {});
-          const existing = (curR?.data || curR || []);
-          // Build dedupe key: supplier_code (nickname) lowercase
-          const existingCodes = new Set(existing.map(s => String(s.supplier_code||'').trim().toLowerCase()).filter(Boolean));
-          const merged = existing.slice();
+          // Build dedupe set from current supplierList (frontend memory) — case-insensitive name
+          const existingNames = new Set(
+            (supplierList || []).map(s => String(s.name||'').trim().toLowerCase()).filter(Boolean)
+          );
           newSuppliers.forEach(ns => {
-            const code = String(ns.supplier_code||'').trim().toLowerCase();
-            if (existingCodes.has(code)) { supSkipped++; return; }
-            merged.push(ns);
-            existingCodes.add(code);
+            const nameKey = String(ns.name||'').trim().toLowerCase();
+            if (!nameKey) { supSkipped++; return; }
+            if (existingNames.has(nameKey)) { supSkipped++; return; }
+            supplierList.push(ns);
+            existingNames.add(nameKey);
             supAdded++;
           });
           if (supAdded > 0) {
-            const sR = await api('saveSuppliers', { records: merged });
+            // Push to cloud + persist locally
+            const sR = await api('saveSuppliers', { records: supplierList, created_by: 'pv-migrate' });
             if (!sR?.success) {
               toast(`⚠️ Save suppliers fail: ${sR?.error||'unknown'} — ข้ามไป migrate PV`, 'error', 4000);
             }
+            try { persistMainState(); } catch(_) {}
           }
         }
         
@@ -38079,7 +38124,7 @@ function _pvOpenMigrateModal(rootEl) {
           toast(`✅ Suppliers +${supAdded} (skip ${supSkipped}) · PV ${r.migrated} + bills ${r.bills_created}`, 'success', 6000);
           closeModal();
           const res = await api('pv_getList', { year: new Date().getFullYear() });
-          if (res?.success) _pvState.list = res.data || [];
+          if (res?.success) { const d = res.data; _pvState.list = Array.isArray(d) ? d : (Array.isArray(d?.data) ? d.data : []); }
           _pvRender(rootEl);
         } else {
           toast(`❌ PV migrate fail: ${r?.error || 'fail'}`, 'error', 5000);
@@ -38202,10 +38247,10 @@ function _pvMakeReversal(orig) {
 
 // ── Initialize after all declarations are ready ──
 (async function() {
-  // ⭐ R25.23 BOOT BEACON
-  console.log('%c[SF R25.23] Active build: 2026-05-16-1100 — Remove pay_date copy-down + Migrate suppliers from xlsx', 'color:#0c8;font-weight:bold;font-size:13px');
-  console.log('%c[SF R25.23] Removed ONLY pay_date copy-down (kept date/bank/due_date) · PV migrate now extracts DropdownVat+NoVat suppliers', 'color:#888');
-  window.__SF_BUILD = 'R25.23-2026-05-16-1100';
+  // ⭐ R25.26 BOOT BEACON
+  console.log('%c[SF R25.26] Active build: 2026-05-16-1400 — Fix raw SVG in modal titles (3 callers)', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.26] Add user/customer/PV modal: ICONS.plus → ➕ emoji (openModal uses textContent — SVG was rendered as text)', 'color:#888');
+  window.__SF_BUILD = 'R25.26-2026-05-16-1400';
   
   await restoreMainState();
   checkSavedLogin();
