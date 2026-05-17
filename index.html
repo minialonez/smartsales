@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.36-2026-05-17-1700 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.38-2026-05-17-1900 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -7,7 +7,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>Smart Finance R25.36</title>
+<title>Smart Finance R25.38</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
@@ -37396,15 +37396,56 @@ function _pvRender(el) {
     const pv = st.list.find(x => x.pv_uuid === b.dataset.uuid);
     if (!pv) return;
     if (!confirm(`ยกเลิก match ของ ${pv.pv_number}?\nStatus จะกลับเป็น "รอ verify"`)) return;
-    const r = await api('pv_unsetMatch', { pv_uuid: pv.pv_uuid });
-    if (r?.success) {
-      toast('✅ ยกเลิก match แล้ว', 'success', 2500);
-      pv.match_status = 'migrated';
-      pv.matched_stmt_uuid = '';
-      pv.matched_at = '';
+    
+    // ⭐ R25.37 — Optimistic UI + fast-path hint
+    //   Save prev state for rollback
+    const prevStatus = pv.match_status;
+    const prevStmtUuid = pv.matched_stmt_uuid;
+    const prevMatchedAt = pv.matched_at;
+    const prevPayDate = pv.pay_date;
+    const prevPayFromBank = pv.pay_from_bank;
+    
+    // Extract bank+year hint from current PV state
+    //   pay_from_bank set by R25.36 pvSetMatch — directly maps to sheet name
+    //   pay_date yyyy-MM-dd → year = substring(0,4)
+    const stmtBankHint = pv.pay_from_bank || '';
+    const stmtYearHint = pv.pay_date ? String(pv.pay_date).substring(0, 4) : '';
+    
+    // Apply optimistic
+    pv.match_status = 'migrated';
+    pv.matched_stmt_uuid = '';
+    pv.matched_at = '';
+    pv.pay_date = '';
+    pv.pay_from_bank = '';
+    _pvRender(el);
+    toast('⏳ ยกเลิก match...', 'info', 1500);
+    
+    try {
+      const r = await api('pv_unsetMatch', { 
+        pv_uuid: pv.pv_uuid,
+        stmt_bank: stmtBankHint,    // ⭐ R25.37 — fast-path hint (saves 5-15s scan-all)
+        stmt_year: stmtYearHint,
+      });
+      if (r?.success) {
+        toast('✅ ยกเลิก match แล้ว', 'success', 2500);
+      } else {
+        // Rollback
+        pv.match_status = prevStatus;
+        pv.matched_stmt_uuid = prevStmtUuid;
+        pv.matched_at = prevMatchedAt;
+        pv.pay_date = prevPayDate;
+        pv.pay_from_bank = prevPayFromBank;
+        _pvRender(el);
+        toast(`❌ ${r?.error || 'fail'}`, 'error', 3000);
+      }
+    } catch (e) {
+      pv.match_status = prevStatus;
+      pv.matched_stmt_uuid = prevStmtUuid;
+      pv.matched_at = prevMatchedAt;
+      pv.pay_date = prevPayDate;
+      pv.pay_from_bank = prevPayFromBank;
       _pvRender(el);
-    } else {
-      toast(`❌ ${r?.error || 'fail'}`, 'error', 3000);
+      toast(`❌ Network error: ${e.message}`, 'error', 5000);
     }
   }));
 }
@@ -37442,6 +37483,11 @@ function _pvRow(pv) {
     statusBadge = '<span style="color:var(--warn);font-size:.75rem">⏳ รอโอน</span>';
   }
   
+  // ⭐ R25.38 — pay_date shown ONLY when matched with stmt (Toppy spec)
+  //   Cash PVs / migrated / pending → show — (even if pay_date has historic value)
+  //   matched only → show pay_date (= stmt.date set by pvSetMatch in R25.36)
+  const showPayDate = (pv.match_status === 'matched') && !!pv.pay_date;
+  
   return `<tr style="border-top:1px solid var(--border)">
     <td style="padding:6px 8px;font-family:monospace;font-size:.78rem">${pv.pv_number||'-'}</td>
     <td style="padding:6px 8px;font-size:.78rem">${fmtDate(pv.issue_date)}</td>
@@ -37452,7 +37498,7 @@ function _pvRow(pv) {
     <td style="text-align:right;padding:6px 8px">${fmtNum(pv.amount_billed||0)}</td>
     <td style="text-align:right;padding:6px 8px;color:${totalDeduct>0?'var(--warn)':'var(--text2)'}">${totalDeduct>0?'-'+fmtNum(totalDeduct):'-'}</td>
     <td style="text-align:right;padding:6px 8px;font-weight:600">${fmtNum(pv.net_amount||0)}</td>
-    <td style="text-align:center;padding:6px 8px;font-size:.78rem">${isPaid?(fmtDate(pv.pay_date)||'-'):'<span style="color:var(--text2)">—</span>'}</td>
+    <td style="text-align:center;padding:6px 8px;font-size:.78rem">${showPayDate?fmtDate(pv.pay_date):'<span style="color:var(--text2)">—</span>'}</td>
     <td style="text-align:center;padding:6px 8px">${statusBadge}</td>
     <td style="text-align:center;padding:6px 8px;white-space:nowrap">
       ${canMatch ? `<button class="btn btn-ghost btn-icon pv-btn-match" data-uuid="${pv.pv_uuid}" title="🔗 จับคู่ statement" style="color:var(--info)">🔗</button>` : ''}
@@ -37899,7 +37945,7 @@ function _pvOpenMatchModal(pv, rootEl) {
             <div style="flex:1;min-width:0">
               <div style="font-size:.85rem;font-weight:500">
                 ${fmtDate(stmt.date)} · <span style="color:var(--text2)">${escapeHtml(stmt.bank||'')}</span>
-                ${diff < 0.01 ? ' <span style="color:var(--success);font-size:.7rem">✓ exact</span>' : ''}
+                ${diff < 0.01 ? ' <span style="color:var(--success);font-size:.7rem">✓ ตรงเป๊ะ</span>' : ''}
               </div>
               <div style="font-size:.75rem;color:var(--text2);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
                 ref: ${escapeHtml(stmt.ref_no||'-')} · ${escapeHtml(String(stmt.description||'').substring(0,60))}
@@ -37955,6 +38001,8 @@ function _pvOpenMatchModal(pv, rootEl) {
           <span>หลัง match: PV.pay_date จะถูกตั้งเป็น <strong id="pvmm-pv-stmt-paydate" style="color:var(--info)">-</strong></span>
           <span id="pvmm-pv-diff" style="font-weight:600"></span>
         </div>
+        <!-- ⭐ R25.37 — Over/under-pay breakdown (visible only for over/under tier) -->
+        <div id="pvmm-pv-breakdown" style="display:none"></div>
       </div>
       
       <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:10px">
@@ -37966,6 +38014,31 @@ function _pvOpenMatchModal(pv, rootEl) {
   
   setTimeout(() => {
     let selectedIdx = -1;
+    
+    // ⭐ R25.37 — 3-tier diff classification
+    //   exact:  signed sum diff < 0.01  → confirm 1-click
+    //   near:   signed sum diff <= ฿1   → confirm 1-click (rounding tolerance)
+    //   over:   stmt magnitude > PV     → second confirm dialog + note flag
+    //   under:  stmt magnitude < PV     → second confirm dialog + note flag
+    function _diffTier(pvNet, stmtAmt) {
+      const signedDiff = pvNet + stmtAmt;     // near 0 = matched
+      const absDiff = Math.abs(signedDiff);
+      if (absDiff < 0.01) {
+        return { tier: 'exact', label: '✓ ยอดตรงเป๊ะ', color: 'var(--success)', requiresConfirm: false, diff: 0 };
+      }
+      if (absDiff <= 1.0) {
+        return { tier: 'near', label: `≈ ใกล้เคียง (ต่าง ฿${fmtNum(absDiff)})`, color: 'var(--info)', requiresConfirm: false, diff: absDiff };
+      }
+      // |stmt| > |PV| → จ่ายเกิน (received more than billed)
+      const overpaid = Math.abs(stmtAmt) > Math.abs(pvNet);
+      return {
+        tier: overpaid ? 'over' : 'under',
+        label: overpaid ? `⚠ จ่ายเกิน ฿${fmtNum(absDiff)}` : `⚠ จ่ายขาด ฿${fmtNum(absDiff)}`,
+        color: 'var(--warn)',
+        requiresConfirm: true,
+        diff: absDiff,
+      };
+    }
     
     function selectRow(idx) {
       // De-highlight previous
@@ -37994,6 +38067,7 @@ function _pvOpenMatchModal(pv, rootEl) {
       const $paydate = document.getElementById('pvmm-pv-stmt-paydate');
       const $diff = document.getElementById('pvmm-pv-diff');
       const $preview = document.getElementById('pvmm-preview');
+      const $confirm = document.getElementById('pvmm-confirm');
       
       if ($bank) $bank.textContent = stmt.bank || '-';
       if ($desc) $desc.textContent = stmt.description || stmt.ref_no || '-';
@@ -38004,21 +38078,61 @@ function _pvOpenMatchModal(pv, rootEl) {
       if ($date) $date.textContent = fmtDate(stmt.date) || '-';
       if ($paydate) $paydate.textContent = fmtDate(stmtDateISO) || '-';
       
-      // Diff indicator
-      const signedDiff = pvNet + stmtAmt;
-      const absDiff = Math.abs(signedDiff);
+      // ⭐ R25.37 — Diff tier classification + confirm button styling
+      const tierInfo = _diffTier(pvNet, stmtAmt);
+      
       if ($diff) {
-        if (absDiff < 0.01) {
-          $diff.innerHTML = '<span style="color:var(--success)">✓ ยอดตรงเป๊ะ</span>';
+        $diff.innerHTML = `<span style="color:${tierInfo.color}">${tierInfo.label}</span>`;
+      }
+      
+      // Show breakdown for over/under-pay (Toppy spec)
+      const $breakdown = document.getElementById('pvmm-pv-breakdown');
+      if ($breakdown) {
+        if (tierInfo.tier === 'over' || tierInfo.tier === 'under') {
+          const pvBilled = Number(pv.amount_billed) || 0;
+          const totalDeduct = (Number(pv.deduct_shipping)||0) + (Number(pv.deduct_dc_pm)||0) 
+                            + (Number(pv.deduct_claim)||0) + (Number(pv.deduct_other)||0);
+          $breakdown.innerHTML = `
+            <div style="margin-top:8px;padding:8px;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.3);border-radius:6px;font-size:.78rem">
+              <div style="font-weight:600;color:var(--warn);margin-bottom:4px">📊 รายละเอียดส่วนต่าง</div>
+              <div style="display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-family:var(--mono,monospace);font-size:.75rem">
+                <span style="color:var(--text2)">ยอด stmt:</span><span style="text-align:right">฿ ${fmtNum(Math.abs(stmtAmt))}</span>
+                <span style="color:var(--text2)">PV net:</span><span style="text-align:right">฿ ${fmtNum(Math.abs(pvNet))}</span>
+                <span style="color:var(--text2)">PV billed:</span><span style="text-align:right">฿ ${fmtNum(pvBilled)} ${totalDeduct>0?`<span style="color:var(--text2)">(− หัก ฿${fmtNum(totalDeduct)})</span>`:''}</span>
+                <span style="color:var(--warn);font-weight:600">ส่วนต่าง:</span><span style="text-align:right;color:var(--warn);font-weight:600">${tierInfo.label}</span>
+              </div>
+            </div>
+          `;
+          $breakdown.style.display = 'block';
         } else {
-          $diff.innerHTML = `<span style="color:var(--warn)">⚠ ต่าง ฿${fmtNum(absDiff)}</span>`;
+          $breakdown.style.display = 'none';
         }
       }
       
       if ($preview) $preview.style.display = 'block';
       
-      const $confirm = document.getElementById('pvmm-confirm');
-      if ($confirm) $confirm.disabled = false;
+      // ⭐ R25.37 — Confirm button label + color based on tier
+      if ($confirm) {
+        $confirm.disabled = false;
+        if (tierInfo.requiresConfirm) {
+          // Warn style — orange/red button
+          $confirm.className = 'btn';
+          $confirm.style.background = 'var(--warn)';
+          $confirm.style.color = '#fff';
+          $confirm.style.border = 'none';
+          $confirm.innerHTML = `⚠ ยืนยัน Match (${tierInfo.tier==='over'?'จ่ายเกิน':'จ่ายขาด'} ฿${fmtNum(tierInfo.diff)})`;
+        } else {
+          // Default primary style
+          $confirm.className = 'btn btn-primary';
+          $confirm.style.background = '';
+          $confirm.style.color = '';
+          $confirm.style.border = '';
+          $confirm.innerHTML = `${typeof ICONS!=='undefined'?ICONS.check:'✓'} ยืนยัน Match`;
+        }
+        // Cache tier info on button for confirm handler
+        $confirm.dataset.tier = tierInfo.tier;
+        $confirm.dataset.diff = String(tierInfo.diff);
+      }
     }
     
     document.querySelectorAll('.pvmm-stmt-opt').forEach(opt => {
@@ -38048,7 +38162,26 @@ function _pvOpenMatchModal(pv, rootEl) {
       const stmtBank = stmtObj.bank || '';
       const stmtYear = String(toISODate(stmtObj.date)||'').substring(0, 4);
       const stmtDateISO = toISODate(stmtObj.date) || '';
+      const stmtAmt = Number(stmtObj.amount) || 0;
       const optimisticNow = new Date().toISOString();
+      
+      // ⭐ R25.37 — Check tier from cached dataset, ask second confirm if over/under
+      const $confirmBtn = document.getElementById('pvmm-confirm');
+      const tier = $confirmBtn?.dataset.tier || 'exact';
+      const tierDiff = Number($confirmBtn?.dataset.diff || 0);
+      let matchNote = '';
+      
+      if (tier === 'over' || tier === 'under') {
+        const label = tier === 'over' ? 'จ่ายเกิน' : 'จ่ายขาด';
+        const msg = `ยืนยัน match ทั้งที่มีส่วนต่าง?\n\n` +
+                    `PV-${pv.pv_number || ''}    ฿${fmtNum(pvNet)} (net)\n` +
+                    `Stmt ${stmtBank}    ฿${fmtNum(stmtAmt)}\n` +
+                    `ส่วนต่าง:    ⚠ ${label} ฿${fmtNum(tierDiff)}\n\n` +
+                    `บันทึก match พร้อมแฟลก ${label}?`;
+        if (!confirm(msg)) return;
+        // Build note for backend
+        matchNote = `${label} ฿${fmtNum(tierDiff)} [matched stmt ${stmtBank} ${fmtDate(stmtDateISO)}]`;
+      }
       
       // Save previous state for rollback
       const prevStatus = pv.match_status;
@@ -38056,6 +38189,7 @@ function _pvOpenMatchModal(pv, rootEl) {
       const prevMatchedAt = pv.matched_at;
       const prevPayDate = pv.pay_date;
       const prevPayFromBank = pv.pay_from_bank;
+      const prevNote = pv.note;
       
       // Apply optimistic — ⭐ R25.36 also set pay_date + pay_from_bank from stmt
       pv.match_status = 'matched';
@@ -38063,6 +38197,10 @@ function _pvOpenMatchModal(pv, rootEl) {
       pv.matched_at = optimisticNow;
       if (stmtDateISO) pv.pay_date = stmtDateISO;
       if (stmtBank) pv.pay_from_bank = stmtBank;
+      // ⭐ R25.37 — append note locally too
+      if (matchNote) {
+        pv.note = pv.note ? (pv.note + ' · ' + matchNote) : matchNote;
+      }
       
       // Also update stmt local state for getAllStatements consistency
       try {
@@ -38077,15 +38215,19 @@ function _pvOpenMatchModal(pv, rootEl) {
       _pvRender(rootEl);
       toast(`⏳ Match ${pv.pv_number} → ${stmtBank}...`, 'info', 1500);
       
-      // Fire async — pass bank+year for backend fast path
+      // Fire async — pass bank+year for backend fast path + match_note for over/under flag
       api('pv_setMatch', { 
         pv_uuid: pv.pv_uuid, 
         stmt_uuid: stmtUuid,
         stmt_bank: stmtBank,
         stmt_year: stmtYear,
+        match_note: matchNote,  // ⭐ R25.37 — backend appends to PV.note
       }).then(r => {
         if (r?.success) {
-          toast(`✅ ${pv.pv_number} ↔ ${r.data?.stmt_bank || stmtBank}`, 'success', 2000);
+          const toastMsg = matchNote 
+            ? `✅ ${pv.pv_number} ↔ ${r.data?.stmt_bank || stmtBank} (มีส่วนต่าง — บันทึก note แล้ว)`
+            : `✅ ${pv.pv_number} ↔ ${r.data?.stmt_bank || stmtBank}`;
+          toast(toastMsg, 'success', matchNote ? 4000 : 2000);
           // Sync server's matched_at + pay_date if returned
           if (r.data?.matched_at) pv.matched_at = r.data.matched_at;
           if (r.data?.pay_date) pv.pay_date = r.data.pay_date;  // ⭐ R25.36 — trust server-normalized date
@@ -38096,6 +38238,7 @@ function _pvOpenMatchModal(pv, rootEl) {
           pv.matched_at = prevMatchedAt;
           pv.pay_date = prevPayDate;
           pv.pay_from_bank = prevPayFromBank;
+          pv.note = prevNote;
           try {
             if (stmtObj && stmtObj.stmt_uuid) {
               stmtObj.match_status = '';
@@ -38112,6 +38255,7 @@ function _pvOpenMatchModal(pv, rootEl) {
         pv.matched_at = prevMatchedAt;
         pv.pay_date = prevPayDate;
         pv.pay_from_bank = prevPayFromBank;
+        pv.note = prevNote;
         _pvRender(rootEl);
         toast(`❌ Network error: ${e.message}`, 'error', 5000);
       });
@@ -38662,10 +38806,10 @@ function _pvMakeReversal(orig) {
 
 // ── Initialize after all declarations are ready ──
 (async function() {
-  // ⭐ R25.36 BOOT BEACON
-  console.log('%c[SF R25.36] Active build: 2026-05-17-1700 — SP-TEMP removed + PV match UX redesign + date fix', 'color:#0c8;font-weight:bold;font-size:13px');
-  console.log('%c[SF R25.36] BE -316 lines · PV match: select→preview→confirm pattern · pay_date = stmt.date (Bangkok TZ) · pay_from_bank auto-set', 'color:#888');
-  window.__SF_BUILD = 'R25.36-2026-05-17-1700';
+  // ⭐ R25.38 BOOT BEACON
+  console.log('%c[SF R25.38] Active build: 2026-05-17-1900 — PV pay_date only when matched + Thai label "ตรงเป๊ะ"', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.38] Fix: pay_date shown only for match_status=matched · "exact" → "ตรงเป๊ะ" in stmt list', 'color:#888');
+  window.__SF_BUILD = 'R25.38-2026-05-17-1900';
   
   await restoreMainState();
   checkSavedLogin();
