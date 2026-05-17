@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.34-2026-05-17-1400 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.35-2026-05-17-1500 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -7,7 +7,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>Smart Finance R25.34</title>
+<title>Smart Finance R25.35</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
@@ -16683,13 +16683,15 @@ async function loadAllFromCloud(opts) {
           });
           
           // ⭐ R25.33 — Stash PV + billing_payments + billing_notes for downstream consumers
-          //   (these are NEW in bootstrap — not in legacy parallel results[])
-          //   Frontend code that uses these picks them up via window.__SF_BOOT
           //   ⭐ R25.34 — pvGetList returns {data:[...], count:N}; unwrap to array
+          //   ⭐ R25.35 — users + customers not in bootstrap yet; fallback to empty
+          //              (consumer will lazy-fetch via api() if __SF_BOOT array empty)
           window.__SF_BOOT = {
             pv: (d.pv && Array.isArray(d.pv.data)) ? d.pv.data : (Array.isArray(d.pv) ? d.pv : []),
             billing_payments: Array.isArray(d.billing_payments) ? d.billing_payments : [],
             billing_notes: Array.isArray(d.billing_notes) ? d.billing_notes : [],
+            users: [],       // bootstrap doesn't include these yet
+            customers: [],
             generated_at: meta.generated_at,
           };
         } else {
@@ -16730,35 +16732,50 @@ async function loadAllFromCloud(opts) {
       });
       
       // ⭐ R25.34 — Fire PV + billing_notes + billing_payments IN PARALLEL with the rest
+      // ⭐ R25.35 — Add users + customers (used by "จัดการผู้ใช้" + "จัดการลูกค้า" pages)
       //   These don't go into results[] (downstream index-based parsing) — instead
       //   their resolved values land in __SF_BOOT after main promise.all settles.
-      //   This adds NO extra wall-clock time (all 15 fire together).
+      //   This adds NO extra wall-clock time (all parallel).
       const sideFetches = {
         pv: api('pv_getList', { year: years[0] || new Date().getFullYear() }).catch(e => ({ _err: e.message })),
         billing_notes: api('getBillingNotes', {}).catch(e => ({ _err: e.message })),
         billing_payments: api('getBillingPayments', {}).catch(e => ({ _err: e.message })),
+        users: api('getUsers', {}).catch(e => ({ _err: e.message })),
+        customers: api('getCustomers', {}).catch(e => ({ _err: e.message })),
       };
       
-      console.log(`[loadAllFromCloud] firing ${fetchPromises.length} parallel requests + 3 side fetches (PV/billing_notes/billing_payments)...`);
+      console.log(`[loadAllFromCloud] firing ${fetchPromises.length} parallel requests + 5 side fetches (PV/billing_notes/billing_payments/users/customers)...`);
       const tFetch = Date.now();
       results = await Promise.all(fetchPromises);
       console.log(`[loadAllFromCloud] all responses received in ${Math.round((Date.now() - tFetch)/1000)}s`);
       
-      // ⭐ R25.34 — Collect side fetches (already resolved or close to it — fired in parallel)
+      // ⭐ R25.34+R25.35 — Collect side fetches (already resolved or close to it — fired in parallel)
       try {
-        const [pvR, bnR, bpR] = await Promise.all([sideFetches.pv, sideFetches.billing_notes, sideFetches.billing_payments]);
+        const [pvR, bnR, bpR, usR, csR] = await Promise.all([
+          sideFetches.pv, sideFetches.billing_notes, sideFetches.billing_payments,
+          sideFetches.users, sideFetches.customers,
+        ]);
         const _pvArr = (pvR && !pvR._err) 
                      ? (Array.isArray(pvR.data?.data) ? pvR.data.data : (Array.isArray(pvR.data) ? pvR.data : []))
                      : [];
         const _bnArr = (bnR && !bnR._err && Array.isArray(bnR.data)) ? bnR.data : [];
         const _bpArr = (bpR && !bpR._err && Array.isArray(bpR.data)) ? bpR.data : [];
+        const _usArr = (usR && !usR._err && Array.isArray(usR.data)) ? usR.data : [];
+        const _csArr = (csR && !csR._err && Array.isArray(csR.data)) ? csR.data : [];
         window.__SF_BOOT = {
           pv: _pvArr,
           billing_payments: _bpArr,
           billing_notes: _bnArr,
+          users: _usArr,
+          customers: _csArr,
           generated_at: new Date().toISOString(),
         };
-        console.log(`[loadAllFromCloud] side fetches: pv=${_pvArr.length} billing_notes=${_bnArr.length} billing_payments=${_bpArr.length}`);
+        // ⭐ R25.35 — also sync to global customerList (used by 8+ places)
+        if (_csArr.length > 0 && typeof customerList !== 'undefined') {
+          customerList = _csArr;
+          try { safeStorage.set('sf_customers_cache', JSON.stringify(_csArr)); } catch(_) {}
+        }
+        console.log(`[loadAllFromCloud] side fetches: pv=${_pvArr.length} billing_notes=${_bnArr.length} billing_payments=${_bpArr.length} users=${_usArr.length} customers=${_csArr.length}`);
       } catch (e) {
         console.warn(`[loadAllFromCloud] side fetch error (non-blocking):`, e.message);
       }
@@ -17048,8 +17065,10 @@ async function loadAllFromCloud(opts) {
       pv: (window.__SF_BOOT.pv || []).length,
       bn: (window.__SF_BOOT.billing_notes || []).length,
       bp: (window.__SF_BOOT.billing_payments || []).length,
-    } : { pv: 0, bn: 0, bp: 0 };
-    console.log(`[loadAllFromCloud] DONE (${reason}) ${elapsed}s — bills=${billList.length} stmts=${totalStmts} sp=${paymentList.length} pv=${_bootCounts.pv} bn=${_bootCounts.bn} bp=${_bootCounts.bp}`);
+      us: (window.__SF_BOOT.users || []).length,
+      cs: (window.__SF_BOOT.customers || []).length,
+    } : { pv: 0, bn: 0, bp: 0, us: 0, cs: 0 };
+    console.log(`[loadAllFromCloud] DONE (${reason}) ${elapsed}s — bills=${billList.length} stmts=${totalStmts} sp=${paymentList.length} pv=${_bootCounts.pv} bn=${_bootCounts.bn} bp=${_bootCounts.bp} users=${_bootCounts.us} customers=${_bootCounts.cs}`);
     
     // ⭐ R25.34 — Toast summary
     //   Always show on initial login + manual click. Suppress only on background tab-focus refresh.
@@ -17057,7 +17076,8 @@ async function loadAllFromCloud(opts) {
     if (!isBackgroundRefresh) {
       const errMsg = errors.length > 0 ? ` (${errors.length} errors)` : '';
       const ready = `✅ พร้อมใช้งาน · ${elapsed}s · บิล ${billList.length} · stmt ${totalStmts} · SP ${paymentList.length}` + 
-                    (_bootCounts.pv ? ` · PV ${_bootCounts.pv}` : '') + errMsg;
+                    (_bootCounts.pv ? ` · PV ${_bootCounts.pv}` : '') + 
+                    (_bootCounts.cs ? ` · ลูกค้า ${_bootCounts.cs}` : '') + errMsg;
       toast(ready, 'success', 5000);
     }
     
@@ -36824,8 +36844,15 @@ async function renderPcSales(el) {
 
 
 async function renderUsers(el) {
-  const res = await api('getUsers');
-  const users = res.data || [];
+  // ⭐ R25.35 — Prefer preloaded users from __SF_BOOT (instant render)
+  //   Fallback: lazy fetch if cache miss
+  let users;
+  if (window.__SF_BOOT && Array.isArray(window.__SF_BOOT.users) && window.__SF_BOOT.users.length > 0) {
+    users = window.__SF_BOOT.users.slice();  // copy to avoid mutating cache
+  } else {
+    const res = await api('getUsers');
+    users = res.data || [];
+  }
   
   // Normalize permissions เป็น array เสมอ (backend อาจส่งเป็น string "read,write")
   users.forEach(u => {
@@ -36967,6 +36994,7 @@ async function renderUsers(el) {
         }
         closeModal();
         toast(`✓ ${isEdit?'อัปเดต':'เพิ่ม'} ${username} แล้ว`, 'success');
+        if (window.__SF_BOOT) window.__SF_BOOT.users = [];  // ⭐ R25.35 — invalidate → forces fresh fetch in renderUsers
         renderUsers(el); // reload
       } catch(err) {
         toast('ไม่สำเร็จ: ' + (err.message || err), 'error');
@@ -36988,6 +37016,7 @@ async function renderUsers(el) {
         }
         closeModal();
         toast(`ลบ ${u.username} แล้ว`, 'success');
+        if (window.__SF_BOOT) window.__SF_BOOT.users = [];  // ⭐ R25.35 — invalidate
         renderUsers(el);
       } catch(err) {
         toast('ลบไม่สำเร็จ: ' + (err.message || err), 'error');
@@ -37012,20 +37041,31 @@ async function renderUsers(el) {
 async function renderCustomersMgmt(el) {
   el.innerHTML = `<div class="card"><p class="text-dim">กำลังโหลด...</p></div>`;
   
+  // ⭐ R25.35 — Prefer preloaded customers from __SF_BOOT (instant render)
   let customers = [];
-  try {
-    const res = await api('getCustomers', {});
-    if (res?.success && Array.isArray(res.data)) {
-      customers = res.data;
-      // Update global cache
-      if (typeof customerList !== 'undefined') {
-        customerList = customers;
-        try { safeStorage.set('sf_customers_cache', JSON.stringify(customers)); } catch(_) {}
-      }
+  const hasBoot = window.__SF_BOOT && Array.isArray(window.__SF_BOOT.customers) && window.__SF_BOOT.customers.length > 0;
+  
+  if (hasBoot) {
+    customers = window.__SF_BOOT.customers.slice();
+    // Sync to global cache so other consumers benefit
+    if (typeof customerList !== 'undefined') {
+      customerList = customers;
     }
-  } catch (e) {
-    el.innerHTML = `<div class="card"><p style="color:var(--danger)">โหลดข้อมูลล้มเหลว: ${e.message}</p></div>`;
-    return;
+  } else {
+    try {
+      const res = await api('getCustomers', {});
+      if (res?.success && Array.isArray(res.data)) {
+        customers = res.data;
+        // Update global cache
+        if (typeof customerList !== 'undefined') {
+          customerList = customers;
+          try { safeStorage.set('sf_customers_cache', JSON.stringify(customers)); } catch(_) {}
+        }
+      }
+    } catch (e) {
+      el.innerHTML = `<div class="card"><p style="color:var(--danger)">โหลดข้อมูลล้มเหลว: ${e.message}</p></div>`;
+      return;
+    }
   }
   
   // Local state for filtering
@@ -37170,6 +37210,8 @@ async function renderCustomersMgmt(el) {
               customerList = customers;
               try { safeStorage.set('sf_customers_cache', JSON.stringify(customers)); } catch(_) {}
             }
+            // ⭐ R25.35 — sync to __SF_BOOT
+            if (window.__SF_BOOT) window.__SF_BOOT.customers = customers;
             renderTable();
           } else {
             toast(`❌ ลบไม่สำเร็จ: ${r?.error || 'unknown'}`, 'error', 4000);
@@ -37290,6 +37332,8 @@ async function renderCustomersMgmt(el) {
                 customerList = customers;
                 try { safeStorage.set('sf_customers_cache', JSON.stringify(customers)); } catch(_) {}
               }
+              // ⭐ R25.35 — sync to __SF_BOOT so other navigations see fresh data
+              if (window.__SF_BOOT) window.__SF_BOOT.customers = customers;
             }
             renderTable();
           } else {
@@ -38668,10 +38712,10 @@ function _pvMakeReversal(orig) {
 
 // ── Initialize after all declarations are ready ──
 (async function() {
-  // ⭐ R25.34 BOOT BEACON
-  console.log('%c[SF R25.34] Active build: 2026-05-17-1400 — Bootstrap reverted as default, PV/billing fire parallel', 'color:#0c8;font-weight:bold;font-size:13px');
-  console.log('%c[SF R25.34] Legacy 15 parallel ~9s · __SF_BOOT populated · DONE toast "✅ พร้อมใช้งาน" · bootstrap kept opt-in', 'color:#888');
-  window.__SF_BUILD = 'R25.34-2026-05-17-1400';
+  // ⭐ R25.35 BOOT BEACON
+  console.log('%c[SF R25.35] Active build: 2026-05-17-1500 — Preload users+customers for instant page nav', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.35] 5 side fetches: pv/billing_notes/billing_payments/users/customers · renderUsers + renderCustomersMgmt now consume __SF_BOOT', 'color:#888');
+  window.__SF_BUILD = 'R25.35-2026-05-17-1500';
   
   await restoreMainState();
   checkSavedLogin();
