@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.29-2026-05-16-1700 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.30-2026-05-17-1000 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -7,7 +7,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>Smart Finance R25.29</title>
+<title>Smart Finance R25.30</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
@@ -37179,7 +37179,7 @@ async function renderCustomersMgmt(el) {
 
 // ══════════════════════════════════════════════════════════════════
 // ⭐ R19 13/5/26 — Payment Voucher V3 (ใบสำคัญจ่าย)
-//   2-tier tabs: VAT/NOVAT × รอจ่าย/จ่ายแล้ว/ทั้งหมด
+//   2-tier tabs: VAT/NOVAT × รอโอน/จ่ายแล้ว/ทั้งหมด
 //   Replaces Transfer Log workflow — sees same data
 // ══════════════════════════════════════════════════════════════════
 
@@ -37296,13 +37296,13 @@ function _pvRender(el) {
       <button id="pv-tab-novat" style="background:${st.vat==='NOVAT'?'var(--primary)':'transparent'};color:${st.vat==='NOVAT'?'#fff':'var(--text2)'};border:none;padding:8px 24px;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer">📋 NOVAT (${counts.novat})</button>
     </div>
     
-    <!-- TIER 2: รอจ่าย / จ่ายแล้ว / ทั้งหมด -->
+    <!-- TIER 2: รอโอน / จ่ายแล้ว / ทั้งหมด -->
     <div style="display:flex;gap:0;border-bottom:1px solid var(--border);margin-bottom:14px;align-items:center">
-      <div id="pv-sub-pending" style="padding:8px 18px;border-bottom:2px solid ${st.sub==='pending'?'var(--warn)':'transparent'};color:${st.sub==='pending'?'var(--warn)':'var(--text2)'};font-size:12px;font-weight:${st.sub==='pending'?'600':'400'};cursor:pointer">⏳ รอจ่าย (${st.vat==='VAT'?counts.vatPending:counts.novatPending})</div>
+      <div id="pv-sub-pending" style="padding:8px 18px;border-bottom:2px solid ${st.sub==='pending'?'var(--warn)':'transparent'};color:${st.sub==='pending'?'var(--warn)':'var(--text2)'};font-size:12px;font-weight:${st.sub==='pending'?'600':'400'};cursor:pointer">⏳ รอโอน (${st.vat==='VAT'?counts.vatPending:counts.novatPending})</div>
       <div id="pv-sub-paid" style="padding:8px 18px;border-bottom:2px solid ${st.sub==='paid'?'var(--success)':'transparent'};color:${st.sub==='paid'?'var(--success)':'var(--text2)'};font-size:12px;font-weight:${st.sub==='paid'?'600':'400'};cursor:pointer">✓ จ่ายแล้ว (${st.vat==='VAT'?counts.vatPaid:counts.novatPaid})</div>
       <div id="pv-sub-all" style="padding:8px 18px;border-bottom:2px solid ${st.sub==='all'?'var(--primary)':'transparent'};color:${st.sub==='all'?'var(--primary)':'var(--text2)'};font-size:12px;font-weight:${st.sub==='all'?'600':'400'};cursor:pointer">📜 ทั้งหมด (${st.vat==='VAT'?counts.vat:counts.novat})</div>
       <div style="margin-left:auto;font-size:11px;color:var(--text2)">
-        <span style="color:var(--warn)">฿${fmtNum(pendingSum)}</span> รอจ่าย
+        <span style="color:var(--warn)">฿${fmtNum(pendingSum)}</span> รอโอน
         <span style="color:var(--border);margin:0 6px">·</span>
         <span style="color:var(--success)">฿${fmtNum(paidSum)}</span> จ่ายแล้ว
       </div>
@@ -37398,17 +37398,26 @@ function _pvRow(pv) {
                 && pv.pay_method !== 'เงินสด';
   const canUnmatch = pv.match_status === 'matched';
   
+  // ⭐ R25.30 — Status labels (Toppy spec):
+  //   matched (stmt confirmed)  → ✓ Matched
+  //   matched_cash / Cash       → 💵 Cash
+  //   migrated_reversal (mirror) → 🔄 รับคืนแล้ว (paid pair)
+  //   migrated + net<0 (รอรับคืน) → ⏳ รอรับคืน  (NEW)
+  //   migrated + net>0           → ⏳ รอโอน    (NEW — was "รอ verify")
+  //   else                        → ⏳ รอโอน
   let statusBadge;
   if (pv.match_status === 'matched') {
     statusBadge = '<span style="color:var(--success);font-size:.75rem">✓ Matched</span>';
   } else if (pv.match_status === 'matched_cash' || pv.pay_method === 'เงินสด') {
     statusBadge = '<span style="color:var(--success);font-size:.75rem">💵 Cash</span>';
-  } else if (pv.match_status === 'migrated') {
-    statusBadge = '<span style="color:var(--warn);font-size:.75rem" title="Imported จากระบบเก่า — ยังไม่ได้ verify กับ stmt">📥 รอ verify</span>';
   } else if (pv.match_status === 'migrated_reversal') {
-    statusBadge = '<span style="color:#ef4444;font-size:.75rem" title="รับเงินคืน (จาก โอนซ้ำ)">🔄 รับคืน</span>';
+    statusBadge = '<span style="color:#ef4444;font-size:.75rem" title="รับเงินคืน (mirror ของ โอนซ้ำ) — ปิดคู่แล้ว">🔄 รับคืนแล้ว</span>';
+  } else if (Number(pv.net_amount) < 0) {
+    // ยอดลบ + ยังไม่ matched = รอรับเงินคืนเข้ามา (PV reversal/refund pending)
+    statusBadge = '<span style="color:var(--info,#3b82f6);font-size:.75rem" title="รอรับเงินคืนจาก supplier">⏳ รอรับคืน</span>';
   } else {
-    statusBadge = '<span style="color:var(--warn);font-size:.75rem">⏳ รอจ่าย</span>';
+    // ยอดบวก + ยังไม่ matched (รวม migrated + new pending) = รอโอน
+    statusBadge = '<span style="color:var(--warn);font-size:.75rem">⏳ รอโอน</span>';
   }
   
   return `<tr style="border-top:1px solid var(--border)">
@@ -37494,7 +37503,7 @@ function _pvModalHtml(d, isEdit) {
     <div class="input-group" style="margin-bottom:10px;position:relative">
       <label>ชื่อบริษัท / Supplier <span style="color:var(--danger)">*</span> <span style="color:var(--text2);font-size:.78rem;font-weight:400">(พิมพ์ค้นหา — เลือกแล้วเติมธนาคาร+เลขบัญชีอัตโนมัติ)</span></label>
       <input id="pv-m-supplier_name" class="input" value="${(d.supplier_name||'').replace(/"/g,'&quot;')}" placeholder="พิมพ์ชื่อบริษัท..." autocomplete="off">
-      <div id="pv-m-supplier-suggest" style="position:absolute;top:100%;left:0;right:0;background:var(--bg-elev);border:1px solid var(--border);border-top:none;max-height:240px;overflow-y:auto;z-index:100;display:none;box-shadow:0 4px 12px rgba(0,0,0,.15);border-radius:0 0 6px 6px"></div>
+      <div id="pv-m-supplier-suggest" style="position:absolute;top:100%;left:0;right:0;background:var(--bg);border:1px solid var(--border);border-top:none;max-height:280px;overflow-y:auto;z-index:1000;display:none;box-shadow:0 8px 24px rgba(0,0,0,.5);border-radius:0 0 6px 6px"></div>
     </div>
     
     <div style="display:grid;grid-template-columns:1fr 1.5fr;gap:8px;margin-bottom:10px">
@@ -37631,25 +37640,30 @@ function _pvWireModal(draft, isEdit, rootEl) {
     const _renderSuggest = (q) => {
       if (!q || q.length < 1) { supSuggest.style.display = 'none'; supSuggest.innerHTML = ''; return; }
       const ql = q.toLowerCase();
+      // ⭐ R25.30 — search ONLY by name (Toppy spec: ค้นชื่อบริษัท · เลิก code search)
+      //   ป้องกัน false match จาก code field ที่อาจมีข้อมูลผิดประเภท (เช่น ธนาคาร)
       const matches = (supplierList || []).filter(s => {
-        return String(s.name||'').toLowerCase().includes(ql)
-            || String(s.code||'').toLowerCase().includes(ql);
-      }).slice(0, 8);
+        return String(s.name||'').toLowerCase().includes(ql);
+      }).slice(0, 10);
       if (matches.length === 0) { supSuggest.style.display = 'none'; return; }
       supSuggest.innerHTML = matches.map((s, i) => `
-        <div class="pv-sup-opt" data-idx="${i}" style="padding:8px 12px;cursor:pointer;border-bottom:1px solid var(--border);${i===activeIdx?'background:var(--primary);color:#fff':''}">
-          <div style="font-weight:500;font-size:.88rem">${escapeHtml(s.name||'-')}</div>
-          <div style="font-size:.75rem;color:${i===activeIdx?'rgba(255,255,255,.85)':'var(--text2)'};margin-top:1px">
-            🏦 ${escapeHtml(s.bank||'-')} · ${escapeHtml(s.account_no||'-')}
-            ${s.vat?`· <span style="opacity:.85">${s.vat}</span>`:''}
+        <div class="pv-sup-opt" data-idx="${i}" 
+             style="padding:10px 12px;cursor:pointer;border-bottom:1px solid var(--border);background:var(--bg)">
+          <div style="font-weight:600;font-size:.92rem;color:var(--text)">${escapeHtml(s.name||'-')}</div>
+          <div style="font-size:.78rem;color:var(--text2);margin-top:3px;display:flex;gap:10px;flex-wrap:wrap">
+            <span>🏦 <strong>${escapeHtml(s.bank||'—')}</strong></span>
+            <span style="font-family:monospace">${escapeHtml(s.account_no||'—')}</span>
+            ${s.vat?`<span style="padding:1px 6px;background:var(--bg-elev);border-radius:3px;font-size:.7rem">${s.vat}</span>`:''}
           </div>
         </div>
       `).join('');
       supSuggest.style.display = 'block';
-      // Wire clicks
+      // Hover highlight
       supSuggest.querySelectorAll('.pv-sup-opt').forEach((el, i) => {
+        el.addEventListener('mouseenter', () => { el.style.background = 'var(--bg-elev)'; });
+        el.addEventListener('mouseleave', () => { el.style.background = 'var(--bg)'; });
         el.addEventListener('mousedown', (e) => {
-          e.preventDefault();  // prevent input blur
+          e.preventDefault();
           const s = matches[i];
           supInput.value = s.name || '';
           if (bankInput) bankInput.value = s.bank || '';
@@ -37794,30 +37808,56 @@ function _nowISO() {
 //     - amount sign matches PV direction (PV+ ↔ stmt-, PV- ↔ stmt+)
 //     - |stmt.amount + pv.net_amount| < 5% tolerance (or within ฿100)
 //   Sort by date proximity to issue_date
+// ⭐ R25.30 — Month diff for yyyy-MM strings (e.g. _monthDiff('2026-01', '2026-03') = 2)
+function _monthDiff(m1, m2) {
+  if (!m1 || !m2) return 0;
+  const [y1, mo1] = m1.split('-').map(Number);
+  const [y2, mo2] = m2.split('-').map(Number);
+  if (!y1 || !y2) return 0;
+  return (y2 - y1) * 12 + (mo2 - mo1);
+}
+
 function _pvOpenMatchModal(pv, rootEl) {
   const pvNet = Number(pv.net_amount) || 0;
   const allStmts = typeof getAllStatements === 'function' ? getAllStatements() : [];
   
-  // Filter: unmatched + sign-compatible + amount close
+  // ⭐ R25.30 — Bank scope by VAT type (Toppy spec):
+  //   VAT   PVs → KBANK only (K PLUS SME JKN account)
+  //   NOVAT PVs → BBL NW only (account 266-4-414113)
+  //   Other vat_type (or undefined) → fallback ทุก bank
+  const preferredBank = pv.vat_type === 'VAT' ? 'KBANK'
+                      : pv.vat_type === 'NOVAT' ? 'BBL NW'
+                      : null;
+  
+  // ⭐ Month-of-issue scope: stmt date should be in same month or ±1 month of pv.issue_date
+  //   Reason: usually transfer happens within the issue month (Toppy spec)
+  const pvIssueMonth = String(pv.issue_date||'').substring(0, 7);  // 'yyyy-MM'
+  
+  // Filter: unmatched + sign-compatible + bank-of-vat + same-month + amount close
   const candidates = allStmts.filter(s => {
     const ms = String(s.match_status || '');
     if (ms === 'paid' || ms === 'matched') return false;
     const amt = Number(s.amount) || 0;
     if (!amt) return false;
-    // PV positive → stmt should be negative (เงินออก) — same magnitude
-    // PV negative (reversal) → stmt should be positive (เงินเข้า) — same magnitude
+    // Sign rule (PV+ ↔ stmt-, PV- ↔ stmt+)
     if (pvNet > 0 && amt > 0) return false;
     if (pvNet < 0 && amt < 0) return false;
-    // Amount tolerance: signed sum near 0
+    // Bank scope by VAT type
+    if (preferredBank && String(s.bank||'') !== preferredBank) return false;
+    // Month scope (±1 month tolerance)
+    if (pvIssueMonth) {
+      const stmtMonth = String(toISODate(s.date)||'').substring(0, 7);
+      if (stmtMonth && Math.abs(_monthDiff(pvIssueMonth, stmtMonth)) > 1) return false;
+    }
+    // Amount tolerance: signed sum near 0 (relax to 10% หรือ 200 บาท for fee differences)
     const diff = Math.abs(pvNet + amt);
-    const tol = Math.max(Math.abs(pvNet) * 0.05, 100);  // 5% หรือ 100 บาท
+    const tol = Math.max(Math.abs(pvNet) * 0.10, 200);
     return diff < tol;
   }).map(s => ({
     stmt: s,
     diff: Math.abs(pvNet + (Number(s.amount)||0)),
     dateDiff: Math.abs(new Date(toISODate(s.date)||'').getTime() - new Date(pv.issue_date||'').getTime()) / 86400000,
   })).sort((a, b) => {
-    // exact match first, then closest date
     if (a.diff < 0.01 && b.diff >= 0.01) return -1;
     if (b.diff < 0.01 && a.diff >= 0.01) return 1;
     return a.dateDiff - b.dateDiff;
@@ -37827,7 +37867,8 @@ function _pvOpenMatchModal(pv, rootEl) {
     ? `<div style="padding:24px;text-align:center;color:var(--text2)">
          <div style="font-size:32px;margin-bottom:8px">🔍</div>
          <div>ไม่พบ statement ที่ match</div>
-         <div style="font-size:.78rem;margin-top:4px">ยอดคาดหวัง: ${pvNet > 0 ? '−' : '+'}${fmtNum(Math.abs(pvNet))} (สัญลักษณ์ตรงข้าม)</div>
+         <div style="font-size:.78rem;margin-top:4px">ยอดคาดหวัง: ${pvNet > 0 ? '−' : '+'}${fmtNum(Math.abs(pvNet))} ใน ${preferredBank || 'stmts ใดๆ'} · เดือน ${pvIssueMonth || '?'} (±1)</div>
+         <div style="font-size:.7rem;margin-top:6px;color:var(--text2)">ถ้าควรเห็นแต่ไม่เจอ ตรวจ: stmt อยู่ bank ถูกหรือยัง · ยอดใกล้เคียงไหม · สัญลักษณ์ตรงข้ามหรือยัง</div>
        </div>`
     : `<div style="max-height:400px;overflow-y:auto">
         ${candidates.map(({stmt, diff, dateDiff}) => `
@@ -37861,7 +37902,7 @@ function _pvOpenMatchModal(pv, rootEl) {
         </div>
       </div>
       <div style="font-size:.78rem;color:var(--text2);margin:6px 0">
-        แสดง stmt ที่ตรงสัญลักษณ์ (${pvNet>0?'เงินออก':'เงินเข้า'}) + ยอดใกล้เคียง (±5%) · เรียงตามวันใกล้สุด
+        แสดง stmt ของ <strong>${preferredBank || 'ทุก bank'}</strong> · ${pvNet>0?'เงินออก':'เงินเข้า'} · เดือน ${pvIssueMonth || '?'} (±1 เดือน) · ยอด ±10% · เรียงตามวันใกล้สุด
       </div>
       ${listHtml}
       <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:10px">
@@ -38440,10 +38481,10 @@ function _pvMakeReversal(orig) {
 
 // ── Initialize after all declarations are ready ──
 (async function() {
-  // ⭐ R25.29 BOOT BEACON
-  console.log('%c[SF R25.29] Active build: 2026-05-16-1700 — PV: migrated≠paid + manual match UI + helper consolidation', 'color:#0c8;font-weight:bold;font-size:13px');
-  console.log('%c[SF R25.29] _pvIsPaid single helper · 🔗 match button + modal · pv_setMatch/pv_unsetMatch endpoints', 'color:#888');
-  window.__SF_BUILD = 'R25.29-2026-05-16-1700';
+  // ⭐ R25.30 BOOT BEACON
+  console.log('%c[SF R25.30] Active build: 2026-05-17-1000 — PV polish: autocomplete fix, status labels, bank-scoped match', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.30] Search by name-only + opaque · status รอโอน/รอรับคืน/รับคืนแล้ว · VAT→KBANK, NOVAT→BBL NW + month scope', 'color:#888');
+  window.__SF_BUILD = 'R25.30-2026-05-17-1000';
   
   await restoreMainState();
   checkSavedLogin();
