@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.28-2026-05-16-1600 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.29-2026-05-16-1700 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -7,7 +7,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>Smart Finance R25.28</title>
+<title>Smart Finance R25.29</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
@@ -37215,20 +37215,28 @@ async function renderPaymentVoucher(el) {
   _pvRender(el);
 }
 
+// ⭐ R25.29 — Single source of truth for paid classification
+//   IMPORTANT: 'migrated' is NOT paid! Imported from xlsx → ยังต้อง verify กับ stmt จริง
+//   Paid when:
+//     - match_status === 'matched' (stmt confirmed)
+//     - match_status === 'matched_cash' (Cash auto)
+//     - match_status === 'migrated_reversal' (mirror reversal — pair กับ original = ปิด)
+//     - pay_method === 'เงินสด' (Cash, ไม่ต้องรอ stmt)
+//     - matched_at filled (stmt match อะไรก็ตามที่ flow set field นี้)
+function _pvIsPaid(pv) {
+  return pv.match_status === 'matched'
+      || pv.match_status === 'matched_cash'
+      || pv.match_status === 'migrated_reversal'
+      || pv.pay_method === 'เงินสด'
+      || !!pv.matched_at;
+}
+
 function _pvFilter() {
   const st = _pvState;
   return st.list.filter(pv => {
     if (pv.vat_type !== st.vat) return false;
     
-    // Sub-tab: pending = no matched_at AND pay_method !== Cash AND match_status !== matched/migrated
-    //          paid    = matched_at OR Cash OR match_status in (matched, migrated, migrated_reversal, matched_cash)
-    const isPaid = pv.match_status === 'matched' 
-                || pv.match_status === 'matched_cash' 
-                || pv.match_status === 'migrated'
-                || pv.match_status === 'migrated_reversal'  // ⭐ R25.22
-                || pv.pay_method === 'เงินสด'
-                || !!pv.matched_at;
-    
+    const isPaid = _pvIsPaid(pv);
     if (st.sub === 'pending' && isPaid) return false;
     if (st.sub === 'paid' && !isPaid) return false;
     
@@ -37247,11 +37255,7 @@ function _pvCounts() {
   const st = _pvState;
   const counts = { vat: 0, novat: 0, vatPending: 0, vatPaid: 0, novatPending: 0, novatPaid: 0 };
   st.list.forEach(pv => {
-    const isPaid = pv.match_status === 'matched' 
-                || pv.match_status === 'matched_cash' 
-                || pv.match_status === 'migrated'
-                || pv.pay_method === 'เงินสด'
-                || !!pv.matched_at;
+    const isPaid = _pvIsPaid(pv);
     if (pv.vat_type === 'VAT') {
       counts.vat++;
       if (isPaid) counts.vatPaid++; else counts.vatPending++;
@@ -37269,12 +37273,10 @@ function _pvRender(el) {
   const counts = _pvCounts();
   
   // Sum stats for current tab
-  const pendingSum = filtered.filter(pv => {
-    return !(pv.match_status === 'matched' || pv.match_status === 'matched_cash' || pv.match_status === 'migrated' || pv.pay_method === 'เงินสด' || !!pv.matched_at);
-  }).reduce((s, pv) => s + (Number(pv.net_amount) || 0), 0);
-  const paidSum = filtered.filter(pv => {
-    return (pv.match_status === 'matched' || pv.match_status === 'matched_cash' || pv.match_status === 'migrated' || pv.pay_method === 'เงินสด' || !!pv.matched_at);
-  }).reduce((s, pv) => s + (Number(pv.net_amount) || 0), 0);
+  const pendingSum = filtered.filter(pv => !_pvIsPaid(pv))
+                             .reduce((s, pv) => s + (Number(pv.net_amount) || 0), 0);
+  const paidSum = filtered.filter(pv => _pvIsPaid(pv))
+                          .reduce((s, pv) => s + (Number(pv.net_amount) || 0), 0);
   
   el.innerHTML = `
     <div class="flex justify-between items-center mb-4">
@@ -37363,12 +37365,38 @@ function _pvRender(el) {
       toast(`❌ ${r?.error || 'fail'}`, 'error', 3000);
     }
   }));
+  // ⭐ R25.29 — Manual match wiring
+  el.querySelectorAll('.pv-btn-match').forEach(b => b.addEventListener('click', () => {
+    const pv = st.list.find(x => x.pv_uuid === b.dataset.uuid);
+    if (pv) _pvOpenMatchModal(pv, el);
+  }));
+  el.querySelectorAll('.pv-btn-unmatch').forEach(b => b.addEventListener('click', async () => {
+    const pv = st.list.find(x => x.pv_uuid === b.dataset.uuid);
+    if (!pv) return;
+    if (!confirm(`ยกเลิก match ของ ${pv.pv_number}?\nStatus จะกลับเป็น "รอ verify"`)) return;
+    const r = await api('pv_unsetMatch', { pv_uuid: pv.pv_uuid });
+    if (r?.success) {
+      toast('✅ ยกเลิก match แล้ว', 'success', 2500);
+      pv.match_status = 'migrated';
+      pv.matched_stmt_uuid = '';
+      pv.matched_at = '';
+      _pvRender(el);
+    } else {
+      toast(`❌ ${r?.error || 'fail'}`, 'error', 3000);
+    }
+  }));
 }
 
 function _pvRow(pv) {
   const totalDeduct = (Number(pv.deduct_shipping)||0) + (Number(pv.deduct_dc_pm)||0) 
                     + (Number(pv.deduct_claim)||0) + (Number(pv.deduct_other)||0);
-  const isPaid = pv.match_status === 'matched' || pv.match_status === 'matched_cash' || pv.match_status === 'migrated' || pv.pay_method === 'เงินสด' || !!pv.matched_at;
+  const isPaid = _pvIsPaid(pv);   // ⭐ R25.29 — single source of truth
+  // ปุ่ม match แสดงเมื่อ: ยังไม่ matched + ไม่ใช่ Cash + ไม่ใช่ reversal mirror
+  const canMatch = pv.match_status !== 'matched' 
+                && pv.match_status !== 'matched_cash'
+                && pv.match_status !== 'migrated_reversal'
+                && pv.pay_method !== 'เงินสด';
+  const canUnmatch = pv.match_status === 'matched';
   
   let statusBadge;
   if (pv.match_status === 'matched') {
@@ -37376,7 +37404,7 @@ function _pvRow(pv) {
   } else if (pv.match_status === 'matched_cash' || pv.pay_method === 'เงินสด') {
     statusBadge = '<span style="color:var(--success);font-size:.75rem">💵 Cash</span>';
   } else if (pv.match_status === 'migrated') {
-    statusBadge = '<span style="color:#9b7fdf;font-size:.75rem" title="Imported จากระบบเก่า">📥 Migrated</span>';
+    statusBadge = '<span style="color:var(--warn);font-size:.75rem" title="Imported จากระบบเก่า — ยังไม่ได้ verify กับ stmt">📥 รอ verify</span>';
   } else if (pv.match_status === 'migrated_reversal') {
     statusBadge = '<span style="color:#ef4444;font-size:.75rem" title="รับเงินคืน (จาก โอนซ้ำ)">🔄 รับคืน</span>';
   } else {
@@ -37396,6 +37424,8 @@ function _pvRow(pv) {
     <td style="text-align:center;padding:6px 8px;font-size:.78rem">${isPaid?(fmtDate(pv.pay_date)||'-'):'<span style="color:var(--text2)">—</span>'}</td>
     <td style="text-align:center;padding:6px 8px">${statusBadge}</td>
     <td style="text-align:center;padding:6px 8px;white-space:nowrap">
+      ${canMatch ? `<button class="btn btn-ghost btn-icon pv-btn-match" data-uuid="${pv.pv_uuid}" title="🔗 จับคู่ statement" style="color:var(--info)">🔗</button>` : ''}
+      ${canUnmatch ? `<button class="btn btn-ghost btn-icon pv-btn-unmatch" data-uuid="${pv.pv_uuid}" title="✕ ยกเลิก match" style="color:var(--warn)">✕</button>` : ''}
       <button class="btn btn-ghost btn-icon pv-btn-print" data-uuid="${pv.pv_uuid}" title="ปริ้น">🖨</button>
       <button class="btn btn-ghost btn-icon pv-btn-edit" data-uuid="${pv.pv_uuid}" title="แก้ไข">${ICONS.edit}</button>
       <button class="btn btn-ghost btn-icon pv-btn-del" data-uuid="${pv.pv_uuid}" data-num="${pv.pv_number||''}" title="ลบ" style="color:var(--danger)">🗑</button>
@@ -37758,6 +37788,115 @@ function _nowISO() {
 }
 
 // ── Print preview window — A4 HTML + window.print() + html2pdf ──
+// ⭐ R25.29 — Manual match modal
+//   Lists candidates from getAllStatements() with:
+//     - match_status NOT 'paid'/'matched' (unmatched stmts)
+//     - amount sign matches PV direction (PV+ ↔ stmt-, PV- ↔ stmt+)
+//     - |stmt.amount + pv.net_amount| < 5% tolerance (or within ฿100)
+//   Sort by date proximity to issue_date
+function _pvOpenMatchModal(pv, rootEl) {
+  const pvNet = Number(pv.net_amount) || 0;
+  const allStmts = typeof getAllStatements === 'function' ? getAllStatements() : [];
+  
+  // Filter: unmatched + sign-compatible + amount close
+  const candidates = allStmts.filter(s => {
+    const ms = String(s.match_status || '');
+    if (ms === 'paid' || ms === 'matched') return false;
+    const amt = Number(s.amount) || 0;
+    if (!amt) return false;
+    // PV positive → stmt should be negative (เงินออก) — same magnitude
+    // PV negative (reversal) → stmt should be positive (เงินเข้า) — same magnitude
+    if (pvNet > 0 && amt > 0) return false;
+    if (pvNet < 0 && amt < 0) return false;
+    // Amount tolerance: signed sum near 0
+    const diff = Math.abs(pvNet + amt);
+    const tol = Math.max(Math.abs(pvNet) * 0.05, 100);  // 5% หรือ 100 บาท
+    return diff < tol;
+  }).map(s => ({
+    stmt: s,
+    diff: Math.abs(pvNet + (Number(s.amount)||0)),
+    dateDiff: Math.abs(new Date(toISODate(s.date)||'').getTime() - new Date(pv.issue_date||'').getTime()) / 86400000,
+  })).sort((a, b) => {
+    // exact match first, then closest date
+    if (a.diff < 0.01 && b.diff >= 0.01) return -1;
+    if (b.diff < 0.01 && a.diff >= 0.01) return 1;
+    return a.dateDiff - b.dateDiff;
+  }).slice(0, 30);
+  
+  const listHtml = candidates.length === 0
+    ? `<div style="padding:24px;text-align:center;color:var(--text2)">
+         <div style="font-size:32px;margin-bottom:8px">🔍</div>
+         <div>ไม่พบ statement ที่ match</div>
+         <div style="font-size:.78rem;margin-top:4px">ยอดคาดหวัง: ${pvNet > 0 ? '−' : '+'}${fmtNum(Math.abs(pvNet))} (สัญลักษณ์ตรงข้าม)</div>
+       </div>`
+    : `<div style="max-height:400px;overflow-y:auto">
+        ${candidates.map(({stmt, diff, dateDiff}) => `
+          <div class="pv-match-opt" data-uuid="${escapeHtml(stmt.stmt_uuid||'')}" 
+               style="padding:10px 12px;border:1px solid var(--border);border-radius:6px;margin-bottom:6px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:8px"
+               onmouseover="this.style.background='var(--bg-elev)'" onmouseout="this.style.background='transparent'">
+            <div style="flex:1;min-width:0">
+              <div style="font-size:.85rem;font-weight:500">
+                ${fmtDate(stmt.date)} · <span style="color:var(--text2)">${escapeHtml(stmt.bank||'')}</span>
+                ${diff < 0.01 ? ' <span style="color:var(--success);font-size:.7rem">✓ exact</span>' : ''}
+              </div>
+              <div style="font-size:.75rem;color:var(--text2);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+                ref: ${escapeHtml(stmt.ref_no||'-')} · ${escapeHtml(String(stmt.description||'').substring(0,60))}
+              </div>
+            </div>
+            <div style="text-align:right">
+              <div style="font-weight:600;color:${(Number(stmt.amount)||0)<0?'var(--danger)':'var(--success)'}">${fmtNum(Number(stmt.amount)||0)}</div>
+              ${dateDiff < 7 ? `<div style="font-size:.7rem;color:var(--text2)">${Math.round(dateDiff)} วัน</div>` : ''}
+            </div>
+          </div>
+        `).join('')}
+       </div>`;
+  
+  openModal(`🔗 จับคู่ ${pv.pv_number||''} — ${fmtNum(pvNet)} ฿`, `
+    <div class="flex-col gap-2">
+      <div style="background:var(--bg-elev);padding:10px;border-radius:6px;font-size:.85rem">
+        <div><strong>${escapeHtml(pv.supplier_name||'-')}</strong></div>
+        <div style="color:var(--text2);font-size:.78rem;margin-top:2px">
+          ${escapeHtml(pv.supplier_bank||'-')} · ${escapeHtml(pv.supplier_account||'-')}
+          · issue ${fmtDate(pv.issue_date)}
+        </div>
+      </div>
+      <div style="font-size:.78rem;color:var(--text2);margin:6px 0">
+        แสดง stmt ที่ตรงสัญลักษณ์ (${pvNet>0?'เงินออก':'เงินเข้า'}) + ยอดใกล้เคียง (±5%) · เรียงตามวันใกล้สุด
+      </div>
+      ${listHtml}
+      <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:10px">
+        <button class="btn btn-outline" onclick="closeModal()">ยกเลิก</button>
+      </div>
+    </div>
+  `);
+  
+  setTimeout(() => {
+    document.querySelectorAll('.pv-match-opt').forEach(opt => {
+      opt.addEventListener('click', async () => {
+        const stmtUuid = opt.dataset.uuid;
+        if (!stmtUuid) return;
+        if (!confirm(`ยืนยัน match ${pv.pv_number} กับ stmt นี้?`)) return;
+        opt.style.opacity = '0.5';
+        opt.style.pointerEvents = 'none';
+        const r = await api('pv_setMatch', { pv_uuid: pv.pv_uuid, stmt_uuid: stmtUuid });
+        if (r?.success) {
+          toast(`✅ Match แล้ว: ${pv.pv_number} ↔ ${r.data?.stmt_bank||''}`, 'success', 3000);
+          // Update local state
+          pv.match_status = 'matched';
+          pv.matched_stmt_uuid = stmtUuid;
+          pv.matched_at = r.data?.matched_at || new Date().toISOString();
+          closeModal();
+          _pvRender(rootEl);
+        } else {
+          toast(`❌ ${r?.error || 'fail'}`, 'error', 4000);
+          opt.style.opacity = '1';
+          opt.style.pointerEvents = 'auto';
+        }
+      });
+    });
+  }, 50);
+}
+
 function _pvOpenPrintPreview(pv) {
   const totalDeduct = (Number(pv.deduct_shipping)||0) + (Number(pv.deduct_dc_pm)||0) + (Number(pv.deduct_claim)||0) + (Number(pv.deduct_other)||0);
   const net = Number(pv.net_amount) || ((Number(pv.amount_billed)||0) - totalDeduct);
@@ -38301,10 +38440,10 @@ function _pvMakeReversal(orig) {
 
 // ── Initialize after all declarations are ready ──
 (async function() {
-  // ⭐ R25.28 BOOT BEACON
-  console.log('%c[SF R25.28] Active build: 2026-05-16-1600 — Fix pvGetList year filter (Date object in Apps Script)', 'color:#0c8;font-weight:bold;font-size:13px');
-  console.log('%c[SF R25.28] _pvRowToObject normalizes Date → ISO string · year filter + sort use ISO yyyy-mm-dd', 'color:#888');
-  window.__SF_BUILD = 'R25.28-2026-05-16-1600';
+  // ⭐ R25.29 BOOT BEACON
+  console.log('%c[SF R25.29] Active build: 2026-05-16-1700 — PV: migrated≠paid + manual match UI + helper consolidation', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.29] _pvIsPaid single helper · 🔗 match button + modal · pv_setMatch/pv_unsetMatch endpoints', 'color:#888');
+  window.__SF_BUILD = 'R25.29-2026-05-16-1700';
   
   await restoreMainState();
   checkSavedLogin();
