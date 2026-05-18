@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.38-2026-05-17-1900 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.39-2026-05-18-0900 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -7,7 +7,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>Smart Finance R25.38</title>
+<title>Smart Finance R25.39</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
@@ -666,6 +666,26 @@ function fmtDate(d) {
   return result;
 }
 function fmtNum(n) { return new Intl.NumberFormat('th-TH',{minimumFractionDigits:2,maximumFractionDigits:2}).format(n); }
+
+// ⭐ R25.39 — Round to 2 decimals (money fields)
+//   <input step="0.01"> is soft browser constraint — users can paste/type 12.345
+//   Save handlers must enforce server-side: amount/fee/wht fields all round to 2 dp.
+function _round2(v) {
+  const n = Number(v);
+  if (isNaN(n)) return 0;
+  return Math.round(n * 100) / 100;
+}
+
+// ⭐ R25.39 — Snap input value to 2 decimals on blur (visible feedback)
+//   User types 12.345 → tabs out → input shows 12.35 immediately
+function _snapBlur(el) {
+  if (!el) return;
+  el.addEventListener('blur', () => {
+    if (el.value === '' || el.value == null) return;
+    const v = Number(el.value);
+    if (!isNaN(v)) el.value = (Math.round(v * 100) / 100).toFixed(2);
+  });
+}
 // Sum diff formatter: แสดง 2 ทศนิยมเสมอ (เช่น +1.00, -18.50, +0.50)
 // สอดคล้องกับแถวอื่นที่ใช้ fmtNum (2 ทศนิยม)
 function fmtDiff(n) {
@@ -8548,19 +8568,22 @@ async function renderMain(el) {
       // ⭐ Wire customer autocomplete ใน Remarks
       const $abRemarks = document.getElementById('ab-remarks');
       if ($abRemarks) wireRemarks1Autocomplete($abRemarks);
+      
+      // ⭐ R25.39 — Snap money inputs to 2 decimals on blur
+      ['ab-amount','ab-wht','ab-transfer-fee','ab-card-fee'].forEach(id => _snapBlur(document.getElementById(id)));
 
       document.getElementById('ab-confirm')?.addEventListener('click', () => {
-        const amount = Number(document.getElementById('ab-amount').value) || 0;
+        const amount = _round2(document.getElementById('ab-amount').value);  // ⭐ R25.39
         const type = document.getElementById('ab-type').value;
         const applies = feeApplies();
         
         let whtAmount = 0, transferFee = 0, cardFee = 0;
         if (applies && (type === 'Transfer' || type === 'Cheque')) {
           // WHT: ใช้ค่าจาก input โดยตรง (อาจถูก user แก้เอง หรือ auto-calc)
-          whtAmount = Number($whtOut.value) || 0;
-          transferFee = Number($tf.value) || 0;
+          whtAmount = _round2($whtOut.value);     // ⭐ R25.39
+          transferFee = _round2($tf.value);       // ⭐ R25.39
         } else if (applies && type === 'Card') {
-          cardFee = Number($cf.value) || 0;
+          cardFee = _round2($cf.value);           // ⭐ R25.39
         }
         
         const confirmation = document.getElementById('ab-confirmation').value.trim();
@@ -9500,12 +9523,15 @@ async function renderMain(el) {
         const $ebRemarks1 = document.getElementById('eb-remarks1');
         if ($ebRemarks1) wireRemarks1Autocomplete($ebRemarks1);
         
+        // ⭐ R25.39 — Snap money inputs to 2 decimals on blur
+        ['eb-amount','eb-wht','eb-transfer-fee','eb-card-fee'].forEach(id => _snapBlur(document.getElementById(id)));
+        
         document.getElementById('eb-save')?.addEventListener('click', () => {
           b.bill_no = document.getElementById('eb-bill').value.trim();
           b.date = document.getElementById('eb-date').value;
           b.station = document.getElementById('eb-station').value;
           b.type = document.getElementById('eb-type').value;
-          b.amount = Number(document.getElementById('eb-amount').value) || 0;
+          b.amount = _round2(document.getElementById('eb-amount').value);  // ⭐ R25.39 — enforce 2 dp
           b.confirmation = document.getElementById('eb-confirmation').value.trim();
           b.pay_date = document.getElementById('eb-pay-date').value;
           b.bank = document.getElementById('eb-bank').value.trim();
@@ -9517,9 +9543,9 @@ async function renderMain(el) {
           // Fee fields: บันทึกเฉพาะ Type = Transfer/Cheque/Card
           // ถ้า Type อื่น → เคลียร์ค่าทิ้ง (ให้ consistency กับ logic แสดงผล)
           if (b.type === 'Transfer' || b.type === 'Cheque' || b.type === 'Card') {
-            b.wht_amount = Number(document.getElementById('eb-wht').value) || 0;
-            b.transfer_fee = Number(document.getElementById('eb-transfer-fee').value) || 0;
-            b.card_fee = Number(document.getElementById('eb-card-fee').value) || 0;
+            b.wht_amount = _round2(document.getElementById('eb-wht').value);          // ⭐ R25.39
+            b.transfer_fee = _round2(document.getElementById('eb-transfer-fee').value); // ⭐ R25.39
+            b.card_fee = _round2(document.getElementById('eb-card-fee').value);        // ⭐ R25.39
             b.wht_enabled = b.wht_amount > 0;
           } else {
             b.wht_amount = 0;
@@ -37781,23 +37807,26 @@ function _pvWireModal(draft, isEdit, rootEl) {
   // Wire deduction inputs
   document.querySelectorAll('.pv-m-deduct').forEach(inp => inp.addEventListener('input', recomp));
   
+  // ⭐ R25.39 — Snap money inputs to 2 decimals on blur
+  document.querySelectorAll('.pv-m-deduct, .pv-bill-amount').forEach(inp => _snapBlur(inp));
+  
   // Save
   document.getElementById('pv-m-save').addEventListener('click', async () => {
-    // Collect bills
+    // Collect bills — ⭐ R25.39: round bill_amount to 2 dp
     const bills = Array.from(document.querySelectorAll('.pv-bill-row')).map((row, i) => ({
       seq: i + 1,
       bill_no: row.querySelector('.pv-bill-no').value.trim(),
       bill_period: row.querySelector('.pv-bill-period').value.trim(),
-      bill_amount: Number(row.querySelector('.pv-bill-amount').value) || 0,
+      bill_amount: _round2(row.querySelector('.pv-bill-amount').value),
     })).filter(b => b.bill_no || b.bill_amount);
     
-    // Build payload
-    const billsSum = bills.reduce((s, b) => s + b.bill_amount, 0);
-    const dShip = Number(document.getElementById('pv-m-deduct_shipping').value)||0;
-    const dDcPm = Number(document.getElementById('pv-m-deduct_dc_pm').value)||0;
-    const dClaim = Number(document.getElementById('pv-m-deduct_claim').value)||0;
-    const dOther = Number(document.getElementById('pv-m-deduct_other').value)||0;
-    const net = billsSum - dShip - dDcPm - dClaim - dOther;
+    // Build payload — ⭐ R25.39: round all deduct + net to 2 dp
+    const billsSum = _round2(bills.reduce((s, b) => s + b.bill_amount, 0));
+    const dShip = _round2(document.getElementById('pv-m-deduct_shipping').value);
+    const dDcPm = _round2(document.getElementById('pv-m-deduct_dc_pm').value);
+    const dClaim = _round2(document.getElementById('pv-m-deduct_claim').value);
+    const dOther = _round2(document.getElementById('pv-m-deduct_other').value);
+    const net = _round2(billsSum - dShip - dDcPm - dClaim - dOther);
     
     const payload = {
       pv_uuid: draft.pv_uuid || '',
@@ -37854,7 +37883,9 @@ function _pvWireModal(draft, isEdit, rootEl) {
 }
 
 function _pvWireBillRow(row, recomp) {
-  row.querySelector('.pv-bill-amount')?.addEventListener('input', recomp);
+  const $amt = row.querySelector('.pv-bill-amount');
+  $amt?.addEventListener('input', recomp);
+  _snapBlur($amt);  // ⭐ R25.39 — snap to 2 dp on blur
   row.querySelector('.pv-bill-del')?.addEventListener('click', () => {
     row.remove();
     recomp();
@@ -38267,6 +38298,13 @@ function _pvOpenPrintPreview(pv) {
   const totalDeduct = (Number(pv.deduct_shipping)||0) + (Number(pv.deduct_dc_pm)||0) + (Number(pv.deduct_claim)||0) + (Number(pv.deduct_other)||0);
   const net = Number(pv.net_amount) || ((Number(pv.amount_billed)||0) - totalDeduct);
   
+  // ⭐ R25.39 — pay_date/pay_from_bank shown ONLY when matched (Toppy spec, same as table row R25.38)
+  //   Cash PVs: show pay_date too (manually entered = real cash transaction date)
+  //   Migrated/pending: hide → prevents printing stale xlsx-migration dates
+  const isPrintShown = (pv.match_status === 'matched')
+                    || (pv.match_status === 'matched_cash')
+                    || (pv.pay_method === 'เงินสด' && !!pv.pay_date);
+  
   const bahtText = _bahtThai(net);
   const billsRows = (pv.bills||[]).map((b, i) => `
     <tr style="background:${i%2?'#fafbfc':'#fff'}">
@@ -38353,8 +38391,8 @@ function _pvOpenPrintPreview(pv) {
               <div style="display:flex;gap:5px;align-items:center"><span style="display:inline-block;width:14px;height:14px;border:1.5px solid ${pv.pay_method==='เช็ค'?'#1a1f2e':'#ccc'};border-radius:2px;${pv.pay_method==='เช็ค'?'background:#1a1f2e;color:#fff;text-align:center;line-height:12px;font-size:10px':''}">${pv.pay_method==='เช็ค'?'✓':''}</span> <span style="font-size:11.5px;${pv.pay_method==='เช็ค'?'font-weight:500':'color:#888'}">เช็ค</span></div>
             </div>
             <div style="font-size:10.5px;color:#666;line-height:1.7">
-              <div>วันที่จ่าย: <span style="color:#1a1f2e;font-weight:500">${fmtDate(pv.pay_date)||'—'}</span></div>
-              <div>ธนาคารผู้จ่าย: <span style="color:#1a1f2e;font-weight:500">${pv.pay_from_bank||'—'}</span></div>
+              <div>วันที่จ่าย: <span style="color:#1a1f2e;font-weight:500">${isPrintShown ? (fmtDate(pv.pay_date)||'—') : '—'}</span></div>
+              <div>ธนาคารผู้จ่าย: <span style="color:#1a1f2e;font-weight:500">${isPrintShown ? (pv.pay_from_bank||'—') : '—'}</span></div>
             </div>
           </div>
         </div>
@@ -38806,10 +38844,10 @@ function _pvMakeReversal(orig) {
 
 // ── Initialize after all declarations are ready ──
 (async function() {
-  // ⭐ R25.38 BOOT BEACON
-  console.log('%c[SF R25.38] Active build: 2026-05-17-1900 — PV pay_date only when matched + Thai label "ตรงเป๊ะ"', 'color:#0c8;font-weight:bold;font-size:13px');
-  console.log('%c[SF R25.38] Fix: pay_date shown only for match_status=matched · "exact" → "ตรงเป๊ะ" in stmt list', 'color:#888');
-  window.__SF_BUILD = 'R25.38-2026-05-17-1900';
+  // ⭐ R25.39 BOOT BEACON
+  console.log('%c[SF R25.39] Active build: 2026-05-18-0900 — Decimal 2 dp enforcement + PV print guard', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.39] _round2 helper + _snapBlur on blur · Add/Edit Bill + PV save · print template hides pay_date/pay_from_bank when not matched', 'color:#888');
+  window.__SF_BUILD = 'R25.39-2026-05-18-0900';
   
   await restoreMainState();
   checkSavedLogin();
