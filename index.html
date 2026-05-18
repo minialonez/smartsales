@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.42-2026-05-18-1200 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.43-2026-05-18-1300 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -7,7 +7,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>Smart Finance R25.42</title>
+<title>Smart Finance R25.43</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
@@ -21920,12 +21920,22 @@ function wireReceivePaymentModalV3(state) {
     $btnSubmit.disabled = true;
     $btnSubmit.textContent = '⏳ กำลังบันทึก...';
     
+    // ⭐ R25.43 — Generate idempotency key BEFORE submit
+    //   Same key on retry → BE returns existing batch instead of creating duplicate
+    //   Stored on state so retry within same modal session reuses key
+    if (!state._idempotency_key) {
+      state._idempotency_key = (typeof crypto !== 'undefined' && crypto.randomUUID) 
+        ? crypto.randomUUID() 
+        : 'idk-' + Date.now() + '-' + Math.random().toString(36).slice(2, 12);
+    }
+    
     try {
       // Build payload
       const payload = {
         cust_code: state.cust_code,
         cust_name: state.cust_name,
         bill_to_sb: state.bill_to_sb,
+        idempotency_key: state._idempotency_key,  // ⭐ R25.43
         sp_groups: state.sp_groups.map(g => ({
           sp_no: g.sp_no.trim() || '',
           installments: g.installments.filter(i => (Number(i.amount)||0) > 0.01).map(i => ({
@@ -21947,8 +21957,13 @@ function wireReceivePaymentModalV3(state) {
       if (!r?.success) throw new Error(r?.error || r?.message || 'บันทึกล้มเหลว');
       
       const d = r.data || {};
-      const msg = `✓ บันทึก ${d.batch_id} — ${d.sp_rows_created} SP-rows, ${d.sb_updated_cash} SB updated (Cash)`;
-      toast(msg, 'success', 5000);
+      // ⭐ R25.43 — Detect idempotent response (BE recognized duplicate submission)
+      if (d.idempotent) {
+        toast(`⚠️ ส่งซ้ำ — ใช้ batch เดิม ${d.batch_id}\n${d.message||''}`, 'warn', 6000);
+      } else {
+        const msg = `✓ บันทึก ${d.batch_id} — ${d.sp_rows_created} SP-rows, ${d.sb_updated_cash} SB updated (Cash)`;
+        toast(msg, 'success', 5000);
+      }
       closeModal();
       
       try { if (typeof _invalidateCachedNotes === 'function') _invalidateCachedNotes(); } catch(e){}
@@ -38890,10 +38905,10 @@ function _pvMakeReversal(orig) {
 
 // ── Initialize after all declarations are ready ──
 (async function() {
-  // ⭐ R25.42 BOOT BEACON
-  console.log('%c[SF R25.42] Active build: 2026-05-18-1200 — Cheque leading zeros + date timezone fix (BE only)', 'color:#0c8;font-weight:bold;font-size:13px');
-  console.log('%c[SF R25.42] _pvObjectToRow TEXT_FIELDS (apostrophe prefix) · DATE_FIELDS += cheque_date · setNumberFormat("@") defense', 'color:#888');
-  window.__SF_BUILD = 'R25.42-2026-05-18-1200';
+  // ⭐ R25.43 BOOT BEACON
+  console.log('%c[SF R25.43] Active build: 2026-05-18-1300 — Idempotency guard + aggregateSB snap fix + getSpRowsForSB endpoint', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.43] Bug B: BE dedup (idk + 60s fingerprint) · Bug C: aggregateSB includes bills_snapshot in changed · UI helper for Bug A', 'color:#888');
+  window.__SF_BUILD = 'R25.43-2026-05-18-1300';
   
   await restoreMainState();
   checkSavedLogin();
