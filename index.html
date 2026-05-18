@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.43-2026-05-18-1300 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.44-2026-05-18-1400 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -7,7 +7,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>Smart Finance R25.43</title>
+<title>Smart Finance R25.44</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
@@ -16615,7 +16615,7 @@ async function loadAllFromCloud(opts) {
       //   This adds NO extra wall-clock time (all parallel).
       const sideFetches = {
         pv: api('pv_getList', { year: years[0] || new Date().getFullYear() }).catch(e => ({ _err: e.message })),
-        billing_notes: api('getBillingNotes', {}).catch(e => ({ _err: e.message })),
+        billing_notes: api('getBillingNotes', { include_snapshot: true }).catch(e => ({ _err: e.message })),  // ⭐ R25.44 — include snapshot for bill count + search
         billing_payments: api('getBillingPayments', {}).catch(e => ({ _err: e.message })),
         users: api('getUsers', {}).catch(e => ({ _err: e.message })),
         customers: api('getCustomers', {}).catch(e => ({ _err: e.message })),
@@ -18132,8 +18132,9 @@ async function renderBilling(el) {
       // Don't clear bootstrap data — used by other consumers too
     } else {
       // Fallback: direct API call
-      // R23: omit bills_snapshot — saves 50-70% bandwidth
-      const r = await api('getBillingNotes', {});
+      // ⭐ R25.44 — include_snapshot for bill_count + bills_snapshot consumers
+      //   (was: R23 omit to save bandwidth, but FE needed snapshot in 5+ places)
+      const r = await api('getBillingNotes', { include_snapshot: true });
       raw = (r && r.success && Array.isArray(r.data)) ? r.data : [];
     }
     billingNotes = raw;
@@ -18520,7 +18521,27 @@ async function renderBilling(el) {
       cachedChanges = d.changes || [];
       
       if (cachedChanges.length === 0) {
-        $result.innerHTML = `<div style="color:var(--success);padding:20px;text-align:center">✅ ทุก SB (${d.scanned} ใบ) มี paid_amount ตรงกับ billing_payments อยู่แล้ว ไม่ต้องแก้</div>`;
+        // ⭐ R25.44 — More diagnostic info when "no changes"
+        const pendingMatchCount = Number(d.pending_match_count || 0);
+        const matchedCount = Number(d.matched_count || 0);
+        const autoAppliedCount = Number(d.auto_applied_count || 0);
+        const legacyCount = Number(d.legacy_count || 0);
+        let hint = '';
+        if (pendingMatchCount > 0) {
+          hint = `<div style="margin-top:10px;padding:10px;background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.3);border-radius:6px;font-size:.85rem;color:var(--warn);text-align:left">
+            ⚠️ มี <b>${pendingMatchCount}</b> payments ที่ยัง <code>pending_match</code> (รอ match กับ stmt)
+            <br><span style="font-size:.78rem;color:var(--muted)">→ ระบบยังไม่นับ pending_match เข้า paid_amount ตามนโยบายของ R25.18 — ต้องไป match SP-bill ในหน้า Main daily ก่อน</span>
+          </div>`;
+        }
+        $result.innerHTML = `
+          <div style="color:var(--success);padding:20px;text-align:center">
+            ✅ ทุก SB (${d.scanned} ใบ) มี paid_amount ตรงกับ billing_payments อยู่แล้ว
+            <div style="font-size:.78rem;color:var(--muted);margin-top:8px">
+              payments: matched ${matchedCount} · cash ${autoAppliedCount} · pending_match ${pendingMatchCount} · legacy ${legacyCount}
+            </div>
+          </div>
+          ${hint}
+        `;
         return;
       }
       
@@ -38905,10 +38926,10 @@ function _pvMakeReversal(orig) {
 
 // ── Initialize after all declarations are ready ──
 (async function() {
-  // ⭐ R25.43 BOOT BEACON
-  console.log('%c[SF R25.43] Active build: 2026-05-18-1300 — Idempotency guard + aggregateSB snap fix + getSpRowsForSB endpoint', 'color:#0c8;font-weight:bold;font-size:13px');
-  console.log('%c[SF R25.43] Bug B: BE dedup (idk + 60s fingerprint) · Bug C: aggregateSB includes bills_snapshot in changed · UI helper for Bug A', 'color:#888');
-  window.__SF_BUILD = 'R25.43-2026-05-18-1300';
+  // ⭐ R25.44 BOOT BEACON
+  console.log('%c[SF R25.44] Active build: 2026-05-18-1400 — SP-bill flip Path B + idempotency 5min + bill_count fix', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.44] Issue 1: flip by sp_no fallback · Issue 2: 5min window + defensive Date · Issue 3: pending_match hint · Issue 4: include_snapshot:true', 'color:#888');
+  window.__SF_BUILD = 'R25.44-2026-05-18-1400';
   
   await restoreMainState();
   checkSavedLogin();
