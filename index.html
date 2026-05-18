@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.39-2026-05-18-0900 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.41-2026-05-18-1100 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -7,7 +7,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>Smart Finance R25.39</title>
+<title>Smart Finance R25.41</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
@@ -37664,6 +37664,30 @@ function _pvModalHtml(d, isEdit) {
           <input id="pv-m-pay_from_bank" class="input" value="${(d.pay_from_bank||'').replace(/"/g,'&quot;')}" placeholder="K PLUS SME JKN">
         </div>
       </div>
+      
+      <!-- ⭐ R25.41 — Cheque detail fields (visible when pay_method === 'เช็ค') -->
+      <div id="pv-m-cheque-block" style="display:${d.pay_method==='เช็ค'?'grid':'none'};grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:8px;padding:8px;background:rgba(79,156,249,.06);border-radius:6px;border:1px dashed rgba(79,156,249,.3)">
+        <div class="input-group">
+          <label style="font-size:.7rem">เลขที่เช็ค</label>
+          <input id="pv-m-cheque_no" class="input" value="${(d.cheque_no||'').replace(/"/g,'&quot;')}" placeholder="0001234">
+        </div>
+        <div class="input-group">
+          <label style="font-size:.7rem">ธนาคารเช็ค</label>
+          <input id="pv-m-cheque_bank" class="input" value="${(d.cheque_bank||'').replace(/"/g,'&quot;')}" placeholder="เช่น KBANK">
+        </div>
+        <div class="input-group">
+          <label style="font-size:.7rem">วันที่ลงเช็ค</label>
+          <input id="pv-m-cheque_date" type="date" class="input" value="${d.cheque_date||''}">
+        </div>
+      </div>
+      
+      <!-- ⭐ R25.41 — Credit card detail (visible when pay_method === 'บัตรเครดิต') -->
+      <div id="pv-m-card-block" style="display:${d.pay_method==='บัตรเครดิต'?'block':'none'};margin-top:8px;padding:8px;background:rgba(139,92,246,.06);border-radius:6px;border:1px dashed rgba(139,92,246,.3)">
+        <div class="input-group">
+          <label style="font-size:.7rem">เลขที่บัตรเครดิต <span class="text-xs text-dim">(4 หลักท้าย หรือเต็มก็ได้)</span></label>
+          <input id="pv-m-card_no" class="input" value="${(d.card_no||'').replace(/"/g,'&quot;')}" placeholder="**** 1234">
+        </div>
+      </div>
     </div>
     
     <!-- Summary -->
@@ -37791,6 +37815,12 @@ function _pvWireModal(draft, isEdit, rootEl) {
     } else {
       hint.textContent = '(จะ auto-fill เมื่อ match stmt)';
     }
+    
+    // ⭐ R25.41 — Toggle cheque/card detail blocks based on method
+    const chequeBlock = document.getElementById('pv-m-cheque-block');
+    const cardBlock = document.getElementById('pv-m-card-block');
+    if (chequeBlock) chequeBlock.style.display = draft.pay_method === 'เช็ค' ? 'grid' : 'none';
+    if (cardBlock) cardBlock.style.display = draft.pay_method === 'บัตรเครดิต' ? 'block' : 'none';
   }));
   
   // Add bill
@@ -37846,6 +37876,11 @@ function _pvWireModal(draft, isEdit, rootEl) {
       pay_method: draft.pay_method,
       pay_date: document.getElementById('pv-m-pay_date').value || '',
       pay_from_bank: document.getElementById('pv-m-pay_from_bank').value.trim(),
+      // ⭐ R25.41 — Cheque + Card detail (only persisted when relevant; else empty string)
+      cheque_no:   draft.pay_method === 'เช็ค' ? (document.getElementById('pv-m-cheque_no')?.value.trim() || '') : '',
+      cheque_bank: draft.pay_method === 'เช็ค' ? (document.getElementById('pv-m-cheque_bank')?.value.trim() || '') : '',
+      cheque_date: draft.pay_method === 'เช็ค' ? (document.getElementById('pv-m-cheque_date')?.value || '') : '',
+      card_no:     draft.pay_method === 'บัตรเครดิต' ? (document.getElementById('pv-m-card_no')?.value.trim() || '') : '',
       match_status: draft.pay_method === 'เงินสด' ? 'matched_cash' : (draft.match_status || 'unmatched'),
       matched_stmt_uuid: draft.matched_stmt_uuid || '',
       matched_at: draft.pay_method === 'เงินสด' ? (draft.matched_at || _nowISO()) : (draft.matched_at || ''),
@@ -38385,14 +38420,25 @@ function _pvOpenPrintPreview(pv) {
         <div>
           <div style="font-size:10px;color:#3b82f6;letter-spacing:.5px;font-weight:600;margin-bottom:6px">วิธีการชำระ (จงกลณี โอนจาก)</div>
           <div style="background:#f5f7fb;border-radius:6px;padding:12px 14px">
-            <div style="display:flex;gap:18px;align-items:center;margin-bottom:8px">
-              <div style="display:flex;gap:5px;align-items:center"><span style="display:inline-block;width:14px;height:14px;border:1.5px solid #1a1f2e;border-radius:2px;${pv.pay_method==='โอน'?'background:#1a1f2e;color:#fff;text-align:center;line-height:12px;font-size:10px':''}">${pv.pay_method==='โอน'?'✓':''}</span> <span style="font-size:11.5px;${pv.pay_method==='โอน'?'font-weight:500':'color:#888'}">โอน</span></div>
-              <div style="display:flex;gap:5px;align-items:center"><span style="display:inline-block;width:14px;height:14px;border:1.5px solid ${pv.pay_method==='เงินสด'?'#1a1f2e':'#ccc'};border-radius:2px;${pv.pay_method==='เงินสด'?'background:#1a1f2e;color:#fff;text-align:center;line-height:12px;font-size:10px':''}">${pv.pay_method==='เงินสด'?'✓':''}</span> <span style="font-size:11.5px;${pv.pay_method==='เงินสด'?'font-weight:500':'color:#888'}">เงินสด</span></div>
-              <div style="display:flex;gap:5px;align-items:center"><span style="display:inline-block;width:14px;height:14px;border:1.5px solid ${pv.pay_method==='เช็ค'?'#1a1f2e':'#ccc'};border-radius:2px;${pv.pay_method==='เช็ค'?'background:#1a1f2e;color:#fff;text-align:center;line-height:12px;font-size:10px':''}">${pv.pay_method==='เช็ค'?'✓':''}</span> <span style="font-size:11.5px;${pv.pay_method==='เช็ค'?'font-weight:500':'color:#888'}">เช็ค</span></div>
+            <div style="display:flex;gap:14px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
+              <div style="display:flex;gap:5px;align-items:center"><span style="display:inline-block;width:14px;height:14px;border:1.5px solid ${isPrintShown && pv.pay_method==='โอน'?'#1a1f2e':'#ccc'};border-radius:2px;${isPrintShown && pv.pay_method==='โอน'?'background:#1a1f2e;color:#fff;text-align:center;line-height:12px;font-size:10px':''}">${isPrintShown && pv.pay_method==='โอน'?'✓':''}</span> <span style="font-size:11.5px;${isPrintShown && pv.pay_method==='โอน'?'font-weight:500':'color:#888'}">โอน</span></div>
+              <div style="display:flex;gap:5px;align-items:center"><span style="display:inline-block;width:14px;height:14px;border:1.5px solid ${isPrintShown && pv.pay_method==='เงินสด'?'#1a1f2e':'#ccc'};border-radius:2px;${isPrintShown && pv.pay_method==='เงินสด'?'background:#1a1f2e;color:#fff;text-align:center;line-height:12px;font-size:10px':''}">${isPrintShown && pv.pay_method==='เงินสด'?'✓':''}</span> <span style="font-size:11.5px;${isPrintShown && pv.pay_method==='เงินสด'?'font-weight:500':'color:#888'}">เงินสด</span></div>
+              <div style="display:flex;gap:5px;align-items:center"><span style="display:inline-block;width:14px;height:14px;border:1.5px solid ${isPrintShown && pv.pay_method==='เช็ค'?'#1a1f2e':'#ccc'};border-radius:2px;${isPrintShown && pv.pay_method==='เช็ค'?'background:#1a1f2e;color:#fff;text-align:center;line-height:12px;font-size:10px':''}">${isPrintShown && pv.pay_method==='เช็ค'?'✓':''}</span> <span style="font-size:11.5px;${isPrintShown && pv.pay_method==='เช็ค'?'font-weight:500':'color:#888'}">เช็ค</span></div>
+              <div style="display:flex;gap:5px;align-items:center"><span style="display:inline-block;width:14px;height:14px;border:1.5px solid ${isPrintShown && pv.pay_method==='บัตรเครดิต'?'#1a1f2e':'#ccc'};border-radius:2px;${isPrintShown && pv.pay_method==='บัตรเครดิต'?'background:#1a1f2e;color:#fff;text-align:center;line-height:12px;font-size:10px':''}">${isPrintShown && pv.pay_method==='บัตรเครดิต'?'✓':''}</span> <span style="font-size:11.5px;${isPrintShown && pv.pay_method==='บัตรเครดิต'?'font-weight:500':'color:#888'}">บัตรเครดิต</span></div>
             </div>
             <div style="font-size:10.5px;color:#666;line-height:1.7">
               <div>วันที่จ่าย: <span style="color:#1a1f2e;font-weight:500">${isPrintShown ? (fmtDate(pv.pay_date)||'—') : '—'}</span></div>
               <div>ธนาคารผู้จ่าย: <span style="color:#1a1f2e;font-weight:500">${isPrintShown ? (pv.pay_from_bank||'—') : '—'}</span></div>
+              ${isPrintShown && pv.pay_method==='เช็ค' ? `
+                <div style="margin-top:4px;padding-top:4px;border-top:1px dashed #ddd">
+                  <div>เลขที่เช็ค: <span style="color:#1a1f2e;font-weight:500">${pv.cheque_no||'—'}</span></div>
+                  <div>ธนาคารเช็ค: <span style="color:#1a1f2e;font-weight:500">${pv.cheque_bank||'—'}</span></div>
+                  <div>วันที่ลงเช็ค: <span style="color:#1a1f2e;font-weight:500">${fmtDate(pv.cheque_date)||'—'}</span></div>
+                </div>` : ''}
+              ${isPrintShown && pv.pay_method==='บัตรเครดิต' ? `
+                <div style="margin-top:4px;padding-top:4px;border-top:1px dashed #ddd">
+                  <div>เลขที่บัตรเครดิต: <span style="color:#1a1f2e;font-weight:500">${pv.card_no||'—'}</span></div>
+                </div>` : ''}
             </div>
           </div>
         </div>
@@ -38844,10 +38890,10 @@ function _pvMakeReversal(orig) {
 
 // ── Initialize after all declarations are ready ──
 (async function() {
-  // ⭐ R25.39 BOOT BEACON
-  console.log('%c[SF R25.39] Active build: 2026-05-18-0900 — Decimal 2 dp enforcement + PV print guard', 'color:#0c8;font-weight:bold;font-size:13px');
-  console.log('%c[SF R25.39] _round2 helper + _snapBlur on blur · Add/Edit Bill + PV save · print template hides pay_date/pay_from_bank when not matched', 'color:#888');
-  window.__SF_BUILD = 'R25.39-2026-05-18-0900';
+  // ⭐ R25.41 BOOT BEACON
+  console.log('%c[SF R25.41] Active build: 2026-05-18-1100 — PV cheque/card detail fields', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.41] PV_HEADERS +4 cols (cheque_no/cheque_bank/cheque_date/card_no) · auto-migrate · conditional edit blocks · print shows detail', 'color:#888');
+  window.__SF_BUILD = 'R25.41-2026-05-18-1100';
   
   await restoreMainState();
   checkSavedLogin();
