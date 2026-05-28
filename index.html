@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.45-2026-05-18-1500 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.45-2026-05-18-1800 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -2088,17 +2088,20 @@ let supplierPayments = []; // รายการที่จะโอน / โ�
 //   Frontend code historically reads s.name/s.code/s.account_no/s.id → undefined after cloud load.
 //   This helper patches legacy alias keys so search/display work without rewriting every read site.
 //   Bug repro: typing supplier name in ใบสำคัญจ่าย autocomplete returned 0 matches (filter s.name was undefined).
+//   ⭐ R25.45 rev2 — also bridge s.vat ↔ s.vat_type (frontend used s.vat; backend stores vat_type).
 function _normSupplier(s) {
   if (!s || typeof s !== 'object') return s;
   if (!s.name && s.supplier_name) s.name = s.supplier_name;
   if (!s.code && s.supplier_code) s.code = s.supplier_code;
   if (!s.id && s.supplier_id) s.id = s.supplier_id;
   if (!s.account_no && s.bank_account) s.account_no = s.bank_account;
+  if (!s.vat && s.vat_type) s.vat = s.vat_type;
   // reverse alias (in case some code reads new schema and source is legacy)
   if (!s.supplier_name && s.name) s.supplier_name = s.name;
   if (!s.supplier_code && s.code) s.supplier_code = s.code;
   if (!s.supplier_id && s.id) s.supplier_id = s.id;
   if (!s.bank_account && s.account_no) s.bank_account = s.account_no;
+  if (!s.vat_type && s.vat) s.vat_type = s.vat;
   return s;
 }
 // PP Report (3 ไฟล์ที่ import รวมกัน)
@@ -11392,13 +11395,14 @@ function validateBillForCustomer(bill) {
   
   // ── Check 2: vat_status ──
   // ⭐ BOTH = ลูกค้าออกได้ทั้ง VAT และ NO_VAT — ไม่ warning
-  const vatStatus = String(customer.vat_status || '').toUpperCase();
+  // ⭐ R25.45 — accept both 'NOVAT' (current schema) และ 'NO_VAT' (legacy) เพื่อกัน schema drift
+  const vatStatus = String(customer.vat_status || '').toUpperCase().replace('_','');
   if (vatStatus === 'BOTH') {
     // ✅ accept ทุก type ของบิลเครดิต
   } else if (vatStatus === 'VAT' && category === 'NO_VAT_CREDIT') {
     result.warnings.push(`⚠️ บิล ${billNo}: ลูกค้า ${customer.cust_name} เป็น "VAT" แต่เปิดบิล ${billNo.substring(0,2)} (NO_VAT) — ควรใช้ SR/SC`);
-  } else if (vatStatus === 'NO_VAT' && category === 'VAT_CREDIT') {
-    result.warnings.push(`⚠️ บิล ${billNo}: ลูกค้า ${customer.cust_name} เป็น "NO_VAT" แต่เปิดบิล ${billNo.substring(0,2)} (VAT) — ควรใช้ OR/JR`);
+  } else if (vatStatus === 'NOVAT' && category === 'VAT_CREDIT') {
+    result.warnings.push(`⚠️ บิล ${billNo}: ลูกค้า ${customer.cust_name} เป็น "NOVAT" แต่เปิดบิล ${billNo.substring(0,2)} (VAT) — ควรใช้ OR/JR`);
   } else if (!vatStatus) {
     result.warnings.push(`บิล ${billNo}: ลูกค้า ${customer.cust_name} ยังไม่กำหนด vat_status ใน customer master`);
   }
@@ -37033,6 +37037,7 @@ async function renderCustomersMgmt(el) {
             <option value="ALL" ${st.filterVat==='ALL'?'selected':''}>VAT: ทั้งหมด</option>
             <option value="VAT" ${st.filterVat==='VAT'?'selected':''}>VAT</option>
             <option value="NOVAT" ${st.filterVat==='NOVAT'?'selected':''}>NOVAT</option>
+            <option value="BOTH" ${st.filterVat==='BOTH'?'selected':''}>BOTH</option>
           </select>
           <select class="input" id="cmgmt-fstatus">
             <option value="ALL" ${st.filterStatus==='ALL'?'selected':''}>สถานะ: ทั้งหมด</option>
@@ -37063,6 +37068,8 @@ async function renderCustomersMgmt(el) {
                 ? '<span class="badge badge-info">VAT</span>'
                 : c.vat_status === 'NOVAT' 
                 ? '<span class="badge badge-warn">NOVAT</span>'
+                : c.vat_status === 'BOTH'
+                ? '<span class="badge" style="background:#8e44ad22;color:#8e44ad">BOTH</span>'
                 : '<span class="text-xs text-dim">-</span>';
               const statusLbl = c.credit_status === 'active'
                 ? '<span class="badge badge-success">active</span>'
@@ -37188,6 +37195,7 @@ async function renderCustomersMgmt(el) {
               <option value="" ${!c.vat_status?'selected':''}>-</option>
               <option value="VAT" ${c.vat_status==='VAT'?'selected':''}>VAT (มี vat)</option>
               <option value="NOVAT" ${c.vat_status==='NOVAT'?'selected':''}>NOVAT (ไม่มี vat)</option>
+              <option value="BOTH" ${c.vat_status==='BOTH'?'selected':''}>BOTH (ทั้งสองแบบ)</option>
             </select>
           </div>
           <div class="input-group">
@@ -38949,7 +38957,7 @@ function _pvMakeReversal(orig) {
 // ── Initialize after all declarations are ready ──
 (async function() {
   // ⭐ R25.44 BOOT BEACON
-  console.log('%c[SF R25.45] Active build: 2026-05-18-1500 — supplier field normalize (PV autocomplete fix)', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.45] Active build: 2026-05-18-1800 — supplier rebuild (col misalignment fix) + customer VAT audit', 'color:#0c8;font-weight:bold;font-size:13px');
   console.log('%c[SF R25.44] Issue 1: flip by sp_no fallback · Issue 2: 5min window + defensive Date · Issue 3: pending_match hint · Issue 4: include_snapshot:true', 'color:#888');
   window.__SF_BUILD = 'R25.44-2026-05-18-1400';
   
