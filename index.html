@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.44-2026-05-18-1400 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.45-2026-05-18-1500 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -7,7 +7,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>Smart Finance R25.44</title>
+<title>Smart Finance R25.45</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
@@ -2083,6 +2083,24 @@ let customerList = []; // Customer master (from Google Sheets customers)
 let cashflowList = []; // เงินเข้า-ออก: Deposit, Withdrawal, Transfer, Misc
 let supplierList = []; // Master Supplier data (ชื่อ, เลขบัญชี, ธนาคาร)
 let supplierPayments = []; // รายการที่จะโอน / โอนแล้ว (PP)
+
+// ⭐ R25.45 — Normalize supplier object: backend schema uses supplier_name/supplier_code/bank_account/supplier_id
+//   Frontend code historically reads s.name/s.code/s.account_no/s.id → undefined after cloud load.
+//   This helper patches legacy alias keys so search/display work without rewriting every read site.
+//   Bug repro: typing supplier name in ใบสำคัญจ่าย autocomplete returned 0 matches (filter s.name was undefined).
+function _normSupplier(s) {
+  if (!s || typeof s !== 'object') return s;
+  if (!s.name && s.supplier_name) s.name = s.supplier_name;
+  if (!s.code && s.supplier_code) s.code = s.supplier_code;
+  if (!s.id && s.supplier_id) s.id = s.supplier_id;
+  if (!s.account_no && s.bank_account) s.account_no = s.bank_account;
+  // reverse alias (in case some code reads new schema and source is legacy)
+  if (!s.supplier_name && s.name) s.supplier_name = s.name;
+  if (!s.supplier_code && s.code) s.supplier_code = s.code;
+  if (!s.supplier_id && s.id) s.supplier_id = s.id;
+  if (!s.bank_account && s.account_no) s.bank_account = s.account_no;
+  return s;
+}
 // PP Report (3 ไฟล์ที่ import รวมกัน)
 let ppReport = {
   period: '',                  // เช่น "01/03/2026 - 31/03/2026"
@@ -4016,6 +4034,7 @@ const syncManager = {
         if (!Array.isArray(items)) throw new Error('Suppliers: unexpected format');
         const seen = new Set(supplierList.map(s => s.supplier_id || s.id || s.name));
         items.forEach(s => {
+          _normSupplier(s); // ⭐ R25.45
           const k = s.supplier_id || s.id || s.name;
           if (k && !seen.has(k)) { supplierList.push(s); seen.add(k); stats.suppliers++; }
         });
@@ -4881,7 +4900,7 @@ async function restoreMainState() {
     const savedCashflow = safeStorage.get('sf_cashflowList');
     if (savedCashflow) cashflowList = JSON.parse(savedCashflow);
     const savedSuppliers = safeStorage.get('sf_supplierList');
-    if (savedSuppliers) supplierList = JSON.parse(savedSuppliers);
+    if (savedSuppliers) { supplierList = JSON.parse(savedSuppliers); supplierList.forEach(_normSupplier); } // ⭐ R25.45
     const savedSupPay = safeStorage.get('sf_supplierPayments');
     if (savedSupPay) supplierPayments = JSON.parse(savedSupPay);
     const savedPPRpt = safeStorage.get('sf_ppReport');
@@ -14328,6 +14347,7 @@ async function renderSupplier(el) {
       
       if (isEdit) supplierList[editIdx] = record;
       else supplierList.push(record);
+      _normSupplier(record); // ⭐ R25.45 — ensure both legacy + new schema keys present
       persistMainState();
       closeModal();
       toast(isEdit?'อัปเดตสำเร็จ':'เพิ่มสำเร็จ', 'success');
@@ -16692,7 +16712,7 @@ async function loadAllFromCloud(opts) {
       const r = results[3];
       if (r?._err) throw new Error(r._err);
       const items = (r?.data?.data) || (Array.isArray(r?.data) ? r.data : []) || [];
-      items.forEach(s => tempSuppliers.push(s));
+      items.forEach(s => tempSuppliers.push(_normSupplier(s))); // ⭐ R25.45
       _log('Suppliers', items.length);
     } catch (e) { _log('Suppliers', 0, e); }
     
@@ -24619,7 +24639,7 @@ function renderData(el) {
           const r = await api('getSuppliers');
           const items = (r?.data?.data) || (Array.isArray(r?.data) ? r.data : []) || [];
           if (Array.isArray(items)) {
-            items.forEach(s => tempSuppliers.push(s));
+            items.forEach(s => tempSuppliers.push(_normSupplier(s))); // ⭐ R25.45
             tsLog(`   ✓ Suppliers: ${items.length} rows`);
           }
         } catch(err) { tsLog(`   ⚠️ Suppliers: ${err.message}`); }
@@ -24979,6 +24999,7 @@ function renderData(el) {
           const items = (r?.data?.data) || r?.data || [];
           const seenSup = new Set(supplierList.map(s => s.supplier_id || s.id || s.name));
           items.forEach(s => {
+            _normSupplier(s); // ⭐ R25.45
             const key = s.supplier_id || s.id || s.name;
             if (key && !seenSup.has(key)) {
               supplierList.push(s);
@@ -38766,6 +38787,7 @@ function _pvOpenMigrateModal(rootEl) {
             const nameKey = String(ns.name||'').trim().toLowerCase();
             if (!nameKey) { supSkipped++; return; }
             if (existingNames.has(nameKey)) { supSkipped++; return; }
+            _normSupplier(ns); // ⭐ R25.45
             supplierList.push(ns);
             existingNames.add(nameKey);
             supAdded++;
@@ -38927,7 +38949,7 @@ function _pvMakeReversal(orig) {
 // ── Initialize after all declarations are ready ──
 (async function() {
   // ⭐ R25.44 BOOT BEACON
-  console.log('%c[SF R25.44] Active build: 2026-05-18-1400 — SP-bill flip Path B + idempotency 5min + bill_count fix', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.45] Active build: 2026-05-18-1500 — supplier field normalize (PV autocomplete fix)', 'color:#0c8;font-weight:bold;font-size:13px');
   console.log('%c[SF R25.44] Issue 1: flip by sp_no fallback · Issue 2: 5min window + defensive Date · Issue 3: pending_match hint · Issue 4: include_snapshot:true', 'color:#888');
   window.__SF_BUILD = 'R25.44-2026-05-18-1400';
   
