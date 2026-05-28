@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.45-2026-05-18-1800 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.45-2026-05-18-1900 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -21333,6 +21333,7 @@ function wireReceivePaymentModalV3(state) {
     
     try {
       const r = await api('getOutstandingSBsByCust', { cust_code: code });
+      state._cust_code = code; // ⭐ R25.45 — remember for stale-snapshot reload
       state.outstanding_sbs = (r?.success && Array.isArray(r.data)) ? r.data : [];
       // Build bill_to_sb map
       state.outstanding_sbs.forEach(sb => {
@@ -21362,7 +21363,10 @@ function wireReceivePaymentModalV3(state) {
     const monthNames = {1:'ม.ค.',2:'ก.พ.',3:'มี.ค.',4:'เม.ย.',5:'พ.ค.',6:'มิ.ย.',7:'ก.ค.',8:'ส.ค.',9:'ก.ย.',10:'ต.ค.',11:'พ.ย.',12:'ธ.ค.'};
     $sbsList.innerHTML = state.outstanding_sbs.map(sb => {
       // ⭐ R25.6 — clear stale cache before re-render (in case sb.paid_amount changed)
+      // ⭐ R25.45 — also clear _billEffMap + _billOutMapPaid so credit-note display recomputes
       sb._billOutMap = null;
+      sb._billEffMap = null;
+      sb._billOutMapPaid = undefined;
       const cycle = `${monthNames[sb.cycle_month]||sb.cycle_month}/${(sb.cycle_year%100).toString().padStart(2,'0')}`;
       // ⭐ R25.6 — date ASC sort (matches FIFO order user sees)
       const bills = [...(sb.bills_snapshot || [])].sort((a, b) =>
@@ -21379,7 +21383,16 @@ function wireReceivePaymentModalV3(state) {
       const sbPaid = Number(sb.paid_amount) || 0;
       const sbPct = sbTotal > 0 ? Math.min(100, (sbPaid / sbTotal) * 100) : 0;
       const sbBarColor = sbPct >= 99.99 ? 'var(--success)' : (sbPct > 0.01 ? '#378ADD' : '#9ca3af');
-      
+
+      // ⭐ R25.45 — stale-snapshot detector: total_amount should equal snapshot sum (with neg credit notes)
+      //   If mismatch → snapshot has ghost/altered bills not reflected in stored total.
+      //   Tells Toppy to re-aggregate this SB (ghost credit note like SR-001385 −1,815 case).
+      const snapSum = bills.reduce((s, b) => s + (Number(b.amount) || 0), 0);
+      const snapMismatch = Math.abs(snapSum - sbTotal) > 0.01;
+      const staleWarn = snapMismatch
+        ? `<span class="rp-sb-stale" data-uuid="${sb.billing_uuid}" data-cust="${sb.cust_code||''}" data-y="${sb.cycle_year||''}" data-m="${sb.cycle_month||''}" title="⚠️ ยอดเต็ม (฿${fmtNum(sbTotal)}) ≠ ผลรวม snapshot (฿${fmtNum(snapSum)}) — snapshot อาจ stale (มีบิล/ลดหนี้ที่ถูกแก้/ลบใน Smart). คลิกเพื่อ re-aggregate" style="cursor:pointer;color:var(--warn);font-weight:700;margin-left:6px">⚠️ snapshot เพี้ยน</span>`
+        : '';
+
       return `
         <div class="rp-sb-card" data-uuid="${sb.billing_uuid}" 
              style="border-bottom:1px solid var(--border);padding:10px 12px;background:${tickedCount>0?'rgba(55,138,221,.06)':'transparent'}">
@@ -21387,7 +21400,7 @@ function wireReceivePaymentModalV3(state) {
             <span class="rp-sb-toggle" data-uuid="${sb.billing_uuid}" 
                   style="cursor:pointer;font-size:1.1rem;user-select:none">${checkboxIcon}</span>
             <span style="font-family:monospace;font-weight:600;font-size:.85rem">${sb.billing_no}</span>
-            <span style="color:var(--muted);font-size:.78rem">${cycle}</span>
+            <span style="color:var(--muted);font-size:.78rem">${cycle}</span>${staleWarn}
             <span style="margin-left:auto;font-size:.78rem">
               <span style="color:var(--muted)">ยอดเต็ม</span> ฿${fmtNum(sbTotal)} ·
               <span style="color:var(--success)">จ่าย</span> ฿${fmtNum(sbPaid)} ·
@@ -21466,6 +21479,28 @@ function wireReceivePaymentModalV3(state) {
     });
     $sbsList.querySelectorAll('.rp-bill-row').forEach(row => {
       row.onclick = () => toggleBill(row.dataset.bill);
+    });
+    // ⭐ R25.45 — stale snapshot heal: re-aggregate this SB's cycle then reload customer
+    $sbsList.querySelectorAll('.rp-sb-stale').forEach(w => {
+      w.onclick = async (e) => {
+        e.stopPropagation();
+        const y = w.dataset.y, m = w.dataset.m, cust = w.dataset.cust;
+        if (!confirm(`⚠️ snapshot ของ SB นี้ไม่ตรงกับบิลจริง\n\nระบบจะ re-aggregate เดือน ${m}/${y} ของลูกค้า ${cust}\n(rebuild bills_snapshot + total_amount จาก bills ปัจจุบัน · ไม่แตะยอดจ่าย)\n\nดำเนินการ?`)) return;
+        w.textContent = '⏳ กำลัง rebuild...';
+        try {
+          const r = await api('aggregateSB', { year: Number(y), month: Number(m), cust_code: cust });
+          if (r?.success === false) throw new Error(r.error || 'aggregate failed');
+          toast('✓ rebuild snapshot สำเร็จ — กำลังโหลดใหม่', 'success');
+          // Reload this customer's outstanding SBs
+          const rr = await api('getOutstandingSBsByCust', { cust_code: state._cust_code || cust });
+          state.outstanding_sbs = (rr?.success && Array.isArray(rr.data)) ? rr.data : [];
+          state.outstanding_sbs.forEach(sb => { sb._billOutMap = null; sb._billEffMap = null; sb._billOutMapPaid = undefined; });
+          renderSBsList();
+        } catch (err) {
+          toast('❌ ' + (err.message || err), 'error');
+          w.textContent = '⚠️ snapshot เพี้ยน';
+        }
+      };
     });
   }
   
@@ -38957,7 +38992,7 @@ function _pvMakeReversal(orig) {
 // ── Initialize after all declarations are ready ──
 (async function() {
   // ⭐ R25.44 BOOT BEACON
-  console.log('%c[SF R25.45] Active build: 2026-05-18-1800 — supplier rebuild (col misalignment fix) + customer VAT audit', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.45] Active build: 2026-05-18-1900 — stale snapshot detector in PV รับชำระ + debugSBSnapshot endpoint', 'color:#0c8;font-weight:bold;font-size:13px');
   console.log('%c[SF R25.44] Issue 1: flip by sp_no fallback · Issue 2: 5min window + defensive Date · Issue 3: pending_match hint · Issue 4: include_snapshot:true', 'color:#888');
   window.__SF_BUILD = 'R25.44-2026-05-18-1400';
   
