@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.45-2026-05-18-2100 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.45-2026-05-18-2200 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -21342,6 +21342,21 @@ function wireReceivePaymentModalV3(state) {
           if (b.bill_uuid) state.bill_to_sb[b.bill_uuid] = sb.billing_uuid;
         });
       });
+      // ⭐ R25.45 rev4 — โหลด bill_uuids ที่ตัดจ่ายแล้ว (รวม SC ที่เคย apply) จาก payments ของแต่ละ SB
+      //   bill_uuid ที่อยู่ใน payment ใด = "ตัดจ่ายแล้ว" → disable เลือกซ้ำใน renderSBsList
+      state._paid_bill_uuids = new Set();
+      try {
+        const payResults = await Promise.all(
+          state.outstanding_sbs.map(sb => loadPaymentsForSB(sb.billing_uuid).catch(() => []))
+        );
+        payResults.forEach(pays => {
+          (pays || []).forEach(p => {
+            let arr = [];
+            try { arr = p.bill_uuids_json ? JSON.parse(p.bill_uuids_json) : (Array.isArray(p.bill_uuids) ? p.bill_uuids : []); } catch(e) { arr = []; }
+            arr.forEach(u => state._paid_bill_uuids.add(u));
+          });
+        });
+      } catch(e) { console.warn('[R25.45] load paid uuids failed', e); }
       const totalOut = state.outstanding_sbs.reduce((s, sb) => s + (Number(sb.outstanding)||0), 0);
       $custInfo.innerHTML = state.outstanding_sbs.length === 0
         ? `<span style="color:var(--success)">✓ <b>${escapeHtml(name)}</b> — ไม่มี SB ค้างชำระ</span>`
@@ -21408,10 +21423,11 @@ function wireReceivePaymentModalV3(state) {
           <div style="padding-left:24px;display:flex;flex-direction:column;gap:3px">
             ${bills.map(b => {
               const billOut = _getBillOutstanding(sb, b);
-              const ticked = state.selected_bills.has(b.bill_uuid);
               const billAmt = Number(b.amount) || 0;
-              // ⭐ R25.45 rev2 — no credit-note absorb. paid = amount − outstanding (real FIFO of paid_amount).
               const isRefund = billAmt < 0;
+              // ⭐ R25.45 rev4 — credit note ที่เคย apply ไปแล้ว (uuid อยู่ใน payment) → ตัดจ่ายแล้ว เลือกไม่ได้
+              const isCreditUsed = isRefund && state._paid_bill_uuids && state._paid_bill_uuids.has(b.bill_uuid);
+              const ticked = !isCreditUsed && state.selected_bills.has(b.bill_uuid);
               const billPaid = Math.max(0, billAmt - billOut);
               const billPct = billAmt > 0 ? Math.min(100, (billPaid / billAmt) * 100) : 100;
               const isPaidClosed = billAmt > 0.01 && billOut < 0.01;
@@ -21419,6 +21435,18 @@ function wireReceivePaymentModalV3(state) {
               const barColor = isPaidClosed ? 'var(--success)' : (isPartial ? '#378ADD' : '#9ca3af');
               
               if (isRefund) {
+                if (isCreditUsed) {
+                  // ตัดจ่ายแล้ว — disabled, แสดงเทาๆ
+                  return `
+                    <div style="display:flex;align-items:center;gap:8px;font-size:.78rem;padding:4px 6px;border-radius:4px;background:var(--bg);opacity:.55">
+                      <span>✓</span>
+                      <span style="font-family:monospace">${b.bill_no}</span>
+                      <span style="color:var(--muted)">${fmtDate(b.date)}</span>
+                      <span style="color:var(--muted);font-weight:600">฿${fmtNum(billAmt)} ลดหนี้</span>
+                      <span style="margin-left:auto;font-size:.7rem;color:var(--success);font-weight:600">ตัดจ่ายแล้ว</span>
+                    </div>
+                  `;
+                }
                 return `
                   <div class="rp-bill-row" data-bill="${b.bill_uuid}" 
                        style="display:flex;align-items:center;gap:8px;font-size:.78rem;cursor:pointer;padding:4px 6px;border-radius:4px;background:${ticked?'rgba(160,100,255,.12)':'rgba(160,100,255,.04)'};border:1px dashed ${ticked?'#a064ff':'transparent'}">
@@ -21524,13 +21552,18 @@ function wireReceivePaymentModalV3(state) {
   function toggleSB(uuid) {
     const sb = state.outstanding_sbs.find(s => s.billing_uuid === uuid);
     if (!sb) return;
-    const billUuids = (sb.bills_snapshot || []).map(b => b.bill_uuid).filter(Boolean);
+    // ⭐ R25.45 rev4 — exclude credit notes ที่ตัดจ่ายแล้ว (เลือกไม่ได้)
+    const billUuids = (sb.bills_snapshot || [])
+      .filter(b => !(state._paid_bill_uuids && state._paid_bill_uuids.has(b.bill_uuid)))
+      .map(b => b.bill_uuid).filter(Boolean);
     const allTicked = billUuids.every(u => state.selected_bills.has(u));
     if (allTicked) billUuids.forEach(u => state.selected_bills.delete(u));
     else billUuids.forEach(u => state.selected_bills.add(u));
     afterSelectionChange();
   }
   function toggleBill(billUuid) {
+    // ⭐ R25.45 rev4 — credit note ที่ตัดจ่ายแล้ว เลือกไม่ได้
+    if (state._paid_bill_uuids && state._paid_bill_uuids.has(billUuid)) return;
     if (state.selected_bills.has(billUuid)) state.selected_bills.delete(billUuid);
     else state.selected_bills.add(billUuid);
     afterSelectionChange();
@@ -21791,6 +21824,19 @@ function wireReceivePaymentModalV3(state) {
     out.sort((a, b) => String(a.bill.date||'').localeCompare(String(b.bill.date||'')));
     return out;
   }
+
+  // ⭐ R25.45 rev4 — uuids ของ credit note (SC/JR) ที่ user tick ใน Step 2
+  function _selectedCreditUuids() {
+    const uuids = [];
+    state.outstanding_sbs.forEach(sb => {
+      (sb.bills_snapshot || []).forEach(b => {
+        if ((Number(b.amount) || 0) < 0 && state.selected_bills.has(b.bill_uuid)) {
+          uuids.push(b.bill_uuid);
+        }
+      });
+    });
+    return uuids;
+  }
   
   function autoFifoAllocate() {
     // For each SP group → distribute sum-installments FIFO across selected bills
@@ -21974,7 +22020,7 @@ function wireReceivePaymentModalV3(state) {
         cust_name: state.cust_name,
         bill_to_sb: state.bill_to_sb,
         idempotency_key: state._idempotency_key,  // ⭐ R25.43
-        sp_groups: state.sp_groups.map(g => ({
+        sp_groups: state.sp_groups.map((g, gi) => ({
           sp_no: g.sp_no.trim() || '',
           installments: g.installments.filter(i => (Number(i.amount)||0) > 0.01).map(i => ({
             amount: Number(i.amount)||0,
@@ -21988,7 +22034,10 @@ function wireReceivePaymentModalV3(state) {
             confirmation: i.confirmation || '',
           })),
           allocations: g.allocations || {},
-        })).filter(g => g.installments.length > 0),
+          // ⭐ R25.45 rev4 — SC/JR uuids ที่ user tick (negative amount) → persist as paid marker
+          //   attach ที่ group แรกเท่านั้น กัน duplicate marker
+          applied_credits: gi === 0 ? _selectedCreditUuids() : [],
+        })).filter(g => g.installments.length > 0 || (g.applied_credits && g.applied_credits.length > 0)),
       };
       
       const r = await api('recordBatchPayment', payload);
@@ -38950,7 +38999,7 @@ function _pvMakeReversal(orig) {
 // ── Initialize after all declarations are ready ──
 (async function() {
   // ⭐ R25.44 BOOT BEACON
-  console.log('%c[SF R25.45] Active build: 2026-05-18-2100 — user เลือกหัก SC เอง (tick SC → ลดยอดสุทธิ) + net breakdown line', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.45] Active build: 2026-05-18-2200 — SC ตัดจ่ายแล้วเลือกไม่ได้ (persist via bill_uuids_json) + applied_credits', 'color:#0c8;font-weight:bold;font-size:13px');
   console.log('%c[SF R25.44] Issue 1: flip by sp_no fallback · Issue 2: 5min window + defensive Date · Issue 3: pending_match hint · Issue 4: include_snapshot:true', 'color:#888');
   window.__SF_BUILD = 'R25.44-2026-05-18-1400';
   
