@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.45-2026-05-18-2300 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.45-2026-05-18-2400 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -21863,6 +21863,46 @@ function wireReceivePaymentModalV3(state) {
     return out;
   }
 
+  // ⭐ R25.45 rev6 (CIC bug) — sessionStorage-backed idempotency_key cache
+  //   Signature = cust_code + total payment amount + sorted bill_uuids (allocations only)
+  //   If user closes/reopens modal with same intent → reuse same key → BE detects dup via Strategy 1
+  //   TTL 1h; cleared on success.
+  const _IDK_TTL_MS = 60 * 60 * 1000;  // 1 hour
+  const _IDK_PREFIX = 'sf_v3_idk:';
+  function _idkSignature() {
+    const cc = String(state.cust_code || '');
+    let totalAmt = 0;
+    const bills = [];
+    state.sp_groups.forEach(g => {
+      (g.installments || []).forEach(i => totalAmt += (Number(i.amount)||0) + (Number(i.wht_amount)||0));
+      Object.keys(g.allocations || {}).forEach(bu => {
+        const methods = g.allocations[bu] || {};
+        let has = false;
+        Object.values(methods).forEach(v => { if ((Number(v)||0) > 0.01) has = true; });
+        if (has) bills.push(bu);
+      });
+    });
+    bills.sort();
+    // simple hash (string concat → length is fine for keying within session)
+    return _IDK_PREFIX + cc + ':' + totalAmt.toFixed(2) + ':' + bills.join(',');
+  }
+  function _readIdkCache(sig) {
+    try {
+      const raw = sessionStorage.getItem(sig);
+      if (!raw) return null;
+      const obj = JSON.parse(raw);
+      if (!obj || !obj.key || !obj.ts) return null;
+      if (Date.now() - obj.ts > _IDK_TTL_MS) { sessionStorage.removeItem(sig); return null; }
+      return obj.key;
+    } catch(e) { return null; }
+  }
+  function _writeIdkCache(sig, key) {
+    try { sessionStorage.setItem(sig, JSON.stringify({ key, ts: Date.now() })); } catch(_) {}
+  }
+  function _clearIdkCache(sig) {
+    try { sessionStorage.removeItem(sig); } catch(_) {}
+  }
+
   // ⭐ R25.45 rev4 — uuids ของ credit note (SC/JR) ที่ user tick ใน Step 2
   function _selectedCreditUuids() {
     const uuids = [];
@@ -22038,17 +22078,38 @@ function wireReceivePaymentModalV3(state) {
   $btnCancel.onclick = () => closeModal();
   
   $btnSubmit.onclick = async () => {
+    // ⭐ R25.45 rev6 (CIC bug) — synchronous double-submit guard (before any await)
+    //   เคส JN-02566: 3 batches เกิดวินาทีเดียวกัน → race ระหว่าง #2 append กับ #3 check
+    //   Fix: flag state._submitting check ก่อน async → block re-entry แม้กดเร็วๆ
+    if (state._submitting) return;
     if ($btnSubmit.disabled) return;
+    state._submitting = true;
     $btnSubmit.disabled = true;
     $btnSubmit.textContent = '⏳ กำลังบันทึก...';
     
-    // ⭐ R25.43 — Generate idempotency key BEFORE submit
-    //   Same key on retry → BE returns existing batch instead of creating duplicate
-    //   Stored on state so retry within same modal session reuses key
+    // ⭐ R25.43 + R25.45 rev6 — Generate idempotency key, persist in sessionStorage
+    //   ก่อน: in-memory state._idempotency_key หาย เมื่อปิด/เปิด modal → key ใหม่ → guard ไม่ทำงาน
+    //   ใหม่: persist ใน sessionStorage (signature-keyed) → กดบันทึกซ้ำหลังปิด/เปิด modal ใช้ key เดิม
+    //   TTL 1 ชม. — กันค้างข้าม browser session, ล้างตอน boot
     if (!state._idempotency_key) {
-      state._idempotency_key = (typeof crypto !== 'undefined' && crypto.randomUUID) 
-        ? crypto.randomUUID() 
-        : 'idk-' + Date.now() + '-' + Math.random().toString(36).slice(2, 12);
+      try {
+        const sig = _idkSignature();         // cust + total + bills hash
+        const cached = _readIdkCache(sig);
+        if (cached) {
+          state._idempotency_key = cached;
+          console.log('[R25.45 rev6] reused cached idempotency_key for sig=' + sig.substring(0,32));
+        } else {
+          state._idempotency_key = (typeof crypto !== 'undefined' && crypto.randomUUID) 
+            ? crypto.randomUUID() 
+            : 'idk-' + Date.now() + '-' + Math.random().toString(36).slice(2, 12);
+          _writeIdkCache(sig, state._idempotency_key);
+        }
+      } catch(e) {
+        // Fallback (sessionStorage may be blocked)
+        state._idempotency_key = (typeof crypto !== 'undefined' && crypto.randomUUID) 
+          ? crypto.randomUUID() 
+          : 'idk-' + Date.now() + '-' + Math.random().toString(36).slice(2, 12);
+      }
     }
     
     try {
@@ -22084,11 +22145,16 @@ function wireReceivePaymentModalV3(state) {
       const d = r.data || {};
       // ⭐ R25.43 — Detect idempotent response (BE recognized duplicate submission)
       if (d.idempotent) {
-        toast(`⚠️ ส่งซ้ำ — ใช้ batch เดิม ${d.batch_id}\n${d.message||''}`, 'warn', 6000);
+        toast(`⚠️ ส่งซ้ำ — ใช้ batch เดิม ${d.batch_id}\n${d.message||d.reason||''}`, 'warn', 6000);
       } else {
         const msg = `✓ บันทึก ${d.batch_id} — ${d.sp_rows_created} SP-rows, ${d.sb_updated_cash} SB updated (Cash)`;
         toast(msg, 'success', 5000);
       }
+      // ⭐ R25.45 rev6 — Success: flush cached idk so next legitimate submission gets fresh key
+      try {
+        const sig2 = _idkSignature();
+        _clearIdkCache(sig2);
+      } catch(_) {}
       closeModal();
       
       try { if (typeof _invalidateCachedNotes === 'function') _invalidateCachedNotes(); } catch(e){}
@@ -22105,9 +22171,14 @@ function wireReceivePaymentModalV3(state) {
         try { window.renderMainKeepScroll(); } catch(e){}
       }
     } catch (e) {
+      // ⭐ R25.45 rev6 — On error: KEEP cached idk so retry uses same key (idempotent)
+      //   Don't reset on error → user can retry with same key → BE responds idempotent (safe)
       toast('❌ ' + (e.message || e), 'error', 5000);
       $btnSubmit.disabled = false;
       $btnSubmit.textContent = '💾 บันทึก batch';
+    } finally {
+      // ⭐ R25.45 rev6 — clear submitting flag in finally (covers both success+error paths)
+      state._submitting = false;
     }
   };
 }
@@ -39037,7 +39108,24 @@ function _pvMakeReversal(orig) {
 // ── Initialize after all declarations are ready ──
 (async function() {
   // ⭐ R25.44 BOOT BEACON
-  console.log('%c[SF R25.45] Active build: 2026-05-18-2300 — recordBillingPayment: Cash-only update SB, non-Cash→pending_match (CIC bug)', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.45] Active build: 2026-05-18-2400 — idempotency hardening: sync submit guard + sessionStorage idk + stmt-uuid uniqueness (CIC bug)', 'color:#0c8;font-weight:bold;font-size:13px');
+  // ⭐ R25.45 rev6 — Sweep stale idempotency_key cache entries (TTL 1h) at boot
+  try {
+    const _IDK_TTL_MS = 60 * 60 * 1000;
+    const _IDK_PREFIX = 'sf_v3_idk:';
+    const _now = Date.now();
+    const _stale = [];
+    for (let i = 0; i < sessionStorage.length; i++) {
+      const k = sessionStorage.key(i);
+      if (!k || k.indexOf(_IDK_PREFIX) !== 0) continue;
+      try {
+        const obj = JSON.parse(sessionStorage.getItem(k));
+        if (!obj || !obj.ts || (_now - obj.ts > _IDK_TTL_MS)) _stale.push(k);
+      } catch(_) { _stale.push(k); }
+    }
+    _stale.forEach(k => sessionStorage.removeItem(k));
+    if (_stale.length) console.log('[R25.45 rev6] Cleared ' + _stale.length + ' stale idk cache entries');
+  } catch(_) {}
   console.log('%c[SF R25.44] Issue 1: flip by sp_no fallback · Issue 2: 5min window + defensive Date · Issue 3: pending_match hint · Issue 4: include_snapshot:true', 'color:#888');
   window.__SF_BUILD = 'R25.44-2026-05-18-1400';
   
