@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.45-2026-05-18-2200 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.45-2026-05-18-2300 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -20597,13 +20597,24 @@ ${bodyHtml}
     }
     
     function totalsHtml() {
-      const sumAmount = installments.reduce((s, x) => s + (Number(x.amount) || 0), 0);
-      const sumWht = installments.reduce((s, x) => s + (Number(x.wht) || 0), 0);
-      const sumFee = installments.reduce((s, x) => s + (Number(x.fee) || 0), 0);
-      const sumPaid = r2(sumAmount + sumWht + sumFee);
-      const newPaid = r2((n.paid_amount || 0) + sumPaid);
-      const newOut = r2(Math.max(0, (n.total_amount || 0) - newPaid));
-      const status = newPaid >= (n.total_amount || 0) - 0.01 ? '✅ ชำระครบ' : (newPaid > 0 ? '🔵 ชำระบางส่วน' : '⏳ รอชำระ');
+      // ⭐ R25.45 rev5 (CIC bug) — แยก Cash (ลง paid ทันที) vs Transfer/Cheque/Card (pending_match)
+      //   เก่า: รวมทุก method → status='ชำระครบ' ทันทีแม้ใช้เช็คที่ยังไม่ได้เงิน
+      //   ใหม่: status คำนวณจาก Cash + paid เดิม เท่านั้น; non-Cash แสดงเป็น "⏳ รอเงินเข้า"
+      let sumCash = 0, sumPending = 0, cntCash = 0, cntPending = 0;
+      installments.forEach(x => {
+        const totalLine = (Number(x.amount)||0) + (Number(x.wht)||0) + (Number(x.fee)||0);
+        if (String(x.method||'Cash') === 'Cash') {
+          sumCash += totalLine; cntCash++;
+        } else {
+          sumPending += totalLine; cntPending++;
+        }
+      });
+      const sumPaid = r2(sumCash + sumPending);                 // รวมทั้งหมด (แสดงผลรวมที่บันทึก)
+      const newPaidImmediate = r2((n.paid_amount || 0) + sumCash);
+      const newOut = r2(Math.max(0, (n.total_amount || 0) - newPaidImmediate));
+      const status = newPaidImmediate >= (n.total_amount || 0) - 0.01 
+        ? '✅ ชำระครบ' 
+        : (newPaidImmediate > (n.paid_amount || 0) ? '🔵 ชำระบางส่วน' : '⏳ รอชำระ');
       const isOverpay = sumPaid > outstanding + 0.01;
       const isFull = newOut < 0.01;
       
@@ -20613,8 +20624,16 @@ ${bodyHtml}
             <span>รวมจ่ายครั้งนี้ (${installments.length} งวด)</span>
             <strong>฿${sumPaid.toFixed(2)}</strong>
           </div>
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-top:4px">
-            <span>คงเหลือหลังบันทึก</span>
+          ${cntCash > 0 ? `<div style="display:flex;justify-content:space-between;margin-top:4px;font-size:12px;color:var(--muted)">
+            <span>↳ Cash ${cntCash} งวด (ลงทันที)</span>
+            <span>฿${sumCash.toFixed(2)}</span>
+          </div>` : ''}
+          ${cntPending > 0 ? `<div style="display:flex;justify-content:space-between;margin-top:2px;font-size:12px;color:#f59e0b">
+            <span>⏳ Transfer/เช็ค ${cntPending} งวด (รอ match)</span>
+            <span>฿${sumPending.toFixed(2)}</span>
+          </div>` : ''}
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px;border-top:1px dashed var(--border);padding-top:6px">
+            <span>คงเหลือหลังบันทึก ${cntPending > 0 ? '<span style="font-size:11px;color:var(--muted)">(หัก Cash เท่านั้น)</span>' : ''}</span>
             <strong style="color:${isFull ? '#16a34a' : '#ef4444'}">฿${newOut.toFixed(2)} (${status})</strong>
           </div>
           ${isOverpay ? `<div style="margin-top:6px;color:#ef4444;font-size:12px">⚠️ รวมเกินยอดคงเหลือ (฿${outstanding.toFixed(2)}) — ตรวจสอบยอด</div>` : ''}
@@ -20785,6 +20804,11 @@ ${bodyHtml}
             if (r && r.success) {
               okCount++;
               lastResp = r.data;
+              // ⭐ R25.45 rev5 — keep response with highest new_paid so state patch uses Cash result
+              //   not the last non-Cash response (where new_paid = unchanged old paid)
+              if (!window._maxRespRBP || (r.data.new_paid || 0) > (window._maxRespRBP.new_paid || 0)) {
+                window._maxRespRBP = r.data;
+              }
               committedIndices.push(origIdx);
             } else if (!firstError) {
               firstError = r?.error || 'unknown error';
@@ -20794,25 +20818,39 @@ ${bodyHtml}
           
           if (okCount === validIndices.length) {
             // ALL success — close modal
-            const statusTxt = lastResp?.new_status === 'paid' ? 'ครบแล้ว ✅' : `คงเหลือ ฿${Number(lastResp?.outstanding || 0).toFixed(2)}`;
+            // ⭐ R25.45 rev5 (CIC bug) — แยกเคส Cash vs Pending ใน toast
+            const pendingCount = installments.filter((x, i) => 
+              validIndices.includes(i) && String(x.method||'Cash') !== 'Cash'
+            ).length;
+            const cashCount = okCount - pendingCount;
+            let statusTxt;
+            if (pendingCount > 0 && cashCount === 0) {
+              statusTxt = `รอ match ${pendingCount} งวด ⏳`;
+            } else if (pendingCount > 0) {
+              statusTxt = `Cash ${cashCount} งวด (ลงทันที), รอ match ${pendingCount} งวด ⏳`;
+            } else {
+              statusTxt = lastResp?.new_status === 'paid' ? 'ครบแล้ว ✅' : `คงเหลือ ฿${Number(lastResp?.outstanding || 0).toFixed(2)}`;
+            }
             toast(`✅ บันทึก ${okCount} งวด สำเร็จ — ${statusTxt}`, 'success', 5000);
             closeModal();
             // ⭐ R22 14/5/26 — patch state แทน full refresh
             //   เก่า: await refresh() reload notes+payments+customers ทั้งหมด ~3-5s
             //   ใหม่: patch แถวเดียวใน billingNotes + fire loadPayments background
             const noteIdx = billingNotes.findIndex(x => x.billing_uuid === uuid);
-            if (noteIdx >= 0 && lastResp) {
+            const patchResp = window._maxRespRBP || lastResp;  // ⭐ R25.45 rev5 — prefer Cash result
+            if (noteIdx >= 0 && patchResp) {
               const _bn = billingNotes[noteIdx];
-              _bn.paid_amount = Number(lastResp.new_paid) || 0;
-              _bn.outstanding = Number(lastResp.outstanding) || 0;
-              if (lastResp.outstanding_vat != null) _bn.outstanding_vat = Number(lastResp.outstanding_vat) || 0;
-              if (lastResp.outstanding_novat != null) _bn.outstanding_novat = Number(lastResp.outstanding_novat) || 0;
+              _bn.paid_amount = Number(patchResp.new_paid) || 0;
+              _bn.outstanding = Number(patchResp.outstanding) || 0;
+              if (patchResp.outstanding_vat != null) _bn.outstanding_vat = Number(patchResp.outstanding_vat) || 0;
+              if (patchResp.outstanding_novat != null) _bn.outstanding_novat = Number(patchResp.outstanding_novat) || 0;
               // Normalize status (backend: open/partial/complete → frontend: pending/partial/paid)
-              const ns = String(lastResp.new_status || '').toLowerCase();
+              const ns = String(patchResp.new_status || '').toLowerCase();
               _bn.status = ns === 'open' ? 'pending' : ns === 'complete' ? 'paid' : ns;
               _bn.last_payment_date = installments[installments.length - 1]?.date || todayISO();
               _bn.updated_at = new Date().toISOString();
             }
+            window._maxRespRBP = null;  // ⭐ cleanup
             render();
             // ⭐ R23: invalidate cache + payments cache for this SB (next view modal re-fetches)
             _invalidateCachedNotes();
@@ -38999,7 +39037,7 @@ function _pvMakeReversal(orig) {
 // ── Initialize after all declarations are ready ──
 (async function() {
   // ⭐ R25.44 BOOT BEACON
-  console.log('%c[SF R25.45] Active build: 2026-05-18-2200 — SC ตัดจ่ายแล้วเลือกไม่ได้ (persist via bill_uuids_json) + applied_credits', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.45] Active build: 2026-05-18-2300 — recordBillingPayment: Cash-only update SB, non-Cash→pending_match (CIC bug)', 'color:#0c8;font-weight:bold;font-size:13px');
   console.log('%c[SF R25.44] Issue 1: flip by sp_no fallback · Issue 2: 5min window + defensive Date · Issue 3: pending_match hint · Issue 4: include_snapshot:true', 'color:#888');
   window.__SF_BUILD = 'R25.44-2026-05-18-1400';
   
