@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.45-2026-05-18-2800 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.45-2026-05-18-3100 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -20349,6 +20349,17 @@ ${bodyHtml}
       });
       if (r && r.success) {
         toast(`✅ สร้างใบวางบิล ${r.data.billing_no} สำเร็จ`, 'success');
+        // ⭐ R25.45 rev10 (bug fix) — invalidate stale __SF_BOOT.billing_notes + local cache
+        //   Bug: หลังกด "สร้างใบใหม่" → activeTab='list' → refresh() → loadNotes() อ่านจาก
+        //   window.__SF_BOOT.billing_notes (R25.33 path) ที่เป็น snapshot ตอน boot → ไม่มี SB ใหม่
+        //   → กลับมาที่ list ไม่เห็นใบที่เพิ่งสร้าง
+        try { _invalidateCachedNotes(); } catch(_) {}
+        try {
+          if (window.__SF_BOOT && Array.isArray(window.__SF_BOOT.billing_notes)) {
+            // Optimistic: prepend new SB so it shows immediately even before refetch
+            window.__SF_BOOT.billing_notes.unshift(r.data);
+          }
+        } catch(_) {}
         // Reset form
         createState = {
           customer: { code: '', name: '', address: '', tax_id: '', phone: '' },
@@ -21381,9 +21392,20 @@ function wireReceivePaymentModalV3(state) {
         });
       });
       // ⭐ R25.45 rev4 — โหลด bill_uuids ที่ตัดจ่ายแล้ว (รวม SC ที่เคย apply) จาก payments ของแต่ละ SB
-      //   bill_uuid ที่อยู่ใน payment ใด = "ตัดจ่ายแล้ว" → disable เลือกซ้ำใน renderSBsList
+      //   ⭐ R25.45 rev10 (bug fix) — เก็บเฉพาะ credit note (SC/JR amount<0) ในชุดนี้
+      //     เคสบั๊ก: SR00126-000358/000359 ขึ้น "ตัดจ่ายแล้ว" ทั้งที่ยังไม่ได้จ่าย — เพราะ bill_uuids_json
+      //     ของ payment เก่ารวมทุก bill ใน allocations (SR ด้วย) → set กว้างเกิน → guard บล็อกเลือก SR
+      //     แก้: filter ด้วย credit-note uuid set ที่สร้างจาก bills_snapshot ของแต่ละ SB
       state._paid_bill_uuids = new Set();
       try {
+        // 1) Build credit-note uuid whitelist จาก current snapshots (SC/JR ที่ amount<0)
+        const creditUuids = new Set();
+        state.outstanding_sbs.forEach(sb => {
+          (sb.bills_snapshot || []).forEach(b => {
+            if ((Number(b.amount) || 0) < 0 && b.bill_uuid) creditUuids.add(b.bill_uuid);
+          });
+        });
+        // 2) Load payments + take only credit-note uuids
         const payResults = await Promise.all(
           state.outstanding_sbs.map(sb => loadPaymentsForSB(sb.billing_uuid).catch(() => []))
         );
@@ -21391,7 +21413,9 @@ function wireReceivePaymentModalV3(state) {
           (pays || []).forEach(p => {
             let arr = [];
             try { arr = p.bill_uuids_json ? JSON.parse(p.bill_uuids_json) : (Array.isArray(p.bill_uuids) ? p.bill_uuids : []); } catch(e) { arr = []; }
-            arr.forEach(u => state._paid_bill_uuids.add(u));
+            arr.forEach(u => {
+              if (creditUuids.has(u)) state._paid_bill_uuids.add(u);
+            });
           });
         });
       } catch(e) { console.warn('[R25.45] load paid uuids failed', e); }
@@ -38011,18 +38035,39 @@ function _pvWireModal(draft, isEdit, rootEl) {
       const matches = (supplierList || []).filter(s => {
         return String(s.name||'').toLowerCase().includes(ql);
       }).slice(0, 10);
-      if (matches.length === 0) { supSuggest.style.display = 'none'; return; }
-      supSuggest.innerHTML = matches.map((s, i) => `
-        <div class="pv-sup-opt" data-idx="${i}" 
-             style="padding:10px 12px;cursor:pointer;border-bottom:1px solid var(--border);background:var(--bg)">
-          <div style="font-weight:600;font-size:.92rem;color:var(--text)">${escapeHtml(s.name||'-')}</div>
-          <div style="font-size:.78rem;color:var(--text2);margin-top:3px;display:flex;gap:10px;flex-wrap:wrap">
-            <span>🏦 <strong>${escapeHtml(s.bank||'—')}</strong></span>
-            <span style="font-family:monospace">${escapeHtml(s.account_no||'—')}</span>
-            ${s.vat?`<span style="padding:1px 6px;background:var(--bg-elev);border-radius:3px;font-size:.7rem">${s.vat}</span>`:''}
+      // ⭐ R25.45 rev11 — Always show "➕ เพิ่ม supplier ใหม่" row when typed name doesn't EXACTLY match
+      //   เคส: Toppy พิมพ์ชื่อ supplier ใหม่ในหน้า PV → อยากเพิ่มเลยโดยไม่ต้องไป tab supplier ก่อน
+      const exactMatch = matches.some(s => String(s.name||'').trim().toLowerCase() === ql.trim());
+      const html = [];
+      matches.forEach((s, i) => {
+        html.push(`
+          <div class="pv-sup-opt" data-idx="${i}" 
+               style="padding:10px 12px;cursor:pointer;border-bottom:1px solid var(--border);background:var(--bg)">
+            <div style="font-weight:600;font-size:.92rem;color:var(--text)">${escapeHtml(s.name||'-')}</div>
+            <div style="font-size:.78rem;color:var(--text2);margin-top:3px;display:flex;gap:10px;flex-wrap:wrap">
+              <span>🏦 <strong>${escapeHtml(s.bank||'—')}</strong></span>
+              <span style="font-family:monospace">${escapeHtml(s.account_no||'—')}</span>
+              ${s.vat?`<span style="padding:1px 6px;background:var(--bg-elev);border-radius:3px;font-size:.7rem">${s.vat}</span>`:''}
+            </div>
           </div>
-        </div>
-      `).join('');
+        `);
+      });
+      if (!exactMatch && q.trim().length >= 2) {
+        html.push(`
+          <div class="pv-sup-add" 
+               style="padding:10px 12px;cursor:pointer;background:rgba(34,197,94,.08);border-top:1px dashed var(--border)">
+            <div style="font-weight:600;font-size:.88rem;color:var(--success)">
+              ➕ เพิ่ม supplier ใหม่: <span style="color:var(--text)">"${escapeHtml(q)}"</span>
+            </div>
+            <div style="font-size:.72rem;color:var(--text2);margin-top:2px">
+              คลิกเพื่อกรอกธนาคาร/เลขบัญชี แล้ว save จะเพิ่มเข้า master อัตโนมัติ
+            </div>
+          </div>
+        `);
+      }
+      if (matches.length === 0 && exactMatch) { supSuggest.style.display = 'none'; return; }
+      if (html.length === 0) { supSuggest.style.display = 'none'; return; }
+      supSuggest.innerHTML = html.join('');
       supSuggest.style.display = 'block';
       // Hover highlight
       supSuggest.querySelectorAll('.pv-sup-opt').forEach((el, i) => {
@@ -38037,6 +38082,18 @@ function _pvWireModal(draft, isEdit, rootEl) {
           supSuggest.style.display = 'none';
         });
       });
+      // ⭐ R25.45 rev11 — "➕ เพิ่ม supplier ใหม่" click: focus bank field → user กรอกต่อ
+      const addOpt = supSuggest.querySelector('.pv-sup-add');
+      if (addOpt) {
+        addOpt.addEventListener('mouseenter', () => { addOpt.style.background = 'rgba(34,197,94,.16)'; });
+        addOpt.addEventListener('mouseleave', () => { addOpt.style.background = 'rgba(34,197,94,.08)'; });
+        addOpt.addEventListener('mousedown', (e) => {
+          e.preventDefault();
+          supSuggest.style.display = 'none';
+          if (bankInput) bankInput.focus();   // คลิกแล้วโฟกัสช่องธนาคารต่อ
+          toast('💡 กรอกธนาคาร + เลขบัญชี แล้ว save จะเพิ่ม supplier เข้า master', 'info', 3500);
+        });
+      }
     };
     supInput.addEventListener('input', () => _renderSuggest(supInput.value.trim()));
     supInput.addEventListener('focus', () => { if (supInput.value.trim()) _renderSuggest(supInput.value.trim()); });
@@ -38147,6 +38204,36 @@ function _pvWireModal(draft, isEdit, rootEl) {
       const r = await api('pv_upsert', { data: payload });
       if (r?.success) {
         toast(`✅ ${isEdit?'อัปเดต':'สร้าง'}สำเร็จ${r.pv_number?' ('+r.pv_number+')':''}`, 'success', 2500);
+        // ⭐ R25.45 rev11 — Auto-add supplier to master หาก name ที่กรอกไม่อยู่ใน supplierList
+        //   เคส: Toppy พิมพ์ supplier ใหม่ตรงในหน้า PV → save แล้วระบบจดจำลง master ทันที
+        //   ครั้งหน้าค้นชื่อนี้เจอ + auto-fill ธนาคาร/บัญชี
+        try {
+          const nm = String(payload.supplier_name || '').trim();
+          const nml = nm.toLowerCase();
+          const exists = (supplierList || []).some(s => String(s.name||'').trim().toLowerCase() === nml);
+          if (nm && !exists) {
+            const newSup = _normSupplier({
+              supplier_id: 'SUP-' + Date.now(),
+              supplier_name: nm,
+              supplier_code: '',
+              bank: String(payload.supplier_bank || '').trim(),
+              bank_account: String(payload.supplier_account || '').trim(),
+              vat_type: payload.vat_type || '',
+              created_at: new Date().toISOString(),
+            });
+            supplierList.push(newSup);
+            // Save to backend (replace-all pattern via saveSuppliers)
+            api('saveSuppliers', { records: supplierList, created_by: currentUser?.display_name || 'pv-modal' })
+              .then(sr => {
+                if (sr?.success) {
+                  toast(`📇 เพิ่ม supplier ใหม่: ${nm}`, 'success', 3500);
+                } else {
+                  console.warn('[PV] auto-add supplier failed:', sr?.error);
+                }
+              })
+              .catch(err => console.warn('[PV] auto-add supplier error:', err));
+          }
+        } catch (e) { console.warn('[PV] auto-add supplier exception:', e); }
         closeModal();
         // Reload list
         const res = await api('pv_getList', { year: new Date().getFullYear() });
@@ -39140,7 +39227,7 @@ function _pvMakeReversal(orig) {
 // ── Initialize after all declarations are ready ──
 (async function() {
   // ⭐ R25.44 BOOT BEACON
-  console.log('%c[SF R25.45] Active build: 2026-05-18-2800 — bill_period text guard + pv_repairBillPeriod (CIC cosmetic fix)', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.45] Active build: 2026-05-18-3100 — VAT split ใช้ BILL_TYPE_META canonical (CIC: JS = NOVAT) + PV inline supplier add', 'color:#0c8;font-weight:bold;font-size:13px');
   // ⭐ R25.45 rev6 — Sweep stale idempotency_key cache entries (TTL 1h) at boot
   try {
     const _IDK_TTL_MS = 60 * 60 * 1000;
