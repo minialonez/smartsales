@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.45-2026-05-18-3200 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.45-2026-05-18-3300 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -38678,10 +38678,10 @@ function _pvOpenPrintPreview(pv) {
   const bahtText = _bahtThai(net);
   const billsRows = (pv.bills||[]).map((b, i) => `
     <tr style="background:${i%2?'#fafbfc':'#fff'}">
-      <td style="padding:8px 10px;border-bottom:1px solid #e5e7eb">${i+1}</td>
-      <td style="padding:8px 10px;border-bottom:1px solid #e5e7eb;font-family:monospace;font-weight:500">${b.bill_no||'-'}</td>
-      <td style="padding:8px 10px;border-bottom:1px solid #e5e7eb;text-align:center;color:#666">${b.bill_period||'-'}</td>
-      <td style="padding:8px 10px;border-bottom:1px solid #e5e7eb;text-align:right;font-weight:500">${fmtNum(b.bill_amount||0)}</td>
+      <td style="padding:9px 10px;border-bottom:1px solid #e5e7eb">${i+1}</td>
+      <td style="padding:9px 10px;border-bottom:1px solid #e5e7eb;font-family:monospace;font-weight:600">${b.bill_no||'-'}</td>
+      <td style="padding:9px 10px;border-bottom:1px solid #e5e7eb;text-align:center;color:#1a1f2e;font-weight:500">${b.bill_period||'-'}</td>
+      <td style="padding:9px 10px;border-bottom:1px solid #e5e7eb;text-align:right;font-weight:600">${fmtNum(b.bill_amount||0)}</td>
     </tr>`).join('');
   
   const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${pv.pv_number||'ใบสำคัญจ่าย'}</title>
@@ -38709,18 +38709,18 @@ function _pvOpenPrintPreview(pv) {
         }
       }
       .head{display:flex;justify-content:space-between;align-items:flex-start;padding-bottom:14px;border-bottom:2px solid #1a1f2e;margin-bottom:18px}
-      .badge-vat{display:inline-block;background:#3b82f6;color:#fff;padding:4px 14px;border-radius:4px;font-size:11px;font-weight:600;letter-spacing:.5px;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+      .badge-vat{display:inline-block;background:#3b82f6;color:#fff;padding:5px 16px;border-radius:4px;font-size:13px;font-weight:700;letter-spacing:.5px;-webkit-print-color-adjust:exact;print-color-adjust:exact}
       .badge-novat{background:#f59e0b}
-      table{width:100%;border-collapse:collapse;font-size:11px}
-      th{background:#1a1f2e;color:#fff;padding:8px 10px;font-weight:500;text-align:left;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+      table{width:100%;border-collapse:collapse;font-size:14px}
+      th{background:#1a1f2e;color:#fff;padding:9px 10px;font-weight:600;text-align:left;-webkit-print-color-adjust:exact;print-color-adjust:exact}
       .supplier-card{background:#f5f7fb;border-radius:6px;padding:12px 16px;margin-bottom:16px}
       .actions{position:sticky;top:0;background:#f0f0f0;padding:10px;text-align:center;margin-bottom:20px}
       .btn{background:#3b82f6;color:#fff;border:none;padding:8px 18px;border-radius:4px;font-size:13px;cursor:pointer;margin:0 4px;font-family:inherit}
       .btn.outline{background:transparent;border:1px solid #3b82f6;color:#3b82f6}
       .summary-card{background:#fff;border:1.5px solid #1a1f2e;border-radius:6px;overflow:hidden}
-      .summary-card .header{background:#1a1f2e;color:#fff;padding:6px 12px;font-size:10px;font-weight:500;letter-spacing:.5px;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+      .summary-card .header{background:#1a1f2e;color:#fff;padding:7px 12px;font-size:13px;font-weight:600;letter-spacing:.5px;-webkit-print-color-adjust:exact;print-color-adjust:exact}
       .summary-card .body{padding:10px 12px}
-      .net-box{background:#1a1f2e;color:#fff;padding:8px 10px;border-radius:4px;display:flex;justify-content:space-between;font-weight:600;font-size:13px;margin-top:8px;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+      .net-box{background:#1a1f2e;color:#fff;padding:10px 12px;border-radius:4px;display:flex;justify-content:space-between;font-weight:700;font-size:16px;margin-top:8px;-webkit-print-color-adjust:exact;print-color-adjust:exact}
     </style></head><body>
     
     <div class="actions no-print">
@@ -38732,65 +38732,65 @@ function _pvOpenPrintPreview(pv) {
     <div class="voucher" id="voucher">
       <div class="head">
         <div>
-          <div style="font-size:11px;color:#666;letter-spacing:1px;font-weight:500">${Number(pv.net_amount)<0?'PAYMENT VOUCHER · REFUND':'PAYMENT VOUCHER'}</div>
-          <div style="font-size:22px;font-weight:600;margin-top:2px">${Number(pv.net_amount)<0?'ใบสำคัญรับเงินคืน':'ใบสำคัญจ่าย'}</div>
-          <div style="font-size:11.5px;color:#444;margin-top:6px">บริษัท จงกลณีการไฟฟ้า จำกัด</div>
-          <div style="font-size:10px;color:#888;margin-top:1px">45,47,49 ถ.พิพิธภักดี ต.สะเตง อ.เมือง จ.ยะลา 95000</div>
+          <div style="font-size:13px;color:#333;letter-spacing:1px;font-weight:600">${Number(pv.net_amount)<0?'PAYMENT VOUCHER · REFUND':'PAYMENT VOUCHER'}</div>
+          <div style="font-size:26px;font-weight:700;margin-top:2px">${Number(pv.net_amount)<0?'ใบสำคัญรับเงินคืน':'ใบสำคัญจ่าย'}</div>
+          <div style="font-size:14px;color:#1a1f2e;margin-top:6px;font-weight:500">บริษัท จงกลณีการไฟฟ้า จำกัด</div>
+          <div style="font-size:13px;color:#333;margin-top:1px">45,47,49 ถ.พิพิธภักดี ต.สะเตง อ.เมือง จ.ยะลา 95000</div>
         </div>
         <div style="text-align:right">
           <div class="badge-vat ${pv.vat_type==='NOVAT'?'badge-novat':''}" style="background:${pv.vat_type==='NOVAT'?'#f59e0b':'#3b82f6'}">${pv.vat_type||'VAT'}</div>
           <div style="margin-top:10px">
-            <div style="font-size:9px;color:#888;letter-spacing:.5px">เลขที่ตัดชำระ</div>
-            <div style="font-family:monospace;font-size:13px;font-weight:600">${pv.pv_number||'(N/A)'}</div>
+            <div style="font-size:12px;color:#333;letter-spacing:.5px;font-weight:500">เลขที่ตัดชำระ</div>
+            <div style="font-family:monospace;font-size:16px;font-weight:700">${pv.pv_number||'(N/A)'}</div>
           </div>
           <div style="margin-top:8px">
-            <div style="font-size:9px;color:#888;letter-spacing:.5px">วันที่ออกใบ</div>
-            <div style="font-size:11.5px;font-weight:500">${fmtDate(pv.issue_date)||'-'}</div>
+            <div style="font-size:12px;color:#333;letter-spacing:.5px;font-weight:500">วันที่ออกใบ</div>
+            <div style="font-size:14px;font-weight:600">${fmtDate(pv.issue_date)||'-'}</div>
           </div>
         </div>
       </div>
       
       <div class="supplier-card">
-        <div style="font-size:9px;color:#3b82f6;letter-spacing:.5px;font-weight:600;margin-bottom:4px">ชำระให้ (SUPPLIER)</div>
-        <div style="font-size:14px;font-weight:600">${pv.supplier_name||'-'}</div>
-        <div style="display:flex;gap:18px;margin-top:6px;font-size:10.5px;color:#666">
-          <div><span style="color:#888">ธนาคาร supplier:</span> <span style="color:#1a1f2e;font-weight:500">${pv.supplier_bank||'-'}</span></div>
-          <div><span style="color:#888">เลขบัญชี supplier:</span> <span style="font-family:monospace;color:#1a1f2e;font-weight:500">${pv.supplier_account||'-'}</span></div>
+        <div style="font-size:12px;color:#3b82f6;letter-spacing:.5px;font-weight:700;margin-bottom:4px">ชำระให้ (SUPPLIER)</div>
+        <div style="font-size:17px;font-weight:700">${pv.supplier_name||'-'}</div>
+        <div style="display:flex;gap:18px;margin-top:6px;font-size:13px;color:#1a1f2e">
+          <div><span style="color:#333;font-weight:500">ธนาคาร supplier:</span> <span style="color:#1a1f2e;font-weight:600">${pv.supplier_bank||'-'}</span></div>
+          <div><span style="color:#333;font-weight:500">เลขบัญชี supplier:</span> <span style="font-family:monospace;color:#1a1f2e;font-weight:600">${pv.supplier_account||'-'}</span></div>
         </div>
       </div>
       
       <div style="margin-bottom:16px">
-        <div style="font-size:10px;color:#3b82f6;letter-spacing:.5px;font-weight:600;margin-bottom:6px">รายการบิลที่ชำระ</div>
+        <div style="font-size:13px;color:#3b82f6;letter-spacing:.5px;font-weight:700;margin-bottom:6px">รายการบิลที่ชำระ</div>
         <table>
           <thead><tr>
-            <th style="width:30px">#</th><th>เลขที่บิล</th><th style="text-align:center;width:80px">รอบบัญชี</th><th style="text-align:right;width:110px">ยอดเงิน</th>
+            <th style="width:30px">#</th><th>เลขที่บิล</th><th style="text-align:center;width:90px">รอบบัญชี</th><th style="text-align:right;width:120px">ยอดเงิน</th>
           </tr></thead>
-          <tbody>${billsRows||'<tr><td colspan="4" style="padding:20px;text-align:center;color:#888">— ไม่มีรายการบิล —</td></tr>'}</tbody>
+          <tbody>${billsRows||'<tr><td colspan="4" style="padding:20px;text-align:center;color:#666;font-size:14px">— ไม่มีรายการบิล —</td></tr>'}</tbody>
         </table>
       </div>
       
       <div style="display:grid;grid-template-columns:1fr 280px;gap:18px;margin-bottom:18px">
         <div>
-          <div style="font-size:10px;color:#3b82f6;letter-spacing:.5px;font-weight:600;margin-bottom:6px">วิธีการชำระ (จงกลณี โอนจาก)</div>
+          <div style="font-size:13px;color:#3b82f6;letter-spacing:.5px;font-weight:700;margin-bottom:6px">วิธีการชำระ (จงกลณี โอนจาก)</div>
           <div style="background:#f5f7fb;border-radius:6px;padding:12px 14px">
-            <div style="display:flex;gap:14px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
-              <div style="display:flex;gap:5px;align-items:center"><span style="display:inline-block;width:14px;height:14px;border:1.5px solid ${isPrintShown && pv.pay_method==='โอน'?'#1a1f2e':'#ccc'};border-radius:2px;${isPrintShown && pv.pay_method==='โอน'?'background:#1a1f2e;color:#fff;text-align:center;line-height:12px;font-size:10px':''}">${isPrintShown && pv.pay_method==='โอน'?'✓':''}</span> <span style="font-size:11.5px;${isPrintShown && pv.pay_method==='โอน'?'font-weight:500':'color:#888'}">โอน</span></div>
-              <div style="display:flex;gap:5px;align-items:center"><span style="display:inline-block;width:14px;height:14px;border:1.5px solid ${isPrintShown && pv.pay_method==='เงินสด'?'#1a1f2e':'#ccc'};border-radius:2px;${isPrintShown && pv.pay_method==='เงินสด'?'background:#1a1f2e;color:#fff;text-align:center;line-height:12px;font-size:10px':''}">${isPrintShown && pv.pay_method==='เงินสด'?'✓':''}</span> <span style="font-size:11.5px;${isPrintShown && pv.pay_method==='เงินสด'?'font-weight:500':'color:#888'}">เงินสด</span></div>
-              <div style="display:flex;gap:5px;align-items:center"><span style="display:inline-block;width:14px;height:14px;border:1.5px solid ${isPrintShown && pv.pay_method==='เช็ค'?'#1a1f2e':'#ccc'};border-radius:2px;${isPrintShown && pv.pay_method==='เช็ค'?'background:#1a1f2e;color:#fff;text-align:center;line-height:12px;font-size:10px':''}">${isPrintShown && pv.pay_method==='เช็ค'?'✓':''}</span> <span style="font-size:11.5px;${isPrintShown && pv.pay_method==='เช็ค'?'font-weight:500':'color:#888'}">เช็ค</span></div>
-              <div style="display:flex;gap:5px;align-items:center"><span style="display:inline-block;width:14px;height:14px;border:1.5px solid ${isPrintShown && pv.pay_method==='บัตรเครดิต'?'#1a1f2e':'#ccc'};border-radius:2px;${isPrintShown && pv.pay_method==='บัตรเครดิต'?'background:#1a1f2e;color:#fff;text-align:center;line-height:12px;font-size:10px':''}">${isPrintShown && pv.pay_method==='บัตรเครดิต'?'✓':''}</span> <span style="font-size:11.5px;${isPrintShown && pv.pay_method==='บัตรเครดิต'?'font-weight:500':'color:#888'}">บัตรเครดิต</span></div>
+            <div style="display:flex;gap:14px;align-items:center;margin-bottom:10px;flex-wrap:wrap">
+              <div style="display:flex;gap:6px;align-items:center"><span style="display:inline-block;width:16px;height:16px;border:2px solid ${isPrintShown && pv.pay_method==='โอน'?'#1a1f2e':'#1a1f2e'};border-radius:2px;${isPrintShown && pv.pay_method==='โอน'?'background:#1a1f2e;color:#fff;text-align:center;line-height:13px;font-size:12px':''}">${isPrintShown && pv.pay_method==='โอน'?'✓':''}</span> <span style="font-size:14px;color:#1a1f2e;${isPrintShown && pv.pay_method==='โอน'?'font-weight:600':'font-weight:500'}">โอน</span></div>
+              <div style="display:flex;gap:6px;align-items:center"><span style="display:inline-block;width:16px;height:16px;border:2px solid ${isPrintShown && pv.pay_method==='เงินสด'?'#1a1f2e':'#1a1f2e'};border-radius:2px;${isPrintShown && pv.pay_method==='เงินสด'?'background:#1a1f2e;color:#fff;text-align:center;line-height:13px;font-size:12px':''}">${isPrintShown && pv.pay_method==='เงินสด'?'✓':''}</span> <span style="font-size:14px;color:#1a1f2e;${isPrintShown && pv.pay_method==='เงินสด'?'font-weight:600':'font-weight:500'}">เงินสด</span></div>
+              <div style="display:flex;gap:6px;align-items:center"><span style="display:inline-block;width:16px;height:16px;border:2px solid ${isPrintShown && pv.pay_method==='เช็ค'?'#1a1f2e':'#1a1f2e'};border-radius:2px;${isPrintShown && pv.pay_method==='เช็ค'?'background:#1a1f2e;color:#fff;text-align:center;line-height:13px;font-size:12px':''}">${isPrintShown && pv.pay_method==='เช็ค'?'✓':''}</span> <span style="font-size:14px;color:#1a1f2e;${isPrintShown && pv.pay_method==='เช็ค'?'font-weight:600':'font-weight:500'}">เช็ค</span></div>
+              <div style="display:flex;gap:6px;align-items:center"><span style="display:inline-block;width:16px;height:16px;border:2px solid ${isPrintShown && pv.pay_method==='บัตรเครดิต'?'#1a1f2e':'#1a1f2e'};border-radius:2px;${isPrintShown && pv.pay_method==='บัตรเครดิต'?'background:#1a1f2e;color:#fff;text-align:center;line-height:13px;font-size:12px':''}">${isPrintShown && pv.pay_method==='บัตรเครดิต'?'✓':''}</span> <span style="font-size:14px;color:#1a1f2e;${isPrintShown && pv.pay_method==='บัตรเครดิต'?'font-weight:600':'font-weight:500'}">บัตรเครดิต</span></div>
             </div>
-            <div style="font-size:10.5px;color:#666;line-height:1.7">
-              <div>วันที่จ่าย: <span style="color:#1a1f2e;font-weight:500">${isPrintShown ? (fmtDate(pv.pay_date)||'—') : '—'}</span></div>
-              <div>ธนาคารผู้จ่าย: <span style="color:#1a1f2e;font-weight:500">${isPrintShown ? (pv.pay_from_bank||'—') : '—'}</span></div>
+            <div style="font-size:13.5px;color:#1a1f2e;line-height:1.8">
+              <div><span style="color:#333;font-weight:500">วันที่จ่าย:</span> <span style="color:#1a1f2e;font-weight:600">${isPrintShown ? (fmtDate(pv.pay_date)||'—') : '—'}</span></div>
+              <div><span style="color:#333;font-weight:500">ธนาคารผู้จ่าย:</span> <span style="color:#1a1f2e;font-weight:600">${isPrintShown ? (pv.pay_from_bank||'—') : '—'}</span></div>
               ${isPrintShown && pv.pay_method==='เช็ค' ? `
-                <div style="margin-top:4px;padding-top:4px;border-top:1px dashed #ddd">
-                  <div>เลขที่เช็ค: <span style="color:#1a1f2e;font-weight:500">${pv.cheque_no||'—'}</span></div>
-                  <div>ธนาคารเช็ค: <span style="color:#1a1f2e;font-weight:500">${pv.cheque_bank||'—'}</span></div>
-                  <div>วันที่ลงเช็ค: <span style="color:#1a1f2e;font-weight:500">${fmtDate(pv.cheque_date)||'—'}</span></div>
+                <div style="margin-top:5px;padding-top:5px;border-top:1px dashed #999">
+                  <div><span style="color:#333;font-weight:500">เลขที่เช็ค:</span> <span style="color:#1a1f2e;font-weight:600">${pv.cheque_no||'—'}</span></div>
+                  <div><span style="color:#333;font-weight:500">ธนาคารเช็ค:</span> <span style="color:#1a1f2e;font-weight:600">${pv.cheque_bank||'—'}</span></div>
+                  <div><span style="color:#333;font-weight:500">วันที่ลงเช็ค:</span> <span style="color:#1a1f2e;font-weight:600">${fmtDate(pv.cheque_date)||'—'}</span></div>
                 </div>` : ''}
               ${isPrintShown && pv.pay_method==='บัตรเครดิต' ? `
-                <div style="margin-top:4px;padding-top:4px;border-top:1px dashed #ddd">
-                  <div>เลขที่บัตรเครดิต: <span style="color:#1a1f2e;font-weight:500">${pv.card_no||'—'}</span></div>
+                <div style="margin-top:5px;padding-top:5px;border-top:1px dashed #999">
+                  <div><span style="color:#333;font-weight:500">เลขที่บัตรเครดิต:</span> <span style="color:#1a1f2e;font-weight:600">${pv.card_no||'—'}</span></div>
                 </div>` : ''}
             </div>
           </div>
@@ -38800,24 +38800,24 @@ function _pvOpenPrintPreview(pv) {
           <div class="summary-card">
             <div class="header">สรุปยอดเงิน</div>
             <div class="body">
-              <div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:5px">
-                <span style="color:#666">ยอดแจ้ง</span><span style="font-weight:500">${fmtNum(pv.amount_billed||0)}</span>
+              <div style="display:flex;justify-content:space-between;font-size:14px;margin-bottom:6px">
+                <span style="color:#1a1f2e;font-weight:500">ยอดแจ้ง</span><span style="font-weight:600">${fmtNum(pv.amount_billed||0)}</span>
               </div>
-              <div style="margin:6px 0;padding:6px 0;border-top:1px dashed #ccc">
-                <div style="font-size:9.5px;color:#888;letter-spacing:.5px;margin-bottom:3px">หัก:</div>
-                <div style="display:flex;justify-content:space-between;font-size:10.5px;color:#c64a4a;margin-bottom:2px">
+              <div style="margin:6px 0;padding:6px 0;border-top:1px dashed #999">
+                <div style="font-size:12px;color:#333;letter-spacing:.5px;margin-bottom:3px;font-weight:600">หัก:</div>
+                <div style="display:flex;justify-content:space-between;font-size:13px;color:#c64a4a;margin-bottom:2px;font-weight:500">
                   <span style="padding-left:8px">• ค่าขนส่ง</span><span>-${fmtNum(pv.deduct_shipping||0)}</span>
                 </div>
-                <div style="display:flex;justify-content:space-between;font-size:10.5px;color:#c64a4a;margin-bottom:2px">
+                <div style="display:flex;justify-content:space-between;font-size:13px;color:#c64a4a;margin-bottom:2px;font-weight:500">
                   <span style="padding-left:8px">• DC/PM</span><span>-${fmtNum(pv.deduct_dc_pm||0)}</span>
                 </div>
-                <div style="display:flex;justify-content:space-between;font-size:10.5px;color:#c64a4a;margin-bottom:2px">
+                <div style="display:flex;justify-content:space-between;font-size:13px;color:#c64a4a;margin-bottom:2px;font-weight:500">
                   <span style="padding-left:8px">• เคลม</span><span>-${fmtNum(pv.deduct_claim||0)}</span>
                 </div>
-                <div style="display:flex;justify-content:space-between;font-size:10.5px;color:#c64a4a">
+                <div style="display:flex;justify-content:space-between;font-size:13px;color:#c64a4a;font-weight:500">
                   <span style="padding-left:8px">• อื่นๆ</span><span>-${fmtNum(pv.deduct_other||0)}</span>
                 </div>
-                <div style="display:flex;justify-content:space-between;font-size:10.5px;color:#c64a4a;font-weight:600;margin-top:3px;padding-top:3px;border-top:1px dotted #e5b8b8">
+                <div style="display:flex;justify-content:space-between;font-size:13px;color:#c64a4a;font-weight:700;margin-top:3px;padding-top:3px;border-top:1px dotted #e5b8b8">
                   <span>รวมหัก</span><span>-${fmtNum(totalDeduct)}</span>
                 </div>
               </div>
@@ -38826,19 +38826,19 @@ function _pvOpenPrintPreview(pv) {
               </div>
             </div>
           </div>
-          <div style="font-size:10.5px;text-align:center;margin-top:6px;color:#666;font-style:italic">
+          <div style="font-size:13px;text-align:center;margin-top:6px;color:#1a1f2e;font-style:italic;font-weight:500">
             (${bahtText})
           </div>
         </div>
       </div>
       
-      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:24px;margin-top:40px;font-size:10.5px">
-        <div style="text-align:center"><div style="border-top:1px solid #1a1f2e;padding-top:4px;width:75%;margin:0 auto"><div style="font-weight:500">ผู้จัดทำ</div><div style="font-size:9px;color:#888;margin-top:2px">วันที่: ...../...../.....</div></div></div>
-        <div style="text-align:center"><div style="border-top:1px solid #1a1f2e;padding-top:4px;width:75%;margin:0 auto"><div style="font-weight:500">ผู้อนุมัติ</div><div style="font-size:9px;color:#888;margin-top:2px">วันที่: ...../...../.....</div></div></div>
-        <div style="text-align:center"><div style="border-top:1px solid #1a1f2e;padding-top:4px;width:75%;margin:0 auto"><div style="font-weight:500">ผู้รับเงิน</div><div style="font-size:9px;color:#888;margin-top:2px">วันที่: ...../...../.....</div></div></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:24px;margin-top:40px;font-size:13px">
+        <div style="text-align:center"><div style="border-top:1px solid #1a1f2e;padding-top:4px;width:75%;margin:0 auto"><div style="font-weight:600;color:#1a1f2e">ผู้จัดทำ</div><div style="font-size:11px;color:#333;margin-top:2px">วันที่: ...../...../.....</div></div></div>
+        <div style="text-align:center"><div style="border-top:1px solid #1a1f2e;padding-top:4px;width:75%;margin:0 auto"><div style="font-weight:600;color:#1a1f2e">ผู้อนุมัติ</div><div style="font-size:11px;color:#333;margin-top:2px">วันที่: ...../...../.....</div></div></div>
+        <div style="text-align:center"><div style="border-top:1px solid #1a1f2e;padding-top:4px;width:75%;margin:0 auto"><div style="font-weight:600;color:#1a1f2e">ผู้รับเงิน</div><div style="font-size:11px;color:#333;margin-top:2px">วันที่: ...../...../.....</div></div></div>
       </div>
       
-      <div style="text-align:center;margin-top:24px;padding-top:10px;border-top:1px dashed #ccc;font-size:8.5px;color:#aaa;letter-spacing:.5px">
+      <div style="text-align:center;margin-top:24px;padding-top:10px;border-top:1px dashed #999;font-size:10px;color:#666;letter-spacing:.5px">
         เอกสารนี้สร้างโดย Smart Finance · ${pv.pv_number||''} · เก็บเป็นหลักฐานทางการบัญชี
       </div>
     </div>
@@ -39245,7 +39245,7 @@ function _pvMakeReversal(orig) {
 // ── Initialize after all declarations are ready ──
 (async function() {
   // ⭐ R25.44 BOOT BEACON
-  console.log('%c[SF R25.45] Active build: 2026-05-18-3200 — PV print: force dark backgrounds (print-color-adjust:exact)', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.45] Active build: 2026-05-18-3300 — PV print: font +3 sizes + เข้มทุกที่ (label เทาจาง → เข้ม)', 'color:#0c8;font-weight:bold;font-size:13px');
   // ⭐ R25.45 rev6 — Sweep stale idempotency_key cache entries (TTL 1h) at boot
   try {
     const _IDK_TTL_MS = 60 * 60 * 1000;
