@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.45-2026-05-18-3300 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.45-2026-05-18-3400 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -37573,6 +37573,7 @@ function _pvRender(el) {
         <p class="text-xs text-dim" style="margin-top:4px">บันทึก/ปริ้น ใบสำคัญจ่ายแยก VAT/NOVAT · auto-sync Transfer Log</p>
       </div>
       <div class="flex gap-2">
+        <button class="btn btn-outline btn-sm" id="pv-btn-excel" title="Export Excel รายเดือน (Daily Summary)">📊 Export Excel</button>
         <button class="btn btn-outline btn-sm" id="pv-btn-migrate" title="Migrate จากไฟล์ Excel เก่า">📥 Migrate</button>
         <button class="btn btn-primary btn-sm" id="pv-btn-new">${ICONS.plus} สร้างใบใหม่</button>
       </div>
@@ -37633,6 +37634,7 @@ function _pvRender(el) {
   document.getElementById('pv-search')?.addEventListener('input', e => { st.search = e.target.value; _pvRender(el); });
   document.getElementById('pv-btn-new')?.addEventListener('click', () => _pvOpenModal(null, el));
   document.getElementById('pv-btn-migrate')?.addEventListener('click', () => _pvOpenMigrateModal(el));
+  document.getElementById('pv-btn-excel')?.addEventListener('click', () => _pvOpenExportModal(el));
   
   el.querySelectorAll('.pv-btn-edit').forEach(b => b.addEventListener('click', async () => {
     // ⭐ R25.45 rev7 — fetch fresh single PV (with bills) before opening edit modal
@@ -38032,8 +38034,18 @@ function _pvWireModal(draft, isEdit, rootEl) {
       const ql = q.toLowerCase();
       // ⭐ R25.30 — search ONLY by name (Toppy spec: ค้นชื่อบริษัท · เลิก code search)
       //   ป้องกัน false match จาก code field ที่อาจมีข้อมูลผิดประเภท (เช่น ธนาคาร)
+      // ⭐ R25.45 rev13 — filter by current vat tab (VAT/NOVAT)
+      //   Bug: supplier เดียวกันมีทั้ง VAT + NOVAT row (หรือ vat='BOTH') → กดแล้วได้ของ tab ผิด
+      //   Fix: ถ้า _pvState.vat = 'VAT' → แสดงเฉพาะ vat='VAT' หรือ vat='BOTH'
+      //        ถ้า _pvState.vat = 'NOVAT' → แสดงเฉพาะ vat='NOVAT' หรือ vat='BOTH'
+      //        ถ้า supplier ไม่มี vat field → fallback แสดงทั้ง 2 tab (ของเก่า)
+      const currentVat = String(_pvState.vat || draft.vat_type || 'VAT').toUpperCase();
       const matches = (supplierList || []).filter(s => {
-        return String(s.name||'').toLowerCase().includes(ql);
+        if (!String(s.name||'').toLowerCase().includes(ql)) return false;
+        const sv = String(s.vat || '').toUpperCase();
+        if (!sv) return true;                                  // no vat field → show in all tabs
+        if (sv === 'BOTH') return true;                        // BOTH → show in all tabs
+        return sv === currentVat;                              // strict match
       }).slice(0, 10);
       // ⭐ R25.45 rev11 — Always show "➕ เพิ่ม supplier ใหม่" row when typed name doesn't EXACTLY match
       //   เคส: Toppy พิมพ์ชื่อ supplier ใหม่ในหน้า PV → อยากเพิ่มเลยโดยไม่ต้องไป tab supplier ก่อน
@@ -38905,6 +38917,220 @@ function _numToThai(n) {
   return result;
 }
 
+// ⭐ R25.45 rev13 — Monthly Excel export (Daily Summary + Monthly Summary)
+//   Toppy: "ดึงข้อมูลสรุป daily รวมเป็น monthly excel export"
+//   2 sheets: 
+//     1. "Detail" — รายการ PV ทุกใบในเดือน (1 row = 1 PV) + line items แตกเป็น cols
+//     2. "Daily Summary" — pivot รายวัน รวมยอดต่อวัน × VAT/NOVAT × pay_method
+//     3. "Monthly Summary" — รวมยอดเดือนทั้งหมด แยก vat/category/pay_method
+function _pvOpenExportModal(rootEl) {
+  const now = new Date();
+  const defaultYear = now.getFullYear();
+  const defaultMonth = now.getMonth() + 1;
+  const MONTHS_TH = ['ม.ค.','ก.พ.','มี.ค.','เม.ย.','พ.ค.','มิ.ย.','ก.ค.','ส.ค.','ก.ย.','ต.ค.','พ.ย.','ธ.ค.'];
+  openModal('📊 Export Excel รายเดือน', `
+    <div class="flex-col gap-3">
+      <p style="font-size:.85rem;color:var(--text2);line-height:1.6">
+        เลือกเดือน → ระบบจะ export ใบสำคัญจ่ายในเดือนนั้นเป็น <code>.xlsx</code> (3 sheets: Detail + Daily Summary + Monthly Summary)
+      </p>
+      <div class="flex gap-3">
+        <div style="flex:1">
+          <label style="font-size:.78rem;color:var(--text2);margin-bottom:4px;display:block">ปี</label>
+          <select id="pv-ex-year" class="input">
+            ${[defaultYear-1, defaultYear, defaultYear+1].map(y => 
+              `<option value="${y}"${y===defaultYear?' selected':''}>${y} (${y+543})</option>`).join('')}
+          </select>
+        </div>
+        <div style="flex:1">
+          <label style="font-size:.78rem;color:var(--text2);margin-bottom:4px;display:block">เดือน</label>
+          <select id="pv-ex-month" class="input">
+            ${MONTHS_TH.map((m, i) => 
+              `<option value="${i+1}"${(i+1)===defaultMonth?' selected':''}>${m} (${i+1})</option>`).join('')}
+          </select>
+        </div>
+        <div style="flex:1">
+          <label style="font-size:.78rem;color:var(--text2);margin-bottom:4px;display:block">VAT</label>
+          <select id="pv-ex-vat" class="input">
+            <option value="ALL">ทั้งหมด (VAT + NOVAT)</option>
+            <option value="VAT">VAT เท่านั้น</option>
+            <option value="NOVAT">NOVAT เท่านั้น</option>
+          </select>
+        </div>
+      </div>
+      <div style="background:rgba(91,124,250,0.08);border-radius:6px;padding:10px 14px;font-size:.78rem;color:var(--text2);line-height:1.5">
+        <b>3 sheets ใน xlsx:</b><br>
+        📄 <b>Detail</b> — รายการ PV ทุกใบ (1 row/PV) พร้อม supplier, ยอด, วิธีจ่าย, status<br>
+        📅 <b>Daily Summary</b> — สรุปยอดรายวัน × pay_method (โอน/เช็ค/เงินสด/บัตร)<br>
+        📊 <b>Monthly Summary</b> — สรุปรวมเดือน × VAT/NOVAT × category × pay_method
+      </div>
+      <div class="flex gap-2 justify-end">
+        <button class="btn btn-ghost" onclick="closeModal()">ยกเลิก</button>
+        <button class="btn btn-primary" id="pv-ex-confirm">📥 Download Excel</button>
+      </div>
+    </div>
+  `, { width: '560px' });
+  document.getElementById('pv-ex-confirm').onclick = () => {
+    const y = Number(document.getElementById('pv-ex-year').value);
+    const m = Number(document.getElementById('pv-ex-month').value);
+    const v = document.getElementById('pv-ex-vat').value;
+    closeModal();
+    _pvExportMonthly(y, m, v);
+  };
+}
+
+function _pvExportMonthly(year, month, vatFilter) {
+  try {
+    // Filter PV list by month + vat
+    const ym = String(year) + '-' + String(month).padStart(2, '0');  // "2026-05"
+    const all = _pvState.list || [];
+    let rows = all.filter(pv => {
+      const d = String(pv.issue_date || '');
+      if (d.indexOf(ym) !== 0) return false;
+      if (vatFilter !== 'ALL' && String(pv.vat_type || '') !== vatFilter) return false;
+      return true;
+    });
+    if (rows.length === 0) {
+      toast(`❌ ไม่มี PV ในเดือน ${month}/${year} ${vatFilter==='ALL'?'':'('+vatFilter+')'}`, 'warn', 4000);
+      return;
+    }
+    // Sort by issue_date asc
+    rows = rows.slice().sort((a, b) => String(a.issue_date||'').localeCompare(String(b.issue_date||'')));
+    
+    const fmtTH = (iso) => {
+      if (!iso) return '';
+      const m = String(iso).match(/^(\d{4})-(\d{2})-(\d{2})/);
+      return m ? `${m[3]}/${m[2]}/${m[1]}` : String(iso);
+    };
+    
+    // ── Sheet 1: Detail (1 row = 1 PV) ──
+    const detailRows = rows.map(pv => {
+      const billsArr = Array.isArray(pv.bills) ? pv.bills : [];
+      const billsStr = billsArr.map(b => 
+        `${b.bill_no||'-'} (${b.bill_period||'-'}) ${Number(b.bill_amount||0).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}`
+      ).join(' | ');
+      return {
+        'เลขที่ PV': pv.pv_number || '',
+        'วันที่ออก': fmtTH(pv.issue_date),
+        'VAT': pv.vat_type || '',
+        'หมวด': pv.category || '',
+        'ชื่อ Supplier': pv.supplier_name || '',
+        'ธนาคาร Supplier': pv.supplier_bank || '',
+        'บัญชี Supplier': pv.supplier_account || '',
+        'ยอดแจ้ง': Number(pv.amount_billed) || 0,
+        'หัก ค่าขนส่ง': Number(pv.deduct_shipping) || 0,
+        'หัก DC/PM': Number(pv.deduct_dc_pm) || 0,
+        'หัก เคลม': Number(pv.deduct_claim) || 0,
+        'หัก อื่นๆ': Number(pv.deduct_other) || 0,
+        'ยอดสุทธิ': Number(pv.net_amount) || 0,
+        'วิธีจ่าย': pv.pay_method || '',
+        'วันที่จ่าย': fmtTH(pv.pay_date),
+        'ธนาคารผู้จ่าย': pv.pay_from_bank || '',
+        'เลขที่เช็ค': pv.cheque_no || '',
+        'ธนาคารเช็ค': pv.cheque_bank || '',
+        'วันที่ลงเช็ค': fmtTH(pv.cheque_date),
+        'เลขที่บัตรเครดิต': pv.card_no || '',
+        'สถานะ Match': pv.match_status || '',
+        'รายการบิล': billsStr,
+        'หมายเหตุ': pv.note || '',
+      };
+    });
+    
+    // ── Sheet 2: Daily Summary (pivot: วัน × pay_method) ──
+    const dayMap = {};   // 'dd/mm/yyyy' → { date_iso, total, transfer, cheque, cash, card, count }
+    rows.forEach(pv => {
+      const d = String(pv.issue_date || '').substring(0, 10);
+      if (!d) return;
+      if (!dayMap[d]) dayMap[d] = { 
+        date_iso: d, total: 0, count: 0,
+        transfer: 0, cheque: 0, cash: 0, card: 0,
+        vat_amt: 0, novat_amt: 0,
+      };
+      const amt = Number(pv.net_amount) || 0;
+      dayMap[d].total += amt;
+      dayMap[d].count += 1;
+      const pm = String(pv.pay_method || '');
+      if (pm === 'โอน') dayMap[d].transfer += amt;
+      else if (pm === 'เช็ค') dayMap[d].cheque += amt;
+      else if (pm === 'เงินสด') dayMap[d].cash += amt;
+      else if (pm === 'บัตรเครดิต') dayMap[d].card += amt;
+      if (String(pv.vat_type) === 'VAT') dayMap[d].vat_amt += amt;
+      else if (String(pv.vat_type) === 'NOVAT') dayMap[d].novat_amt += amt;
+    });
+    const dailySorted = Object.values(dayMap).sort((a, b) => a.date_iso.localeCompare(b.date_iso));
+    const dailyRows = dailySorted.map(d => ({
+      'วันที่': fmtTH(d.date_iso),
+      'จำนวนใบ': d.count,
+      'รวมสุทธิ': d.total,
+      'โอน': d.transfer,
+      'เช็ค': d.cheque,
+      'เงินสด': d.cash,
+      'บัตรเครดิต': d.card,
+      'VAT': d.vat_amt,
+      'NOVAT': d.novat_amt,
+    }));
+    // Add total row
+    const dailyTotal = {
+      'วันที่': '🟰 รวม',
+      'จำนวนใบ': dailySorted.reduce((s, d) => s + d.count, 0),
+      'รวมสุทธิ': dailySorted.reduce((s, d) => s + d.total, 0),
+      'โอน':      dailySorted.reduce((s, d) => s + d.transfer, 0),
+      'เช็ค':     dailySorted.reduce((s, d) => s + d.cheque, 0),
+      'เงินสด':   dailySorted.reduce((s, d) => s + d.cash, 0),
+      'บัตรเครดิต': dailySorted.reduce((s, d) => s + d.card, 0),
+      'VAT':      dailySorted.reduce((s, d) => s + d.vat_amt, 0),
+      'NOVAT':    dailySorted.reduce((s, d) => s + d.novat_amt, 0),
+    };
+    dailyRows.push(dailyTotal);
+    
+    // ── Sheet 3: Monthly Summary (group by category × pay_method) ──
+    const monAgg = {};  // `${vat}|${category}|${pay_method}` → { vat, category, pay_method, count, amount }
+    rows.forEach(pv => {
+      const key = (pv.vat_type||'?') + '|' + (pv.category||'-') + '|' + (pv.pay_method||'-');
+      if (!monAgg[key]) monAgg[key] = {
+        vat: pv.vat_type || '?',
+        category: pv.category || '-',
+        pay_method: pv.pay_method || '-',
+        count: 0,
+        amount: 0,
+      };
+      monAgg[key].count += 1;
+      monAgg[key].amount += Number(pv.net_amount) || 0;
+    });
+    const monRows = Object.values(monAgg).sort((a, b) => {
+      if (a.vat !== b.vat) return a.vat.localeCompare(b.vat);
+      if (a.category !== b.category) return a.category.localeCompare(b.category);
+      return a.pay_method.localeCompare(b.pay_method);
+    }).map(r => ({
+      'VAT': r.vat,
+      'หมวด': r.category,
+      'วิธีจ่าย': r.pay_method,
+      'จำนวนใบ': r.count,
+      'ยอดรวมสุทธิ': r.amount,
+    }));
+    const monGrandTotal = {
+      'VAT': '🟰 รวม',
+      'หมวด': '',
+      'วิธีจ่าย': '',
+      'จำนวนใบ': monRows.reduce((s, r) => s + r['จำนวนใบ'], 0),
+      'ยอดรวมสุทธิ': monRows.reduce((s, r) => s + r['ยอดรวมสุทธิ'], 0),
+    };
+    monRows.push(monGrandTotal);
+    
+    // Build workbook
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(detailRows), 'Detail');
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(dailyRows), 'Daily Summary');
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(monRows), 'Monthly Summary');
+    
+    const filename = `PV_${year}-${String(month).padStart(2,'0')}${vatFilter==='ALL'?'':'_'+vatFilter}.xlsx`;
+    XLSX.writeFile(wb, filename);
+    toast(`✅ Export ${rows.length} ใบ → ${filename}`, 'success', 4000);
+  } catch (e) {
+    console.error('[PV Export] error:', e);
+    toast('❌ Export ล้มเหลว: ' + e.message, 'error', 5000);
+  }
+}
+
 // ── Migration modal ──
 function _pvOpenMigrateModal(rootEl) {
   openModal('📥 Migrate จาก Excel เก่า', `
@@ -39245,7 +39471,7 @@ function _pvMakeReversal(orig) {
 // ── Initialize after all declarations are ready ──
 (async function() {
   // ⭐ R25.44 BOOT BEACON
-  console.log('%c[SF R25.45] Active build: 2026-05-18-3300 — PV print: font +3 sizes + เข้มทุกที่ (label เทาจาง → เข้ม)', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.45] Active build: 2026-05-18-3400 — PV: supplier suggest กรอง VAT/NOVAT + Excel export รายเดือน (3 sheets)', 'color:#0c8;font-weight:bold;font-size:13px');
   // ⭐ R25.45 rev6 — Sweep stale idempotency_key cache entries (TTL 1h) at boot
   try {
     const _IDK_TTL_MS = 60 * 60 * 1000;
