@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.45-2026-05-18-3400 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.45-2026-05-18-3500 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -6794,6 +6794,183 @@ async function renderMainStmtsTab(el) {
   el.innerHTML = '<div style="padding:24px;text-align:center;color:var(--text2)">⚠️ Matching component not loaded</div>';
 }
 
+// ⭐ R25.45 rev14 — Main daily + Cashflow → Monthly Excel export
+//   Toppy: "ดึงข้อมูลสรุป daily รวมเป็น monthly excel export"
+//   3 sheets:
+//     1. Daily Summary  — รายวัน × station × row (cashIn/cashOut/returns) จาก mainSummary.__byDate
+//     2. Cashflow       — รายการ cashflowList ในเดือน (deposit/supplier/transfer/misc)
+//     3. Monthly Pivot  — รวมยอดรายเดือน × type/bank/vat
+function _openMainExportModal(selectedDateRef) {
+  const now = new Date();
+  const ref = selectedDateRef ? new Date(selectedDateRef) : now;
+  const defaultYear = ref.getFullYear();
+  const defaultMonth = ref.getMonth() + 1;
+  const MONTHS_TH = ['ม.ค.','ก.พ.','มี.ค.','เม.ย.','พ.ค.','มิ.ย.','ก.ค.','ส.ค.','ก.ย.','ต.ค.','พ.ย.','ธ.ค.'];
+  openModal('📊 Export รายเดือน — Main daily + Cashflow', `
+    <div class="flex-col gap-3">
+      <p style="font-size:.85rem;color:var(--text2);line-height:1.6">
+        เลือกเดือน → export เป็น <code>.xlsx</code> รวม 3 sheets:<br>
+        <b>1. Daily Summary</b> — ยอด นำเงินเข้า/ออก/คืน รายวัน × station × ปลายเดือนสรุป<br>
+        <b>2. Cashflow</b> — รายการ Cashflow (deposit / supplier / transfer / misc) ในเดือน<br>
+        <b>3. Monthly Pivot</b> — สรุปรวมเดือน × type × bank × vat
+      </p>
+      <div class="flex gap-3">
+        <div style="flex:1">
+          <label style="font-size:.78rem;color:var(--text2);margin-bottom:4px;display:block">ปี</label>
+          <select id="mn-ex-year" class="input">
+            ${[defaultYear-1, defaultYear, defaultYear+1].map(y => 
+              `<option value="${y}"${y===defaultYear?' selected':''}>${y} (${y+543})</option>`).join('')}
+          </select>
+        </div>
+        <div style="flex:1">
+          <label style="font-size:.78rem;color:var(--text2);margin-bottom:4px;display:block">เดือน</label>
+          <select id="mn-ex-month" class="input">
+            ${MONTHS_TH.map((m, i) => 
+              `<option value="${i+1}"${(i+1)===defaultMonth?' selected':''}>${m} (${i+1})</option>`).join('')}
+          </select>
+        </div>
+      </div>
+      <div class="flex gap-2 justify-end">
+        <button class="btn btn-ghost" onclick="closeModal()">ยกเลิก</button>
+        <button class="btn btn-primary" id="mn-ex-confirm">📥 Download Excel</button>
+      </div>
+    </div>
+  `, { width: '560px' });
+  document.getElementById('mn-ex-confirm').onclick = () => {
+    const y = Number(document.getElementById('mn-ex-year').value);
+    const m = Number(document.getElementById('mn-ex-month').value);
+    closeModal();
+    _exportMainMonthly(y, m);
+  };
+}
+
+function _exportMainMonthly(year, month) {
+  try {
+    const ymPrefix = String(year) + '-' + String(month).padStart(2, '0');  // "2026-05"
+    const fmtTH = (iso) => {
+      if (!iso) return '';
+      const m = String(iso).match(/^(\d{4})-(\d{2})-(\d{2})/);
+      return m ? `${m[3]}/${m[2]}/${m[1]}` : String(iso);
+    };
+    const monthLastDay = new Date(year, month, 0).getDate();
+    
+    // ── Sheet 1: Daily Summary (one row per date in month) ──
+    //   Columns: วันที่ + [cashIn × stations] + [cashOut × stations] + [returns × stations] + รวม
+    const STATIONS = ['Front1','Front2','Front3','Front4','Invoice','Order','Payment','Invoice Credit','Order Credit'];
+    const ROW_KEYS = [
+      { key: 'cashIn',  label: 'นำเงินเข้า' },
+      { key: 'cashOut', label: 'นำเงินออก' },
+      { key: 'returns', label: 'ยอดคืนสินค้า' },
+    ];
+    const byDate = (typeof mainSummary !== 'undefined' && mainSummary && mainSummary.__byDate) ? mainSummary.__byDate : {};
+    
+    const dailyRows = [];
+    let monthTotals = {};   // key 'cashIn_Front1' → sum
+    for (let d = 1; d <= monthLastDay; d++) {
+      const iso = `${year}-${String(month).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+      const day = byDate[iso] || {};
+      // dayLabels: { 'cashIn': { 'Front1': 100, ... }, ... } — but actual structure may be flat
+      //   mainSummary key format = "row_station" (e.g. cashIn_Front1)
+      //   __byDate[iso] = same flat structure for that date
+      const row = { 'วันที่': fmtTH(iso) };
+      let dayTotal = 0;
+      ROW_KEYS.forEach(({ key, label }) => {
+        STATIONS.forEach(st => {
+          const cellKey = `${key}_${st}`;
+          // Check both nested + flat structure
+          let val = 0;
+          if (day[key] && typeof day[key] === 'object') {
+            val = Number(day[key][st] || 0);
+          } else {
+            val = Number(day[cellKey] || 0);
+          }
+          row[`${label} · ${st}`] = val || '';
+          dayTotal += val;
+          monthTotals[cellKey] = (monthTotals[cellKey] || 0) + val;
+        });
+      });
+      row['รวมวันนี้'] = dayTotal || '';
+      // Skip empty days from the export to save space — but keep Sundays etc visible? include all
+      dailyRows.push(row);
+    }
+    // Add month total row
+    const monthTotalRow = { 'วันที่': '🟰 รวมเดือน' };
+    let grandTotal = 0;
+    ROW_KEYS.forEach(({ key, label }) => {
+      STATIONS.forEach(st => {
+        const v = monthTotals[`${key}_${st}`] || 0;
+        monthTotalRow[`${label} · ${st}`] = v || '';
+        grandTotal += v;
+      });
+    });
+    monthTotalRow['รวมวันนี้'] = grandTotal || '';
+    dailyRows.push(monthTotalRow);
+    
+    // ── Sheet 2: Cashflow details (records in month) ──
+    const cfList = (typeof cashflowList !== 'undefined' && Array.isArray(cashflowList)) ? cashflowList : [];
+    const cfInMonth = cfList.filter(c => String(c.date || '').indexOf(ymPrefix) === 0)
+      .sort((a, b) => String(a.date||'').localeCompare(String(b.date||'')));
+    const cfRows = cfInMonth.map(c => ({
+      'วันที่': fmtTH(c.date),
+      'ประเภท': c.type || '',
+      'VAT': c.vat || '',
+      'ธนาคาร': c.bank || '',
+      'คู่ค้า/ผู้รับ': c.counterparty || '',
+      'ยอด': Number(c.amount) || 0,
+      'หมายเหตุ': c.note || '',
+      'match': c.match_status || '',
+      'ID': c.id || '',
+    }));
+    // Cashflow grand totals by type
+    const cfTotalsByType = { deposit:0, supplier:0, transfer:0, misc:0, other:0 };
+    cfInMonth.forEach(c => {
+      const t = c.type || 'other';
+      cfTotalsByType[t] = (cfTotalsByType[t] || 0) + (Number(c.amount) || 0);
+    });
+    // Append total rows
+    cfRows.push({});  // blank separator
+    cfRows.push({ 'วันที่': '🟰 รวม Deposit',   'ยอด': cfTotalsByType.deposit });
+    cfRows.push({ 'วันที่': '🟰 รวม Supplier',  'ยอด': cfTotalsByType.supplier });
+    cfRows.push({ 'วันที่': '🟰 รวม Transfer',  'ยอด': cfTotalsByType.transfer });
+    cfRows.push({ 'วันที่': '🟰 รวม Misc',      'ยอด': cfTotalsByType.misc });
+    
+    // ── Sheet 3: Monthly Pivot (cashflow × bank × vat) ──
+    const pivotAgg = {};   // key = `${type}|${bank}|${vat}` → { type, bank, vat, count, amount }
+    cfInMonth.forEach(c => {
+      const k = (c.type||'-') + '|' + (c.bank||'-') + '|' + (c.vat||'-');
+      if (!pivotAgg[k]) pivotAgg[k] = { type: c.type||'-', bank: c.bank||'-', vat: c.vat||'-', count: 0, amount: 0 };
+      pivotAgg[k].count++;
+      pivotAgg[k].amount += Number(c.amount) || 0;
+    });
+    const pivotRows = Object.values(pivotAgg).sort((a, b) => {
+      if (a.type !== b.type) return a.type.localeCompare(b.type);
+      if (a.bank !== b.bank) return a.bank.localeCompare(b.bank);
+      return a.vat.localeCompare(b.vat);
+    }).map(r => ({
+      'ประเภท': r.type, 'ธนาคาร': r.bank, 'VAT': r.vat,
+      'จำนวนรายการ': r.count, 'ยอดรวม': r.amount,
+    }));
+    pivotRows.push({
+      'ประเภท': '🟰 รวมเดือน', 'ธนาคาร': '', 'VAT': '',
+      'จำนวนรายการ': cfInMonth.length,
+      'ยอดรวม': cfInMonth.reduce((s, c) => s + (Number(c.amount) || 0), 0),
+    });
+    
+    // Build workbook
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(dailyRows), 'Daily Summary');
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(cfRows.length ? cfRows : [{ 'วันที่': '— ไม่มี cashflow ในเดือนนี้ —' }]), 'Cashflow');
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(pivotRows.length ? pivotRows : [{ 'ประเภท': '— ไม่มีข้อมูล —' }]), 'Monthly Pivot');
+    
+    const filename = `MainDaily_${year}-${String(month).padStart(2,'0')}.xlsx`;
+    XLSX.writeFile(wb, filename);
+    toast(`✅ Export เดือน ${month}/${year} → ${filename} (Daily ${monthLastDay} วัน, Cashflow ${cfInMonth.length} รายการ)`, 'success', 5000);
+  } catch (e) {
+    console.error('[Main Export] error:', e);
+    toast('❌ Export ล้มเหลว: ' + e.message, 'error', 5000);
+  }
+}
+
 async function renderMain(el) {
   // ⭐ Consume filter hint จาก dashboard card click (ถ้ามี)
   const hint = window.__mainFilterHint;
@@ -7322,6 +7499,7 @@ async function renderMain(el) {
           <button class="btn btn-sm" id="btn-unmatch-day" style="background:var(--warn);color:#1a1d27;border:none;font-weight:700" title="Unmatch บิลทั้งหมดในวันนี้ — ปลด link statement ทุกตัวที่ match กับวันนี้">↩ Unmatch วันนี้</button>
           <button class="btn btn-outline btn-sm" id="btn-check-issues">🔍 ตรวจสอบ</button>
           <button class="btn btn-outline btn-sm" id="btn-refresh-cloud" title="ดึงข้อมูลล่าสุดจาก Sheet (ทับ local)">🔄 Refresh</button>
+          <button class="btn btn-outline btn-sm" id="btn-export-monthly" title="Export Excel รายเดือน — Daily Summary + Cashflow + Monthly Pivot">📊 Export Excel</button>
           <button class="btn btn-success btn-sm" id="btn-save-main" style="position:relative">${ICONS.check} บันทึก<span id="dirty-count-badge" style="display:none;background:var(--warn);color:#1a1d27;font-size:.7rem;font-weight:700;padding:1px 6px;border-radius:9px;margin-left:6px"></span></button>
         </div>
       </div>
@@ -8863,6 +9041,10 @@ async function renderMain(el) {
     if (!window._dirtyBadgeInterval) {
       window._dirtyBadgeInterval = setInterval(updateDirtyDot, 1000);
     }
+    
+    document.getElementById('btn-export-monthly')?.addEventListener('click', () => {
+      _openMainExportModal(selectedDate);
+    });
     
     document.getElementById('btn-save-main')?.addEventListener('click', async () => {
       // ── Pre-save validation ──
@@ -39471,7 +39653,7 @@ function _pvMakeReversal(orig) {
 // ── Initialize after all declarations are ready ──
 (async function() {
   // ⭐ R25.44 BOOT BEACON
-  console.log('%c[SF R25.45] Active build: 2026-05-18-3400 — PV: supplier suggest กรอง VAT/NOVAT + Excel export รายเดือน (3 sheets)', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.45] Active build: 2026-05-18-3500 — Main daily: Excel export รายเดือน (Daily Summary + Cashflow + Monthly Pivot)', 'color:#0c8;font-weight:bold;font-size:13px');
   // ⭐ R25.45 rev6 — Sweep stale idempotency_key cache entries (TTL 1h) at boot
   try {
     const _IDK_TTL_MS = 60 * 60 * 1000;
