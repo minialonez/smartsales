@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.45-2026-05-18-3500 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.45-2026-05-18-3600 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -38052,7 +38052,7 @@ function _pvModalHtml(d, isEdit) {
     
     <div class="input-group" style="margin-bottom:10px;position:relative">
       <label>ชื่อบริษัท / Supplier <span style="color:var(--danger)">*</span> <span style="color:var(--text2);font-size:.78rem;font-weight:400">(พิมพ์ค้นหา — เลือกแล้วเติมธนาคาร+เลขบัญชีอัตโนมัติ)</span></label>
-      <input id="pv-m-supplier_name" class="input" value="${(d.supplier_name||'').replace(/"/g,'&quot;')}" placeholder="พิมพ์ชื่อบริษัท..." autocomplete="off">
+      <input id="pv-m-supplier_name" class="input" value="${(d.supplier_name||'').replace(/"/g,'&quot;')}" placeholder="พิมพ์ชื่อบริษัทหรือ code..." autocomplete="off">
       <div id="pv-m-supplier-suggest" style="position:absolute;top:100%;left:0;right:0;background:var(--bg);border:1px solid var(--border);border-top:none;max-height:280px;overflow-y:auto;z-index:1000;display:none;box-shadow:0 8px 24px rgba(0,0,0,.5);border-radius:0 0 6px 6px"></div>
     </div>
     
@@ -38214,16 +38214,15 @@ function _pvWireModal(draft, isEdit, rootEl) {
     const _renderSuggest = (q) => {
       if (!q || q.length < 1) { supSuggest.style.display = 'none'; supSuggest.innerHTML = ''; return; }
       const ql = q.toLowerCase();
-      // ⭐ R25.30 — search ONLY by name (Toppy spec: ค้นชื่อบริษัท · เลิก code search)
-      //   ป้องกัน false match จาก code field ที่อาจมีข้อมูลผิดประเภท (เช่น ธนาคาร)
-      // ⭐ R25.45 rev13 — filter by current vat tab (VAT/NOVAT)
-      //   Bug: supplier เดียวกันมีทั้ง VAT + NOVAT row (หรือ vat='BOTH') → กดแล้วได้ของ tab ผิด
-      //   Fix: ถ้า _pvState.vat = 'VAT' → แสดงเฉพาะ vat='VAT' หรือ vat='BOTH'
-      //        ถ้า _pvState.vat = 'NOVAT' → แสดงเฉพาะ vat='NOVAT' หรือ vat='BOTH'
-      //        ถ้า supplier ไม่มี vat field → fallback แสดงทั้ง 2 tab (ของเก่า)
+      // ⭐ R25.45 rev15 — Search name OR code (ตามที่ Toppy ขอ — ค้นชื่อยาก ใช้ code ได้ด้วย)
+      //   เดิม R25.30: เฉพาะชื่อ (กัน false match จาก code field มีข้อมูลผิดประเภท)
+      //   ใหม่: หลัง paste suppliers_paste_ready.xlsx แล้ว code field สะอาด → กลับมาใช้ code ค้นได้
+      //   filter ตาม vat tab ยังคงเดิม (rev13)
       const currentVat = String(_pvState.vat || draft.vat_type || 'VAT').toUpperCase();
       const matches = (supplierList || []).filter(s => {
-        if (!String(s.name||'').toLowerCase().includes(ql)) return false;
+        const nm = String(s.name||'').toLowerCase();
+        const cd = String(s.code||'').toLowerCase();
+        if (!nm.includes(ql) && !cd.includes(ql)) return false;
         const sv = String(s.vat || '').toUpperCase();
         if (!sv) return true;                                  // no vat field → show in all tabs
         if (sv === 'BOTH') return true;                        // BOTH → show in all tabs
@@ -38237,7 +38236,10 @@ function _pvWireModal(draft, isEdit, rootEl) {
         html.push(`
           <div class="pv-sup-opt" data-idx="${i}" 
                style="padding:10px 12px;cursor:pointer;border-bottom:1px solid var(--border);background:var(--bg)">
-            <div style="font-weight:600;font-size:.92rem;color:var(--text)">${escapeHtml(s.name||'-')}</div>
+            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+              ${s.code?`<span style="font-family:monospace;font-size:.72rem;padding:2px 7px;background:rgba(91,124,250,.14);color:#3b82f6;border-radius:3px;font-weight:600">${escapeHtml(s.code)}</span>`:''}
+              <span style="font-weight:600;font-size:.92rem;color:var(--text)">${escapeHtml(s.name||'-')}</span>
+            </div>
             <div style="font-size:.78rem;color:var(--text2);margin-top:3px;display:flex;gap:10px;flex-wrap:wrap">
               <span>🏦 <strong>${escapeHtml(s.bank||'—')}</strong></span>
               <span style="font-family:monospace">${escapeHtml(s.account_no||'—')}</span>
@@ -39653,7 +39655,7 @@ function _pvMakeReversal(orig) {
 // ── Initialize after all declarations are ready ──
 (async function() {
   // ⭐ R25.44 BOOT BEACON
-  console.log('%c[SF R25.45] Active build: 2026-05-18-3500 — Main daily: Excel export รายเดือน (Daily Summary + Cashflow + Monthly Pivot)', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.45] Active build: 2026-05-18-3600 — PV supplier suggest: ค้นจาก code ได้ + แสดง code chip', 'color:#0c8;font-weight:bold;font-size:13px');
   // ⭐ R25.45 rev6 — Sweep stale idempotency_key cache entries (TTL 1h) at boot
   try {
     const _IDK_TTL_MS = 60 * 60 * 1000;
