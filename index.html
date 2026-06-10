@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.45-2026-05-18-3800 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.45-2026-05-18-3900 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -38593,7 +38593,7 @@ function _pvOpenMatchModal(pv, rootEl) {
         </div>
       </div>
       <div style="font-size:.78rem;color:var(--text2);margin:6px 0">
-        แสดง stmt ของ <strong>${preferredBank || 'ทุก bank'}</strong> · ${pvNet>0?'เงินออก':'เงินเข้า'} · เดือน ${pvIssueMonth || '?'} (±1 เดือน) · ยอด ±10% · เรียงตามวันใกล้สุด
+        แสดง stmt ของ <strong>${preferredBanks ? preferredBanks.join(' / ') : 'ทุก bank'}</strong> · ${pvNet>0?'เงินออก':'เงินเข้า'} · เดือน ${pvIssueMonth || '?'} (±1 เดือน) · ยอด ±10% · เรียงตามวันใกล้สุด
       </div>
       ${listHtml}
       
@@ -39677,7 +39677,7 @@ function _pvMakeReversal(orig) {
 // ── Initialize after all declarations are ready ──
 (async function() {
   // ⭐ R25.44 BOOT BEACON
-  console.log('%c[SF R25.45] Active build: 2026-05-18-3800 — PV match: VAT=KTB+KBANK+BBL, NOVAT=BBL NW (ขยาย bank scope)', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.45] Active build: 2026-05-18-3900 — Hotfix: preferredBank → preferredBanks (rev3800 ตกหล่น 1 จุด ทำให้ match modal crash)', 'color:#0c8;font-weight:bold;font-size:13px');
   // ⭐ R25.45 rev6 — Sweep stale idempotency_key cache entries (TTL 1h) at boot
   try {
     const _IDK_TTL_MS = 60 * 60 * 1000;
