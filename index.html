@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.45-2026-05-18-3600 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.45-2026-05-18-3800 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -37813,7 +37813,28 @@ function _pvRender(el) {
   document.getElementById('pv-sub-pending')?.addEventListener('click', () => { st.sub = 'pending'; _pvRender(el); });
   document.getElementById('pv-sub-paid')?.addEventListener('click', () => { st.sub = 'paid'; _pvRender(el); });
   document.getElementById('pv-sub-all')?.addEventListener('click', () => { st.sub = 'all'; _pvRender(el); });
-  document.getElementById('pv-search')?.addEventListener('input', e => { st.search = e.target.value; _pvRender(el); });
+  // ⭐ R25.45 rev16 — debounce search + preserve focus/cursor across re-render
+  //   Bug: ทุก keystroke → _pvRender() rebuild DOM → input ถูกแทนที่ → focus หาย → user ต้องคลิกใหม่
+  //   Fix: debounce 220ms + after render → re-focus + restore cursor position + caret end
+  document.getElementById('pv-search')?.addEventListener('input', e => {
+    st.search = e.target.value;
+    const caretPos = e.target.selectionStart;
+    clearTimeout(window.__pvSearchDebounce);
+    window.__pvSearchDebounce = setTimeout(() => {
+      _pvRender(el);
+      // After re-render: focus new input + restore caret
+      requestAnimationFrame(() => {
+        const newInput = document.getElementById('pv-search');
+        if (newInput) {
+          newInput.focus();
+          try {
+            const pos = Math.min(caretPos != null ? caretPos : newInput.value.length, newInput.value.length);
+            newInput.setSelectionRange(pos, pos);
+          } catch(_) {}
+        }
+      });
+    }, 220);
+  });
   document.getElementById('pv-btn-new')?.addEventListener('click', () => _pvOpenModal(null, el));
   document.getElementById('pv-btn-migrate')?.addEventListener('click', () => _pvOpenMigrateModal(el));
   document.getElementById('pv-btn-excel')?.addEventListener('click', () => _pvOpenExportModal(el));
@@ -38486,13 +38507,14 @@ function _pvOpenMatchModal(pv, rootEl) {
   const pvNet = Number(pv.net_amount) || 0;
   const allStmts = typeof getAllStatements === 'function' ? getAllStatements() : [];
   
-  // ⭐ R25.30 — Bank scope by VAT type (Toppy spec):
-  //   VAT   PVs → KBANK only (K PLUS SME JKN account)
+  // ⭐ R25.45 rev17 (Toppy) — Bank scope by VAT type:
+  //   VAT   PVs → KTB / KBANK / BBL (3 banks ที่จ่ายฝั่ง VAT)
   //   NOVAT PVs → BBL NW only (account 266-4-414113)
   //   Other vat_type (or undefined) → fallback ทุก bank
-  const preferredBank = pv.vat_type === 'VAT' ? 'KBANK'
-                      : pv.vat_type === 'NOVAT' ? 'BBL NW'
-                      : null;
+  //   เก่า R25.30: VAT=KBANK only → match BBL/KTB ไม่ได้
+  const preferredBanks = pv.vat_type === 'VAT' ? ['KTB', 'KBANK', 'BBL']
+                       : pv.vat_type === 'NOVAT' ? ['BBL NW']
+                       : null;
   
   // ⭐ Month-of-issue scope: stmt date should be in same month or ±1 month of pv.issue_date
   //   Reason: usually transfer happens within the issue month (Toppy spec)
@@ -38508,7 +38530,7 @@ function _pvOpenMatchModal(pv, rootEl) {
     if (pvNet > 0 && amt > 0) return false;
     if (pvNet < 0 && amt < 0) return false;
     // Bank scope by VAT type
-    if (preferredBank && String(s.bank||'') !== preferredBank) return false;
+    if (preferredBanks && preferredBanks.indexOf(String(s.bank||'')) === -1) return false;
     // Month scope (±1 month tolerance)
     if (pvIssueMonth) {
       const stmtMonth = String(toISODate(s.date)||'').substring(0, 7);
@@ -38532,7 +38554,7 @@ function _pvOpenMatchModal(pv, rootEl) {
     ? `<div style="padding:24px;text-align:center;color:var(--text2)">
          <div style="font-size:32px;margin-bottom:8px">🔍</div>
          <div>ไม่พบ statement ที่ match</div>
-         <div style="font-size:.78rem;margin-top:4px">ยอดคาดหวัง: ${pvNet > 0 ? '−' : '+'}${fmtNum(Math.abs(pvNet))} ใน ${preferredBank || 'stmts ใดๆ'} · เดือน ${pvIssueMonth || '?'} (±1)</div>
+         <div style="font-size:.78rem;margin-top:4px">ยอดคาดหวัง: ${pvNet > 0 ? '−' : '+'}${fmtNum(Math.abs(pvNet))} ใน ${preferredBanks ? preferredBanks.join(' / ') : 'stmts ใดๆ'} · เดือน ${pvIssueMonth || '?'} (±1)</div>
          <div style="font-size:.7rem;margin-top:6px;color:var(--text2)">ถ้าควรเห็นแต่ไม่เจอ ตรวจ: stmt อยู่ bank ถูกหรือยัง · ยอดใกล้เคียงไหม · สัญลักษณ์ตรงข้ามหรือยัง</div>
        </div>`
     : `<div id="pvmm-stmt-list" style="max-height:320px;overflow-y:auto;border:1px solid var(--border);border-radius:8px">
@@ -39655,7 +39677,7 @@ function _pvMakeReversal(orig) {
 // ── Initialize after all declarations are ready ──
 (async function() {
   // ⭐ R25.44 BOOT BEACON
-  console.log('%c[SF R25.45] Active build: 2026-05-18-3600 — PV supplier suggest: ค้นจาก code ได้ + แสดง code chip', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.45] Active build: 2026-05-18-3800 — PV match: VAT=KTB+KBANK+BBL, NOVAT=BBL NW (ขยาย bank scope)', 'color:#0c8;font-weight:bold;font-size:13px');
   // ⭐ R25.45 rev6 — Sweep stale idempotency_key cache entries (TTL 1h) at boot
   try {
     const _IDK_TTL_MS = 60 * 60 * 1000;
