@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.45-2026-05-18-4300 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.45-2026-05-18-4500 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -8934,6 +8934,23 @@ async function renderMain(el) {
       });
       const changeGrand = changeRows.reduce((s, r) => s + r.total, 0);
       
+      // ── Bills for selected date (computed early — formulas reference this range) ──
+      const dayBills = (typeof getBillsForSelectedDate === 'function')
+        ? getBillsForSelectedDate()
+        : billList.filter(b => toISODate(b.date) === dateISO);
+      const BILL_DATA_START = 15;                          // first bill data row
+      const BILL_DATA_END = BILL_DATA_START + Math.max(dayBills.length, 1) - 1;
+      const dateStr = fmtTH(dateISO);                      // B2 value (matches bill 'Bill Date' col B)
+      // SUMIFS ranges (absolute) over bill list:
+      //   E = Baht (col 5), B = Bill Date (col 2), C = Station (col 3), D = Type (col 4), F = Confirmation (col 6)
+      const RNG = {
+        baht: `$E$${BILL_DATA_START}:$E$${BILL_DATA_END}`,
+        bdate: `$B$${BILL_DATA_START}:$B$${BILL_DATA_END}`,
+        stn:  `$C$${BILL_DATA_START}:$C$${BILL_DATA_END}`,
+        typ:  `$D$${BILL_DATA_START}:$D$${BILL_DATA_END}`,
+        conf: `$F$${BILL_DATA_START}:$F$${BILL_DATA_END}`,
+      };
+      
       // ════ Build with ExcelJS (styled) ════
       if (typeof ExcelJS === 'undefined') {
         toast('❌ ExcelJS ยังโหลดไม่เสร็จ — ลองใหม่อีกครั้ง', 'error', 4000);
@@ -8953,7 +8970,14 @@ async function renderMain(el) {
       
       const setCell = (r, c, val, opts = {}) => {
         const cell = ws.getCell(r, c);
-        cell.value = (val === '' || val === undefined || val === null) ? null : val;
+        // Formula support: pass {formula:'SUM(...)', result: <cached>} OR opts.formula
+        if (opts.formula) {
+          cell.value = { formula: opts.formula, result: (val === '' ? null : val) };
+        } else if (val && typeof val === 'object' && val.formula) {
+          cell.value = val;
+        } else {
+          cell.value = (val === '' || val === undefined || val === null) ? null : val;
+        }
         cell.border = allBorder;
         if (opts.fill) cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: opts.fill } };
         if (opts.font) cell.font = opts.font;
@@ -8961,6 +8985,15 @@ async function renderMain(el) {
         if (opts.numFmt) cell.numFmt = opts.numFmt;
         return cell;
       };
+      
+      // Excel column letters for stations: C..K (cols 3-11)
+      const COL = (n) => {
+        let s = ''; let x = n;
+        while (x > 0) { const m = (x - 1) % 26; s = String.fromCharCode(65 + m) + s; x = Math.floor((x - 1) / 26); }
+        return s;
+      };
+      // station col letters C(3)..K(11)
+      const ST_COLS = STATIONS.map((_, i) => COL(3 + i));   // ['C','D',...,'K']
       
       const NUM = '#,##0.00;[Red]-#,##0.00';
       const INT = '#,##0';
@@ -8970,59 +9003,130 @@ async function renderMain(el) {
       setCell(2, 2, fmtTH(dateISO), { fill: C.dark, font: headFont, align: 'center' });
       STATIONS.forEach((st, i) => setCell(2, 3 + i, st, { fill: C.dark, font: headFont, align: 'center' }));
       
-      // ── summary rows (3-11) ──
+      // ── summary rows (3-11) — ⭐ ใส่สูตรเหมือน JKN เดิม ──
+      //   Row layout: 3=นำเงินเข้า 4=ยอดขาย 5=นำเงินออก 6=ยอดคืนสินค้า
+      //               7=Cash Drawer 8=Transfer 9=Card 10=Cheque 11=Refund 12=Sum
+      //   Station cols: C(Front1)..K(Order Credit) — header at row 2
+      //   Change block: M(denom) N(count) O(total) rows 3-10, grand O11
+      //
+      //   สูตรหลัก:
+      //     A (All Station) = SUM(C:K) ของแถวนั้น
+      //     ยอดขาย (row4):  Front1-4 + IC/OC = SUMIFS(baht, bdate=B2, stn=col)
+      //                     Invoice (G) = รวม Invoice+Order+Payment ยอดขาย (J/K แยก)
+      //     Transfer/Card/Cheque/Refund (row 8-11): SUMIFS(baht, bdate, stn, typ, conf<>"")
+      //     Cash Drawer (row7): G7 = O11 − G3 − G5 (เงินทอนรวม − นำเงินเข้า − นำเงินออก ของ Invoice)
+      //     นำเงินเข้า/ออก/คืน (row 3,5,6): static (user ใส่มือ)
+      
+      const TYPE_LABEL = { Transfer: 'Transfer', Card: 'Card', Cheque: 'Cheque', Refund: 'Refund' };
+      
+      // helper: build SUMIFS for a station-col matching type
+      const sumifsTypeStation = (stCol, typeLabel) =>
+        `SUMIFS(${RNG.baht},${RNG.bdate},$B$2,${RNG.stn},${stCol}$2,${RNG.typ},"${typeLabel}",${RNG.conf},"<>")`;
+      // helper: SUMIFS sales for a station-col (all types)
+      const sumifsSalesStation = (stCol) =>
+        `SUMIFS(${RNG.baht},${RNG.bdate},$B$2,${RNG.stn},${stCol}$2)`;
+      
       const summaryDefs = [
-        { label: 'นำเงินเข้า',    getter: getCashIn,   fill: 'FFE8F5E9' },
-        { label: 'ยอดขาย',        getter: getSales,    fill: null },
-        { label: 'นำเงินออก',     getter: getCashOut,  fill: 'FFFDECEA' },
-        { label: 'ยอดคืนสินค้า',  getter: getReturns,  fill: 'FFFEF6E7' },
-        { label: 'Cash Drawer',  getter: getDrawer,   fill: C.auto },
-        { label: 'Transfer',     getter: getTransfer, fill: C.auto },
-        { label: 'Card',         getter: getCard,     fill: C.auto },
-        { label: 'Cheque',       getter: getCheque,   fill: C.auto },
-        { label: 'Refund',       getter: getRefund,   fill: C.auto },
+        { row: 3,  label: 'นำเงินเข้า',    getter: getCashIn,   fill: 'FFE8F5E9', mode: 'static' },
+        { row: 4,  label: 'ยอดขาย',        getter: getSales,    fill: null,       mode: 'sales' },
+        { row: 5,  label: 'นำเงินออก',     getter: getCashOut,  fill: 'FFFDECEA', mode: 'static' },
+        { row: 6,  label: 'ยอดคืนสินค้า',  getter: getReturns,  fill: 'FFFEF6E7', mode: 'static' },
+        { row: 7,  label: 'Cash Drawer',  getter: getDrawer,   fill: C.auto,     mode: 'drawer' },
+        { row: 8,  label: 'Transfer',     getter: getTransfer, fill: C.auto,     mode: 'type', type: 'Transfer' },
+        { row: 9,  label: 'Card',         getter: getCard,     fill: C.auto,     mode: 'type', type: 'Card' },
+        { row: 10, label: 'Cheque',       getter: getCheque,   fill: C.auto,     mode: 'type', type: 'Cheque' },
+        { row: 11, label: 'Refund',       getter: getRefund,   fill: C.auto,     mode: 'type', type: 'Refund' },
       ];
-      summaryDefs.forEach((def, idx) => {
-        const r = 3 + idx;
+      
+      summaryDefs.forEach(def => {
+        const r = def.row;
         const vals = rowVals(def.getter);
-        setCell(r, 1, allSumOf(vals), { font: labelFont, numFmt: NUM, fill: def.fill || undefined, align: 'right' });
+        // Col A = SUM(C:K) formula
+        setCell(r, 1, allSumOf(vals), { font: labelFont, numFmt: NUM, fill: def.fill || undefined, align: 'right',
+                                        formula: `SUM(C${r}:K${r})` });
+        // Col B = label
         setCell(r, 2, def.label, { font: labelFont, align: 'left', fill: def.fill || undefined });
-        vals.forEach((v, i) => setCell(r, 3 + i, v || 0, { numFmt: NUM, fill: def.fill || undefined }));
+        // Cols C-K
+        STATIONS.forEach((st, i) => {
+          const col = 3 + i;
+          const stCol = ST_COLS[i];
+          const cached = vals[i] || 0;
+          let formula = null;
+          if (def.mode === 'sales') {
+            // ยอดขาย: Front1-4 (i<4) static (user counts), Invoice/Order/Payment/IC/OC = SUMIFS
+            if (i >= 4) formula = sumifsSalesStation(stCol);
+          } else if (def.mode === 'type') {
+            formula = sumifsTypeStation(stCol, TYPE_LABEL[def.type]);
+          } else if (def.mode === 'drawer') {
+            // Cash Drawer per station = (counted cash) static for Front, Invoice uses O11−cashIn−cashOut
+            if (st === 'Invoice') {
+              formula = `O11-G3-G5`;   // grand change − Invoice cashIn − Invoice cashOut
+            }
+          }
+          if (formula) {
+            setCell(r, col, cached, { numFmt: NUM, fill: def.fill || undefined, formula });
+          } else {
+            setCell(r, col, cached, { numFmt: NUM, fill: def.fill || undefined });
+          }
+        });
       });
       
-      // ── Sum row (12) ──
+      // ── Sum row (12) — ⭐ IF formula เหมือน JKN ──
+      //   Standard station: IF(SUM(Cx7,Cx8:Cx11)=SUM(Cx3:Cx6),"OK",diff)
+      //     = (CashDrawer + Transfer+Card+Cheque+Refund) vs (cashIn+sales+cashOut+returns)
+      //   Invoice (G): IF(SUM(G7,G8:I11)=SUM(G4:I4),"OK",diff) — รวม Invoice+Order+Payment
       const rSum = 12;
       setCell(rSum, 1, '', { fill: C.dark });
       setCell(rSum, 2, 'Sum', { fill: C.dark, font: headFont, align: 'left' });
       STATIONS.forEach((st, i) => {
-        let txt = '', font = { size: 10, bold: true, color: { argb: C.okGreen } }, fill = undefined;
+        const col = 3 + i;
+        const cc = ST_COLS[i];   // C..K
+        // cached display value
+        let cached = '';
         try {
           const chk = calcSumCheck(st);
-          if (chk.empty) { txt = ''; }
-          else if (chk.isOk) { txt = 'OK'; font = { size: 10, bold: true, color: { argb: 'FFFFFFFF' } }; }
-          else { txt = Number(chk.diff.toFixed(2)); font = { size: 10, bold: true, color: { argb: 'FFFFE08A' } }; }
+          if (chk.empty) cached = '';
+          else if (chk.isOk) cached = 'OK';
+          else cached = Number(chk.diff.toFixed(2));
         } catch(_) {}
-        const cell = setCell(rSum, 3 + i, txt, { font, align: 'center' });
+        // formula
+        let formula;
+        if (st === 'Invoice') {
+          // G col special: outflow = G7 + G8:I11 ; inflow = G4:I4
+          formula = `IF(SUM(G7,G8:I11)=SUM(G4:I4),"OK",SUM(G7,G8:I11)-SUM(G4:I4))`;
+        } else if (st === 'Order' || st === 'Payment') {
+          // merged into Invoice — leave blank
+          formula = null;
+        } else {
+          formula = `IF(SUM(${cc}7,${cc}8:${cc}11)=SUM(${cc}3:${cc}6),"OK",SUM(${cc}7,${cc}8:${cc}11)-SUM(${cc}3:${cc}6))`;
+        }
+        const font = { size: 10, bold: true, color: { argb: (cached === 'OK' ? 'FFFFFFFF' : 'FFFFE08A') } };
+        const cell = formula
+          ? setCell(rSum, col, cached, { font, align: 'center', formula })
+          : setCell(rSum, col, cached, { font, align: 'center' });
         cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: C.dark } };
       });
       
-      // ── Change block (col 13=denom, 14=count, 15=total) ──
+      // ── Change block (col 13=denom M, 14=count N, 15=total O) ──
+      //   ⭐ O = M×N formula, grand = SUM(O3:O10)
       setCell(1, 13, 'Change', { fill: C.changeHd, font: headFont, align: 'center' });
       ws.mergeCells(1, 13, 1, 15);
       setCell(2, 13, 'ธนบัตร', { fill: C.dark, font: headFont, align: 'center' });
       setCell(2, 14, 'จำนวน', { fill: C.dark, font: headFont, align: 'center' });
       setCell(2, 15, 'รวม', { fill: C.dark, font: headFont, align: 'center' });
       changeRows.forEach((cr, i) => {
-        const r = 3 + i;
+        const r = 3 + i;   // rows 3-10
         setCell(r, 13, cr.denom, { numFmt: INT, align: 'center', font: labelFont });
         setCell(r, 14, cr.count, { numFmt: INT, align: 'center' });
-        setCell(r, 15, cr.total, { numFmt: NUM });
+        // O = M × N (formula)
+        setCell(r, 15, cr.total, { numFmt: NUM, formula: `M${r}*N${r}` });
       });
-      // Grand total row (after 8 denoms → row 11)
+      // Grand total row 11: O11 = SUM(O3:O10)
       const rGrand = 3 + changeRows.length;  // = 11
       setCell(rGrand, 13, 'รวม', { fill: C.dark, font: headFont, align: 'center' });
       ws.mergeCells(rGrand, 13, rGrand, 14);
-      setCell(rGrand, 15, changeGrand, { fill: C.dark, font: { bold: true, color: { argb: 'FFFFFFFF' }, size: 11 }, numFmt: NUM });
+      setCell(rGrand, 15, changeGrand, { fill: C.dark, font: { bold: true, color: { argb: 'FFFFFFFF' }, size: 11 }, numFmt: NUM,
+                                         formula: `SUM(O3:O${rGrand - 1})` });
       
       // ── Bill list header (row 14) ──
       const rBillHd = 14;
@@ -9031,10 +9135,7 @@ async function renderMain(el) {
         const cell = setCell(rBillHd, 1 + i, h, { fill: C.head, font: headFont, align: 'center' });
       });
       
-      // ── Bills ──
-      const dayBills = (typeof getBillsForSelectedDate === 'function')
-        ? getBillsForSelectedDate()
-        : billList.filter(b => toISODate(b.date) === dateISO);
+      // ── Bills (dayBills computed earlier) ──
       dayBills.forEach((b, bi) => {
         const r = rBillHd + 1 + bi;
         const zebra = bi % 2 ? C.zebra : undefined;
@@ -9058,19 +9159,21 @@ async function renderMain(el) {
         { width: 9 },  { width: 9 },  { width: 12 },  // Change cols 13-15
       ];
       
-      // Write + download
+      // Write + download — ⭐ filename: "YYYYMMDD Daily.xlsx" (เช่น 20260421 Daily.xlsx)
+      const ymd = String(dateISO).replace(/-/g, '');   // 2026-04-21 → 20260421
+      const fname = `${ymd} Daily.xlsx`;
       const buf = await wb.xlsx.writeBuffer();
       const blob = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `Daily_${dateISO}.xlsx`;
+      a.download = fname;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
       setTimeout(() => URL.revokeObjectURL(url), 2000);
       
-      toast(`✅ Export ${fmtTH(dateISO)} → Daily_${dateISO}.xlsx (${dayBills.length} บิล, Change ฿${fmtNum(changeGrand)})`, 'success', 4000);
+      toast(`✅ Export ${fmtTH(dateISO)} → ${fname} (${dayBills.length} บิล, Change ฿${fmtNum(changeGrand)})`, 'success', 4000);
     }
     
     document.getElementById('btn-save-main')?.addEventListener('click', async () => {
@@ -39705,7 +39808,7 @@ function _pvMakeReversal(orig) {
 // ── Initialize after all declarations are ready ──
 (async function() {
   // ⭐ R25.44 BOOT BEACON
-  console.log('%c[SF R25.45] Active build: 2026-05-18-4300 — Export Main: เพิ่ม Change block + ตีตาราง/สี (ExcelJS) เหมือน daily', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.45] Active build: 2026-05-18-4500 — Export Main: เปลี่ยนชื่อไฟล์เป็น YYYYMMDD Daily.xlsx', 'color:#0c8;font-weight:bold;font-size:13px');
   // ⭐ R25.45 rev6 — Sweep stale idempotency_key cache entries (TTL 1h) at boot
   try {
     const _IDK_TTL_MS = 60 * 60 * 1000;
