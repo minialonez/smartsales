@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.45-2026-05-18-4700 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.45-2026-05-18-4800 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -9205,6 +9205,39 @@ async function renderMain(el) {
           const amt = Number(s.amount) || 0;
           const withdraw = amt < 0 ? Math.abs(amt) : '';   // เงินออก
           const deposit  = amt > 0 ? amt : '';               // เงินเข้า
+          
+          // ⭐ R25.45 rev18 — ดึง match info จากทุก field (เคส 3137.50: matched แต่ station/bill ว่าง)
+          //   statement match ได้หลายแบบ:
+          //     - match_station + match_bill  (single bill ปกติ)
+          //     - matched_bills array          (split payment / SP-TEMP chain — key "no|sb|uuid")
+          //     - match_bill = PV number       (PV match — ไม่มี station)
+          //     - match_reason                 (manual reason — match โดยไม่ผูก bill)
+          //     - match_station='SP-TEMP'      (placeholder)
+          let stationTxt = s.match_station || '';
+          let billTxt = '';
+          // Bill: prefer match_bill, then matched_bills array, then reason
+          if (s.match_bill && String(s.match_bill).trim()) {
+            // SP-TEMP key format "no|sb|uuid" → show first segment (the doc no)
+            const mb = String(s.match_bill).trim();
+            billTxt = mb.includes('|') ? mb.split('|')[0] : mb;
+          } else if (Array.isArray(s.matched_bills) && s.matched_bills.length) {
+            billTxt = s.matched_bills.map(x => {
+              const v = String(x).trim();
+              return v.includes('|') ? v.split('|')[0] : v;
+            }).filter(Boolean).join(', ');
+          }
+          // Reason: if matched but no bill found, show reason as the explanation
+          let reasonTxt = '';
+          if (s.match_reason && String(s.match_reason).trim()) {
+            reasonTxt = String(s.match_reason).trim();
+          }
+          // SP-TEMP label cleanup
+          if (stationTxt === 'SP-TEMP') stationTxt = 'SP (รับชำระ)';
+          // If matched but everything empty → note match_method as hint
+          if (s.match_status === 'paid' && !stationTxt && !billTxt && !reasonTxt) {
+            reasonTxt = s.match_method ? `matched (${s.match_method})` : 'matched (ไม่ระบุ bill)';
+          }
+          
           const statusTxt = s.match_status === 'paid' ? '✓ matched' : (s.match_status || '');
           setS(r, 1, fmtTH(toISODate(s.date)), { align: 'center', fill: zebra });
           setS(r, 2, s.time || '', { align: 'center', fill: zebra });
@@ -9213,8 +9246,10 @@ async function renderMain(el) {
           setS(r, 5, withdraw, { numFmt: NUM, fill: zebra });
           setS(r, 6, deposit, { numFmt: NUM, fill: zebra });
           setS(r, 7, (s.balance != null && s.balance !== '') ? Number(s.balance) : '', { numFmt: NUM, fill: zebra });
-          setS(r, 8, s.match_station || '', { align: 'center', fill: zebra });
-          setS(r, 9, s.match_bill || '', { align: 'center', fill: zebra });
+          setS(r, 8, stationTxt, { align: 'center', fill: zebra });
+          // Bill Number col — show bill or reason (reason เป็น fallback เมื่อไม่มี bill)
+          setS(r, 9, billTxt || reasonTxt, { align: 'center', fill: zebra,
+                                              font: (!billTxt && reasonTxt) ? { italic: true, color: { argb: 'FF888888' } } : undefined });
           setS(r, 10, statusTxt, { align: 'center', fill: zebra,
                                    font: s.match_status === 'paid' ? { color: { argb: C.okGreen }, bold: true } : undefined });
         });
@@ -39898,7 +39933,7 @@ function _pvMakeReversal(orig) {
 // ── Initialize after all declarations are ready ──
 (async function() {
   // ⭐ R25.44 BOOT BEACON
-  console.log('%c[SF R25.45] Active build: 2026-05-18-4700 — FIX Sum row: ใช้สูตร Smart (drawer adj − cashIn ทั้ง 2 ฝั่ง) แทน JKN — แก้ Front แสดง diff ผิด', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.45] Active build: 2026-05-18-4800 — FIX statement match info: ดึงจากทุก field (matched_bills/reason/SP-TEMP) — แก้เคส matched แต่ station/bill ว่าง', 'color:#0c8;font-weight:bold;font-size:13px');
   // ⭐ R25.45 rev6 — Sweep stale idempotency_key cache entries (TTL 1h) at boot
   try {
     const _IDK_TTL_MS = 60 * 60 * 1000;
