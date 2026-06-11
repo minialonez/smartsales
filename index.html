@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.45-2026-05-18-4600 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.45-2026-05-18-4700 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -9071,10 +9071,13 @@ async function renderMain(el) {
         });
       });
       
-      // ── Sum row (12) — ⭐ IF formula เหมือน JKN ──
-      //   Standard station: IF(SUM(Cx7,Cx8:Cx11)=SUM(Cx3:Cx6),"OK",diff)
-      //     = (CashDrawer + Transfer+Card+Cheque+Refund) vs (cashIn+sales+cashOut+returns)
-      //   Invoice (G): IF(SUM(G7,G8:I11)=SUM(G4:I4),"OK",diff) — รวม Invoice+Order+Payment
+      // ── Sum row (12) — ⭐ ตรงกับ Smart calcSumCheck (ไม่ใช่ JKN) ──
+      //   Smart logic: diff = accountedSide − incomeSide
+      //     accountedSide = drawer(r7) + transfer(r8) + card(r9) + cheque(r10) + refund(r11) − cashOut(r5)
+      //     incomeSide    = sales(r4) + returns(r6)
+      //     *** ไม่รวม cashIn (r3) — เพราะ Cash Drawer หัก cashIn ไปแล้ว (adjusted) ***
+      //   Excel: SUM(Cx7:Cx11) − Cx5 − Cx4 − Cx6
+      //   Invoice (G): รวม Invoice+Order+Payment (G,H,I) → SUM(G7:I11)−G5:I5−G4:I4−G6:I6
       const rSum = 12;
       setCell(rSum, 1, '', { fill: C.dark });
       setCell(rSum, 2, 'Sum', { fill: C.dark, font: headFont, align: 'left' });
@@ -9089,16 +9092,20 @@ async function renderMain(el) {
           else if (chk.isOk) cached = 'OK';
           else cached = Number(chk.diff.toFixed(2));
         } catch(_) {}
-        // formula
+        // formula — match Smart calcSumCheck
         let formula;
         if (st === 'Invoice') {
-          // G col special: outflow = G7 + G8:I11 ; inflow = G4:I4
-          formula = `IF(SUM(G7,G8:I11)=SUM(G4:I4),"OK",SUM(G7,G8:I11)-SUM(G4:I4))`;
+          // Invoice รวม Invoice(G)+Order(H)+Payment(I) — 3 cols
+          //   accounted = SUM(G7:I11) − SUM(G5:I5) ; income = SUM(G4:I4) + SUM(G6:I6)
+          const acc = `SUM(G7:I11)-SUM(G5:I5)`;
+          const inc = `SUM(G4:I4)+SUM(G6:I6)`;
+          formula = `IF(ROUND((${acc})-(${inc}),2)=0,"OK",ROUND((${acc})-(${inc}),2))`;
         } else if (st === 'Order' || st === 'Payment') {
-          // merged into Invoice — leave blank
-          formula = null;
+          formula = null;  // merged into Invoice
         } else {
-          formula = `IF(SUM(${cc}7,${cc}8:${cc}11)=SUM(${cc}3:${cc}6),"OK",SUM(${cc}7,${cc}8:${cc}11)-SUM(${cc}3:${cc}6))`;
+          const acc = `SUM(${cc}7:${cc}11)-${cc}5`;
+          const inc = `${cc}4+${cc}6`;
+          formula = `IF(ROUND((${acc})-(${inc}),2)=0,"OK",ROUND((${acc})-(${inc}),2))`;
         }
         const font = { size: 10, bold: true, color: { argb: (cached === 'OK' ? 'FFFFFFFF' : 'FFFFE08A') } };
         const cell = formula
@@ -39891,7 +39898,7 @@ function _pvMakeReversal(orig) {
 // ── Initialize after all declarations are ready ──
 (async function() {
   // ⭐ R25.44 BOOT BEACON
-  console.log('%c[SF R25.45] Active build: 2026-05-18-4600 — Export: เพิ่ม statement 5 ธนาคาร (KTB/KBANK/BBL NW/BBL/TTB) แยก sheet', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.45] Active build: 2026-05-18-4700 — FIX Sum row: ใช้สูตร Smart (drawer adj − cashIn ทั้ง 2 ฝั่ง) แทน JKN — แก้ Front แสดง diff ผิด', 'color:#0c8;font-weight:bold;font-size:13px');
   // ⭐ R25.45 rev6 — Sweep stale idempotency_key cache entries (TTL 1h) at boot
   try {
     const _IDK_TTL_MS = 60 * 60 * 1000;
