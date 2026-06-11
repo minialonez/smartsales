@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.45-2026-05-18-4000 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.45-2026-05-18-4100 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -6855,56 +6855,72 @@ function _exportMainMonthly(year, month) {
     const monthLastDay = new Date(year, month, 0).getDate();
     
     // ── Sheet 1: Daily Summary (one row per date in month) ──
-    //   Columns: วันที่ + [cashIn × stations] + [cashOut × stations] + [returns × stations] + รวม
+    //   ⭐ R25.45 rev19 (FIX) — โครงสร้างจริงคือ nested ภาษาไทย:
+    //     mainSummary.__byDate['2026-04-01']['นำเงินเข้า']['Front1'] = value
+    //   เก่า (บั๊ก): อ่าน key อังกฤษ 'cashIn_Front1' → ไม่ match → ได้ None ทุก cell
     const STATIONS = ['Front1','Front2','Front3','Front4','Invoice','Order','Payment','Invoice Credit','Order Credit'];
-    const ROW_KEYS = [
-      { key: 'cashIn',  label: 'นำเงินเข้า' },
-      { key: 'cashOut', label: 'นำเงินออก' },
-      { key: 'returns', label: 'ยอดคืนสินค้า' },
-    ];
+    const ROW_LABELS = ['นำเงินเข้า', 'ยอดขาย', 'นำเงินออก', 'ยอดคืนสินค้า'];
     const byDate = (typeof mainSummary !== 'undefined' && mainSummary && mainSummary.__byDate) ? mainSummary.__byDate : {};
     
-    const dailyRows = [];
-    let monthTotals = {};   // key 'cashIn_Front1' → sum
+    // Diagnostic: how many days in this month have any data?
+    const daysWithData = Object.keys(byDate).filter(iso => iso.indexOf(ymPrefix) === 0).length;
+    console.log(`[Main Export] ${ymPrefix}: ${daysWithData} days have __byDate entries`, 
+                daysWithData > 0 ? Object.keys(byDate).filter(iso => iso.indexOf(ymPrefix) === 0).slice(0, 3) : '(none)');
+    
+    // Pass 1: compute month totals per (label · station) to find non-empty columns
+    const monthTotals = {};
     for (let d = 1; d <= monthLastDay; d++) {
       const iso = `${year}-${String(month).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
       const day = byDate[iso] || {};
-      // dayLabels: { 'cashIn': { 'Front1': 100, ... }, ... } — but actual structure may be flat
-      //   mainSummary key format = "row_station" (e.g. cashIn_Front1)
-      //   __byDate[iso] = same flat structure for that date
-      const row = { 'วันที่': fmtTH(iso) };
-      let dayTotal = 0;
-      ROW_KEYS.forEach(({ key, label }) => {
+      ROW_LABELS.forEach(label => {
+        const stationsObj = (day[label] && typeof day[label] === 'object') ? day[label] : {};
         STATIONS.forEach(st => {
-          const cellKey = `${key}_${st}`;
-          // Check both nested + flat structure
-          let val = 0;
-          if (day[key] && typeof day[key] === 'object') {
-            val = Number(day[key][st] || 0);
-          } else {
-            val = Number(day[cellKey] || 0);
-          }
-          row[`${label} · ${st}`] = val || '';
-          dayTotal += val;
-          monthTotals[cellKey] = (monthTotals[cellKey] || 0) + val;
+          const colKey = `${label} · ${st}`;
+          monthTotals[colKey] = (monthTotals[colKey] || 0) + Number(stationsObj[st] || 0);
         });
       });
+    }
+    // Only keep columns that have at least one non-zero value in the month
+    const activeCols = [];
+    ROW_LABELS.forEach(label => {
+      STATIONS.forEach(st => {
+        const colKey = `${label} · ${st}`;
+        if (Math.abs(monthTotals[colKey] || 0) > 0.001) activeCols.push({ label, st, colKey });
+      });
+    });
+    
+    // Pass 2: build rows using only active columns
+    const dailyRows = [];
+    for (let d = 1; d <= monthLastDay; d++) {
+      const iso = `${year}-${String(month).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+      const day = byDate[iso] || {};
+      const row = { 'วันที่': fmtTH(iso) };
+      let dayTotal = 0;
+      activeCols.forEach(({ label, st, colKey }) => {
+        const stationsObj = (day[label] && typeof day[label] === 'object') ? day[label] : {};
+        const val = Number(stationsObj[st] || 0);
+        row[colKey] = val || '';
+        dayTotal += val;
+      });
       row['รวมวันนี้'] = dayTotal || '';
-      // Skip empty days from the export to save space — but keep Sundays etc visible? include all
       dailyRows.push(row);
     }
-    // Add month total row
+    // Month total row
     const monthTotalRow = { 'วันที่': '🟰 รวมเดือน' };
     let grandTotal = 0;
-    ROW_KEYS.forEach(({ key, label }) => {
-      STATIONS.forEach(st => {
-        const v = monthTotals[`${key}_${st}`] || 0;
-        monthTotalRow[`${label} · ${st}`] = v || '';
-        grandTotal += v;
-      });
+    activeCols.forEach(({ colKey }) => {
+      const v = monthTotals[colKey] || 0;
+      monthTotalRow[colKey] = v || '';
+      grandTotal += v;
     });
     monthTotalRow['รวมวันนี้'] = grandTotal || '';
     dailyRows.push(monthTotalRow);
+    
+    // If no station data at all, add a hint row
+    if (activeCols.length === 0) {
+      dailyRows.length = 0;
+      dailyRows.push({ 'วันที่': `— ไม่มีข้อมูล นำเงินเข้า/ออก/คืน ในเดือน ${month}/${year} —`, 'หมายเหตุ': 'ตรวจว่าเลือกเดือนถูก + ข้อมูลถูก sync แล้ว' });
+    }
     
     // ── Sheet 2: Cashflow details (records in month) ──
     const cfList = (typeof cashflowList !== 'undefined' && Array.isArray(cashflowList)) ? cashflowList : [];
@@ -6964,7 +6980,11 @@ function _exportMainMonthly(year, month) {
     
     const filename = `MainDaily_${year}-${String(month).padStart(2,'0')}.xlsx`;
     XLSX.writeFile(wb, filename);
-    toast(`✅ Export เดือน ${month}/${year} → ${filename} (Daily ${monthLastDay} วัน, Cashflow ${cfInMonth.length} รายการ)`, 'success', 5000);
+    if (activeCols.length === 0 && cfInMonth.length === 0) {
+      toast(`⚠️ Export ${month}/${year} แต่ไม่มีข้อมูล — ตรวจว่าเลือกเดือนถูก + sync แล้ว (ดู console)`, 'warn', 6000);
+    } else {
+      toast(`✅ Export ${month}/${year} → ${filename} (${activeCols.length} cols มีข้อมูล, Cashflow ${cfInMonth.length} รายการ)`, 'success', 5000);
+    }
   } catch (e) {
     console.error('[Main Export] error:', e);
     toast('❌ Export ล้มเหลว: ' + e.message, 'error', 5000);
@@ -39678,7 +39698,7 @@ function _pvMakeReversal(orig) {
 // ── Initialize after all declarations are ready ──
 (async function() {
   // ⭐ R25.44 BOOT BEACON
-  console.log('%c[SF R25.45] Active build: 2026-05-18-4000 — FIX match ล้มเหลว: pvSetMatch หา stmt ผิด sheet (per-bank → per-year stmts_YYYY)', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.45] Active build: 2026-05-18-4100 — FIX Main export: อ่าน __byDate label ไทย (นำเงินเข้า) + ตัด col ว่าง + diagnostic', 'color:#0c8;font-weight:bold;font-size:13px');
   // ⭐ R25.45 rev6 — Sweep stale idempotency_key cache entries (TTL 1h) at boot
   try {
     const _IDK_TTL_MS = 60 * 60 * 1000;
