@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.45-2026-05-18-4200 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.45-2026-05-18-4300 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -10,6 +10,7 @@
 <title>Smart Finance R25.45</title>
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/themes/dark.css">
 <script src="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.js"></script>
@@ -8871,9 +8872,9 @@ async function renderMain(el) {
       window._dirtyBadgeInterval = setInterval(updateDirtyDot, 1000);
     }
     
-    document.getElementById('btn-export-monthly')?.addEventListener('click', () => {
+    document.getElementById('btn-export-monthly')?.addEventListener('click', async () => {
       try {
-        _exportMainDailySheet(selectedDate);
+        await _exportMainDailySheet(selectedDate);
       } catch (e) {
         console.error('[Main Export] error:', e);
         toast('❌ Export ล้มเหลว: ' + (e.message || e), 'error', 5000);
@@ -8889,7 +8890,7 @@ async function renderMain(el) {
     //     - row14: bill list header
     //     - row15+: bills ของวันนั้น
     //   ⭐ ใช้ฟังก์ชัน calc* ใน scope renderMain → ตรงกับที่หน้าจอแสดงเป๊ะ (ไม่ duplicate logic)
-    function _exportMainDailySheet(dateISO) {
+    async function _exportMainDailySheet(dateISO) {
       const STATIONS = ['Front1','Front2','Front3','Front4','Invoice','Order','Payment','Invoice Credit','Order Credit'];
       const fmtTH = (iso) => {
         if (!iso) return '';
@@ -8903,7 +8904,6 @@ async function renderMain(el) {
       const getReturns  = (st) => Number(_getSummaryValue('returns', st)) || 0;
       const getSales    = (st) => Number(calcSales(st)) || 0;
       const getDrawer   = (st) => {
-        // Cash Drawer adjusted = raw − cashIn (ตรงกับ display)
         let raw = 0;
         if (st === 'Invoice') {
           const counted = calcCashDrawer('Invoice');
@@ -8918,84 +8918,159 @@ async function renderMain(el) {
       const getCheque   = (st) => Number(calcAutoValue('Cheque', st)) || 0;
       const getRefund   = (st) => Number(calcAutoValue('Refund', st)) || 0;
       
-      // Build AOA (array of arrays) for exact layout
-      const aoa = [];
-      // row1: Change marker (single cell at col M like original)
-      aoa.push(['', '', '', '', '', '', '', '', '', '', '', '', 'Change']);
-      // row2: header — All Station | date | stations
-      aoa.push(['All Station', fmtTH(dateISO), ...STATIONS]);
+      const frontInv = STATIONS;
+      const rowVals = (getter) => STATIONS.map(st => getter(st));
+      const allSumOf = (vals) => vals.reduce((s, v) => s + (Number(v) || 0), 0);
       
-      // Helper: build a summary row — [allStationSum, label, ...perStation]
-      const rowFor = (label, getter, includeStations) => {
-        const vals = STATIONS.map(st => includeStations.includes(st) ? getter(st) : '');
-        const allSum = vals.reduce((s, v) => s + (Number(v) || 0), 0);
-        return [allSum || 0, label, ...vals.map(v => v === '' ? '' : (v || 0))];
+      // ── Change block (cash count) — รวม count ของแต่ละ denomination ข้ามทุก station ──
+      //   getCashForDate(date) → key "<denom>_<station>" = จำนวนใบ
+      //   Change row = denom × (รวม count ทุก station)
+      const dayCash = (typeof getCashForDate === 'function') ? (getCashForDate(dateISO) || {}) : {};
+      const DENOMS_ASC = [1, 5, 10, 20, 50, 100, 500, 1000];   // ascending (ตามไฟล์เดิม)
+      const changeRows = DENOMS_ASC.map(denom => {
+        let totalCount = 0;
+        STATIONS.forEach(st => { totalCount += Number(dayCash[denom + '_' + st] || 0); });
+        return { denom, count: totalCount, total: denom * totalCount };
+      });
+      const changeGrand = changeRows.reduce((s, r) => s + r.total, 0);
+      
+      // ════ Build with ExcelJS (styled) ════
+      if (typeof ExcelJS === 'undefined') {
+        toast('❌ ExcelJS ยังโหลดไม่เสร็จ — ลองใหม่อีกครั้ง', 'error', 4000);
+        return;
+      }
+      const wb = new ExcelJS.Workbook();
+      const ws = wb.addWorksheet('Main', { views: [{ state: 'frozen', ySplit: 2 }] });
+      
+      // Style helpers
+      const C = { dark: 'FF1A1F2E', head: 'FF2D3748', cashIn: 'FF16A34A', cashOut: 'FFDC2626',
+                  returns: 'FFF59E0B', auto: 'FFEFF2F7', changeHd: 'FF3B82F6', zebra: 'FFF7FAFC',
+                  okGreen: 'FF16A34A', diffRed: 'FFDC2626' };
+      const thin = { style: 'thin', color: { argb: 'FFCBD5E1' } };
+      const allBorder = { top: thin, left: thin, bottom: thin, right: thin };
+      const headFont = { bold: true, color: { argb: 'FFFFFFFF' }, size: 11 };
+      const labelFont = { bold: true, color: { argb: C.dark }, size: 11 };
+      
+      const setCell = (r, c, val, opts = {}) => {
+        const cell = ws.getCell(r, c);
+        cell.value = (val === '' || val === undefined || val === null) ? null : val;
+        cell.border = allBorder;
+        if (opts.fill) cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: opts.fill } };
+        if (opts.font) cell.font = opts.font;
+        cell.alignment = { vertical: 'middle', horizontal: opts.align || 'right' };
+        if (opts.numFmt) cell.numFmt = opts.numFmt;
+        return cell;
       };
       
-      // Station scopes per row (ตามภาพ — บางแถวมีเฉพาะบาง station)
-      const allSt = STATIONS;
-      const frontInv = ['Front1','Front2','Front3','Front4','Invoice','Order','Payment','Invoice Credit','Order Credit'];
+      const NUM = '#,##0.00;[Red]-#,##0.00';
+      const INT = '#,##0';
       
-      aoa.push(rowFor('นำเงินเข้า',    getCashIn,   frontInv));
-      aoa.push(rowFor('ยอดขาย',        getSales,    frontInv));
-      aoa.push(rowFor('นำเงินออก',     getCashOut,  frontInv));
-      aoa.push(rowFor('ยอดคืนสินค้า',  getReturns,  frontInv));
-      aoa.push(rowFor('Cash Drawer',  getDrawer,   frontInv));
-      aoa.push(rowFor('Transfer',     getTransfer, frontInv));
-      aoa.push(rowFor('Card',         getCard,     frontInv));
-      aoa.push(rowFor('Cheque',       getCheque,   frontInv));
-      aoa.push(rowFor('Refund',       getRefund,   frontInv));
+      // ── row2: header (All Station | date | stations) ──
+      setCell(2, 1, 'All Station', { fill: C.dark, font: headFont, align: 'center' });
+      setCell(2, 2, fmtTH(dateISO), { fill: C.dark, font: headFont, align: 'center' });
+      STATIONS.forEach((st, i) => setCell(2, 3 + i, st, { fill: C.dark, font: headFont, align: 'center' }));
       
-      // Sum row (diff per station — OK or number)
-      const sumRow = ['', 'Sum'];
-      STATIONS.forEach(st => {
-        try {
-          const chk = calcSumCheck(st);   // returns { diff, isOk, empty }
-          if (chk.empty) sumRow.push('');
-          else if (chk.isOk) sumRow.push('OK');
-          else sumRow.push(Number(chk.diff.toFixed(2)));
-        } catch(_) { sumRow.push(''); }
+      // ── summary rows (3-11) ──
+      const summaryDefs = [
+        { label: 'นำเงินเข้า',    getter: getCashIn,   fill: 'FFE8F5E9' },
+        { label: 'ยอดขาย',        getter: getSales,    fill: null },
+        { label: 'นำเงินออก',     getter: getCashOut,  fill: 'FFFDECEA' },
+        { label: 'ยอดคืนสินค้า',  getter: getReturns,  fill: 'FFFEF6E7' },
+        { label: 'Cash Drawer',  getter: getDrawer,   fill: C.auto },
+        { label: 'Transfer',     getter: getTransfer, fill: C.auto },
+        { label: 'Card',         getter: getCard,     fill: C.auto },
+        { label: 'Cheque',       getter: getCheque,   fill: C.auto },
+        { label: 'Refund',       getter: getRefund,   fill: C.auto },
+      ];
+      summaryDefs.forEach((def, idx) => {
+        const r = 3 + idx;
+        const vals = rowVals(def.getter);
+        setCell(r, 1, allSumOf(vals), { font: labelFont, numFmt: NUM, fill: def.fill || undefined, align: 'right' });
+        setCell(r, 2, def.label, { font: labelFont, align: 'left', fill: def.fill || undefined });
+        vals.forEach((v, i) => setCell(r, 3 + i, v || 0, { numFmt: NUM, fill: def.fill || undefined }));
       });
-      aoa.push(sumRow);
       
-      // row13: spacer
-      aoa.push([]);
+      // ── Sum row (12) ──
+      const rSum = 12;
+      setCell(rSum, 1, '', { fill: C.dark });
+      setCell(rSum, 2, 'Sum', { fill: C.dark, font: headFont, align: 'left' });
+      STATIONS.forEach((st, i) => {
+        let txt = '', font = { size: 10, bold: true, color: { argb: C.okGreen } }, fill = undefined;
+        try {
+          const chk = calcSumCheck(st);
+          if (chk.empty) { txt = ''; }
+          else if (chk.isOk) { txt = 'OK'; font = { size: 10, bold: true, color: { argb: 'FFFFFFFF' } }; }
+          else { txt = Number(chk.diff.toFixed(2)); font = { size: 10, bold: true, color: { argb: 'FFFFE08A' } }; }
+        } catch(_) {}
+        const cell = setCell(rSum, 3 + i, txt, { font, align: 'center' });
+        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: C.dark } };
+      });
       
-      // row14: bill list header
-      aoa.push(['Bill Number','Bill Date','Station','Type','Baht','Confirmation','Pay Date','Remarks1','Remarks2','Bank - Due Date']);
+      // ── Change block (col 13=denom, 14=count, 15=total) ──
+      setCell(1, 13, 'Change', { fill: C.changeHd, font: headFont, align: 'center' });
+      ws.mergeCells(1, 13, 1, 15);
+      setCell(2, 13, 'ธนบัตร', { fill: C.dark, font: headFont, align: 'center' });
+      setCell(2, 14, 'จำนวน', { fill: C.dark, font: headFont, align: 'center' });
+      setCell(2, 15, 'รวม', { fill: C.dark, font: headFont, align: 'center' });
+      changeRows.forEach((cr, i) => {
+        const r = 3 + i;
+        setCell(r, 13, cr.denom, { numFmt: INT, align: 'center', font: labelFont });
+        setCell(r, 14, cr.count, { numFmt: INT, align: 'center' });
+        setCell(r, 15, cr.total, { numFmt: NUM });
+      });
+      // Grand total row (after 8 denoms → row 11)
+      const rGrand = 3 + changeRows.length;  // = 11
+      setCell(rGrand, 13, 'รวม', { fill: C.dark, font: headFont, align: 'center' });
+      ws.mergeCells(rGrand, 13, rGrand, 14);
+      setCell(rGrand, 15, changeGrand, { fill: C.dark, font: { bold: true, color: { argb: 'FFFFFFFF' }, size: 11 }, numFmt: NUM });
       
-      // Bills for selected date
+      // ── Bill list header (row 14) ──
+      const rBillHd = 14;
+      const billHdrs = ['Bill Number','Bill Date','Station','Type','Baht','Confirmation','Pay Date','Remarks1','Remarks2','Bank - Due Date'];
+      billHdrs.forEach((h, i) => {
+        const cell = setCell(rBillHd, 1 + i, h, { fill: C.head, font: headFont, align: 'center' });
+      });
+      
+      // ── Bills ──
       const dayBills = (typeof getBillsForSelectedDate === 'function')
         ? getBillsForSelectedDate()
         : billList.filter(b => toISODate(b.date) === dateISO);
-      dayBills.forEach(b => {
-        aoa.push([
-          b.bill_no || '',
-          fmtTH(toISODate(b.date)),
-          b.station || '',
-          b.type || '',
-          Number(b.amount) || 0,
-          b.confirmation || '',
-          b.pay_date ? fmtTH(toISODate(b.pay_date)) : '',
-          b.remarks1 || '',
-          b.remarks2 || '',
-          b.bank || '',
-        ]);
+      dayBills.forEach((b, bi) => {
+        const r = rBillHd + 1 + bi;
+        const zebra = bi % 2 ? C.zebra : undefined;
+        setCell(r, 1, b.bill_no || '', { align: 'left', fill: zebra });
+        setCell(r, 2, fmtTH(toISODate(b.date)), { align: 'center', fill: zebra });
+        setCell(r, 3, b.station || '', { align: 'left', fill: zebra });
+        setCell(r, 4, b.type || '', { align: 'center', fill: zebra });
+        setCell(r, 5, Number(b.amount) || 0, { numFmt: NUM, fill: zebra });
+        setCell(r, 6, b.confirmation || '', { align: 'center', fill: zebra });
+        setCell(r, 7, b.pay_date ? fmtTH(toISODate(b.pay_date)) : '', { align: 'center', fill: zebra });
+        setCell(r, 8, b.remarks1 || '', { align: 'left', fill: zebra });
+        setCell(r, 9, b.remarks2 || '', { align: 'left', fill: zebra });
+        setCell(r, 10, b.bank || '', { align: 'center', fill: zebra });
       });
       
-      // Build worksheet from AOA
-      const ws = XLSX.utils.aoa_to_sheet(aoa);
       // Column widths
-      ws['!cols'] = [
-        { wch: 12 }, { wch: 14 }, { wch: 11 }, { wch: 11 }, { wch: 11 }, { wch: 11 },
-        { wch: 13 }, { wch: 11 }, { wch: 13 }, { wch: 14 }, { wch: 13 },
+      ws.columns = [
+        { width: 13 }, { width: 14 }, { width: 11 }, { width: 11 }, { width: 12 }, { width: 12 },
+        { width: 13 }, { width: 12 }, { width: 13 }, { width: 15 },
+        { width: 3 },  { width: 3 },  // spacer cols 11-12
+        { width: 9 },  { width: 9 },  { width: 12 },  // Change cols 13-15
       ];
-      const wb = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(wb, ws, 'Main');
       
-      const filename = `Daily_${dateISO}.xlsx`;
-      XLSX.writeFile(wb, filename);
-      toast(`✅ Export ${fmtTH(dateISO)} → ${filename} (${dayBills.length} บิล)`, 'success', 4000);
+      // Write + download
+      const buf = await wb.xlsx.writeBuffer();
+      const blob = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `Daily_${dateISO}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+      
+      toast(`✅ Export ${fmtTH(dateISO)} → Daily_${dateISO}.xlsx (${dayBills.length} บิล, Change ฿${fmtNum(changeGrand)})`, 'success', 4000);
     }
     
     document.getElementById('btn-save-main')?.addEventListener('click', async () => {
@@ -39630,7 +39705,7 @@ function _pvMakeReversal(orig) {
 // ── Initialize after all declarations are ready ──
 (async function() {
   // ⭐ R25.44 BOOT BEACON
-  console.log('%c[SF R25.45] Active build: 2026-05-18-4200 — Export วันที่ดูอยู่ เป็น xlsx เหมือนหน้าจอ (summary block + bill list ตามไฟล์ JKN เดิม)', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.45] Active build: 2026-05-18-4300 — Export Main: เพิ่ม Change block + ตีตาราง/สี (ExcelJS) เหมือน daily', 'color:#0c8;font-weight:bold;font-size:13px');
   // ⭐ R25.45 rev6 — Sweep stale idempotency_key cache entries (TTL 1h) at boot
   try {
     const _IDK_TTL_MS = 60 * 60 * 1000;
