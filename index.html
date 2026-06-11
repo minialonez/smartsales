@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.45-2026-05-18-3900 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.45-2026-05-18-4000 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -38842,6 +38842,7 @@ function _pvOpenMatchModal(pv, rootEl) {
         stmt_year: stmtYear,
         match_note: matchNote,  // ⭐ R25.37 — backend appends to PV.note
       }).then(r => {
+        console.log('[pv_setMatch] response:', JSON.stringify(r), '| sent:', { pv_uuid: pv.pv_uuid, stmt_uuid: stmtUuid, stmt_bank: stmtBank, stmt_year: stmtYear });
         if (r?.success) {
           const toastMsg = matchNote 
             ? `✅ ${pv.pv_number} ↔ ${r.data?.stmt_bank || stmtBank} (มีส่วนต่าง — บันทึก note แล้ว)`
@@ -39677,7 +39678,7 @@ function _pvMakeReversal(orig) {
 // ── Initialize after all declarations are ready ──
 (async function() {
   // ⭐ R25.44 BOOT BEACON
-  console.log('%c[SF R25.45] Active build: 2026-05-18-3900 — Hotfix: preferredBank → preferredBanks (rev3800 ตกหล่น 1 จุด ทำให้ match modal crash)', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.45] Active build: 2026-05-18-4000 — FIX match ล้มเหลว: pvSetMatch หา stmt ผิด sheet (per-bank → per-year stmts_YYYY)', 'color:#0c8;font-weight:bold;font-size:13px');
   // ⭐ R25.45 rev6 — Sweep stale idempotency_key cache entries (TTL 1h) at boot
   try {
     const _IDK_TTL_MS = 60 * 60 * 1000;
