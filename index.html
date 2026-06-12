@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.45-2026-05-18-5600 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.45-2026-05-18-5700 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -2766,8 +2766,8 @@ const syncManager = {
       console.log('[poll pull] skip — dirty:', [...this.dirty].join(','));
       return;
     }
-    // Guard 3: กำลัง push อยู่ → skip (กัน race) — ใช้ status flag ที่ _flushPush ตั้ง
-    if (this.status === 'pushing') return;
+    // Guard 3: กำลัง push อยู่ → skip (กัน race) — เช็คทั้ง _pushing flag + status
+    if (this._pushing || this.status === 'pushing') return;
     // Guard 4: กำลัง pull อยู่แล้ว → skip
     if (this._pulling) return;
     try {
@@ -2967,7 +2967,39 @@ const syncManager = {
   async _flushPush() {
     // ⭐ Manual save: ทำงานเสมอเมื่อถูกเรียก (ไม่สน enabled flag)
     if (this.dirty.size === 0) return { ok: 0, fail: 0, skipped: 0, errors: [] };
-    if (this.status === 'pushing') return { ok: 0, fail: 0, skipped: 0, errors: ['already pushing'] };
+    
+    // ⭐ R25.45 rev26 (CIC Bug 1) — CONCURRENT-PUSH GUARD ที่ entry ทันที
+    //   ปัญหา: guard เดิม (status==='pushing') เช็คที่ L2970 แต่ status set ที่ L3081
+    //          → มี race window ~110 บรรทัด (guard logic) → ถ้าเรียกซ้ำในช่วงนี้
+    //          → ผ่าน guard → dirty.clear() รอบ 2 ล้าง dirty รอบแรกที่ยังไม่ push
+    //          → batch stmts หาย + fingerprint set ทั้งที่ push ไม่ครบ → statement หายเงียบๆ
+    //   แก้: _pushing flag ตั้งที่ entry ทันที (ก่อน guard logic ใดๆ) + reset ใน finally
+    //   ⭐ TIMEOUT RECOVERY: ถ้า _pushing ค้าง > 60s (รอบก่อน dead) → force reset
+    if (this._pushing) {
+      const stuckMs = this._pushStartedAt ? (Date.now() - this._pushStartedAt) : 0;
+      if (stuckMs > 60000) {
+        console.warn(`[sync] _flushPush stuck > 60s (${Math.round(stuckMs/1000)}s) — force reset + proceed`);
+        this._pushing = false;
+        this.status = 'idle';
+      } else {
+        console.warn('[sync] _flushPush already running — skip concurrent call');
+        return { skipped: 'already_pushing' };
+      }
+    }
+    this._pushing = true;
+    this._pushStartedAt = Date.now();
+    
+    if (this.status === 'pushing') {
+      // status ค้างจากรอบก่อน (ไม่ควรถึงตรงนี้ถ้า _pushing guard ทำงาน — safety)
+      const stuckMs = this.lastPushAt ? (Date.now() - this.lastPushAt) : 999999;
+      if (stuckMs > 60000) {
+        console.warn('[sync] status=pushing stuck > 60s — force reset');
+        this.status = 'idle';
+      } else {
+        this._pushing = false;   // ปล่อย flag (ไม่ได้เริ่ม push จริง)
+        return { ok: 0, fail: 0, skipped: 0, errors: ['already pushing'] };
+      }
+    }
     
     // ══════════════════════════════════════════════════════════════
     // ⭐ DATA LOSS GUARD (4/5/26 — Pattern B Phase 2a)
@@ -3672,6 +3704,9 @@ const syncManager = {
         try { localStorage.setItem('sf_sync_last_push', String(this.lastPushAt)); } catch(_){}
         this._emit();
       }
+      // ⭐ R25.45 rev26 (CIC Bug 1) — reset _pushing flag เสมอ (กันค้าง → push ไม่ได้ตลอดไป)
+      this._pushing = false;
+      this._pushStartedAt = 0;
     }
   },
   
@@ -40171,7 +40206,7 @@ function _pvMakeReversal(orig) {
 // ── Initialize after all declarations are ready ──
 (async function() {
   // ⭐ R25.44 BOOT BEACON
-  console.log('%c[SF R25.45] Active build: 2026-05-18-5600 — FIX statement per-bank (PV match + KBANK/BBL NW หาย) + BE version beacon ping — ต้อง redeploy code.gs', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.45] Active build: 2026-05-18-5700 — FIX stuck-pushing: concurrent-push guard (_pushing flag) + timeout recovery 60s — กัน statement หายเงียบ', 'color:#0c8;font-weight:bold;font-size:13px');
   // ⭐ R25.45 rev6 — Sweep stale idempotency_key cache entries (TTL 1h) at boot
   try {
     const _IDK_TTL_MS = 60 * 60 * 1000;
