@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.45-2026-05-18-5300 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.45-2026-05-18-5400 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -7553,12 +7553,15 @@ async function renderMain(el) {
                 <td style="font-weight:800">ส่วนต่าง</td>
                 <td></td>
                 ${(() => {
-                  const counted = calcCashDrawer('Invoice');
-                  const system = ['Invoice','Order','Payment'].reduce((s,st)=>s+calcCashFromBillsPure(st),0);
-                  const diff = counted - system;
-                  const isOk = Math.abs(diff) < 0.01 && (counted > 0 || system > 0);
-                  const content = (counted === 0 && system === 0) ? '-' : (isOk ? '✓ ตรง' : fmtNum(diff));
-                  const color = isOk ? 'var(--success)' : (counted === 0 && system === 0 ? 'var(--text3)' : 'var(--danger)');
+                  // ⭐ R25.45 rev23 (CIC) — ใช้สูตรเดียวกับ Sum row (calcSumCheck) เป็น source of truth
+                  //   เดิม: counted_cash − bills_cash (เงินสดล้วน) → ขัดกับ Sum row ที่รวมทุก channel
+                  //   ใหม่: calcSumCheck('Invoice') = all_channels − sales_returns (ตรงกับ Daily Sum)
+                  const check = calcSumCheck('Invoice');
+                  if (check.empty) {
+                    return `<td style="text-align:right;font-weight:800;color:var(--text3)" id="cash-diff">-</td>`;
+                  }
+                  const content = check.isOk ? '✓ ตรง' : fmtNum(check.diff);
+                  const color = check.isOk ? 'var(--success)' : 'var(--danger)';
                   return `<td style="text-align:right;font-weight:800;color:${color}" id="cash-diff">${content}</td>`;
                 })()}
               </tr>
@@ -10277,13 +10280,15 @@ async function renderMain(el) {
           
           const diffEl = document.getElementById('cash-diff');
           if (diffEl) {
-            const counted = calcCashDrawer('Invoice');
-            const diff = counted - systemCalc;
-            const isOk = Math.abs(diff) < 0.01 && (counted > 0 || systemCalc > 0);
-            const content = (counted === 0 && systemCalc === 0) ? '-' : (isOk ? '✓ ตรง' : fmtNum(diff));
-            const color = isOk ? 'var(--success)' : (counted === 0 && systemCalc === 0 ? 'var(--text3)' : 'var(--danger)');
-            diffEl.textContent = content;
-            diffEl.style.color = color;
+            // ⭐ R25.45 rev23 (CIC) — ใช้ calcSumCheck เหมือน Sum row
+            const check = calcSumCheck('Invoice');
+            if (check.empty) {
+              diffEl.textContent = '-';
+              diffEl.style.color = 'var(--text3)';
+            } else {
+              diffEl.textContent = check.isOk ? '✓ ตรง' : fmtNum(check.diff);
+              diffEl.style.color = check.isOk ? 'var(--success)' : 'var(--danger)';
+            }
           }
           
           // นับได้ (จริง) ก็ต้อง update เพราะ counted = sum(cash count) - cashIn
@@ -10345,13 +10350,15 @@ async function renderMain(el) {
         
         const diffEl = document.getElementById('cash-diff');
         if (diffEl) {
-          const counted = calcCashDrawer('Invoice');
-          const diff = counted - systemCalc;
-          const isOk = Math.abs(diff) < 0.01 && (counted > 0 || systemCalc > 0);
-          const content = (counted === 0 && systemCalc === 0) ? '-' : (isOk ? '✓ ตรง' : fmtNum(diff));
-          const color = isOk ? 'var(--success)' : (counted === 0 && systemCalc === 0 ? 'var(--text3)' : 'var(--danger)');
-          diffEl.textContent = content;
-          diffEl.style.color = color;
+          // ⭐ R25.45 rev23 (CIC) — ใช้ calcSumCheck เหมือน Sum row
+          const check = calcSumCheck('Invoice');
+          if (check.empty) {
+            diffEl.textContent = '-';
+            diffEl.style.color = 'var(--text3)';
+          } else {
+            diffEl.textContent = check.isOk ? '✓ ตรง' : fmtNum(check.diff);
+            diffEl.style.color = check.isOk ? 'var(--success)' : 'var(--danger)';
+          }
         }
         
         // ── Update Cash Drawer row ในสรุปด้านบน ──
@@ -40131,7 +40138,7 @@ function _pvMakeReversal(orig) {
 // ── Initialize after all declarations are ready ──
 (async function() {
   // ⭐ R25.44 BOOT BEACON
-  console.log('%c[SF R25.45] Active build: 2026-05-18-5300 — CIC 3tasks: re-enable poll pull (บิลหาย) + ลบ badge noise + เช็ค 3 สถานะ (ในมือ/รอเรียกเก็บ/ผ่าน)', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.45] Active build: 2026-05-18-5400 — FIX นับธนบัตร 'ส่วนต่าง' ใช้สูตรเดียวกับ Sum row (calcSumCheck) — เลิกขัดแย้งกัน', 'color:#0c8;font-weight:bold;font-size:13px');
   // ⭐ R25.45 rev6 — Sweep stale idempotency_key cache entries (TTL 1h) at boot
   try {
     const _IDK_TTL_MS = 60 * 60 * 1000;
