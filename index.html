@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.45-2026-05-18-5400 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.45-2026-05-18-5500 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -3003,25 +3003,34 @@ const syncManager = {
     //    ใหม่: ถ้า bills drop > 5 ใบ จาก high-water → ABORT (require explicit override)
     //          source breakdown: log Smart bills count → ดูได้ว่าหายเฉพาะ source ไหน
     if (willPushBills && window._billsPushHighWater > 100) {
-      const drop = window._billsPushHighWater - _currentBills;
+      const rawDrop = window._billsPushHighWater - _currentBills;
+      // ⭐ R25.45 rev24 (CIC) — หักลบ tracked deletions (บิลที่ user กดลบเอง)
+      //   drop ที่อธิบายได้ = deletedBillUuids → ไม่ใช่ data loss
+      //   guard ควร trip เฉพาะ "unexplained drop" = rawDrop − tracked
+      //   เคส false-positive: ลบ POS ซ้ำ 9 ใบ → rawDrop=9 > 5 → trip ผิด (จริงๆ user ตั้งใจลบ)
+      const trackedDeletions = this.deletedBillUuids ? this.deletedBillUuids.size : 0;
+      const unexplainedDrop = Math.max(0, rawDrop - trackedDeletions);
       const ratio = _currentBills / window._billsPushHighWater;
-      // ABSOLUTE drop check (>5 ใบ) — strict
-      if (drop > 5) {
-        abortReasons.push(`Bills: drop ${drop} ใบ (${_currentBills}/${window._billsPushHighWater}) — high-water threshold เข้มงวด 5 ใบ`);
+      // ABSOLUTE drop check — เฉพาะ drop ที่อธิบายไม่ได้
+      if (unexplainedDrop > 5) {
+        abortReasons.push(`Bills: หาย ${unexplainedDrop} ใบโดยไม่ได้ลบ (rawDrop ${rawDrop} − ลบเอง ${trackedDeletions}) (${_currentBills}/${window._billsPushHighWater})`);
       }
-      // Existing 50% relative check (catastrophic)
-      else if (ratio < dangerThreshold) {
-        abortReasons.push(`Bills: memory มี ${_currentBills} ลด > 50% จาก ${window._billsPushHighWater} (high-water)`);
+      // Catastrophic 50% relative check — trip เฉพาะเมื่อมี unexplained จริง
+      else if (ratio < dangerThreshold && unexplainedDrop > 0) {
+        abortReasons.push(`Bills: memory มี ${_currentBills} ลด > 50% จาก ${window._billsPushHighWater} (unexplained ${unexplainedDrop})`);
       }
     }
     if (willPushStmts && window._stmtsPushHighWater > 100) {
-      const drop = window._stmtsPushHighWater - _currentStmts;
+      const rawDrop = window._stmtsPushHighWater - _currentStmts;
+      // ⭐ R25.45 rev24 (CIC) — หักลบ tracked stmt deletions
+      const trackedDeletions = this.deletedStmtUuids ? this.deletedStmtUuids.size : 0;
+      const unexplainedDrop = Math.max(0, rawDrop - trackedDeletions);
       const ratio = _currentStmts / window._stmtsPushHighWater;
-      if (drop > 5) {
-        abortReasons.push(`Stmts: drop ${drop} ใบ (${_currentStmts}/${window._stmtsPushHighWater}) — high-water threshold เข้มงวด 5 ใบ`);
+      if (unexplainedDrop > 5) {
+        abortReasons.push(`Stmts: หาย ${unexplainedDrop} ใบโดยไม่ได้ลบ (rawDrop ${rawDrop} − ลบเอง ${trackedDeletions}) (${_currentStmts}/${window._stmtsPushHighWater})`);
       }
-      else if (ratio < dangerThreshold) {
-        abortReasons.push(`Stmts: memory มี ${_currentStmts} ลด > 50% จาก ${window._stmtsPushHighWater} (high-water)`);
+      else if (ratio < dangerThreshold && unexplainedDrop > 0) {
+        abortReasons.push(`Stmts: memory มี ${_currentStmts} ลด > 50% จาก ${window._stmtsPushHighWater} (unexplained ${unexplainedDrop})`);
       }
     }
     
@@ -40138,7 +40147,7 @@ function _pvMakeReversal(orig) {
 // ── Initialize after all declarations are ready ──
 (async function() {
   // ⭐ R25.44 BOOT BEACON
-  console.log('%c[SF R25.45] Active build: 2026-05-18-5400 — FIX นับธนบัตร ส่วนต่าง ใช้สูตรเดียวกับ Sum row (calcSumCheck) — เลิกขัดแย้งกัน', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.45] Active build: 2026-05-18-5500 — Sync login hotfix + FIX high-water guard หักลบ tracked deletions (เลิก false-positive ตอนลบบิลเยอะ)', 'color:#0c8;font-weight:bold;font-size:13px');
   // ⭐ R25.45 rev6 — Sweep stale idempotency_key cache entries (TTL 1h) at boot
   try {
     const _IDK_TTL_MS = 60 * 60 * 1000;
