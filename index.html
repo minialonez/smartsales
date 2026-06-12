@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.45-2026-05-18-5500 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.45-2026-05-18-5600 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -16905,6 +16905,30 @@ function showApp() {
   //    Cloud = source of truth; local memory = session cache only
   //    No localStorage persistence for bills/stmts/meta — เปิดเว็บ = load fresh
   loadAllFromCloud({ silent: false, reason: 'login' });
+  
+  // ⭐ R25.45 rev25 — BE version beacon check (กัน FE/BE version mismatch)
+  //   เรียก ping → ถ้า BE เก่า (ไม่มี v2 endpoints) → เตือน redeploy code.gs
+  (async () => {
+    try {
+      const EXPECTED_BE = 'rev25';   // FE คาดหวัง BE version นี้ขึ้นไป
+      const r = await api('ping', {});
+      const beVer = r?.data?.be_version || r?.be_version || '';
+      const hasV2 = (r?.data?.v2_stmts === true) || (r?.v2_stmts === true);
+      if (!beVer || !hasV2) {
+        console.warn('[ping] BE เก่า — ไม่มี v2 endpoints. ควร redeploy code.gs');
+        toast('⚠️ Backend เวอร์ชันเก่า — statement/PV match อาจผิดพลาด กรุณา redeploy code.gs (Apps Script)', 'warning', 8000);
+      } else {
+        console.log(`[ping] BE version: ${beVer} (v2 stmts: ${hasV2})`);
+        if (beVer.indexOf(EXPECTED_BE) !== 0 && !beVer.startsWith('rev2') && Number((beVer.match(/rev(\d+)/)||[])[1]||0) < 25) {
+          toast(`⚠️ Backend version ${beVer} เก่ากว่าที่คาด (${EXPECTED_BE}) — ควร redeploy code.gs`, 'warning', 7000);
+        }
+      }
+    } catch (e) {
+      // ping ไม่ได้ = BE เก่ามาก(ไม่มี endpoint นี้) → เตือน
+      console.warn('[ping] failed — BE อาจเก่ามาก (ไม่มี ping endpoint):', e.message);
+      toast('⚠️ Backend ไม่ตอบ ping — อาจเป็นเวอร์ชันเก่า ควร redeploy code.gs', 'warning', 7000);
+    }
+  })();
   
   // ⭐ 12/5/26 — Load company info from Sheet (cached for session)
   if (typeof _loadCompanyInfo === 'function') {
@@ -40147,7 +40171,7 @@ function _pvMakeReversal(orig) {
 // ── Initialize after all declarations are ready ──
 (async function() {
   // ⭐ R25.44 BOOT BEACON
-  console.log('%c[SF R25.45] Active build: 2026-05-18-5500 — Sync login hotfix + FIX high-water guard หักลบ tracked deletions (เลิก false-positive ตอนลบบิลเยอะ)', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.45] Active build: 2026-05-18-5600 — FIX statement per-bank (PV match + KBANK/BBL NW หาย) + BE version beacon ping — ต้อง redeploy code.gs', 'color:#0c8;font-weight:bold;font-size:13px');
   // ⭐ R25.45 rev6 — Sweep stale idempotency_key cache entries (TTL 1h) at boot
   try {
     const _IDK_TTL_MS = 60 * 60 * 1000;
