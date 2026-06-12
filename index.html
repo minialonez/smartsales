@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.45-2026-05-18-5200 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.45-2026-05-18-5300 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -2738,22 +2738,50 @@ const syncManager = {
       const dStmts = JSON.parse(localStorage.getItem('sf_deleted_stmt_uuids') || '[]');
       if (Array.isArray(dStmts)) this.deletedStmtUuids = new Set(dStmts);
     } catch(_){}
-    // ⛔ AUTO-SYNC DISABLED — manual save/refresh only
-    // เดิม: this._startPollPull() + visibilitychange auto-pull
-    // ใหม่: ใช้ปุ่ม "บันทึก" และ "🔄 Refresh" เท่านั้น
-    //       ป้องกัน race condition + ตัวเลขเปลี่ยนเอง + multi-device conflict
+    // ⭐ R25.45 rev22 (CIC Task 1) — RE-ENABLE auto-poll pull (แก้บิลหาย: pull starvation)
+    //   เดิม disabled กัน race → แต่ทำให้บิลจาก device อื่นไม่ลง local จนกด Refresh มือ
+    //   ใหม่: เปิด poll แบบปลอดภัย — เคารพ dirty guard (dirty>0 skip), monthScope กัน freeze
+    this._startPollPull();
   },
   
-  // ⛔ DISABLED: poll pull (auto-sync from other devices)
-  // Manual refresh button = หน้าที่นี้แทน
+  // ⭐ R25.45 rev22 — Poll pull (auto-sync จาก device อื่น) — guarded
   _startPollPull() {
-    // no-op — kept for compat (อาจมี code เรียก)
-    return;
+    if (this._pollTimer) return;   // กัน double-start
+    const POLL_MS = 3 * 60 * 1000;  // ทุก 3 นาที
+    this._pollTimer = setInterval(() => {
+      this._backgroundPull().catch(e => console.warn('[poll pull] failed:', e));
+    }, POLL_MS);
+    // First pull หลัง boot 30s (ให้ initial load เสร็จก่อน)
+    setTimeout(() => {
+      this._backgroundPull().catch(e => console.warn('[poll pull boot] failed:', e));
+    }, 30 * 1000);
   },
   
-  // ⛔ DISABLED: background pull
+  // ⭐ R25.45 rev22 — Background pull (guarded — ไม่ทับงานที่ user กำลังแก้)
   async _backgroundPull() {
-    return; // no-op — kept for compat
+    // Guard 1: sync disabled → skip
+    if (!this.enabled) return;
+    // Guard 2: มี dirty (user แก้ค้าง) → skip (กัน overwrite งานที่ยังไม่ push)
+    if (this.dirty && this.dirty.size > 0) {
+      console.log('[poll pull] skip — dirty:', [...this.dirty].join(','));
+      return;
+    }
+    // Guard 3: กำลัง push อยู่ → skip (กัน race) — ใช้ status flag ที่ _flushPush ตั้ง
+    if (this.status === 'pushing') return;
+    // Guard 4: กำลัง pull อยู่แล้ว → skip
+    if (this._pulling) return;
+    try {
+      this._pulling = true;
+      // monthScope: pull เฉพาะเดือนปัจจุบัน + เดือนที่ดูอยู่ (กัน freeze จาก pull 2 ปี)
+      const now = new Date();
+      const monthScope = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+      if (this.pullFromCloud) {
+        await this.pullFromCloud(2, 'poll', { types: ['bills', 'stmts'], monthScope });
+        console.log('[poll pull] done — scope:', monthScope);
+      }
+    } finally {
+      this._pulling = false;
+    }
   },
   
   // ⭐ เรียกจาก code ที่ลบ bill/stmt → track uuid + schedule push
@@ -7646,21 +7674,37 @@ async function renderMain(el) {
                   // ── Row status (สีไฮไลต์ตามสถานะ) ──
                   const isVoid = b.match_status === 'void';
                   const isPaid = !isVoid && (b.match_status === 'paid');
-                  // ⭐ R25.45 rev21 — เช็คที่ยัง pending = รอ stmt match (ไม่ใช่ "เคลียร์แล้ว")
-                  //   Bug: รับชำระลูกค้าด้วยเช็ค → SP-row match_status='pending' (ถูก)
-                  //        แต่ isAwaitingClear เดิมเช็ค `!b.confirmation` → ถ้ามี confirmation → ไม่ขึ้น badge
-                  //        + isPendingMatch ไม่รวม Cheque → เช็คไม่มี badge "รอ match" → ดูเหมือนจ่ายแล้ว
-                  //   Fix: เช็คที่ยังไม่ paid + ยังไม่ bounced = รอเช็คเข้า/รอ match เสมอ (ไม่สน confirmation)
-                  const isAwaitingClear = !isVoid && !isPaid && (
-                    b.match_status === 'awaiting_clear' || 
-                    (b.type === 'Cheque' && b.match_status !== 'paid' && b.match_status !== 'bounced')
-                  );
                   const isBounced = b.match_status === 'bounced';
+                  // ⭐ R25.45 rev22 (CIC Task 3) — 3-state cheque (FE display-time จาก due_date)
+                  //   1. เช็คในมือ (cheque_on_hand) — ยังไม่ถึงวันขึ้นเงิน (due_date > today)
+                  //   2. รอเรียกเก็บ (cheque_due)    — ถึงวันขึ้นเงินแล้ว (due_date ≤ today) แต่เงินยังไม่เข้า
+                  //   3. เช็คผ่าน (paid)             — match กับ statement แล้ว
+                  //   FE eval ทุก render จาก due_date (single source of truth — ไม่ persist ใน BE กัน stale)
+                  //   CIC adjustments: fallback due ว่าง → on_hand · ใช้ toISODate ทุกการเทียบ
+                  const isChequeType = (b.type === 'Cheque');
+                  const isChequeUnsettled = isChequeType && !isVoid && !isPaid && !isBounced;
+                  let chequeState = null;  // 'on_hand' | 'due' | null
+                  if (isChequeUnsettled) {
+                    const dueISO = b.due_date ? toISODate(b.due_date) : '';
+                    const todayISOv = toISODate(new Date());
+                    if (!dueISO) {
+                      chequeState = 'on_hand';   // fallback: due ว่าง → เช็คในมือ (ปลอดภัย)
+                    } else if (dueISO > todayISOv) {
+                      chequeState = 'on_hand';   // ยังไม่ถึงวันขึ้นเงิน
+                    } else {
+                      chequeState = 'due';       // ถึง/เลยวันขึ้นเงินแล้ว แต่ยังไม่ paid
+                    }
+                  }
+                  const isAwaitingClear = chequeState !== null;   // เช็คที่ยังไม่ settle (on_hand หรือ due)
                   const billPrefix = (b.bill_no||'').substring(0,2).toUpperCase();
+                  // ⭐ R25.45 rev22 (CIC Task 2) — ลบ badge 📋 ใบลดหนี้ / 🧾 ใบกำกับภาษี / 📦 ใบส่งของ
+                  //   เหตุผล: ซ้ำกับ prefix ใน bill_no column (เห็นชัดอยู่แล้ว) ไม่ actionable = noise
+                  //   เก็บไว้แค่ row highlight สี (visual grouping) — ไม่ขึ้น text badge
                   const isCreditNote = !isVoid && !isPaid && ['SC','PC','JS','JR','BR','BS'].includes(billPrefix);
                   const isCreditSale = !isVoid && !isPaid && ['SR','OR'].includes(billPrefix);
+                  // ⭐ R25.45 rev22 (CIC Task 3) — exclude Cheque (มี 3-state ของตัวเอง) กัน badge ซ้อน
                   const isPendingMatch = !isVoid && !isPaid && !isAwaitingClear && !isBounced && !isCreditNote && !isCreditSale &&
-                    (b.type === 'Transfer' || b.type === 'Card' || b.type === 'Cheque') &&
+                    (b.type === 'Transfer' || b.type === 'Card') &&
                     b.station !== 'Invoice Credit' && b.station !== 'Order Credit';
                   const billKey = b.bill_no ? `${b.bill_no}|${(b.type||'').trim()}|${Number(b.amount)||0}` : '';
                   const isDuplicate = !isVoid && billKey && dupeKeys.has(billKey);
@@ -7685,15 +7729,24 @@ async function renderMain(el) {
                     rowStyle = 'background:rgba(239,87,87,.12);border-left:3px solid var(--danger)';
                     statusBadge = `<br><span class="badge badge-danger" style="margin-top:2px">🚫 เช็คเด้ง</span>`;
                   } else if (isAwaitingClear) {
-                    rowStyle = 'background:rgba(245,166,35,.10);border-left:3px solid var(--warn)';
-                    statusBadge = `<br><span class="badge badge-warn" style="margin-top:2px" title="เช็ครอเคลียร์">⏳ รอเช็คเข้า</span>`;
+                    // ⭐ R25.45 rev22 — 3-state cheque badges
+                    if (chequeState === 'on_hand') {
+                      // เช็คในมือ — ยังไม่ถึงวันขึ้นเงิน (เทา)
+                      rowStyle = 'background:rgba(148,163,184,.10);border-left:3px solid #94a3b8';
+                      const dueStr = b.due_date ? fmtDate(toISODate(b.due_date)) : '(ไม่ระบุวันที่)';
+                      statusBadge = `<br><span class="badge" style="background:rgba(148,163,184,.18);color:#64748b;margin-top:2px" title="เช็คในมือ — ขึ้นเงินได้ ${dueStr}">🤝 เช็คในมือ</span>`;
+                    } else {
+                      // รอเรียกเก็บ — ถึงวันขึ้นเงินแล้ว แต่เงินยังไม่เข้า (ส้ม)
+                      rowStyle = 'background:rgba(245,166,35,.10);border-left:3px solid var(--warn)';
+                      const dueStr = b.due_date ? fmtDate(toISODate(b.due_date)) : '';
+                      statusBadge = `<br><span class="badge badge-warn" style="margin-top:2px" title="ถึงวันขึ้นเงินแล้ว${dueStr?' ('+dueStr+')':''} — รอเงินเข้าบัญชี / match statement">⏳ รอเรียกเก็บ</span>`;
+                    }
                   } else if (isCreditNote) {
+                    // ⭐ R25.45 rev22 — เก็บ row highlight (สีม่วง) แต่ลบ text badge (noise)
                     rowStyle = 'background:rgba(160,100,255,.08);border-left:3px solid rgba(160,100,255,.6)';
-                    statusBadge = `<br><span class="badge" style="background:rgba(160,100,255,.15);color:#a064ff;margin-top:2px">📋 ใบลดหนี้</span>`;
                   } else if (isCreditSale) {
+                    // ⭐ R25.45 rev22 — เก็บ row highlight (สีฟ้า) แต่ลบ text badge (noise)
                     rowStyle = 'background:rgba(91,124,250,.08);border-left:3px solid rgba(91,124,250,.6)';
-                    const csLabel = billPrefix === 'SR' ? '🧾 ใบกำกับภาษี' : '📦 ใบส่งของ';
-                    statusBadge = `<br><span class="badge" style="background:rgba(91,124,250,.15);color:#5b7cfa;margin-top:2px">${csLabel}</span>`;
                   } else if (isPendingMatch) {
                     rowStyle = 'background:rgba(239,87,87,.08);border-left:3px solid var(--danger)';
                     statusBadge = `<br><span class="badge badge-danger" style="margin-top:2px">⚠ ยัง Match ไม่เจอ</span>`;
@@ -10445,12 +10498,18 @@ async function renderMain(el) {
           const oldStatus = b.match_status;
           
           if (hasConf && isCheque) {
-            // ⭐ R25.45 rev21 — เช็ค + confirmation → awaiting_clear (รอเช็คเข้าบัญชีจริง)
-            //   เช็คยังไม่ขึ้นเงินจนกว่าจะ match กับ statement → ห้าม paid ทันที
+            // ⭐ R25.45 rev22 (CIC Task 3) — เช็ค + confirmation → awaiting_clear marker
+            //   renderer จะแยก "เช็คในมือ" vs "รอเรียกเก็บ" จาก due_date ตอน display (ไม่ persist 2 สถานะ)
+            //   เช็คยังไม่ paid จนกว่าจะ match กับ statement
             if (b.match_status !== 'paid' && b.match_status !== 'void' && b.match_status !== 'bounced') {
               b.match_status = 'awaiting_clear';
-              // ไม่ตั้ง pay_date — รอเช็คเข้าจริงค่อยกรอกตอน match stmt
-              toast(`⏳ เช็ค ${b.bill_no||''} — รอเช็คเข้าบัญชี (match กับ statement ก่อนถึงจะชำระครบ)`, 'info', 4000);
+              const dueISO = b.due_date ? toISODate(b.due_date) : '';
+              const todayISOv = toISODate(new Date());
+              if (!dueISO || dueISO > todayISOv) {
+                toast(`🤝 เช็ค ${b.bill_no||''} — เช็คในมือ${dueISO?' (ขึ้นเงินได้ '+fmtDate(dueISO)+')':''}`, 'info', 4000);
+              } else {
+                toast(`⏳ เช็ค ${b.bill_no||''} — รอเรียกเก็บ (ถึงวันขึ้นเงินแล้ว match statement เพื่อยืนยันเงินเข้า)`, 'info', 4000);
+              }
             }
           } else if (hasConf && canMatchByType) {
             // Type = Transfer/Card/Refund + มี confirmation → matched (เงินเข้าแล้ว)
@@ -40072,7 +40131,7 @@ function _pvMakeReversal(orig) {
 // ── Initialize after all declarations are ready ──
 (async function() {
   // ⭐ R25.44 BOOT BEACON
-  console.log('%c[SF R25.45] Active build: 2026-05-18-5200 — FIX เช็ค: กรอก confirmation → awaiting_clear (รอเช็คเข้า/match stmt) ไม่ paid ทันที', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.45] Active build: 2026-05-18-5300 — CIC 3tasks: re-enable poll pull (บิลหาย) + ลบ badge noise + เช็ค 3 สถานะ (ในมือ/รอเรียกเก็บ/ผ่าน)', 'color:#0c8;font-weight:bold;font-size:13px');
   // ⭐ R25.45 rev6 — Sweep stale idempotency_key cache entries (TTL 1h) at boot
   try {
     const _IDK_TTL_MS = 60 * 60 * 1000;
