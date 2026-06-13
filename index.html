@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.45-2026-05-18-5800 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.45-2026-05-18-5900 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -7408,6 +7408,7 @@ async function renderMain(el) {
           <button class="btn btn-outline btn-sm" id="btn-check-issues">🔍 ตรวจสอบ</button>
           <button class="btn btn-outline btn-sm" id="btn-refresh-cloud" title="ดึงข้อมูลล่าสุดจาก Sheet (ทับ local)">🔄 Refresh</button>
           <button class="btn btn-outline btn-sm" id="btn-export-monthly" title="Export Excel วันที่ดูอยู่ — Summary + Bill List (เหมือนหน้าจอ)">📊 Export วันนี้</button>
+          <button class="btn btn-outline btn-sm" id="btn-export-range" title="Export หลายวัน แยกเป็นหลายไฟล์ (1 วัน = 1 ไฟล์)">📦 Export ช่วงวันที่</button>
           <button class="btn btn-success btn-sm" id="btn-save-main" style="position:relative">${ICONS.check} บันทึก<span id="dirty-count-badge" style="display:none;background:var(--warn);color:#1a1d27;font-size:.7rem;font-weight:700;padding:1px 6px;border-radius:9px;margin-left:6px"></span></button>
         </div>
       </div>
@@ -8991,6 +8992,101 @@ async function renderMain(el) {
         toast('❌ Export ล้มเหลว: ' + (e.message || e), 'error', 5000);
       }
     });
+    
+    // ⭐ R25.45 rev29 — Export ช่วงวันที่ แยกเป็นหลายไฟล์ (1 วัน = 1 ไฟล์)
+    //   set selectedDate ชั่วคราวแต่ละรอบ → _exportMainDailySheet ใช้ค่านั้น → restore
+    //   delay ระหว่างไฟล์ กัน browser block multiple downloads + ให้ ExcelJS เสร็จ
+    async function _exportDateRange(fromISO, toISO) {
+      const start = new Date(fromISO + 'T00:00:00');
+      const end = new Date(toISO + 'T00:00:00');
+      if (isNaN(start) || isNaN(end) || start > end) {
+        toast('⚠️ ช่วงวันที่ไม่ถูกต้อง', 'warn');
+        return;
+      }
+      // build list of dates
+      const days = [];
+      for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+        days.push(`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`);
+      }
+      if (days.length > 40) {
+        if (!confirm(`จะ export ${days.length} ไฟล์ (วันละ 1 ไฟล์) — แน่ใจไหม?`)) return;
+      }
+      const savedDate = selectedDate;   // ⭐ จำวันที่เดิมไว้ restore
+      let ok = 0, skip = 0;
+      toast(`⏳ กำลัง export ${days.length} วัน...`, 'info', 3000);
+      try {
+        for (let i = 0; i < days.length; i++) {
+          const d = days[i];
+          // มีข้อมูลวันนี้ไหม (bills หรือ summary)
+          selectedDate = d;
+          invalidateBillsCache();
+          const hasBills = billList.some(b => toISODate(b.date) === d);
+          const hasSummary = mainSummary.__byDate && mainSummary.__byDate[d];
+          if (!hasBills && !hasSummary) { skip++; continue; }   // ข้ามวันว่าง (อาทิตย์ปิด ฯลฯ)
+          try {
+            await _exportMainDailySheet(d);
+            ok++;
+          } catch (e) {
+            console.error(`[Range Export] ${d} ล้มเหลว:`, e);
+          }
+          // delay กัน browser block + ให้ download เสร็จ
+          await new Promise(r => setTimeout(r, 600));
+        }
+      } finally {
+        // ⭐ restore วันที่เดิม + re-render
+        selectedDate = savedDate;
+        invalidateBillsCache();
+        if (typeof render === 'function') render();
+      }
+      toast(`✅ Export เสร็จ ${ok} ไฟล์${skip > 0 ? ` (ข้าม ${skip} วันที่ไม่มีข้อมูล)` : ''}`, 'success', 5000);
+    }
+    
+    // ปุ่ม Export ช่วงวันที่ → เปิด modal
+    document.getElementById('btn-export-range')?.addEventListener('click', () => {
+      _openExportRangeModal();
+    });
+    
+    function _openExportRangeModal() {
+      const today = selectedDate || todayISO();
+      // default: วันที่ 1 ของเดือนที่ดูอยู่ → วันที่ดูอยู่
+      const firstOfMonth = today.substring(0, 8) + '01';
+      const html = `
+        <div class="modal-backdrop" id="export-range-modal" style="display:flex">
+          <div class="modal" style="max-width:420px">
+            <div class="modal-header">
+              <h3 style="margin:0">📊 Export ช่วงวันที่ (แยกไฟล์)</h3>
+              <button class="modal-close" onclick="document.getElementById('export-range-modal').remove()">✕</button>
+            </div>
+            <div class="modal-body" style="padding:16px">
+              <p style="font-size:.85rem;color:var(--text2);margin:0 0 14px">
+                แต่ละวันจะได้ 1 ไฟล์แยกกัน (เช่น 01/04–05/04 = 5 ไฟล์)<br>
+                <span style="color:var(--text3)">วันที่ไม่มีข้อมูลจะถูกข้ามอัตโนมัติ</span>
+              </p>
+              <div style="display:flex;gap:12px;margin-bottom:16px">
+                <div style="flex:1">
+                  <label style="font-size:.8rem;color:var(--text2);display:block;margin-bottom:4px">จากวันที่</label>
+                  <input type="date" id="export-range-from" class="input" value="${firstOfMonth}" style="width:100%">
+                </div>
+                <div style="flex:1">
+                  <label style="font-size:.8rem;color:var(--text2);display:block;margin-bottom:4px">ถึงวันที่</label>
+                  <input type="date" id="export-range-to" class="input" value="${today}" style="width:100%">
+                </div>
+              </div>
+              <div style="display:flex;gap:8px;justify-content:flex-end">
+                <button class="btn btn-outline btn-sm" onclick="document.getElementById('export-range-modal').remove()">ยกเลิก</button>
+                <button class="btn btn-primary btn-sm" id="export-range-go">📥 Export</button>
+              </div>
+            </div>
+          </div>
+        </div>`;
+      document.body.insertAdjacentHTML('beforeend', html);
+      document.getElementById('export-range-go')?.addEventListener('click', async () => {
+        const from = document.getElementById('export-range-from').value;
+        const to = document.getElementById('export-range-to').value;
+        document.getElementById('export-range-modal')?.remove();
+        if (from && to) await _exportDateRange(from, to);
+      });
+    }
     
     // ⭐ R25.45 rev20 — Export วันที่ดูอยู่ เป็น xlsx 1 sheet (เหมือนหน้าจอ Main daily)
     //   Layout เป๊ะตามไฟล์เดิม JKN:
@@ -40230,7 +40326,7 @@ function _pvMakeReversal(orig) {
 // ── Initialize after all declarations are ready ──
 (async function() {
   // ⭐ R25.44 BOOT BEACON
-  console.log('%c[SF R25.45] Active build: 2026-05-18-5800 — Export main daily: Cash Drawer RAW + Sum หัก cashIn + merge Invoice/Order/Payment (row3+row7)', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.45] Active build: 2026-05-18-5900 — Export ช่วงวันที่ แยกหลายไฟล์ (1 วัน = 1 ไฟล์)', 'color:#0c8;font-weight:bold;font-size:13px');
   // ⭐ R25.45 rev6 — Sweep stale idempotency_key cache entries (TTL 1h) at boot
   try {
     const _IDK_TTL_MS = 60 * 60 * 1000;
