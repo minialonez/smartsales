@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.45-2026-05-18-6100 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.45-2026-05-18-6200 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -40383,7 +40383,7 @@ function _pvMakeReversal(orig) {
 // ── Initialize after all declarations are ready ──
 (async function() {
   // ⭐ R25.44 BOOT BEACON
-  console.log('%c[SF R25.45] Active build: 2026-05-18-6100 — CIC 4bug: month-scope stmt pull + selective bills push + stuck-detection ก่อน early-return + watchdog + แยก swap bills/stmts', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.45] Active build: 2026-05-18-6200 — CID: FIX double-application (Strategy 0 sp_no uniqueness + resync dedup) + bump SF_BUILD', 'color:#0c8;font-weight:bold;font-size:13px');
   // ⭐ R25.45 rev6 — Sweep stale idempotency_key cache entries (TTL 1h) at boot
   try {
     const _IDK_TTL_MS = 60 * 60 * 1000;
@@ -40402,7 +40402,7 @@ function _pvMakeReversal(orig) {
     if (_stale.length) console.log('[R25.45 rev6] Cleared ' + _stale.length + ' stale idk cache entries');
   } catch(_) {}
   console.log('%c[SF R25.44] Issue 1: flip by sp_no fallback · Issue 2: 5min window + defensive Date · Issue 3: pending_match hint · Issue 4: include_snapshot:true', 'color:#888');
-  window.__SF_BUILD = 'R25.44-2026-05-18-1400';
+  window.__SF_BUILD = 'R25.45-2026-05-18-6200';
   
   await restoreMainState();
   checkSavedLogin();
