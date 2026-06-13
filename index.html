@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.45-2026-05-18-6200 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.45-2026-05-18-6400 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -984,6 +984,18 @@ if (typeof window !== 'undefined') {
     window.__excludedCustomers = new Set();
   }
 })();
+
+// 🚫 R25.45 rev34 — helper เช็คว่า cust_code อยู่ในรายการ "ไม่นับยอด" ไหม
+//   ใช้ทั้ง Main daily (calcSales) + billing notes aggregate (aging/AR/outstanding)
+//   เคส: ฟาฉาย (BE-00789) + ป๊อกกี้ (JN-05797) = บริษัทเครือ ออก SB ปกติ แต่ไม่นับยอดทางการ
+//   เดิม __excludedCustomers ใช้แค่ calcSales → billing total ยังรวม → ยอด AR เกินจริง
+function _isExcludedCustomer(code) {
+  if (!code) return false;
+  const excl = window.__excludedCustomers;
+  if (!excl || excl.size === 0) return false;
+  return excl.has(String(code).trim().toUpperCase());
+}
+window._isExcludedCustomer = _isExcludedCustomer;
 
 // ── Excel / CSV File Parser ──
 // ⭐ 13/5/26 — preferFormatted=true → raw:false → preserve leading zeros (string values from .w property)
@@ -5511,12 +5523,22 @@ async function restoreMainState() {
   
   // ── Auto-mark: confirmation มีค่าแล้ว → matched ──
   // (รองรับข้อมูลเก่าที่ user กรอก confirmation ก่อนหน้ามี auto-match feature)
+  //   ⭐ R25.45 rev32 (CID) — ยกเว้น Cheque + SP-PENDING ที่ยังรอ stmt match
+  //     เคส rp_v3: เช็คเคยถูกผูกเลขเช็คเข้า confirmation → heal นี้ flip paid ผิด (false-paid)
+  //     เช็ค/SP-pending ต้องรอ stmt match จริงก่อน (3-state cheque: on_hand/due/paid)
+  //   แก้ typo: บรรทัดที่ 2 เคยเขียน !=='paid' ซ้ำ → ควรเป็น !=='matched'
   let confMatched = 0;
   billList.forEach(b => {
+    const billNo = String(b.bill_no || '');
+    const isCheque = (b.type === 'Cheque');
+    const isSpPending = billNo.indexOf('SP-PENDING') === 0;
+    // ⭐ ข้ามเช็ค + SP-PENDING — อย่า flip paid จาก confirmation เฉยๆ (ต้องรอ stmt match)
+    if (isCheque || isSpPending) return;
     if (b.confirmation && String(b.confirmation).trim() &&
         b.match_status !== 'paid' && 
-        b.match_status !== 'paid' && 
-        b.match_status !== 'void') {
+        b.match_status !== 'matched' && 
+        b.match_status !== 'void' &&
+        b.match_status !== 'bounced') {
       b.match_status = 'paid';
       if (!b.pay_date) b.pay_date = b.date;
       confMatched++;
@@ -19130,6 +19152,8 @@ async function renderBilling(el) {
     
     for (let i = 0; i < billingNotes.length; i++) {
       const n = billingNotes[i];
+      // 🚫 R25.45 rev34 — ข้ามลูกค้าที่ไม่นับยอด (ฟาฉาย/ป๊อกกี้) → aging/outstanding ไม่เกินจริง
+      if (_isExcludedCustomer(n.cust_code)) continue;
       totalCount++;
       if (n.status === 'pending') pendingCount++;
       else if (n.status === 'partial') partialCount++;
@@ -19693,6 +19717,8 @@ async function renderBilling(el) {
     billingNotes.forEach(n => {
       if (n.status !== 'pending' && n.status !== 'partial') return;
       const code = String(n.cust_code || '').trim().toUpperCase();
+      // 🚫 R25.45 rev34 — ข้ามลูกค้าที่ไม่นับยอด (ฟาฉาย/ป๊อกกี้) → AR/aging ไม่เกินจริง
+      if (_isExcludedCustomer(code)) return;
       const key = code || ('NAME:' + (n.cust_name || ''));
       if (!map[key]) {
         map[key] = {
@@ -22573,8 +22599,8 @@ function wireReceivePaymentModalV3(state) {
         
         ${isCheque ? `
           <label style="font-size:.78rem;color:var(--muted)">เลขเช็ค:</label>
-          <input class="input rp-inst-confirmation" data-gidx="${gIdx}" data-iidx="${iIdx}" 
-                 value="${escapeHtml(inst.confirmation||'')}" placeholder="0001234"
+          <input class="input rp-inst-remarks2" data-gidx="${gIdx}" data-iidx="${iIdx}" 
+                 value="${escapeHtml(inst.remarks2||'')}" placeholder="0001234"
                  style="font-size:.8rem;padding:4px 6px;width:110px">
           <label style="font-size:.78rem;color:var(--muted)" title="วันครบกำหนดเช็ค">ครบกำหนด:</label>
           <input type="date" class="input rp-inst-duedate" data-gidx="${gIdx}" data-iidx="${iIdx}" 
@@ -22637,6 +22663,7 @@ function wireReceivePaymentModalV3(state) {
     wireField('.rp-inst-date', 'pay_date');
     wireField('.rp-inst-bank', 'bank');
     wireField('.rp-inst-duedate', 'due_date');
+    wireField('.rp-inst-remarks2', 'remarks2');   // ⭐ rev32 — เลขเช็ค → remarks2 (ตาม convention manual/legacy)
     wireField('.rp-inst-confirmation', 'confirmation');
     wireField('.rp-inst-ref', 'reference');
     wireField('.rp-inst-wht-amt', 'wht_amount', inp => Number(inp.value) || 0);
@@ -22649,8 +22676,9 @@ function wireReceivePaymentModalV3(state) {
         const oldMethod = i.method;
         i.method = sel.value;
         // Clear cheque-specific fields if switched away
+        //   ⭐ rev32 — เช็คเก็บเลขเช็คใน remarks2 (ไม่ใช่ confirmation) → clear remarks2 + due_date
         if (sel.value !== 'Cheque') {
-          i.confirmation = '';
+          i.remarks2 = '';
           i.due_date = '';
         }
         // ⭐ R25.11 — clear bank when switched to Cash (Cash ไม่ผ่าน bank)
@@ -22981,7 +23009,8 @@ function wireReceivePaymentModalV3(state) {
             remarks2: i.remarks2 || '',
             due_date: i.method === 'Cheque' ? (i.due_date || '') : '',
             wht_amount: i.wht_enabled ? (Number(i.wht_amount)||0) : 0,
-            confirmation: i.confirmation || '',
+            // ⭐ rev32 — เช็ค: confirmation ปล่อยว่าง รอ stmt match เติม (เลขเช็คอยู่ remarks2 แล้ว)
+            confirmation: i.method === 'Cheque' ? '' : (i.confirmation || ''),
           })),
           allocations: g.allocations || {},
           // ⭐ R25.45 rev4 — SC/JR uuids ที่ user tick (negative amount) → persist as paid marker
@@ -40383,7 +40412,7 @@ function _pvMakeReversal(orig) {
 // ── Initialize after all declarations are ready ──
 (async function() {
   // ⭐ R25.44 BOOT BEACON
-  console.log('%c[SF R25.45] Active build: 2026-05-18-6200 — CID: FIX double-application (Strategy 0 sp_no uniqueness + resync dedup) + bump SF_BUILD', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.45] Active build: 2026-05-18-6400 — FIX confirmation/bank alias (match_bank to bank) + exclude ฟาฉาย/ป๊อกกี้ จาก AR/aging', 'color:#0c8;font-weight:bold;font-size:13px');
   // ⭐ R25.45 rev6 — Sweep stale idempotency_key cache entries (TTL 1h) at boot
   try {
     const _IDK_TTL_MS = 60 * 60 * 1000;
@@ -40402,7 +40431,7 @@ function _pvMakeReversal(orig) {
     if (_stale.length) console.log('[R25.45 rev6] Cleared ' + _stale.length + ' stale idk cache entries');
   } catch(_) {}
   console.log('%c[SF R25.44] Issue 1: flip by sp_no fallback · Issue 2: 5min window + defensive Date · Issue 3: pending_match hint · Issue 4: include_snapshot:true', 'color:#888');
-  window.__SF_BUILD = 'R25.45-2026-05-18-6200';
+  window.__SF_BUILD = 'R25.45-2026-05-18-6400';
   
   await restoreMainState();
   checkSavedLogin();
