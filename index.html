@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.45-2026-05-18-6400 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.45-2026-05-18-6500 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -7034,6 +7034,8 @@ async function renderMain(el) {
       const st = (b.station || '').trim();
       const ty = (b.type || '').trim();
       const no = b.bill_no || '';
+      // 🚫 R25.45 rev35 (CID) — ตัดลูกค้าที่ไม่นับยอด (สมมาตรกับ calcSales)
+      if (_isExcludedBill(b)) return false;
       return st === station && ty === 'Cash' && (isCashDrawerBill(no) || !no);
     }).reduce((s, b) => s + (Number(b.amount) || 0), 0);
     
@@ -7051,6 +7053,8 @@ async function renderMain(el) {
       const st = (b.station || '').trim();
       const ty = (b.type || '').trim();
       const no = b.bill_no || '';
+      // 🚫 R25.45 rev35 (CID) — ตัดลูกค้าที่ไม่นับยอด (สมมาตรกับ calcSales)
+      if (_isExcludedBill(b)) return false;
       return st === station && ty === 'Cash' && (isCashDrawerBill(no) || !no);
     }).reduce((s, b) => s + (Number(b.amount) || 0), 0);
   }
@@ -7061,6 +7065,10 @@ async function renderMain(el) {
       const st = (b.station || '').trim();
       const ty = (b.type || '').trim();
       if (st !== station || ty !== type) return false;
+      // 🚫 R25.45 rev35 (CID) — ตัดลูกค้าที่ไม่นับยอด (ฟาฉาย/ป๊อกกี้) ให้สมมาตรกับ calcSales
+      //   เดิม: filter อยู่ฝั่ง income (calcSales) แต่ไม่อยู่ฝั่ง accounted (ที่นี่)
+      //   → Sum diff เด้งเป็นยอด transfer/cheque ของลูกค้า excluded (false "เงินเกิน")
+      if (_isExcludedBill(b)) return false;
       // ⭐ Phase 4 (5/5/26) — SP-PENDING ที่ยัง unmatched ไม่นับ ใน Daily "ยอดโอน/เช็ค/บัตร"
       //    เพราะเงินยังไม่เข้าจริง (รอ match stmt) — paid_by_sp = JSON allocation (truthy)
       //    แต่นี่เป็น "ตั้งใจรับชำระ" ยังไม่ใช่ "เงินเข้าจริง"
@@ -40412,7 +40420,7 @@ function _pvMakeReversal(orig) {
 // ── Initialize after all declarations are ready ──
 (async function() {
   // ⭐ R25.44 BOOT BEACON
-  console.log('%c[SF R25.45] Active build: 2026-05-18-6400 — FIX confirmation/bank alias (match_bank to bank) + exclude ฟาฉาย/ป๊อกกี้ จาก AR/aging', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.45] Active build: 2026-05-18-6500 — FIX excluded-customer asymmetry (filter ฝั่ง accounted: calcAutoValue + calcCashFromBills) → Sum balance', 'color:#0c8;font-weight:bold;font-size:13px');
   // ⭐ R25.45 rev6 — Sweep stale idempotency_key cache entries (TTL 1h) at boot
   try {
     const _IDK_TTL_MS = 60 * 60 * 1000;
@@ -40431,7 +40439,7 @@ function _pvMakeReversal(orig) {
     if (_stale.length) console.log('[R25.45 rev6] Cleared ' + _stale.length + ' stale idk cache entries');
   } catch(_) {}
   console.log('%c[SF R25.44] Issue 1: flip by sp_no fallback · Issue 2: 5min window + defensive Date · Issue 3: pending_match hint · Issue 4: include_snapshot:true', 'color:#888');
-  window.__SF_BUILD = 'R25.45-2026-05-18-6400';
+  window.__SF_BUILD = 'R25.45-2026-05-18-6500';
   
   await restoreMainState();
   checkSavedLogin();
