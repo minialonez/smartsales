@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.45-2026-05-18-6000 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.45-2026-05-18-6100 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -2469,7 +2469,53 @@ async function pushStatementsCompat(year, records, deletes) {
   return { success: true, totalDeleted: Number(r?.data?.deleted) || 0 };
 }
 
-async function pullStatementsCompat(year) {
+async function pullStatementsCompat(year, opts) {
+  opts = opts || {};
+  // ⭐ R25.45 rev30 (CIC Bug 1) — month-scoped per-bank pull (กัน freeze จากดึงทั้งปี 11,585 ราย)
+  //   ถ้า opts.monthScope = ['2026-05','2026-06'] → ดึงเฉพาะเดือนนั้น ทีละ bank (payload เล็ก)
+  //   ถ้าไม่ระบุ → full-year (initial load เท่านั้น)
+  const BANKS = ['KTB', 'KBANK', 'BBL_NW', 'BBL', 'TTB'];
+  const _normalizeBankToDisplay = (b) => (b === 'BBL_NW' || b === 'BBLNW') ? 'BBL NW' : b;
+  
+  if (opts.monthScope && Array.isArray(opts.monthScope) && opts.monthScope.length > 0 && window.__v2StmtsAvailable !== false) {
+    // เดือน → from/to ISO (ครอบทุกเดือนใน scope)
+    const months = opts.monthScope.slice().sort();
+    const fromISO = months[0] + '-01';
+    const lastM = months[months.length - 1];
+    const [ly, lm] = lastM.split('-').map(Number);
+    const lastDay = new Date(ly, lm, 0).getDate();
+    const toISO = `${lastM}-${String(lastDay).padStart(2,'0')}`;
+    try {
+      const out = [];
+      // ดึงทีละ bank (payload เล็ก ไม่ freeze) — parallel
+      const results = await Promise.all(BANKS.map(bank =>
+        api('v2_getStatementsByBankAndDateRange', { bank, year, from: fromISO, to: toISO })
+          .then(r => ({ bank, r }))
+          .catch(e => ({ bank, r: { success: false, error: e.message } }))
+      ));
+      for (const { bank, r } of results) {
+        if (r?.success === false) {
+          if (/not handled|unknown action|no route|not found/i.test(String(r.error || ''))) {
+            window.__v2StmtsAvailable = false;
+            throw new Error('V2_NOT_DEPLOYED');
+          }
+          continue; // bank นี้ error → ข้าม (ไม่ทำทั้ง pull พัง)
+        }
+        window.__v2StmtsAvailable = true;
+        const arr = r?.data?.statements || [];
+        const disp = _normalizeBankToDisplay(bank);
+        for (let i = 0; i < arr.length; i++) { arr[i].bank = disp; out.push(arr[i]); }
+      }
+      console.log(`[v2 stmts] month-scoped pull: ${out.length} ราย (${fromISO}→${toISO}, ${BANKS.length} banks)`);
+      return out;
+    } catch (e) {
+      if (e.message === 'V2_NOT_DEPLOYED') throw e;
+      console.warn('[v2 stmts] month-scoped pull error → fallback full-year:', e.message);
+      // ตกลงไป full-year ด้านล่าง
+    }
+  }
+  
+  // Full-year pull (initial load) — payload ใหญ่ ใช้เฉพาะตอนจำเป็น
   if (window.__v2StmtsAvailable !== false) {
     try {
       const r = await api('v2_getAllStatementsByYear', { year });
@@ -2481,12 +2527,6 @@ async function pullStatementsCompat(year) {
         throw new Error(r.error || 'v2_getAllStatementsByYear failed');
       }
       window.__v2StmtsAvailable = true;
-      // ⭐ Backend returns data.banks = { KTB: [...], KBANK: [...], BBL_NW: [...], BBL: [...], TTB: [...] }
-      //   each row has `bank` field already injected by v2GetStatementsByBank
-      //   → flatten into single array (preserves per-row bank info)
-      //   ⚠ Map underscore canonical 'BBL_NW' → display 'BBL NW' (space) ใช้ทั่ว frontend
-      // Fallback to data.records if older backend version returns flat array
-      const _normalizeBankToDisplay = (b) => (b === 'BBL_NW' || b === 'BBLNW') ? 'BBL NW' : b;
       if (Array.isArray(r?.data?.records)) {
         return r.data.records.map(s => ({ ...s, bank: _normalizeBankToDisplay(s.bank) }));
       }
@@ -2497,7 +2537,6 @@ async function pullStatementsCompat(year) {
         const displayBank = _normalizeBankToDisplay(b);
         if (Array.isArray(arr)) {
           for (let i = 0; i < arr.length; i++) {
-            // ensure bank field is set + normalized to display form
             arr[i].bank = displayBank;
             out.push(arr[i]);
           }
@@ -2755,6 +2794,19 @@ const syncManager = {
     setTimeout(() => {
       this._backgroundPull().catch(e => console.warn('[poll pull boot] failed:', e));
     }, 30 * 1000);
+    // ⭐ R25.45 rev30 (CIC Bug 3) — WATCHDOG: auto-reset stuck pushing ทุก 30s
+    //   เผื่อ status='pushing' ค้าง + ไม่มีใครเรียก _flushPush → deadlock ถาวร
+    if (!this._watchdogTimer) {
+      this._watchdogTimer = setInterval(() => {
+        if ((this.status === 'pushing' || this._pushing) && this._pushStartedAt && (Date.now() - this._pushStartedAt > 60000)) {
+          console.warn(`[watchdog] stuck pushing > 60s (${Math.round((Date.now()-this._pushStartedAt)/1000)}s) — auto reset`);
+          this.status = 'idle';
+          this._pushing = false;
+          this._pushStartedAt = 0;
+          this._emit && this._emit();
+        }
+      }, 30 * 1000);
+    }
   },
   
   // ⭐ R25.45 rev22 — Background pull (guarded — ไม่ทับงานที่ user กำลังแก้)
@@ -2965,40 +3017,34 @@ const syncManager = {
   },
   
   async _flushPush() {
+    // ⭐ R25.45 rev30 (CIC Bug 3) — STUCK DETECTION ก่อนทุกอย่าง (แก้ deadlock)
+    //   ปัญหาเดิม: early-return if(dirty===0) อยู่ก่อน timeout recovery
+    //             → ถ้า status='pushing' ค้าง + dirty ว่าง → return ทันที → ไม่เคย reset → deadlock ถาวร (21 นาที!)
+    //   แก้: เช็ค stuck >60s ก่อน early-return → force reset เสมอ
+    if ((this.status === 'pushing' || this._pushing) && this._pushStartedAt && (Date.now() - this._pushStartedAt > 60000)) {
+      console.warn(`[sync] stuck pushing > 60s (${Math.round((Date.now()-this._pushStartedAt)/1000)}s) — force reset`);
+      this.status = 'idle';
+      this._pushing = false;
+      this._pushStartedAt = 0;
+      this._emit && this._emit();
+    }
+    
     // ⭐ Manual save: ทำงานเสมอเมื่อถูกเรียก (ไม่สน enabled flag)
     if (this.dirty.size === 0) return { ok: 0, fail: 0, skipped: 0, errors: [] };
     
     // ⭐ R25.45 rev26 (CIC Bug 1) — CONCURRENT-PUSH GUARD ที่ entry ทันที
-    //   ปัญหา: guard เดิม (status==='pushing') เช็คที่ L2970 แต่ status set ที่ L3081
-    //          → มี race window ~110 บรรทัด (guard logic) → ถ้าเรียกซ้ำในช่วงนี้
-    //          → ผ่าน guard → dirty.clear() รอบ 2 ล้าง dirty รอบแรกที่ยังไม่ push
-    //          → batch stmts หาย + fingerprint set ทั้งที่ push ไม่ครบ → statement หายเงียบๆ
-    //   แก้: _pushing flag ตั้งที่ entry ทันที (ก่อน guard logic ใดๆ) + reset ใน finally
-    //   ⭐ TIMEOUT RECOVERY: ถ้า _pushing ค้าง > 60s (รอบก่อน dead) → force reset
+    //   _pushing flag ตั้งที่ entry ทันที (ก่อน guard logic ใดๆ) + reset ใน finally
     if (this._pushing) {
-      const stuckMs = this._pushStartedAt ? (Date.now() - this._pushStartedAt) : 0;
-      if (stuckMs > 60000) {
-        console.warn(`[sync] _flushPush stuck > 60s (${Math.round(stuckMs/1000)}s) — force reset + proceed`);
-        this._pushing = false;
-        this.status = 'idle';
-      } else {
-        console.warn('[sync] _flushPush already running — skip concurrent call');
-        return { skipped: 'already_pushing' };
-      }
+      console.warn('[sync] _flushPush already running — skip concurrent call');
+      return { skipped: 'already_pushing' };
     }
     this._pushing = true;
     this._pushStartedAt = Date.now();
     
     if (this.status === 'pushing') {
-      // status ค้างจากรอบก่อน (ไม่ควรถึงตรงนี้ถ้า _pushing guard ทำงาน — safety)
-      const stuckMs = this.lastPushAt ? (Date.now() - this.lastPushAt) : 999999;
-      if (stuckMs > 60000) {
-        console.warn('[sync] status=pushing stuck > 60s — force reset');
-        this.status = 'idle';
-      } else {
-        this._pushing = false;   // ปล่อย flag (ไม่ได้เริ่ม push จริง)
-        return { ok: 0, fail: 0, skipped: 0, errors: ['already pushing'] };
-      }
+      // status ค้างจากรอบก่อน (stuck-detection ข้างบนจัดการแล้วถ้า >60s — นี่คือ <60s)
+      this._pushing = false;   // ปล่อย flag (ไม่ได้เริ่ม push จริง)
+      return { ok: 0, fail: 0, skipped: 0, errors: ['already pushing'] };
     }
     
     // ══════════════════════════════════════════════════════════════
@@ -3932,7 +3978,9 @@ const syncManager = {
       for (const y of years) {
         if (!_shouldPull('stmts')) break;  // ⭐ Type filter
         try {
-          const items = await pullStatementsCompat(y);
+          // ⭐ R25.45 rev30 (CIC Bug 1) — ถ้ามี monthScope → ดึงเฉพาะเดือนนั้น per-bank (กัน freeze)
+          const stmtOpts = monthScope ? { monthScope: [monthScope] } : {};
+          const items = await pullStatementsCompat(y, stmtOpts);
           if (Array.isArray(items) && items.length > 0) {
             items.forEach(s => {
               normalizeStmt(s);
@@ -9619,8 +9667,14 @@ async function renderMain(el) {
         syncManager._inPull = false;
         syncManager.status = 'idle';
         
-        syncManager.markDirty('bills');
-        syncManager.markDirty('stmts');
+        // ⭐ R25.45 rev30 (CIC Bug 2) — ไม่ blanket-mark bills/stmts (กัน push ทั้ง 13,900)
+        //   bills/stmts ที่แก้จริงถูก track ผ่าน markDirty(type, uuid) ตอนแก้แต่ละรายการแล้ว
+        //   การ markDirty('bills') เปล่า → dirtyUuids ว่าง → selective พัง → fallback push ทั้งหมด
+        //   → save ค้าง 4-5 นาที + freeze + status=pushing → รับชำระผิดพลาด
+        //   แก้: mark bills/stmts dirty เฉพาะถ้ามี dirtyUuids อยู่แล้ว (รักษา selective)
+        if (syncManager.dirtyUuids?.bills?.size > 0) syncManager.dirty.add('bills');
+        if (syncManager.dirtyUuids?.stmts?.size > 0) syncManager.dirty.add('stmts');
+        // type อื่นไม่มี selective → mark ได้ตามเดิม
         syncManager.markDirty('meta');
         syncManager.markDirty('payments');
         syncManager.markDirty('cashflow');
@@ -17610,41 +17664,43 @@ async function loadAllFromCloud(opts) {
     //              → resolve ได้ผ่าน manual reload (mode='force', reason='manual-*')
     const highWaterBills = window._billsPushHighWater || 0;
     const highWaterStmts = window._stmtsPushHighWater || 0;
-    const dropFromHighBills = highWaterBills - tempBills.length;
-    const dropFromHighStmts = highWaterStmts - totalStmts;
+    // ⭐ R25.45 rev30 (CIC Bug 4) — หัก tracked deletions (บิลที่ user ลบเอง ไม่ใช่ stale)
+    const trackedBillDel = this?.deletedBillUuids?.size || syncManager?.deletedBillUuids?.size || 0;
+    const trackedStmtDel = this?.deletedStmtUuids?.size || syncManager?.deletedStmtUuids?.size || 0;
+    const dropFromHighBills = Math.max(0, (highWaterBills - tempBills.length) - trackedBillDel);
+    const dropFromHighStmts = Math.max(0, (highWaterStmts - totalStmts) - trackedStmtDel);
     
     // First-load case: never pushed yet (highWater still 0) — must allow initial seed
     const isFirstLoad = highWaterBills === 0 && highWaterStmts === 0;
     
-    // ⭐ STRICT: any drop ≥1 = stale cloud snapshot (Google Apps Script propagation lag)
+    // ⭐ STRICT: any unexplained drop ≥1 = stale cloud snapshot (Google Apps Script propagation lag)
     const STALE_DROP_THRESHOLD = 1;
     const billsStale = !isFirstLoad && dropFromHighBills >= STALE_DROP_THRESHOLD;
     const stmtsStale = !isFirstLoad && dropFromHighStmts >= STALE_DROP_THRESHOLD;
     
-    // ⭐ ATOMIC: ถ้า bills หรือ stmts stale → ABORT BOTH (bills/stmts mutate together
-    //          เช่น match operation อัปเดต stmts.match_bill + bills.matched_stmt_uuid ทั้งคู่)
-    const atomicStale = billsStale || stmtsStale;
-    
-    // 95% threshold ยังอยู่ — defense in depth (กัน massive cloud failure)
-    const swapBills = !atomicStale && (beforeBillsCount === 0 || tempBills.length >= beforeBillsCount * 0.95);
-    const swapStmts = !atomicStale && (beforeStmtsCount === 0 || totalStmts >= beforeStmtsCount * 0.95);
+    // ⭐ R25.45 rev30 (CIC Bug 4) — แยก swap bills/stmts อิสระ (ไม่ atomic ลากกัน)
+    //   เดิม: atomicStale = billsStale || stmtsStale → bills drop=1 → abort stmts ด้วย
+    //         → statement ใหม่ (12/06) ไม่เข้า ทั้งที่ stmts ไม่ stale
+    //   ใหม่: bills stale → abort bills เท่านั้น · stmts stale → abort stmts เท่านั้น
+    //   (match operation ที่อัปเดตทั้งคู่ — ถ้า bills stale จาก push ค้าง stmts ฝั่ง cloud ก็ยังใหม่กว่า local เสมอ
+    //    การ swap stmts เข้ามาไม่ทำให้ match พัง เพราะ heal logic จัดการ match_status ให้ consistent)
+    const swapBills = !billsStale && (beforeBillsCount === 0 || tempBills.length >= beforeBillsCount * 0.95);
+    const swapStmts = !stmtsStale && (beforeStmtsCount === 0 || totalStmts >= beforeStmtsCount * 0.95);
     
     const skipReasons = [];
-    if (atomicStale) {
-      const reasons = [];
-      if (billsStale) reasons.push(`bills drop=${dropFromHighBills} (${tempBills.length}/${highWaterBills})`);
-      if (stmtsStale) reasons.push(`stmts drop=${dropFromHighStmts} (${totalStmts}/${highWaterStmts})`);
-      skipReasons.push(`ATOMIC ABORT (stale cloud): ${reasons.join(' · ')}`);
-      console.warn(`🚨 [loadAllFromCloud] ATOMIC ABORT both swaps — STALE cloud snapshot detected: ${reasons.join(' | ')} · reason=${reason}`);
-    } else {
-      if (!swapBills) {
-        skipReasons.push(`Bills ${tempBills.length} < 95% of before ${beforeBillsCount}`);
-        console.warn(`[loadAllFromCloud] ABORT bills swap (95% rule): tempBills=${tempBills.length} before=${beforeBillsCount}`);
-      }
-      if (!swapStmts) {
-        skipReasons.push(`Stmts ${totalStmts} < 95% of before ${beforeStmtsCount}`);
-        console.warn(`[loadAllFromCloud] ABORT stmts swap (95% rule): tempStmts=${totalStmts} before=${beforeStmtsCount}`);
-      }
+    if (billsStale) {
+      skipReasons.push(`Bills stale drop=${dropFromHighBills} (${tempBills.length}/${highWaterBills}, tracked del ${trackedBillDel})`);
+      console.warn(`🚨 [loadAllFromCloud] ABORT bills swap — stale: drop=${dropFromHighBills} · reason=${reason}`);
+    } else if (!swapBills) {
+      skipReasons.push(`Bills ${tempBills.length} < 95% of before ${beforeBillsCount}`);
+      console.warn(`[loadAllFromCloud] ABORT bills swap (95% rule): tempBills=${tempBills.length} before=${beforeBillsCount}`);
+    }
+    if (stmtsStale) {
+      skipReasons.push(`Stmts stale drop=${dropFromHighStmts} (${totalStmts}/${highWaterStmts}, tracked del ${trackedStmtDel})`);
+      console.warn(`🚨 [loadAllFromCloud] ABORT stmts swap — stale: drop=${dropFromHighStmts} · reason=${reason}`);
+    } else if (!swapStmts) {
+      skipReasons.push(`Stmts ${totalStmts} < 95% of before ${beforeStmtsCount}`);
+      console.warn(`[loadAllFromCloud] ABORT stmts swap (95% rule): tempStmts=${totalStmts} before=${beforeStmtsCount}`);
     }
     
     if (skipReasons.length > 0 && !silent) {
@@ -18548,7 +18604,8 @@ window.autoLinkBillsToCustomers = async function(opts = {}) {
   
   if (!dryRun && matched > 0) {
     persistMainState();
-    syncManager.markDirty('bills');
+    // ⭐ R25.45 rev30 (CIC Bug 2) — track เฉพาะ bills ที่เปลี่ยน (selective push)
+    updatedBills.forEach(b => { if (b.bill_uuid) syncManager.markDirty('bills', b.bill_uuid); });
     invalidateBillsCache?.();
   }
   
@@ -40326,7 +40383,7 @@ function _pvMakeReversal(orig) {
 // ── Initialize after all declarations are ready ──
 (async function() {
   // ⭐ R25.44 BOOT BEACON
-  console.log('%c[SF R25.45] Active build: 2026-05-18-6000 — FIX Export ช่วงวันที่ modal (ใช้ .modal-overlay ที่ถูกต้อง)', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.45] Active build: 2026-05-18-6100 — CIC 4bug: month-scope stmt pull + selective bills push + stuck-detection ก่อน early-return + watchdog + แยก swap bills/stmts', 'color:#0c8;font-weight:bold;font-size:13px');
   // ⭐ R25.45 rev6 — Sweep stale idempotency_key cache entries (TTL 1h) at boot
   try {
     const _IDK_TTL_MS = 60 * 60 * 1000;
