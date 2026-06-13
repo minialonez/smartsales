@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.45-2026-05-18-5900 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.45-2026-05-18-6000 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -9051,13 +9051,13 @@ async function renderMain(el) {
       // default: วันที่ 1 ของเดือนที่ดูอยู่ → วันที่ดูอยู่
       const firstOfMonth = today.substring(0, 8) + '01';
       const html = `
-        <div class="modal-backdrop" id="export-range-modal" style="display:flex">
-          <div class="modal" style="max-width:420px">
+        <div class="modal-overlay open" id="export-range-modal" style="z-index:2000">
+          <div class="modal" style="width:420px">
             <div class="modal-header">
-              <h3 style="margin:0">📊 Export ช่วงวันที่ (แยกไฟล์)</h3>
-              <button class="modal-close" onclick="document.getElementById('export-range-modal').remove()">✕</button>
+              <div class="modal-title">📊 Export ช่วงวันที่ (แยกไฟล์)</div>
+              <button class="btn btn-ghost btn-sm" onclick="document.getElementById('export-range-modal').remove()">✕</button>
             </div>
-            <div class="modal-body" style="padding:16px">
+            <div>
               <p style="font-size:.85rem;color:var(--text2);margin:0 0 14px">
                 แต่ละวันจะได้ 1 ไฟล์แยกกัน (เช่น 01/04–05/04 = 5 ไฟล์)<br>
                 <span style="color:var(--text3)">วันที่ไม่มีข้อมูลจะถูกข้ามอัตโนมัติ</span>
@@ -40326,7 +40326,7 @@ function _pvMakeReversal(orig) {
 // ── Initialize after all declarations are ready ──
 (async function() {
   // ⭐ R25.44 BOOT BEACON
-  console.log('%c[SF R25.45] Active build: 2026-05-18-5900 — Export ช่วงวันที่ แยกหลายไฟล์ (1 วัน = 1 ไฟล์)', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.45] Active build: 2026-05-18-6000 — FIX Export ช่วงวันที่ modal (ใช้ .modal-overlay ที่ถูกต้อง)', 'color:#0c8;font-weight:bold;font-size:13px');
   // ⭐ R25.45 rev6 — Sweep stale idempotency_key cache entries (TTL 1h) at boot
   try {
     const _IDK_TTL_MS = 60 * 60 * 1000;
