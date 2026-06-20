@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.45-2026-05-18-6700 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.45-2026-05-18-6800 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -9420,6 +9420,13 @@ async function renderMain(el) {
       STATIONS.forEach((st, i) => {
         const col = 3 + i;
         const cc = ST_COLS[i];   // C..K
+        // R25.45 rev38 — Order/Payment merge เข้า Invoice (G12) -> ช่องนี้ต้องว่าง
+        //   เดิม: เขียน cached=calcSumCheck('Payment') (-5000) ทั้งที่ formula=null -> โชว์ -5000 ค้าง
+        if (st === 'Order' || st === 'Payment') {
+          const cM = setCell(rSum, col, '', { font: { size: 10 }, align: 'center' });
+          cM.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: C.dark } };
+          return;
+        }
         // cached display value
         let cached = '';
         try {
@@ -9436,8 +9443,6 @@ async function renderMain(el) {
           const acc = `SUM(G7:I11)-SUM(G3:I3)-SUM(G5:I5)`;  // ⭐ rev28 drawer RAW → หัก cashIn(r3)
           const inc = `SUM(G4:I4)+SUM(G6:I6)`;
           formula = `IF(ROUND((${acc})-(${inc}),2)=0,"OK",ROUND((${acc})-(${inc}),2))`;
-        } else if (st === 'Order' || st === 'Payment') {
-          formula = null;  // merged into Invoice
         } else {
           const acc = `SUM(${cc}7:${cc}11)-${cc}3-${cc}5`;  // ⭐ rev28 drawer RAW → หัก cashIn(r3)
           const inc = `${cc}4+${cc}6`;
@@ -40449,7 +40454,7 @@ function _pvMakeReversal(orig) {
 // ── Initialize after all declarations are ready ──
 (async function() {
   // ⭐ R25.44 BOOT BEACON
-  console.log('%c[SF R25.45] Active build: 2026-05-18-6700 — FIX Sum เกินตอน export: getters อ่าน __byDate[dateISO] ตรงๆ (ตรงกับโปรแกรม) แทน flat key ที่ค้างค่าวันเก่า', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.45] Active build: 2026-05-18-6800 — FIX Payment Sum -5000 ค้าง (Order/Payment cell ว่าง เพราะ merge เข้า Invoice)', 'color:#0c8;font-weight:bold;font-size:13px');
   // ⭐ R25.45 rev6 — Sweep stale idempotency_key cache entries (TTL 1h) at boot
   try {
     const _IDK_TTL_MS = 60 * 60 * 1000;
@@ -40468,7 +40473,7 @@ function _pvMakeReversal(orig) {
     if (_stale.length) console.log('[R25.45 rev6] Cleared ' + _stale.length + ' stale idk cache entries');
   } catch(_) {}
   console.log('%c[SF R25.44] Issue 1: flip by sp_no fallback · Issue 2: 5min window + defensive Date · Issue 3: pending_match hint · Issue 4: include_snapshot:true', 'color:#888');
-  window.__SF_BUILD = 'R25.45-2026-05-18-6700';
+  window.__SF_BUILD = 'R25.45-2026-05-18-6800';
   
   await restoreMainState();
   checkSavedLogin();
