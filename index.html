@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SF Build: R25.45-2026-05-18-6500 — DO NOT REMOVE (V8 cache bust marker) -->
+<!-- SF Build: R25.45-2026-05-18-6700 — DO NOT REMOVE (V8 cache bust marker) -->
 <html lang="th">
 <head>
 <meta charset="UTF-8">
@@ -7724,7 +7724,9 @@ async function renderMain(el) {
           <input type="date" class="input" id="filter-date-to" value="${filterDateTo}" placeholder="ถึง" title="วันที่สิ้นสุด" style="width:140px;font-size:.8rem">
           ${filterDateFrom||filterDateTo?'<button class="btn btn-ghost btn-sm" id="btn-clear-date">✕ ล้างวันที่</button>':''}
           <button class="btn btn-primary btn-sm" id="btn-add-bill">${ICONS.plus} เพิ่มบิล</button>
+          <!-- 🚫 R25.45 rev36 — ปิดปุ่มรับชำระลูกค้า (ไม่ใช้งานแล้ว — เก็บไว้ ไม่ลบ)
           <button class="btn btn-sm" id="btn-receive-payment" style="background:var(--success);color:#fff" title="รับชำระลูกค้า + ตัดจ่าย SB">💵 รับชำระลูกค้า</button>
+          -->
           <button class="btn btn-outline btn-sm" id="btn-bulk-date">📅 Bulk</button>
           <button class="btn btn-outline btn-sm" id="btn-auto-duedate">⚡ Auto Due</button>
           <button class="btn btn-sm" id="btn-delete-selected" style="background:var(--danger);color:#fff;display:none">🗑 ลบที่เลือก (<span id="del-count">0</span>)</button>
@@ -9183,23 +9185,48 @@ async function renderMain(el) {
         return m ? `${m[3]}/${m[2]}/${m[1]}` : String(iso);
       };
       
-      // Per-station value getters (reuse scope functions — ตรงกับหน้าจอ)
-      const getCashIn   = (st) => Number(_getSummaryValue('cashIn', st)) || 0;
-      const getCashOut  = (st) => Number(_getSummaryValue('cashOut', st)) || 0;
-      const getReturns  = (st) => Number(_getSummaryValue('returns', st)) || 0;
-      const getSales    = (st) => Number(calcSales(st)) || 0;
+      // ⭐ R25.45 rev37 — FIX Sum เกินตอน export: อ่านค่าจาก __byDate[dateISO] ตรงๆ
+      //   ปัญหาเดิม: getters ใช้ _getSummaryValue ที่ลอง flat key (mainSummary['cashDrawer_Front1'])
+      //             ก่อน → flat key = ค่าของ selectedDate ปัจจุบัน ไม่ใช่ของ dateISO ที่ export
+      //             → export วันอื่นได้ Cash Drawer ของวันที่เลือกอยู่ → Sum เพี้ยน
+      //   แก้: อ่าน __byDate[dateISO][thaiLabel][station] ตรงๆ เหมือน summaryRow ใน calcSumCheck
+      //        (โปรแกรมแสดง OK เพราะอ่าน __byDate, export เพี้ยนเพราะอ่าน flat key)
+      const _SUMM_LABEL = { cashIn:'นำเงินเข้า', sales:'ยอดขาย', cashOut:'นำเงินออก',
+                            returns:'ยอดคืนสินค้า', cashDrawer:'Cash Drawer',
+                            transfer:'Transfer', card:'Card', cheque:'Cheque', refund:'Refund' };
+      const _byDateVal = (field, st) => {
+        const thLabel = _SUMM_LABEL[field];
+        if (thLabel && mainSummary.__byDate && mainSummary.__byDate[dateISO]) {
+          const labelObj = mainSummary.__byDate[dateISO][thLabel];
+          if (labelObj && typeof labelObj === 'object') return Number(labelObj[st]) || 0;
+        }
+        return 0;
+      };
+      // cashIn/cashOut/returns ใช้ merged input (Front1-4 + Invoice เท่านั้น)
+      const _MERGED_INPUT = ['Front1','Front2','Front3','Front4','Invoice'];
+      
+      // Per-station value getters — อ่าน __byDate[dateISO] (ตรงกับ calcSumCheck ในโปรแกรม)
+      const getCashIn   = (st) => _MERGED_INPUT.includes(st) ? _byDateVal('cashIn', st) : 0;
+      const getCashOut  = (st) => _MERGED_INPUT.includes(st) ? _byDateVal('cashOut', st) : 0;
+      const getReturns  = (st) => _MERGED_INPUT.includes(st) ? _byDateVal('returns', st) : 0;
+      const getSales    = (st) => {
+        // Front1-4: __byDate ก่อน → fallback bills · Invoice/Order/Payment/IC/OC: bills
+        if (['Invoice','Invoice Credit','Order','Order Credit','Payment'].includes(st)) {
+          return Number(calcSales(st)) || 0;  // calcSales ใช้ bills สำหรับ station เหล่านี้ (date-safe ผ่าน getBillsForSelectedDate)
+        }
+        const v = _byDateVal('sales', st);
+        if (v) return v;
+        return Number(calcSales(st)) || 0;
+      };
       const getDrawer   = (st) => {
-        // ⭐ R25.45 rev28 — export แสดง Cash Drawer แบบ RAW (ยังไม่หัก นำเงินเข้า)
-        //   สูตร Sum จะหัก cashIn (row3) เอง → เห็นการหักชัดในตาราง (ตรวจสอบง่าย)
-        //   (ในโปรแกรมยังใช้ adjusted ปกติ — แก้เฉพาะ export)
-        let raw = 0;
+        // ⭐ rev37 — Cash Drawer RAW จาก __byDate[dateISO] (ตรงกับโปรแกรม)
         if (st === 'Invoice') {
           const counted = calcCashDrawer('Invoice');
-          raw = counted > 0 ? counted : (Number(_getSummaryValue('cashDrawer','Invoice'))||0);
-        } else {
-          raw = (Number(_getSummaryValue('cashDrawer', st)) || 0) || calcCashFromBills(st);
+          return counted > 0 ? counted : _byDateVal('cashDrawer', 'Invoice');
         }
-        return raw;   // RAW (ไม่หัก cashIn)
+        const v = _byDateVal('cashDrawer', st);
+        if (v) return v;
+        return calcCashFromBills(st);   // fallback bills
       };
       const getTransfer = (st) => Number(calcAutoValue('Transfer', st)) || 0;
       const getCard     = (st) => Number(calcAutoValue('Card', st)) || 0;
@@ -13449,7 +13476,7 @@ function renderSpSectionsForDate(opts) {
                 ${temps.length} รายการ · Bills ฿${fmtNum(totalBills)} · จ่าย ฿${fmtNum(totalPaid)} · เหลือ ฿${fmtNum(totalRemain)}
               </span>
             </div>
-            <button class="btn btn-warn btn-sm" id="main-sp-add-temp" style="padding:4px 10px;font-size:.75rem">
+            <button class="btn btn-warn btn-sm" id="main-sp-add-temp" style="padding:4px 10px;font-size:.75rem;display:none">
               ${ICONS.plus} สร้าง SP-TEMP
             </button>
           </div>
@@ -13609,7 +13636,7 @@ function renderSpSectionsForDate(opts) {
     emptyStateHtml = `
       <div class="card-flat" style="padding:16px;text-align:center;color:var(--text3)">
         <div class="text-sm" style="margin-bottom:8px">ยังไม่มี SP หรือ SP-TEMP สำหรับวัน ${dateLabel}</div>
-        <button class="btn btn-warn btn-sm" id="main-sp-add-temp" style="padding:4px 10px;font-size:.8rem">
+        <button class="btn btn-warn btn-sm" id="main-sp-add-temp" style="padding:4px 10px;font-size:.8rem;display:none">
           ${ICONS.plus} สร้าง SP ชั่วคราว
         </button>
       </div>
@@ -13778,7 +13805,7 @@ async function renderPayments(el) {
           <input class="input" placeholder="ค้นหา SP / ลูกค้า" id="pay-search" value="${searchText}" style="width:240px">
           <button class="btn btn-outline btn-sm" id="btn-refresh-pay" title="ดึงข้อมูล SP/SP-TEMP ล่าสุดจาก Sheet (ทับ local)">🔄 Refresh</button>
           <button class="btn btn-primary btn-sm" id="btn-import-sp">${ICONS.download} นำเข้า SP</button>
-          <button class="btn btn-warn btn-sm" id="btn-add-temp-sp" style="background:var(--warn);color:#fff">${ICONS.plus} SP ชั่วคราว</button>
+          <button class="btn btn-warn btn-sm" id="btn-add-temp-sp" style="background:var(--warn);color:#fff;display:none">${ICONS.plus} SP ชั่วคราว</button>
           <button class="btn btn-outline btn-sm" id="btn-clear-pay">ล้าง</button>
           <button class="btn btn-success btn-sm" id="btn-save-pay">${ICONS.check} บันทึก</button>
         </div>
@@ -17103,7 +17130,9 @@ const NAV_ITEMS = [
   { id:'payment_voucher', icon:'dollar', label:'💰 ใบสำคัญจ่าย' },
   { id:'sp_recon',  icon:'check',   label:'📥 ตรวจ SP (ลูกหนี้)' },
   { id:'pp_recon',  icon:'check',   label:'📤 ตรวจ PP (เจ้าหนี้)' },
-  { id:'billing',   icon:'card',    label:'📋 ใบวางบิล + หนี้' },
+  // 🚫 R25.45 rev36 — ปิดเมนูใบวางบิล (ไม่ใช้งานแล้ว — เก็บโค้ดไว้ ไม่ลบ)
+  //   เหตุผล: ปัญหาเยอะ ไม่มีเวลาแก้ + จะเลิกใช้อยู่แล้ว → ซ่อนจาก UI
+  // { id:'billing',   icon:'card',    label:'📋 ใบวางบิล + หนี้' },
   { id:'data',      icon:'folder',  label:'จัดการข้อมูล' },
   { id:'alerts',    icon:'bell',    label:'แจ้งเตือน', badge: true },
   { id:'reports',   icon:'file',    label:'รายงานบัญชี' },
@@ -40420,7 +40449,7 @@ function _pvMakeReversal(orig) {
 // ── Initialize after all declarations are ready ──
 (async function() {
   // ⭐ R25.44 BOOT BEACON
-  console.log('%c[SF R25.45] Active build: 2026-05-18-6500 — FIX excluded-customer asymmetry (filter ฝั่ง accounted: calcAutoValue + calcCashFromBills) → Sum balance', 'color:#0c8;font-weight:bold;font-size:13px');
+  console.log('%c[SF R25.45] Active build: 2026-05-18-6700 — FIX Sum เกินตอน export: getters อ่าน __byDate[dateISO] ตรงๆ (ตรงกับโปรแกรม) แทน flat key ที่ค้างค่าวันเก่า', 'color:#0c8;font-weight:bold;font-size:13px');
   // ⭐ R25.45 rev6 — Sweep stale idempotency_key cache entries (TTL 1h) at boot
   try {
     const _IDK_TTL_MS = 60 * 60 * 1000;
@@ -40439,7 +40468,7 @@ function _pvMakeReversal(orig) {
     if (_stale.length) console.log('[R25.45 rev6] Cleared ' + _stale.length + ' stale idk cache entries');
   } catch(_) {}
   console.log('%c[SF R25.44] Issue 1: flip by sp_no fallback · Issue 2: 5min window + defensive Date · Issue 3: pending_match hint · Issue 4: include_snapshot:true', 'color:#888');
-  window.__SF_BUILD = 'R25.45-2026-05-18-6500';
+  window.__SF_BUILD = 'R25.45-2026-05-18-6700';
   
   await restoreMainState();
   checkSavedLogin();
